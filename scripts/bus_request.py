@@ -389,6 +389,18 @@ def handle(rows, conn, now=None, append=None, max_per_run=MAX_PER_RUN) -> dict:
             continue
         budget -= 1
 
+        if req["action"] == "redis-op" and (req.get("op") or "").strip().lower() == redis_gov.VERIFY_OP:
+            # The public Sheet is not the haudit route. Do not run the manifest and do not publish
+            # a receipt. Counts and digests stay with the in-process caller. C11.
+            if append:
+                append(row_for(RESULT_ACTION, req,
+                               "HAUDIT withheld. Request and receipt stay off the board.",
+                               "HAUDIT withheld"))
+            already.add(req["req_id"])
+            out["answered"].append({"req_id": req["req_id"], "status": "REFUSED",
+                                    "op": req.get("op"), "key": "",
+                                    "latency_ms": 0})
+            continue
         if req["action"] == "redis-op":
             # ONE ROW, NOT TWO. The probe writes a RECEIPT then a RESULT because it takes a moment;
             # a governed op is one round trip, and every row addressed to an agent can wake it (a row

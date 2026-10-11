@@ -48,11 +48,39 @@ def spec(mapping):
     return {"sha256": digest, "len": length}
 
 
+def head_binding(specs):
+    """Head fields for these documents: manifest_root, page_count, listed. Page size 8."""
+    names = sorted(specs)
+    pages = []
+    for index, start in enumerate(range(0, len(names), gov.PAGE_SIZE)):
+        chunk = {name: specs[name] for name in names[start:start + gov.PAGE_SIZE]}
+        pages.append({"index": index, "keys": chunk})
+    return {
+        "manifest_root": gov.root_from_pages(pages) if pages else "",
+        "page_count": str(len(pages)),
+        "listed": str(len(specs)),
+    }
+
+
+def root_for(specs):
+    return head_binding(specs)["manifest_root"]
+
+
+def b64_pages(pages):
+    raw = json.dumps({"pages": pages}, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return base64.b64encode(raw).decode("ascii")
+
+
 class AuditRedis(FakeRedis):
     def __init__(self):
         super().__init__()
         self.scans = 0
         self.gets = 0
+        self.fetches = 0
+
+    def hgetall(self, key):
+        self.fetches += 1
+        return super().hgetall(key)
 
     def scan_iter(self, match=None, count=None):
         import fnmatch
@@ -179,7 +207,33 @@ class CanonicalUtf8(unittest.TestCase):
             gov.report_body(specs))
         self.assertEqual("d7f90960d6066e7208157ed3b0a559ec11d32a325d46686f23dea23ba6cb6960", report_hex)
         self.assertEqual(138, report_len)
-        self.assertNotEqual(report_hex, gov.manifest_digest(specs))
+        manifest = gov.manifest_digest(specs)
+        self.assertEqual("7ee61c4addbd4d475a50ace20c2060118887e158a0b85e8529a009e8c509d1fc", manifest)
+        self.assertNotEqual(report_hex, manifest)
+        # #296 head 45916666. One page, a then b. Page digest is the entries array, not the keys object.
+        one_page = gov.page_body(gov.page_entries(specs))
+        self.assertEqual(
+            b'[{"key":"a","len":9,"sha256":"013bdcb2b4d38b7d26f13f2a48631e9a5ae45530c3ef0e5946668d4f1892baa1"},'
+            b'{"key":"b","len":10,"sha256":"e37ae44535cf9436886c8517b4a6346e25fcd0501667d96726dd1831b3b7b232"}]',
+            one_page)
+        one_digest = gov.page_digest(gov.page_entries(specs))
+        self.assertEqual("4a800f8cbca06711efaf4eefb0ecc94ed900a0baff72e45d07af88396413915d", one_digest)
+        one_root_body = gov.root_body([one_digest], 2)
+        self.assertEqual(
+            b'{"listed":2,"page_count":1,"pages":["4a800f8cbca06711efaf4eefb0ecc94ed900a0baff72e45d07af88396413915d"]}',
+            one_root_body)
+        self.assertEqual(104, len(one_root_body))
+        self.assertEqual("8ede2b59d10a262095a25ee66783215a0152e89c5f43599ff41fc75f01099daa",
+                         gov.root_digest([one_digest], 2))
+        # Page size 1, a then b. Same entry encoding, two pages.
+        page_a = gov.page_digest(gov.page_entries({"a": specs["a"]}))
+        page_b = gov.page_digest(gov.page_entries({"b": specs["b"]}))
+        self.assertEqual("41c97912018db9fcf8eb1630c4bf636683079375a0a8ae7a7b9655f1d0e357fb", page_a)
+        self.assertEqual("2795e63c8651a476a23b7c4f35556b39a17de55deb2ebc2949d9d63848d68402", page_b)
+        two_root = gov.root_body([page_a, page_b], 2)
+        self.assertEqual(171, len(two_root))
+        self.assertEqual("12a5f441a619a1da3f97c767f43f03936502d260012ef9085a50104585113e5e",
+                         gov.root_digest([page_a, page_b], 2))
 
     def test_a_stored_nfd_hash_matches_the_nfc_digest_and_hides_the_text(self):
         os.environ[gov.VERIFY_FLAG] = "1"
@@ -188,13 +242,16 @@ class CanonicalUtf8(unittest.TestCase):
         key = prefix_for(gen) + "meta"
         stored = {"note": "private-caf\u00e9-value", "n": "1"}
         put_hash(conn, key, {"note": "private-cafe\u0301-value", "n": "1"})
-        put_hash(conn, "proj:pr-board:v1:head", {"generation": gen, "witness": HEAD_SECRET})
-        out = audit(conn, gen, {key: spec(stored)})
-        self.assertTrue(out["ok"], out)
-        self.assertEqual("match", out["keys"][0]["status"])
-        self.assertEqual(spec(stored)["sha256"], out["keys"][0]["sha256"])
-        self.assertEqual(spec(stored)["len"], out["keys"][0]["len"])
+        expected = {key: spec(stored)}
+        put_hash(conn, "proj:pr-board:v1:head", dict(head_binding(expected), generation=gen,
+                                                     witness=HEAD_SECRET))
+        out = audit(conn, gen, expected)
+        self.assertFalse(out["ok"], out)
+        self.assertTrue(out["page_ok"], out)
+        self.assertEqual(1, out["coverage"]["matched"])
+        self.assertEqual(spec(stored)["sha256"], gov.payload_digest(stored)[0])
         blob = json.dumps(out) + gov.summarise(out) + json.dumps(conn.audit())
+        self.assertNotIn(key, blob)
         self.assertNotIn("private-caf", blob)
         self.assertNotIn(HEAD_SECRET, blob)
 
@@ -207,14 +264,19 @@ class GenerationAudit(unittest.TestCase):
     def tearDown(self):
         self._env.stop()
 
-    def _plant(self, conn, gen, hashes, head_generation=None):
+    def _plant(self, conn, gen, hashes, head_generation=None, root_specs=None):
         for key, mapping in hashes.items():
             put_hash(conn, key, mapping)
-        put_hash(conn, "proj:pr-board:v1:head", {
+        specs = (root_specs if root_specs is not None
+                 else {key: spec(mapping) for key, mapping in hashes.items()})
+        fields = {
             "generation": head_generation if head_generation is not None else gen,
             "witness": HEAD_SECRET,
             "advisory": "1",
-        })
+        }
+        if specs:
+            fields.update(head_binding(specs))
+        put_hash(conn, "proj:pr-board:v1:head", fields)
 
     def test_every_key_in_the_generation_is_covered(self):
         conn = AuditRedis()
@@ -225,8 +287,9 @@ class GenerationAudit(unittest.TestCase):
         self._plant(conn, gen, {**one, **two})
         expected = {key: spec(mapping) for key, mapping in {**one, **two}.items()}
         out = audit(conn, gen, expected, cid="cid-covered-1")
-        self.assertTrue(out["ok"], out)
-        self.assertTrue(out["coverage"]["covered"])
+        self.assertFalse(out["ok"], out)
+        self.assertTrue(out["page_ok"], out)
+        self.assertFalse(out["coverage"]["covered"])
         self.assertEqual(2, out["coverage"]["expected"])
         self.assertEqual(2, out["coverage"]["seen"])
         self.assertEqual(2, out["coverage"]["matched"])
@@ -239,23 +302,29 @@ class GenerationAudit(unittest.TestCase):
         self.assertEqual("cid-covered-1", out["correlation"])
         self.assertEqual(gen, out["generation"])
         self.assertEqual(gen, out["head_generation"])
-        self.assertEqual({"match", "match"}, {entry["status"] for entry in out["keys"]})
-        lines = ["%s\t%s\t%d" % (entry["key"], entry["sha256"], entry["len"])
-                 for entry in sorted(out["keys"], key=lambda item: item["key"])]
-        report = "\n".join(lines).encode("utf-8")
-        self.assertEqual(hashlib.sha256(report).hexdigest(), out["digest"])
-        self.assertEqual(len(report), out["length"])
+        self.assertEqual(1, out["page_count"])
+        self.assertEqual(root_for(expected), out["manifest_root"])
+        self.assertEqual(root_for(expected), out["head_manifest_root"])
+        report_hex, report_len = gov.report_digest(expected)
+        self.assertEqual(report_hex, out["digest"])
+        self.assertEqual(report_len, out["length"])
         self.assertEqual(2, out["listed"])
+        self.assertEqual(1, out["pages"])
         self.assertEqual(gov.manifest_digest(expected), out["manifest_digest"])
         self.assertNotEqual(out["digest"], out["manifest_digest"])
+        self.assertNotEqual(out["digest"], out["manifest_root"])
         self.assertEqual(0, conn.scans)
-        blob = json.dumps(out)
+        blob = json.dumps(out) + gov.summarise(out) + json.dumps(conn.audit())
+        self.assertNotIn(prefix + "meta", blob)
+        self.assertNotIn(prefix + "i:0", blob)
         self.assertNotIn("alpha", blob)
         self.assertNotIn("beta", blob)
         self.assertNotIn(HEAD_SECRET, blob)
-        self.assertNotIn("value", out)
+        self.assertNotIn("keys", out)
         line = gov.summarise(out)
-        self.assertIn("covered=1", line)
+        self.assertIn("covered=0", line)
+        self.assertIn("ok=0", line)
+        self.assertIn("page_ok=1", line)
         self.assertIn("cid-covered-1", line)
         self.assertNotIn("|", line)
         self.assertNotIn("\n", line)
@@ -275,13 +344,7 @@ class GenerationAudit(unittest.TestCase):
             missing: spec({"body": "never-stored"}),
         }
         out = audit(conn, gen, expected, cid="cid-mix-1")
-        by_status = {}
-        for entry in out["keys"]:
-            by_status.setdefault(entry["status"], []).append(entry["key"])
-        self.assertEqual([prefix + "ok"], by_status["match"])
-        self.assertEqual([prefix + "bad"], by_status["changed"])
-        self.assertEqual([missing], by_status["missing"])
-        self.assertNotIn("extra", by_status)
+        self.assertFalse(out["page_ok"])
         self.assertEqual(1, out["coverage"]["missing"])
         self.assertEqual(0, out["coverage"]["extra"])
         self.assertEqual(1, out["coverage"]["changed"])
@@ -292,6 +355,10 @@ class GenerationAudit(unittest.TestCase):
         self.assertFalse(out["partial"])
         self.assertEqual("cid-mix-1", out["correlation"])
         blob = json.dumps(out) + gov.summarise(out) + json.dumps(conn.audit())
+        self.assertNotIn(prefix + "ok", blob)
+        self.assertNotIn(prefix + "bad", blob)
+        self.assertNotIn(missing, blob)
+        self.assertNotIn(prefix + "extra", blob)
         self.assertNotIn(SECRET, blob)
         self.assertNotIn(TOKEN, blob)
         self.assertNotIn(HEAD_SECRET, blob)
@@ -417,7 +484,8 @@ class GenerationAudit(unittest.TestCase):
         self.assertEqual("cid-echo-99", out["correlation"])
         self.assertEqual(gen, out["generation"])
         self.assertIn("cid-echo-99", gov.summarise(out))
-        self.assertEqual("changed", out["keys"][0]["status"])
+        self.assertEqual(1, out["coverage"]["changed"])
+        self.assertNotIn(key, json.dumps(out) + gov.summarise(out))
 
     def test_a_listed_key_changed_before_exec_is_not_a_pass(self):
         conn = AuditRedis()
@@ -497,9 +565,10 @@ class GenerationAudit(unittest.TestCase):
         out = audit(conn, gen, {key: spec(replaced)}, cid="cid-utf8-1")
         self.assertFalse(out["ok"], out)
         self.assertFalse(out["coverage"]["covered"])
-        self.assertNotEqual(["match"], [entry["status"] for entry in out["keys"]])
-        self.assertNotEqual(spec(replaced)["sha256"], out["keys"][0]["sha256"])
+        self.assertEqual(1, out["coverage"]["changed"])
+        self.assertNotEqual(spec(replaced)["sha256"], out["digest"])
         blob = json.dumps(out) + gov.summarise(out) + json.dumps(conn.audit())
+        self.assertNotIn(key, blob)
         self.assertNotIn("\ufffd", blob)
         self.assertEqual("cid-utf8-1", out["correlation"])
 
@@ -508,11 +577,13 @@ class GenerationAudit(unittest.TestCase):
         key2 = prefix_for(gen2) + "meta"
         text = {"note": "caf\u00e9"}
         valid.data[key2] = {b"note": "caf\u00e9".encode("utf-8")}
-        put_hash(valid, "proj:pr-board:v1:head", {"generation": gen2})
-        good = audit(valid, gen2, {key2: spec(text)}, cid="cid-utf8-ok")
-        self.assertTrue(good["ok"], good)
-        self.assertEqual("match", good["keys"][0]["status"])
-        self.assertEqual(spec(text)["sha256"], good["keys"][0]["sha256"])
+        expected = {key2: spec(text)}
+        put_hash(valid, "proj:pr-board:v1:head", dict(head_binding(expected), generation=gen2))
+        good = audit(valid, gen2, expected, cid="cid-utf8-ok")
+        self.assertFalse(good["ok"], good)
+        self.assertTrue(good["page_ok"], good)
+        self.assertEqual(1, good["coverage"]["matched"])
+        self.assertNotIn(key2, json.dumps(good) + gov.summarise(good))
 
     def test_unlisted_keys_are_not_scanned_and_a_match_can_pass(self):
         conn = AuditRedis()
@@ -522,7 +593,8 @@ class GenerationAudit(unittest.TestCase):
         put_hash(conn, one, {"n": "1"})
         for n in range(1, 300):
             put_hash(conn, prefix + "%03d" % n, {"n": "1"})
-        put_hash(conn, "proj:pr-board:v1:head", {"generation": gen})
+        expected = {one: spec({"n": "1"})}
+        put_hash(conn, "proj:pr-board:v1:head", dict(head_binding(expected), generation=gen))
         called = {"keys": 0, "scan": 0, "eval": 0}
 
         def forbid(name):
@@ -533,15 +605,18 @@ class GenerationAudit(unittest.TestCase):
 
         for name in ("keys", "scan", "eval"):
             setattr(conn, name, forbid(name))
-        out = audit(conn, gen, {one: spec({"n": "1"})}, cid="cid-nolist-1")
+        out = audit(conn, gen, expected, cid="cid-nolist-1")
         self.assertEqual({"keys": 0, "scan": 0, "eval": 0}, called)
         self.assertEqual(0, conn.scans)
-        self.assertTrue(out["ok"], out)
+        self.assertFalse(out["ok"], out)
+        self.assertTrue(out["page_ok"], out)
         self.assertFalse(out["partial"])
         self.assertEqual(1, out["listed"])
         self.assertEqual(0, out["coverage"]["extra"])
         self.assertEqual("cid-nolist-1", out["correlation"])
-        self.assertNotIn(prefix + "001", json.dumps(out))
+        blob = json.dumps(out) + gov.summarise(out)
+        self.assertNotIn(one, blob)
+        self.assertNotIn(prefix + "001", blob)
 
     def test_a_manifest_over_the_cap_is_refused_and_never_ok(self):
         conn = AuditRedis()
@@ -569,6 +644,110 @@ class GenerationAudit(unittest.TestCase):
         self.assertEqual("cid-over-cap", out["correlation"])
         self.assertNotIn("ab" * 32, out["refused"])
 
+    def test_a_single_page_is_page_ok_and_never_ok(self):
+        conn = AuditRedis()
+        gen = generation("a")
+        prefix = prefix_for(gen)
+        left = prefix + "a"
+        right = prefix + "b"
+        planted = {left: {"x": "1"}, right: {"y": "2"}}
+        self._plant(conn, gen, planted)
+        expected = {key: spec(mapping) for key, mapping in planted.items()}
+        out = audit(conn, gen, expected, cid="cid-one-page")
+        self.assertTrue(out["page_ok"], out)
+        self.assertFalse(out["ok"])
+        self.assertFalse(out["coverage"]["covered"])
+        self.assertEqual(1, out["page_count"])
+        self.assertEqual(root_for(expected), out["manifest_root"])
+        self.assertEqual(root_for(expected), out["head_manifest_root"])
+        blob = json.dumps(out) + gov.summarise(out) + json.dumps(conn.audit())
+        self.assertNotIn(left, blob)
+        self.assertNotIn(right, blob)
+
+    def test_one_page_of_a_larger_generation_is_not_ok(self):
+        conn = AuditRedis()
+        gen = generation("b")
+        prefix = prefix_for(gen)
+        planted = {prefix + "k%02d" % n: {"n": str(n)} for n in range(9)}
+        self._plant(conn, gen, planted)
+        first = {prefix + "k%02d" % n: spec(planted[prefix + "k%02d" % n]) for n in range(8)}
+        out = audit(conn, gen, first, cid="cid-page0-only")
+        self.assertTrue(out["page_ok"], out)
+        self.assertFalse(out["ok"])
+        self.assertEqual(1, out["page_count"])
+        self.assertNotEqual(out["manifest_root"], out["head_manifest_root"])
+        blob = json.dumps(out) + gov.summarise(out)
+        for n in range(9):
+            self.assertNotIn(prefix + "k%02d" % n, blob)
+
+    def test_every_page_of_a_two_page_generation_is_ok(self):
+        conn = AuditRedis()
+        gen = generation("c")
+        prefix = prefix_for(gen)
+        planted = {prefix + "k%02d" % n: {"n": str(n)} for n in range(9)}
+        self._plant(conn, gen, planted)
+        expected = {key: spec(mapping) for key, mapping in planted.items()}
+        out = audit(conn, gen, expected, cid="cid-two-pages")
+        self.assertTrue(out["page_ok"], out)
+        self.assertTrue(out["ok"], out)
+        self.assertTrue(out["coverage"]["covered"])
+        self.assertEqual(2, out["page_count"])
+        self.assertEqual(9, out["listed"])
+        self.assertEqual(root_for(expected), out["manifest_root"])
+        self.assertEqual(out["manifest_root"], out["head_manifest_root"])
+        self.assertEqual(0, conn.scans)
+        blob = json.dumps(out) + gov.summarise(out) + json.dumps(conn.audit())
+        for n in range(9):
+            self.assertNotIn(prefix + "k%02d" % n, blob)
+
+    def test_a_gap_or_an_overlap_is_refused_before_a_fetch(self):
+        conn = AuditRedis()
+        gen = generation("d")
+        prefix = prefix_for(gen)
+        specs = {prefix + "k%02d" % n: {"sha256": "ab" * 32, "len": 1} for n in range(9)}
+        names = sorted(specs)
+        gap = base64.b64encode(json.dumps({"pages": [
+            {"index": 0, "keys": {name: specs[name] for name in names[:8]}},
+            {"index": 2, "keys": {names[8]: specs[names[8]]}},
+        ]}).encode()).decode()
+        out = gov.execute(conn, ACL, "cursor", "via", gov.VERIFY_OP, prefix_for(gen),
+                          raw_value=gap, enc="b64", generation=gen, correlation="cid-gap",
+                          head="proj:pr-board:v1:head")
+        self.assertFalse(out["ok"])
+        self.assertIn("contiguous", out["refused"])
+        self.assertEqual(0, conn.fetches)
+        overlap = base64.b64encode(json.dumps({"pages": [
+            {"index": 0, "keys": {name: specs[name] for name in names[:8]}},
+            {"index": 1, "keys": {names[7]: specs[names[7]]}},
+        ]}).encode()).decode()
+        again = gov.execute(conn, ACL, "cursor", "via", gov.VERIFY_OP, prefix_for(gen),
+                            raw_value=overlap, enc="b64", generation=gen, correlation="cid-overlap",
+                            head="proj:pr-board:v1:head")
+        self.assertFalse(again["ok"])
+        self.assertIn("two pages", again["refused"])
+        self.assertEqual(0, conn.fetches)
+        for name in names:
+            self.assertNotIn(name, again["refused"])
+
+    def test_an_oversized_hash_is_refused_before_hgetall(self):
+        conn = AuditRedis()
+        gen = generation("e")
+        prefix = prefix_for(gen)
+        key = prefix + "big"
+        marker = "OVERSIZE-" + SECRET
+        put_hash(conn, key, {"body": marker + ("x" * 1_100_000)})
+        expected = {key: {"sha256": "ab" * 32, "len": 1}}
+        put_hash(conn, "proj:pr-board:v1:head", dict(head_binding(expected), generation=gen))
+        out = audit(conn, gen, expected, cid="cid-bound")
+        self.assertFalse(out["ok"], out)
+        self.assertFalse(out["page_ok"])
+        self.assertIn("2048", out["refused"])
+        self.assertEqual(0, conn.fetches)
+        blob = json.dumps(out) + gov.summarise(out)
+        self.assertNotIn(marker, blob)
+        self.assertNotIn(key, blob)
+        self.assertNotIn(SECRET, blob)
+
 
 class ScopeAndManifest(unittest.TestCase):
     def setUp(self):
@@ -583,20 +762,25 @@ class ScopeAndManifest(unittest.TestCase):
         conn = AuditRedis()
         own_prefix = "fleet:inbox:cursor:g:%s:" % gen[:16]
         own = own_prefix + "meta"
+        own_expected = {own: spec({"body": "mine"})}
         put_hash(conn, own, {"body": "mine"})
-        put_hash(conn, "fleet:inbox:cursor:head", {"generation": gen})
-        out = audit(conn, gen, {own: spec({"body": "mine"})}, who="cursor",
+        put_hash(conn, "fleet:inbox:cursor:head", dict(head_binding(own_expected), generation=gen))
+        out = audit(conn, gen, own_expected, who="cursor",
                     prefix=own_prefix, head="fleet:inbox:cursor:head")
-        self.assertTrue(out["ok"], out)
-        self.assertEqual(["match"], [entry["status"] for entry in out["keys"]])
+        self.assertFalse(out["ok"], out)
+        self.assertTrue(out["page_ok"], out)
+        self.assertEqual(1, out["coverage"]["matched"])
+        self.assertNotIn(own, json.dumps(out))
 
         conf_prefix = prefix_for(gen, "conf:room:g:")
         conf_key = conf_prefix + "meta"
+        conf_expected = {conf_key: spec({"body": "room"})}
         put_hash(conn, conf_key, {"body": "room"})
-        put_hash(conn, "conf:room:head", {"generation": gen})
-        room = audit(conn, gen, {conf_key: spec({"body": "room"})}, prefix=conf_prefix,
+        put_hash(conn, "conf:room:head", dict(head_binding(conf_expected), generation=gen))
+        room = audit(conn, gen, conf_expected, prefix=conf_prefix,
                      head="conf:room:head", cid="cid-conf-1")
-        self.assertTrue(room["ok"], room)
+        self.assertFalse(room["ok"], room)
+        self.assertTrue(room["page_ok"], room)
 
         other = prefix_for(gen, "fleet:inbox:grok:g:") + "meta"
         put_hash(conn, other, {"body": SECRET})
@@ -667,65 +851,50 @@ class ThroughTheWorker(unittest.TestCase):
                 "BCB|v=1|id=%s|req=%s|do=redis-op|%s" % (req, req, payload),
                 "", "", "", ""]
 
-    def test_flag_off_is_refused_on_the_board_and_flag_on_returns_the_digest(self):
+    def test_the_board_does_not_carry_a_receipt_or_a_key_name(self):
         gen = generation("6")
         key = prefix_for(gen) + "meta"
         mapping = {"body": SECRET}
         conn = AuditRedis()
         put_hash(conn, key, mapping)
-        put_hash(conn, "proj:pr-board:v1:head", {"generation": gen, "witness": HEAD_SECRET})
         expected = {key: spec(mapping)}
         rows = []
         out = br.handle([self._row(gen, expected, "cid-worker-off")], conn, now=self.now,
                         append=rows.append)
         self.assertEqual("REFUSED", out["answered"][0]["status"])
-        self.assertIn("off", rows[0]["payload"])
-        self.assertIn("cid-worker-off", rows[0]["payload"])
+        self.assertIn("withheld", rows[0]["payload"])
+        self.assertNotIn(key, rows[0]["payload"])
         self.assertNotIn(SECRET, rows[0]["payload"])
+        self.assertNotIn(spec(mapping)["sha256"], rows[0]["payload"])
+        self.assertEqual(0, conn.fetches)
         self.assertEqual(0, conn.scans)
 
         os.environ[gov.VERIFY_FLAG] = "1"
         rows = []
         out = br.handle([self._row(gen, expected, "cid-worker-on", req="REQ-AUDIT02")], conn,
                         now=self.now, append=rows.append)
-        self.assertEqual("OK", out["answered"][0]["status"])
-        self.assertIn("cid-worker-on", rows[0]["payload"])
-        self.assertIn(spec(mapping)["sha256"], rows[0]["payload"])
+        self.assertEqual("REFUSED", out["answered"][0]["status"])
+        self.assertIn("withheld", rows[0]["payload"])
+        self.assertNotIn(key, rows[0]["payload"])
+        self.assertNotIn(spec(mapping)["sha256"], rows[0]["payload"])
         self.assertNotIn(SECRET, rows[0]["payload"])
-        self.assertNotIn(HEAD_SECRET, rows[0]["payload"])
-        self.assertNotIn("|", rows[0]["payload"].split("text=", 1)[-1])
+        self.assertEqual(0, conn.fetches)
 
-    def test_a_mismatch_is_failed_and_a_timeout_is_an_error(self):
+    def test_a_mismatch_is_not_published_on_the_board(self):
         os.environ[gov.VERIFY_FLAG] = "1"
         gen = generation("7")
         key = prefix_for(gen) + "meta"
         conn = AuditRedis()
         put_hash(conn, key, {"body": SECRET})
-        put_hash(conn, "proj:pr-board:v1:head", {"generation": gen})
         rows = []
         out = br.handle([self._row(gen, {key: spec({"body": "nope"})}, "cid-fail-1",
                                     req="REQ-AUDIT03")], conn, now=self.now, append=rows.append)
-        self.assertEqual("FAILED", out["answered"][0]["status"])
+        self.assertEqual("REFUSED", out["answered"][0]["status"])
         self.assertEqual([], out["errors"])
-        self.assertIn("changed=1", rows[0]["payload"])
+        self.assertIn("withheld", rows[0]["payload"])
+        self.assertNotIn(key, rows[0]["payload"])
         self.assertNotIn(SECRET, rows[0]["payload"])
-
-        conn = AuditRedis()
-        put_hash(conn, key, {"body": SECRET})
-        put_hash(conn, "proj:pr-board:v1:head", {"generation": gen})
-
-        def hget(key, field):
-            raise TimeoutError("nope " + TOKEN)
-
-        conn.hget = hget
-        rows = []
-        out = br.handle([self._row(gen, {key: spec({"body": SECRET})}, "cid-fail-2",
-                                    req="REQ-AUDIT04")], conn, now=self.now, append=rows.append)
-        self.assertEqual("ERROR", out["answered"][0]["status"])
-        self.assertEqual(["REQ-AUDIT04"], out["errors"])
-        self.assertIn("timeout=1", rows[0]["payload"])
-        self.assertNotIn(TOKEN, rows[0]["payload"])
-        self.assertNotIn(SECRET, rows[0]["payload"])
+        self.assertNotIn("changed=1", rows[0]["payload"])
 
 
 if __name__ == "__main__":

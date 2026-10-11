@@ -87,6 +87,23 @@ class FakeRedis:
         self._need(key, "hash")
         return dict(self.data.get(key) or {})
 
+    def hlen(self, key):
+        self._need(key, "hash")
+        return len(self.data.get(key) or {})
+
+    def hkeys(self, key):
+        self._need(key, "hash")
+        return list((self.data.get(key) or {}).keys())
+
+    def hstrlen(self, key, field):
+        self._need(key, "hash")
+        raw = (self.data.get(key) or {}).get(field)
+        if raw is None:
+            return 0
+        if isinstance(raw, bytes):
+            return len(raw)
+        return len(str(raw).encode("utf-8"))
+
     def keys(self, pattern="*"):
         import fnmatch
         return [key for key in list(self.data) if fnmatch.fnmatch(key, pattern)]
