@@ -816,18 +816,20 @@ def handle(method: str, path: str, headers: dict, body: bytes, deps) -> tuple:
         out["worker"] = {"claude-code-cli": "online" if alive is not None else "offline",
                          "api": canonical(deps.api_worker) or "none"}
         return 200, out
+    # THE TOKEN BEFORE THE FLAG (the loopback smoke of 2026-10-11): a caller with no token learns
+    # nothing, not even that the flag is off. 401 is the only answer to an unauthenticated POST.
     if method == "POST" and path == "/hooks/drive":
-        if not deps.enabled:
-            return 200, {"enabled": False, "intake": []}
         if not channel_token_ok(deps.channel_token, headers.get("x-goog-channel-token", "")):
             return 401, {"error": "bad channel token"}
+        if not deps.enabled:
+            return 200, {"enabled": False, "intake": []}
         return 200, {"enabled": True,
                      "intake": [decide(h, deps) for h in hints_from_push(headers)]}
     if method == "POST" and path == "/poll":
-        if not deps.enabled:
-            return 200, {"enabled": False, "intake": []}
         if not poll_token_ok(deps.poll_token, headers):
             return 401, {"error": "bad poll token"}
+        if not deps.enabled:
+            return 200, {"enabled": False, "intake": []}
         return 200, {"enabled": True, "intake": poll(deps)}
     return 404, {"error": "not found"}
 

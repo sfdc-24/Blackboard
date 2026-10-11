@@ -1369,6 +1369,12 @@ class WiringTest(unittest.TestCase):
         d = deps(changes=lambda folder: [])
         self.assertEqual(200, di.handle("POST", "/poll", {"Authorization": "Bearer eyJ", "X-Drive-Intake-Poll-Token": "poll"}, b"", d)[0])
         self.assertEqual(401, di.handle("POST", "/poll", {"Authorization": "Bearer eyJ"}, b"", d)[0])
+        # the token comes BEFORE the flag: with the flag off, no token still means 401, not "enabled: false"
+        off = deps(enabled=False)
+        self.assertEqual(401, di.handle("POST", "/poll", {}, b"", off)[0])
+        self.assertEqual(401, di.handle("POST", "/hooks/drive", {"X-Goog-Resource-State": "update"}, b"", off)[0])
+        self.assertEqual((200, {"enabled": False, "intake": []}),
+                         di.handle("POST", "/poll", {"Authorization": "Bearer poll"}, b"", off))
 
     def test_deps_from_env_wires_what_a_deploy_gives_and_nothing_it_does_not(self):
         env = {"DRIVE_INTAKE_ENABLED": "on", "DRIVE_INTAKE_FOLDER_ID": FOLDER,

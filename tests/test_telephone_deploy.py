@@ -63,6 +63,9 @@ class IntakeDeployTest(unittest.TestCase):
         self.assertNotIn("--vpc-egress all-traffic", self.script)
         self.assertIn("--oidc-service-account-email", self.script)
         self.assertIn("X-Drive-Intake-Poll-Token=", self.script)   # the header main.py reads
+        self.assertRegex(self.script, r"services enable[^\n]*docs\.googleapis\.com[^\n]*drive\.googleapis\.com")
+        self.assertIn("gcp-sa-cloudscheduler.iam.gserviceaccount.com", self.script)   # the agent may act as the poller
+        self.assertNotIn("print-identity-token --audiences", self.script)   # a user account's token has none
         self.assertNotIn("REDIS_HOST=10.", self.script)            # the private address is never committed
         self.assertNotIn("token_hex(32)\" >", self.script)         # a minted token goes to Secret Manager, not a file
         for secret in ("REDIS_AUTH_STRING", "REDIS_CA_CERT", "DRIVE_INTAKE_POLL_TOKEN", "DRIVE_INTAKE_CHANNEL_TOKEN"):
@@ -89,6 +92,7 @@ class WorkerDeployTest(unittest.TestCase):
         self.assertIn('MODEL="${CLAUDE_API_WORKER_MODEL:-}"', self.script)
         self.assertNotRegex(self.script, r"claude-(haiku|sonnet|opus)-\d")
         self.assertIn("--max-retries 0", self.script)             # one attempt, no automatic retry
+        self.assertRegex(self.script, r"services enable[^\n]*docs\.googleapis\.com[^\n]*drive\.googleapis\.com")
         self.assertIn('EGRESS="private-ranges-only"', self.script)
         self.assertNotIn('EGRESS="all-traffic"', self.script)
         self.assertNotIn("--vpc-egress all-traffic", self.script)

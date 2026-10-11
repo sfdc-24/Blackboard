@@ -68,6 +68,10 @@ FOLDER_ID="${DRIVE_INTAKE_FOLDER_ID:-1gZlJFDD2Wm419YOuolIXC3HXwzXOWYfP}"
 HEARTBEAT_SECONDS="${DRIVE_INTAKE_HEARTBEAT_SECONDS:-300}"
 
 setup() {
+  # The APIs the job calls (Docs, Drive) and the ones this script uses; enabling is idempotent.
+  "$GCLOUD" services enable docs.googleapis.com drive.googleapis.com run.googleapis.com \
+    cloudscheduler.googleapis.com secretmanager.googleapis.com cloudbuild.googleapis.com \
+    --project "$PROJECT"
   "$GCLOUD" iam service-accounts describe "$SA" --project "$PROJECT" >/dev/null 2>&1 ||
     "$GCLOUD" iam service-accounts create "$SA_NAME" --project "$PROJECT" \
       --display-name "claude-api worker: one bounded answer per tick, and the laptop lane"

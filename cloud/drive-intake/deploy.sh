@@ -30,6 +30,7 @@
 set -euo pipefail
 
 PROJECT="${PROJECT:-sfdc24}"
+PROJECT_NUMBER="${PROJECT_NUMBER:-96522051727}"
 REGION="${REGION:-us-central1}"
 SERVICE="${SERVICE:-drive-intake}"
 NAME="drive-intake"
@@ -65,12 +66,20 @@ HEARTBEAT_SECONDS="${DRIVE_INTAKE_HEARTBEAT_SECONDS:-300}"
 POLL_SECONDS="${DRIVE_INTAKE_POLL_SECONDS:-120}"
 
 setup() {
+  # The APIs the service calls (Docs, Drive) and the ones this script uses; enabling is idempotent.
+  "$GCLOUD" services enable docs.googleapis.com drive.googleapis.com run.googleapis.com \
+    cloudscheduler.googleapis.com secretmanager.googleapis.com cloudbuild.googleapis.com \
+    --project "$PROJECT"
   "$GCLOUD" iam service-accounts describe "$SA" --project "$PROJECT" >/dev/null 2>&1 ||
     "$GCLOUD" iam service-accounts create "$SA_NAME" --project "$PROJECT" \
       --display-name "Drive intake: read the folder, append receipts, write fleet: keys"
   "$GCLOUD" iam service-accounts describe "$INVOKER" --project "$PROJECT" >/dev/null 2>&1 ||
     "$GCLOUD" iam service-accounts create "$INVOKER_NAME" --project "$PROJECT" \
       --display-name "Drive intake poller: Cloud Scheduler's identity for POST /poll"
+  # Cloud Scheduler mints the poller's OIDC token, so its service agent must be allowed to act as it.
+  "$GCLOUD" iam service-accounts add-iam-policy-binding "$INVOKER" --project "$PROJECT" \
+    --member "serviceAccount:service-${PROJECT_NUMBER}@gcp-sa-cloudscheduler.iam.gserviceaccount.com" \
+    --role roles/iam.serviceAccountUser >/dev/null
   for secret in "${SECRETS[@]}"; do
     "$GCLOUD" secrets describe "$secret" --project "$PROJECT" >/dev/null 2>&1 ||
       { echo "secret ${secret} does not exist yet; run: deploy.sh tokens (the two tokens) or create it" >&2; continue; }
@@ -144,7 +153,9 @@ readback() {
   local url
   url="$(service_url)"
   echo "healthz:"
-  curl -s -H "Authorization: Bearer $("$GCLOUD" auth print-identity-token --audiences "$url")" "${url}/healthz"; echo
+  # A user account's identity token (no --audiences: that flag is for service accounts) is accepted
+  # by a private Cloud Run service when the account holds run.invoker, which the project owner does.
+  curl -s -H "Authorization: Bearer $("$GCLOUD" auth print-identity-token)" "${url}/healthz"; echo
   echo "a scheduler with no lastAttemptTime has never attempted; poll reads unknown until the first tick"
 }
 
