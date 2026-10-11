@@ -88,6 +88,7 @@ from urllib.parse import urljoin
 import repo_context  # noqa: E402
 import cloud_context  # noqa: E402
 import okf_land  # noqa: E402
+import redis_keys  # noqa: E402
 from bus import load_env as _load_bus_env
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -123,9 +124,9 @@ REDIS, which you may read and write through your adapter, governed and audited:
   form (op first, then the key, then the value when the op takes one):
       REDIS-OP|op=xadd|key=conf:side:YYYYMMDD|val=your line of text
   ops: get, hgetall, xrange (reads); set, hset (needs field=), hput, xadd, del (writes).
-  The key must start with conf:, fleet: or proj:, for reads and writes alike; any other key
-  is refused before posting. The side channel every voice on the conference line reads is
-  conf:side:<today, UTC yyyymmdd>.
+  A key must be shared (conf:, proj:), your own inbox (fleet:inbox:<you>), or
+  gov:worker:heartbeat for a read; any other key is refused before posting. The side
+  channel every voice on the conference line reads is conf:side:<today, UTC yyyymmdd>.
 - Your adapter posts that line as a request row under your own tag and removes it from the
   text of your answer. The governed worker judges it under the access list and answers you
   with ONE later row (AYA_RESULT) saying OK or REFUSED and why. Until that row exists nothing
@@ -815,11 +816,6 @@ REDIS_OPS = ("get", "hgetall", "xrange", "set", "del", "hset", "hput", "xadd")
 
 
 REQUEST_FIELDS = ("op", "key", "val", "field", "count")
-# The namespaces a MODEL may name, for reads and writes alike. Narrower than the access list on
-# purpose: the list grants every principal read `*` (the owner's 2026-10-08 instruction), and that is
-# right for an agent's own tool; a model's text output is not an agent's tool. Grok on #367: through
-# this hook a model could have gov:audit or another agent's inbox read and posted onto the board.
-REQUEST_PREFIXES = ("conf:", "fleet:", "proj:")
 REQUEST_STATES = ("posted", "unconfirmed", "refused", "cut", "malformed")
 
 
@@ -925,10 +921,13 @@ def post_request(me: str, cfg: dict, request: dict, verbose: bool, answers: str 
     DIFFERENT request, and reads the row back by id AND payload; "VERIFIED on the board" is the only
     posted; "refused before posting" / "NOT SENT" is refused; anything else is unconfirmed - never
     "absent": a timeout may have landed (append contract)."""
-    key = str(request.get("key") or "")
-    if not key.startswith(REQUEST_PREFIXES):
-        return "refused", ("the key is outside the namespaces a model may name (%s); nothing was sent"
-                           % ", ".join(REQUEST_PREFIXES))
+    # ONE KEY RULE FOR THE MODEL'S PATH AND THE COMMAND LINE (Grok on #367, item 1): shared keys, the
+    # agent's own inbox, the heartbeat for a read. scripts/redis_keys.py owns it (fleet_agent applies
+    # the same); it is checked here first so a refused key never reaches a subprocess, a log line or
+    # the board.
+    denied = redis_keys.key_allowed_for(me, request.get("op", ""), str(request.get("key") or ""))
+    if denied:
+        return "refused", denied + "; nothing was sent"
     for part in ("key", "field"):
         chosen = request.get(part)
         if chosen and okf_land.scrub_secrets(str(chosen)) != str(chosen):
@@ -951,12 +950,12 @@ def post_request(me: str, cfg: dict, request: dict, verbose: bool, answers: str 
     if verbose:
         print("    " + out.strip()[-400:].replace("\n", "\n    "))
     found = re.search(r"VERIFIED on the board: Row_ID=(\S+)", out)
-    if found:
+    if found and res.returncode == 0:
         return "posted", found.group(1)
     reason = " ".join(out.split())[-200:] or "no output from fleet_agent request"
-    if "refused before posting" in out or "NOT SENT" in out:
-        return "refused", reason
-    return "unconfirmed", reason
+    if res.returncode in (1, 2) or "refused before posting" in out or "NOT SENT" in out:
+        return "refused", reason          # fleet_agent's EXIT_NOT_SENT / EXIT_REFUSED: nothing appended
+    return "unconfirmed", reason          # EXIT_UNCONFIRMED, a timeout, or words it did not say
 
 
 def request_note(request, state: str, detail: str) -> str:

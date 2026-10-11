@@ -262,6 +262,16 @@ def refusals(req, now, already, acl=None) -> list:
     if req.get("action") == "redis-op" and req.get("repeated"):
         out.append("ambiguous: the field(s) %s appear more than once"
                    % ", ".join(safe(k)[:20] for k in req["repeated"][:5]))
+    # A RAW VALUE ON THE BOARD IS REFUSED (Grok on #367, board row 2cc985ed). The payload has no
+    # escaping, so a raw value holding a pipe was split into fields before this worker read the row,
+    # and what reached Redis was the part before the pipe: a truncation with an OK and an audit entry.
+    # base64 carries anything, fleet_agent request encodes it, and the page documents no other form.
+    # The Git channel keeps its grammar for now: its lines are Cursor's, and moving them to base64 is
+    # Cursor's change, not a silent break of a live lane; it already refuses repeated fields.
+    if (req.get("action") == "redis-op" and req.get("channel", "board") != "git"
+            and req.get("val") and req.get("enc") != "b64"):
+        out.append("val must travel as base64 with enc=b64: a raw value has no escaping on the board "
+                   "(fleet_agent request encodes it for you)")
     return out
 
 

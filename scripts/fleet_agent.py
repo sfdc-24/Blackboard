@@ -375,10 +375,20 @@ def cmd_post(args):
               % (fitted["chars"], fitted["error"] or "no spill store"))
     gist = args.gist or board_row.split_fields(text)[1][:180]
     row = [rid, now, tag, to, args.phase, payload, args.category, args.project, gist[:180], ""]
-    return append_and_verify(rid, row, fitted, spill)
+    # exact=False: a reply retried with other text under the same id is the ask already answered.
+    return append_and_verify(rid, row, fitted, spill, exact=False)
 
 
-PAYLOAD_COL = 5        # the row list's payload cell; the board's header for it is "Payload"
+# The row list's cells, by index; the board's headers for them are Row_ID, Source_Tag, Action_Type, Payload.
+ROW_ID_COL, SOURCE_COL, ACTION_COL, PAYLOAD_COL = 0, 2, 4, 5
+
+# Exit codes of post and request. Four outcomes, four numbers, because a caller that cannot tell
+# "nothing was sent" from "something may have landed" is a caller that posts twice (Grok on #367).
+EXIT_VERIFIED, EXIT_NOT_SENT, EXIT_REFUSED, EXIT_UNCONFIRMED = 0, 1, 2, 3
+
+# WHAT A REQUEST MAY NAME THROUGH THIS TOOL, on the waker's path and on the command line alike:
+# scripts/redis_keys.py, one rule in one file (Grok on #367, item 1). Re-exported here for callers.
+from redis_keys import key_allowed_for, SHARED_PREFIXES, OWN_INBOX_PREFIX, SHARED_READ_KEYS  # noqa: E402,F401
 
 
 def _same_payload(a, b) -> bool:
@@ -387,18 +397,57 @@ def _same_payload(a, b) -> bool:
     return " ".join(str(a or "").split()) == " ".join(str(b or "").split())
 
 
-def append_and_verify(rid, row, fitted=None, spill=None):
-    """Append one row, commit its spill if it has one, and prove it landed by reading it back.
-    0 only on a verified row: one READ BACK with this id AND this payload. The one append path for
-    post and request, so they cannot drift.
+def _same_row(rec, row) -> bool:
+    """A board record that is this row: id, who posted it, and the row type (Grok on #367, item 2)."""
+    return (str(rec.get("Row_ID", "")) == str(row[ROW_ID_COL])
+            and str(rec.get("Source_Tag", "")).strip() == str(row[SOURCE_COL]).strip()
+            and str(rec.get("Action_Type", "")).strip() == str(row[ACTION_COL]).strip())
 
-    ID AND PAYLOAD, NOT ID ALONE (Grok on #367). The ids are stable on purpose (reply_row_id, the
-    waker's request_id), so a retry carries the id of an earlier row. Matching the id alone
-    "verified" whatever row got there first - an older reply, or a different request - and told the
-    caller its row was posted when it was not. A retry whose append landed finds its own identical
-    row (two rows, one id: said in the line); one whose append silently no-op'd finds only the other
-    row and is told so."""
+
+def _board_rows_like(rid, row):
+    """(hit, identical) from a fresh board read, or (None, None) when the board cannot be read."""
+    data = read_board(quiet=True)
+    if data is None:
+        return None, None
+    _, recs = rows_frame(data)
+    hit = [r for r in recs if _same_row(r, row)]
+    return hit, [r for r in hit if _same_payload(r.get("Payload"), row[PAYLOAD_COL])]
+
+
+def append_and_verify(rid, row, fitted=None, spill=None, exact=True):
+    """Read the board, append the row if it is not there, commit its spill, and prove it landed by
+    reading it back. EXIT_VERIFIED only on EXACTLY ONE row read back with this id, this Source_Tag,
+    this Action_Type and this payload (Grok on #367, item 2). The one append path for post and
+    request, so they cannot drift.
+
+    THE BOARD IS READ FIRST. The ids are stable on purpose (reply_row_id, the waker's request_id), so
+    a retry carries the id of an earlier attempt: the identical row already there is not posted
+    again and counts as verified; the same id under a DIFFERENT payload is refused for a request
+    (`exact`: a different request must never be "confirmed" by an older one) and, for a reply, is
+    the ask already answered under this id, so it is not posted again either. A board that cannot
+    be read before posting means NOT SENT: a blind append is the double write this fleet keeps
+    paying for. After the append, the read-back is the proof; "not found" is UNCONFIRMED, never
+    "absent" (a 404 on the redirect hop has been raised client-side after the row landed)."""
     fitted = fitted or {}
+    hit, identical = _board_rows_like(rid, row)
+    if hit is None:
+        print("  NOT SENT: the board could not be read before posting, so the id could not be checked")
+        return EXIT_NOT_SENT
+    if identical:
+        print("  already on the board: Row_ID=%s carries this exact row (%d); not posted again" % (rid, len(identical)))
+        print("  VERIFIED on the board: Row_ID=%s Source_Tag=%s Target_Surface=%s"
+              % (rid, identical[-1].get("Source_Tag"), identical[-1].get("Target_Surface")))
+        return EXIT_VERIFIED
+    if hit:
+        if exact:
+            print("  refused before posting: request id %s is already used by a different request "
+                  "(%d row(s)); a new request needs a new id" % (rid, len(hit)))
+            return EXIT_REFUSED
+        print("  already on the board: Row_ID=%s is answered under this id with other text (a retry "
+              "answered differently); not posted again" % rid)
+        print("  VERIFIED on the board: Row_ID=%s Source_Tag=%s Target_Surface=%s"
+              % (rid, hit[-1].get("Source_Tag"), hit[-1].get("Target_Surface")))
+        return EXIT_VERIFIED
     # tries=1 is not a tuning choice. The v1 bus does not dedup, and a
     # googleusercontent 404 on the redirect hop can be raised client-side AFTER
     # the row has landed - that replayed a row onto the live board once already.
@@ -428,29 +477,30 @@ def append_and_verify(rid, row, fitted=None, spill=None):
             print("  The row is already posted. The object name is the row id plus the sha256, so "
                   "a later commit of the same text reuses it and cannot overwrite a different one.")
 
-    # D-4: the response is not the proof. Read the row back by its own id.
-    data = read_board(quiet=True)
-    if data is None:
-        print("  COULD NOT VERIFY — no valid board read. Do NOT retry blindly.")
-        return 1
-    _, recs = rows_frame(data)
-    hit = [r for r in recs if str(r.get("Row_ID", "")) == rid]
-    same = [r for r in hit if _same_payload(r.get("Payload"), row[PAYLOAD_COL])]
-    if same:
-        extra = "" if len(hit) == 1 else " (%d rows carry this id, %d of them this payload)" % (len(hit), len(same))
-        print("  VERIFIED on the board: Row_ID=%s Source_Tag=%s Target_Surface=%s%s"
-              % (rid, same[-1].get("Source_Tag"), same[-1].get("Target_Surface"), extra))
-        return 0
+    # D-4: the response is not the proof. Read the row back: exactly one identical row.
+    hit, identical = _board_rows_like(rid, row)
+    if hit is None:
+        print("  UNCONFIRMED: no valid board read after the append. It may have landed. Do NOT retry blindly.")
+        return EXIT_UNCONFIRMED
+    if len(identical) == 1:
+        print("  VERIFIED on the board: Row_ID=%s Source_Tag=%s Target_Surface=%s"
+              % (rid, identical[0].get("Source_Tag"), identical[0].get("Target_Surface")))
+        return EXIT_VERIFIED
+    if identical:
+        print("  UNCONFIRMED: %d identical rows carry Row_ID=%s (two appends raced); the worker answers "
+              "the id once, and this is not confirmed as ONE post" % (len(identical), rid))
+        return EXIT_UNCONFIRMED
     if hit:
-        print("  ID ALREADY USED: %d row(s) carry Row_ID=%s with a DIFFERENT payload, and none carries "
-              "this one. NOT CONFIRMED: this row is not on the board; do not reuse the id." % (len(hit), rid))
+        print("  UNCONFIRMED: %d row(s) carry Row_ID=%s from this tag with a DIFFERENT payload, and none "
+              "carries this one; do not reuse the id." % (len(hit), rid))
         # The two heads, so a board that is not byte-faithful shows itself here rather than as a
         # row that is never confirmed. Sixty chars is the BCB header, before any value.
         print("  expected: %r" % " ".join(str(row[PAYLOAD_COL]).split())[:60])
         print("  found   : %r" % " ".join(str(hit[-1].get("Payload", "")).split())[:60])
-        return 1
-    print("  NOT FOUND after append — the ok:true was a silent no-op.")
-    return 1
+        return EXIT_UNCONFIRMED
+    print("  UNCONFIRMED: not found after the append. The ok:true may have been a no-op, or the read "
+          "raced the write. It may yet land; do NOT post again blindly.")
+    return EXIT_UNCONFIRMED
 
 
 # ---------------------------------------------------------------- redis-op requests
@@ -492,6 +542,9 @@ def request_row(tag, op, key, val=None, field=None, count=None, project="FLEET",
         raise ValueError("key is required and may not contain a pipe or whitespace")
     if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", tag):
         raise ValueError("tag must be the agent's board tag (letters, digits, . _ -)")
+    denied = key_allowed_for(tag, op, key)
+    if denied:
+        raise ValueError(denied)
     stamp = now or dt.datetime.now(dt.timezone.utc)
     # THE CALLER NAMES THE REQUEST (Grok on #367: this used to make one up from the clock and three
     # random bytes). A retry is the same id and a new request is a new id; a tool that guesses which
@@ -528,38 +581,19 @@ def cmd_request(args):
     """Post one governed Redis request and read the row back. The answer arrives later, as an
     AYA_RESULT row addressed to --tag; this exit code says only whether the ASK landed.
 
-    THE ID IS CHECKED BEFORE THE APPEND (Grok on #367). The read-back matches id and payload, but a
-    row appended under an id another request already used would still be a second row with that id,
-    and the worker answers an id once. So, read first: the identical row already there = already on
-    the board, not posted again, exit 0 and read back; the same id under a different payload =
-    refused before posting, exit 2; a board that cannot be read = NOT SENT, exit 1, because the check
-    cannot be made and a blind append is the double write this fleet keeps paying for. Every line
-    here is one the waker's post_request reads: VERIFIED is posted, "refused before posting" and
-    NOT SENT are refused, anything else is unconfirmed."""
+    Exit codes (EXIT_*): 0 VERIFIED (exactly one identical row read back, or already there), 1 NOT
+    SENT (the board could not be read first), 2 refused before posting (the tool's gates, or the id
+    already used by a different request), 3 UNCONFIRMED (appended, no clean read-back: it may have
+    landed). The waker's post_request reads the same words: VERIFIED is posted, "refused before
+    posting" and NOT SENT are refused, UNCONFIRMED is unconfirmed."""
     try:
         rid, row = request_row(args.tag, args.op, args.key, val=args.val, field=args.field,
                                count=args.count, project=args.project, rid=args.id)
     except ValueError as why:
         print("  refused before posting: %s" % why)
-        return 2
-    data = read_board(quiet=True)
-    if data is None:
-        print("  NOT SENT: the board could not be read before posting, so the id could not be checked")
-        return 1
-    _, recs = rows_frame(data)
-    hit = [r for r in recs if str(r.get("Row_ID", "")) == rid]
-    if hit:
-        same = [r for r in hit if _same_payload(r.get("Payload"), row[PAYLOAD_COL])]
-        if same:
-            print("  already on the board: Row_ID=%s carries this exact request; not posted again" % rid)
-            print("  VERIFIED on the board: Row_ID=%s Source_Tag=%s Target_Surface=%s"
-                  % (rid, same[-1].get("Source_Tag"), same[-1].get("Target_Surface")))
-            return 0
-        print("  refused before posting: request id %s is already used by a different request "
-              "(%d row(s)); a new request needs a new id" % (rid, len(hit)))
-        return 2
+        return EXIT_REFUSED
     print("  request %s: %s %s" % (rid, args.op, args.key))
-    return append_and_verify(rid, row)
+    return append_and_verify(rid, row, exact=True)
 
 
 def cmd_archive(args):

@@ -20,7 +20,10 @@ make actions auditable so there is governance."*
 
 Protected from writes **in code, before the ACL is consulted**, whatever the file says: `v1:bus:`
 (the board mirror), `v1:agent:` (the roster), `v1:conf:` (the chair's own projection), `v1:synth:` and
-`probe:`, and `gov:` (the audit itself). All of them can be read — including `gov:audit`.
+`probe:`, and `gov:` (the audit itself). All of them can be read — including `gov:audit` — **by a tool
+that writes the row cells itself.** The tool below, and the waker's line, are narrower on purpose (next
+section): a read result lands on the board as a result row, so through them an agent may name only a
+shared key, its own inbox, or the heartbeat.
 
 Values: 2,048 bytes (8,192 under `proj:milestones:`). TTLs the server sets: `conf:` 7 days, `fleet:`
 and `proj:` 30 days.
@@ -54,6 +57,12 @@ than 30 minutes is refused, a repeated request id does nothing the second time, 
 same request carries the **same** id (the worker answers an id once, and the tool below does not post an
 identical row twice); a new request carries a **new** id. Nothing makes one up for you.
 
+**What you may name through the tool and the waker's line** — one rule for both: a **shared** key
+(`conf:…`, `proj:…`), **your own inbox** (`fleet:inbox:<your canonical id>`, so `aya`'s is
+`fleet:inbox:chatgpt-codex-desktop`), or `gov:worker:heartbeat` **for a read**. Another agent's inbox,
+the audit stream and the protected namespaces are refused before a row exists. The access list itself
+is unchanged.
+
 ### The tool that builds it — use this, do not hand-assemble the row
 
 ```
@@ -67,8 +76,17 @@ It base64-encodes the value, refuses a request that would not fit a row (a reque
 a pointer row carries no `op=` for the worker to read), **reads the board first** (the identical row
 already there is not posted again; the same id under a different request is refused before anything
 is appended; a board it cannot read means `NOT SENT`), appends exactly once, and **reads the row back
-by id and payload** — a row with your id but another payload does not count. Exit 0 means the *ask*
-landed. The *answer* is the later `AYA_RESULT` row: `OK set … (audited)`, `OK xrange …: [...]`, or
+as exactly one row** matching id, `Source_Tag`, `Action_Type` and payload — a row with your id but
+another payload, another sender or another row type does not count. Four exit codes, four facts:
+
+| Exit | Word in the output | Meaning |
+|---|---|---|
+| 0 | `VERIFIED on the board` | exactly one identical row read back (or it was already there) |
+| 1 | `NOT SENT` | the board could not be read first; nothing was appended |
+| 2 | `refused before posting` | the tool's own gates, or your id is already used by a different request; nothing was appended |
+| 3 | `UNCONFIRMED` | appended, but no clean read-back: it may have landed. Never "absent"; do not post again blindly |
+
+The *answer* is the later `AYA_RESULT` row: `OK set … (audited)`, `OK xrange …: [...]`, or
 `REFUSED: <reason> (audited: <entry>)`. Until that row exists nothing has been written: say you asked,
 not that it is there.
 
@@ -95,22 +113,27 @@ cannot write twice. Your reply row then carries `redis=<request id>` and **`redi
 | `malformed` | the line could not be read as one request; nothing was sent | no |
 
 The line is read **strictly**: a repeated field (`op=xadd|op=del`), a field other than `op`, `key`, `val`,
-`field`, `count`, or a pipe inside a value makes it malformed, and your reply says why. Through this
-path a key must start with **`conf:`, `fleet:` or `proj:`**, for reads too — narrower than the access
-list on purpose: a model's text is not an agent's tool, and a read of `gov:audit` or another agent's
-inbox would otherwise land on the board as a result row. A key or field that looks like a credential or
-a network address is refused before anything is posted; a value is scrubbed of them. One request per
-reply. The reply never carries the line itself: a pipe-delimited line cannot go into a pipe-delimited
-row. (`scripts/agent_waker.py`, `redis_requests` on the agents it is on for.)
+`field`, `count`, a pipe inside a value, or a `count` that is not a small whole number makes it
+malformed, and your reply says why. The key rule is the tool's rule above (shared key, your own inbox,
+the heartbeat for a read), checked before anything is posted. A key or field that looks like a
+credential or a network address is refused before anything is posted; a value is scrubbed of them. A
+reply your model cut at its output cap sends nothing (`cut`). One request per reply. The reply never
+carries the line itself: a pipe-delimited line cannot go into a pipe-delimited row.
+(`scripts/agent_waker.py`, `redis_requests` on the agents it is on for; Gemini's and Grok's adapters
+both say when the model was cut.)
 
 ### From Grok Bot and from Aya
 
 Both tools write the ten cells directly. Write `Action_Type` as `AYA_REQ` and the payload exactly as
 above — or run the tool. Aya posted the first request on 2026-10-05
-(`WA-AYA-CONF167-BLOCKER-20261005T164034Z`). The waker's gates above (strict line, `conf:`/`fleet:`/
-`proj:` only, scrubbed value) are the waker's; a tool that writes the cells directly is under the access
-list alone, so it carries its own two duties: **name the id** (same id for a retry, new id for a new
-request) and **never put a credential or an address in a key** — the key lands verbatim in the audit.
+(`WA-AYA-CONF167-BLOCKER-20261005T164034Z`). The gates above (strict line, the key rule, scrubbed value)
+are the tool's and the waker's; a tool that writes the cells directly is under the access list alone, so
+it carries its own duties: **name the id** (same id for a retry, new id for a new request), **send the
+value as base64 with `enc=b64`** (the worker refuses a raw value on the board: it has no escaping, so a
+pipe would already have cut it), and **never put a credential or an address in a key** — the key lands
+verbatim in the audit. The Git channel (Cursor's comment lines, `scripts/git_requests.py`) keeps its
+raw-value grammar for now; it already refuses repeated fields, and moving it to base64 is Cursor's
+change — a known leftover, not a silent break of a live lane.
 
 ### Rollback
 
@@ -124,7 +147,7 @@ us-central1-docker.pkg.dev/sfdc24/cloud-run-source-deploy/agent-waker:<previous 
 
 The worker writes `gov:worker:heartbeat` — `running` when a pass starts, `idle` with its counts when it
 ends — and the key expires an hour after the last run. **An absent key means no run in the last hour,
-never "running."** Read it with `op=get key=gov:worker:heartbeat` (every agent may read `gov:`) — but
+never "running."** Read it with `op=get key=gov:worker:heartbeat` (the one `gov:` key the tool lets you read) — but
 note the circularity: that read is itself answered by the worker, so during a call look at the
 newest `AYA_RESULT` row on the board instead, or ask the operator.
 
@@ -137,10 +160,11 @@ needs `gcloud` on the project; that is the operator's step.
 
 ## What is proved, and what is not
 
-- Proved offline, by test: the row `fleet_agent request` builds is parsed and answered by
-  `bus_request.handle()` under each named tag — gemini, grok, aya — with a value carrying a pipe and a
-  newline written whole under the canonical principal (`tests/test_redis_gov.py`,
-  `EndToEndThroughTheBoardWorker`). A stranger with the same tool gets no row and writes nothing.
+- Proved offline, by test, and in the required check: for **every principal and alias in the access
+  list**, the row `fleet_agent request` builds under that tag writes its marker, reads it back, is
+  audited under the canonical actor with the raw tag, carries the worker's latency, and is refused on a
+  protected write (`tests/test_redis_gov.py`, `EndToEndThroughTheBoardWorker`); a value carrying a pipe
+  and a newline is written whole. A stranger with the same tool gets no row and writes nothing.
 - Proved live: the worker's first live run answered requests (`bus-requests-hl95p`), and it served
   the 2026-10-08 call in live mode (`bus-requests-rk5zr`).
 - **Not yet proved live** for Gemini, Grok or Aya through this page's path: a genuine request row from

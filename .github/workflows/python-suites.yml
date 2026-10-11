@@ -127,6 +127,9 @@ on:
       - "tests/test_bus_reconcile.py"
       - "scripts/bus_request.py"
       - "tests/test_bus_request.py"
+      - "scripts/redis_gov.py"
+      - "scripts/redis_acl.json"
+      - "tests/test_redis_gov.py"
       - "scripts/sf360.py"
       - "tests/test_org_publish.py"
       - "scripts/org_publish.py"
@@ -204,6 +207,9 @@ on:
       - "tests/test_bus_reconcile.py"
       - "scripts/bus_request.py"
       - "tests/test_bus_request.py"
+      - "scripts/redis_gov.py"
+      - "scripts/redis_acl.json"
+      - "tests/test_redis_gov.py"
       - "scripts/roster_seed.py"
       - "tests/test_roster_seed.py"
       - "tests/test_image_layout.py"
@@ -980,6 +986,20 @@ jobs:
           if [ -f tests/test_bus_request.py ]; then
             python_bin="$(command -v python3)"
             sudo unshare -n -- "$python_bin" -B -m unittest tests.test_bus_request -v
+          else
+            echo "not on this branch; skipping"
+          fi
+
+      # The governor and the access list, end to end through the board worker (Grok on #367, item 6:
+      # this suite was green on laptops and absent from the check). Every principal and alias the
+      # owner named writes its marker, reads it back, is audited, and is refused on a protected
+      # write; the row fleet_agent builds is the row the worker answers; the read-back is exactly one row.
+      - name: "redis governor: every named agent, through the board, under the access list (no network)"
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_redis_gov.py ]; then
+            python_bin="$(command -v python3)"
+            sudo unshare -n -- "$python_bin" -B -m unittest tests.test_redis_gov -v
           else
             echo "not on this branch; skipping"
           fi

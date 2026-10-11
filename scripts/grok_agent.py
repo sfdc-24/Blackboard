@@ -249,6 +249,10 @@ def ask(
     Token usage lands in LAST_USAGE.
     """
     global LAST_USAGE
+    # MODEL CUT-OFF IS SAID ON THE FUNCTION, as gemini_agent does (Grok on #367, item 4): the waker
+    # reads ask.last_finish before it lifts a REDIS-OP line, and a reply this API cut at max_tokens
+    # (finish_reason "length") must post nothing. None until the response says otherwise.
+    ask.last_finish = None
     chosen = model or pick()
     messages = []
     if system:
@@ -275,6 +279,8 @@ def ask(
     if not choices:
         raise SystemExit("no choices in the response: %s" % json.dumps(body)[:300])
     text = (choices[0].get("message") or {}).get("content") or ""
+    if str(choices[0].get("finish_reason") or "").lower() == "length":
+        ask.last_finish = "MAX_TOKENS"
     return text.strip(), chosen
 
 
