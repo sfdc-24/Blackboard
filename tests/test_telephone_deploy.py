@@ -6,6 +6,7 @@ running with the default. So every `environ.get("NAME")` the two services read m
 script that deploys them, or be on the short list of optional ones, and nothing else.
 """
 import importlib.util
+import json
 import math
 import os
 import re
@@ -87,6 +88,13 @@ def load(name, path):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def gate_constant(name):
+    """A constant of the worker script's cost gate, read by running the gate's own source."""
+    namespace = {"__name__": "cost_gate"}
+    exec(quoted((WORKER / "deploy.sh").read_text(encoding="utf-8"), "COST_MISSING_PY"), namespace)
+    return namespace[name]
 
 
 def gate():
@@ -366,7 +374,7 @@ UNUSABLE = (
     ("CLAUDE_API_WORKER_USD_PER_MTOK_OUT", "inf"), ("CLAUDE_API_WORKER_USD_PER_MTOK_OUT", "0.5 USD"),
     ("FLEET_CAD_PER_USD", "-1.45"), ("FLEET_CAD_PER_USD", "1,45"), ("FLEET_CAD_PER_USD", "1e-400"),
     ("CLAUDE_API_WORKER_MAX_INPUT_TOKENS", "100000.0"), ("CLAUDE_API_WORKER_MAX_INPUT_TOKENS", "-5"),
-    ("CLAUDE_API_WORKER_MAX_INPUT_TOKENS", "100k"),
+    ("CLAUDE_API_WORKER_MAX_INPUT_TOKENS", "100k"), ("CLAUDE_API_WORKER_MAX_INPUT_TOKENS", "1500"),
     ("CLAUDE_API_WORKER_AUTHORIZED_UNTIL_UTC", "2099-01-01T00:00:00+00:00"),
     ("CLAUDE_API_WORKER_AUTHORIZED_UNTIL_UTC", "2099-01-01T00:00:00z"),
     ("CLAUDE_API_WORKER_AUTHORIZED_UNTIL_UTC", "2099-01-01"),
@@ -590,16 +598,26 @@ class CostGateTest(unittest.TestCase):
         cls.problems = staticmethod(gate())
         cls.wk = load("claude_api_worker_for_deploy", WORKER / "main.py")
 
+    def smallest_request(self, model, max_tokens):
+        """What call_reservation measures against the input bound, for a request of no words at all."""
+        wk = self.wk
+        request = json.dumps({"model": model, "max_tokens": max_tokens, "system": wk.DOCTRINE % wk.RESULT_MAX,
+                              "messages": [{"role": "user", "content": ""}]}).encode("utf-8")
+        return len(request) + wk.INPUT_TOKEN_OVERHEAD
+
     def runtime_can_call(self, env, now):
-        """main.py's verdict on this env, by its own readers and the conditions call_reservation states."""
+        """main.py's verdict on this env, by its own readers and the conditions call_reservation states:
+        whether ANY request, even an empty one, could be reserved and called."""
         wk = self.wk
         until = wk._utc_deadline_env(env, "CLAUDE_API_WORKER_AUTHORIZED_UNTIL_UTC")
+        max_tokens = wk._int_env(env, "CLAUDE_API_WORKER_MAX_TOKENS", wk.DEFAULT_MAX_TOKENS)
         return bool(
             (env.get("CLAUDE_API_WORKER_MODEL") or "").strip()
             and wk._int_env(env, "CLAUDE_API_WORKER_RESERVE_CENTS_CAD", 0) > 0
             and wk._int_env(env, "FLEET_SPEND_CAP_CENTS_CAD", 0) > 0
-            and wk._int_env(env, "CLAUDE_API_WORKER_MAX_TOKENS", wk.DEFAULT_MAX_TOKENS) > 0
-            and wk._int_env(env, "CLAUDE_API_WORKER_MAX_INPUT_TOKENS", 0) > 0
+            and max_tokens > 0
+            and wk._int_env(env, "CLAUDE_API_WORKER_MAX_INPUT_TOKENS", 0)
+            >= self.smallest_request(env.get("CLAUDE_API_WORKER_MODEL") or "", max_tokens)
             and until is not None and now < until
             and wk.valid_prices(wk._float_env(env, "CLAUDE_API_WORKER_USD_PER_MTOK_IN"),
                                 wk._float_env(env, "CLAUDE_API_WORKER_USD_PER_MTOK_OUT"),
@@ -613,6 +631,24 @@ class CostGateTest(unittest.TestCase):
             self.assertIn(name, named)
         self.assertFalse(self.runtime_can_call(dict(DEFAULTS), NOW))
         self.assertEqual([], self.problems({k: v for k, v in SET.items() if k != "CLAUDE_API_WORKER_MAX_TOKENS"}, NOW))
+
+    def test_an_input_bound_too_small_for_the_workers_own_instructions_is_refused(self):
+        # Cursor on fb22006: a whole number under about 1877 passed the gate, and call_reservation
+        # still returned nothing, because the instructions and the overhead alone are that long.
+        floor = gate_constant("MIN_INPUT_BOUND")
+        at = lambda bound: dict(SET, CLAUDE_API_WORKER_MAX_INPUT_TOKENS=str(bound))  # noqa: E731
+        self.assertEqual([], self.problems(at(floor), NOW))
+        found = self.problems(at(floor - 1), NOW)
+        self.assertEqual(1, len(found), found)
+        self.assertTrue(found[0].startswith("CLAUDE_API_WORKER_MAX_INPUT_TOKENS (under %d" % floor), found)
+        # The floor stays above main.py's own, with room for a real request: a long model id and
+        # the largest answer limit do not lift the smallest request to half of it. A doctrine
+        # that grows past that fails HERE, not in a doc that says QUEUED once a day.
+        smallest = self.smallest_request("m" * 64, 10 ** 7)
+        self.assertGreater(smallest, 1500)                               # the measurement is of something
+        self.assertLessEqual(smallest * 2, floor)
+        self.assertTrue(self.runtime_can_call(at(floor), NOW))
+        self.assertFalse(self.runtime_can_call(at(1500), NOW))
 
     def test_every_unusable_value_is_named_and_none_of_them_would_have_called(self):
         for name, value in UNUSABLE:
@@ -628,7 +664,8 @@ class CostGateTest(unittest.TestCase):
         # Every cell the gate passes, the worker must pass. Wider than the table above: shapes the
         # two readers could disagree on (spaces, signs, exponents, fractions of a second, offsets).
         prices = ("0.1", " 0.1 ", "+0.1", "1e-3", "1E2", ".5", "5.", "0x10", "1_0", "", "0", "0.0", "-0", "NaN", "Infinity")
-        ints = ("100000", " 100000 ", "+7", "1_000", "07", "1e5", "100000.0", "", "0", "-1", "0x10")
+        ints = ("100000", " 100000 ", "+7", "1_000", "07", "1e5", "100000.0", "", "0", "-1", "0x10",
+                "1876", "1877", "4095", "4096", "+4096", "4_096")
         dates = ("2099-01-01T00:00:00Z", "2099-01-01T00:00:00.000Z", "2099-01-01 00:00:00Z", "20990101T000000Z",
                  "2099-01-01T00:00Z", "2099-01-01T00:00:00ZZ", "Z", "", "2099-01-01T00:00:00+00:00Z",
                  "2025-10-09T08:53:20Z", "2025-10-09T08:53:21Z")

@@ -204,7 +204,9 @@ prints the inputs as deployed. `worker on` refuses while any is missing, and
 while any is a value the worker would read as nothing: a negative or
 non-numeric price or rate, `100000.0` for the input bound (the worker reads a
 whole number or zero), a deadline not written `YYYY-MM-DDTHH:MM:SSZ` or already
-passed, a zero cap or reservation. It also refuses when the job cannot be read
+passed, a zero cap or reservation, an input bound under 4096 (the instructions
+the worker sends with every request take about 1900 of it before a word of the
+request). It also refuses when the job cannot be read
 back at all.
 
 **One intake at a time.** #374 also ships `PHONE_DOC_INTAKE_ENABLED`, a second

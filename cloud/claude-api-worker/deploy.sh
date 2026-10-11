@@ -227,12 +227,17 @@ flag() {
 # zero, None or past is as unset as an empty one. A negative or NaN price, 100000.0 for the input
 # bound (int() refuses it and the worker reads 0), a deadline ending +00:00 or a lowercase z, a
 # deadline already passed. Never looser than the worker; the deadline shape is stricter on purpose.
+# And an input bound under MIN_INPUT_BOUND: the worker checks every request against that bound, and
+# its own instructions plus its 1024 overhead are about 1900 of it before a word of any request, so
+# a small whole number passed here and still called nothing (Cursor on fb22006). A real tier bound
+# is tens of thousands; tests/test_telephone_deploy.py holds the floor above main.py's own.
 # The model id is on the list because an empty one is Unconfigured on every pass.
 COST_MISSING_PY='
 import math, re, sys, time
 from datetime import datetime
 
 DEADLINE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
+MIN_INPUT_BOUND = 4096
 
 def positive_int(raw, default=0):
     try:
@@ -267,6 +272,8 @@ def problems(env, now):
     for name in ("CLAUDE_API_WORKER_MAX_INPUT_TOKENS", "FLEET_SPEND_CAP_CENTS_CAD", "CLAUDE_API_WORKER_RESERVE_CENTS_CAD"):
         if not positive_int(env.get(name, "")):
             bad(name, "not a whole number above zero")
+        elif name == "CLAUDE_API_WORKER_MAX_INPUT_TOKENS" and int(env[name]) < MIN_INPUT_BOUND:
+            bad(name, "under %d, too small for the instructions the worker sends with every request" % MIN_INPUT_BOUND)
     if "CLAUDE_API_WORKER_MAX_TOKENS" in env and not positive_int(env["CLAUDE_API_WORKER_MAX_TOKENS"], 1):
         bad("CLAUDE_API_WORKER_MAX_TOKENS", "not a whole number above zero")
     until = deadline(env.get("CLAUDE_API_WORKER_AUTHORIZED_UNTIL_UTC", ""))
