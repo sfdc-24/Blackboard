@@ -1206,6 +1206,12 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
                                         title, settings.visitor_sessions_per_day)
             except LeadCapExceeded as exc:
                 raise HTTPException(429, "the conversations for today are used up") from exc
+        # telephone_doc stays unset. This handler's fields (title, creation_id,
+        # start, topic) are the client's, and the task id on the session is
+        # minted here, not taken from a Drive file. drive-intake's dispatcher
+        # keeps source_doc_id on its own tuple and does not write this session.
+        # Copying ?doc= or a body field into the binding would make the client
+        # the authority, which the telephone read is written to refuse.
         token = mint_token(state["session_id"], state["expires_at"], settings.session_secret)
         return {
             "session_id": state["session_id"],
@@ -1569,6 +1575,11 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         Server-side only: no request body writes telephone_doc. The telephone
         query is checked against this field and is not itself the binding.
         Off with the trail (no STUDIO_TELEPHONE_URL), this refuses and stores nothing.
+
+        Nothing in the normal session path calls this. POST /v1/session does
+        not know a Drive file id the server assigned, and drive-intake's
+        dispatcher never writes a studio session. Until one of those holds a
+        trusted id, a session created the normal way stays unbound.
         """
         if not settings.telephone_url:
             raise HTTPException(404, "the telephone trail is off")

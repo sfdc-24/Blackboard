@@ -264,8 +264,13 @@ is per session and doc, so one session is not handed another's trail. It needs
 `STUDIO_TELEPHONE_URL` (the service URL), `STUDIO_TELEPHONE_TOKEN` (the same
 value as `DRIVE_INTAKE_POLL_TOKEN`, from Secret Manager), and `roles/run.invoker`
 on drive-intake for this service's account, since the call carries this
-service's own OIDC identity. The binding is written by the server
-(`bind_telephone_doc`), not by the query, and that writer is off with the flag.
+service's own OIDC identity. The binding is written only by
+`bind_telephone_doc`, not by the query, and that writer is off with the flag.
+Nothing in session creation calls it. `POST /v1/session` has no
+server-assigned Drive file id (its body is the client's, and the session's
+task id is minted here), and drive-intake's dispatcher keeps `source_doc_id`
+on its own tuple and does not write this session. A normal session therefore
+stays unbound, and with the flag on its telephone read stays 403.
 
 Keep `STUDIO_MAX_SESSION_SECONDS=600`, `STUDIO_DAILY_SESSION_CAP=20`, and
 the operator allowlist for the approved initial envelope. Voice is one call per
