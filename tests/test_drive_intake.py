@@ -85,20 +85,37 @@ class Receipts:
 
 
 class Queue:
-    """An inbox that can be read back by task id, like fleet:inbox."""
+    """An inbox that can be read back by task id, like fleet:inbox, and whose put is
+    append-unless-present the way PUT_ONCE_LUA is. `hold` parks a put until flush()."""
 
-    def __init__(self, fail=None, fail_after=None):
-        self.puts, self.fail, self.fail_after = [], fail, fail_after
+    def __init__(self, fail=None, fail_after=None, hold=False):
+        self.puts, self.fail, self.fail_after, self.hold, self.held = [], fail, fail_after, hold, []
 
     def has(self, recipient, task_id):
         return any(t["recipient_id"] == recipient and t["task_id"] == task_id for t, _, _ in self.puts)
 
+    def _land(self, tuple_, gist_, at):
+        if self.has(tuple_["recipient_id"], tuple_["task_id"]):
+            return False
+        self.puts.append((dict(tuple_), dict(gist_), at))
+        return True
+
     def put(self, tuple_, gist_, at):
         if self.fail:
             raise self.fail
-        self.puts.append((dict(tuple_), dict(gist_), at))
+        if self.hold:
+            self.held.append((dict(tuple_), dict(gist_), at))
+            raise TimeoutError("put still in flight")
+        added = self._land(tuple_, gist_, at)
         if self.fail_after:
             raise self.fail_after
+        return added
+
+    def flush(self):
+        """The in-flight puts finally reach Redis, in order."""
+        results = [self._land(*h) for h in self.held]
+        self.held = []
+        return results
 
     def recipients(self):
         return [t["recipient_id"] for t, _, _ in self.puts]
@@ -406,6 +423,65 @@ class FailoverTest(unittest.TestCase):
         di.decide(hint(), d2)
         self.assertTrue(seen[0].startswith("delivering:claude-api:1000"), seen)
 
+    def test_a_put_that_outlives_its_lease_lands_once_because_the_queue_itself_dedupes(self):
+        """Cursor on 07a6b1c: a put still in flight at +61 s was overtaken; a chain at 0, +61,
+        +122 appended three times. The put is append-unless-present, so the late one is a no-op."""
+        slow = Queue(hold=True)
+        d = deps(queue=slow)
+        first = di.decide(hint(), d)                              # takes the lease, put parked in flight
+        self.assertEqual("queue_error", first["status"], first)  # (its own view: nothing landed yet)
+        self.assertEqual(1, len(slow.held))
+        d.now = 1000.0 + di.DELIVER_LEASE + 1                    # a second pass finds the lease dead
+        slow.hold = False
+        second = di.decide(hint(), d)
+        self.assertEqual("dispatched", second["status"], second)
+        self.assertEqual(1, len(slow.puts))
+        self.assertEqual([False], slow.flush())                  # the slow put reaches Redis: not added
+        self.assertEqual(1, len(slow.puts))
+        self.assertEqual(1, len(d.ring.calls))
+        for extra in (122, 183):
+            d.now = 1000.0 + extra
+            self.assertEqual("duplicate", di.decide(hint(), d)["status"])
+        self.assertEqual(1, len(slow.puts))
+
+    def test_the_wait_a_request_came_through_rides_the_claim_so_its_line_survives_a_crash(self):
+        """Cursor on 07a6b1c: a QUEUED line not read back was abandoned once the route changed."""
+        d = deps(docs=Docs(text=REQUEST + "Use the sf CLI.\n"))
+        d.claims.states[key_for(text=REQUEST + "Use the sf CLI.\n")] = "delivering:claude-code-cli:0:q"
+        laptop_up(d)
+        out = di.decide(hint(), d)
+        self.assertEqual("dispatched", out["status"], out)
+        self.assertEqual(["QUEUED", "REQUESTED", "DISPATCHED"], d.receipts.states())
+        self.assertIn("awaiting the laptop", d.receipts.lines[0][2])
+        self.assertTrue(all(":q" in s for s in d.claims.states.values()) or
+                        list(d.claims.states.values()) == [di.DONE])
+
+    def test_a_wait_line_that_still_will_not_read_back_keeps_dispatched_owed(self):
+        """The wait line is re-attempted before the put; if THAT also fails to land, the trail
+        is still short and dispatched must wait for it, not for the last line alone."""
+        class DropsQueued(Receipts):
+            dropping = True
+
+            def append(self, file_id, expected_revision, receipt_id, block):
+                if self.dropping and "QUEUED - task" in block:
+                    self.appends += 1
+                    return self.revision
+                return super().append(file_id, expected_revision, receipt_id, block)
+        text = REQUEST + "Use the sf CLI.\n"
+        d = deps(docs=Docs(text=text), receipts=DropsQueued())
+        self.assertEqual("queued", di.decide(hint(), d)["status"])
+        laptop_up(d)
+        out = di.decide(hint(), d)
+        self.assertEqual("dispatched_receipt_owed", out["status"], out)
+        self.assertEqual(["REQUESTED", "DISPATCHED"], d.receipts.states())
+        self.assertEqual(1, len(d.ring.calls))
+        d.receipts.dropping = False
+        later = di.decide(hint(), d)
+        self.assertEqual("dispatched", later["status"], later)
+        self.assertEqual(["REQUESTED", "DISPATCHED", "QUEUED"], d.receipts.states())
+        self.assertEqual(1, len(d.ring.calls))
+        self.assertEqual(1, len(d.queue.puts))
+
     def test_a_crash_before_the_put_resumes_to_the_bound_worker(self):
         d = deps()
         d.claims.states[key_for()] = "delivering:claude-api"     # bound, then died before the put
@@ -476,7 +552,7 @@ class RetryTest(unittest.TestCase):
         out = di.decide(hint(), d)
         self.assertEqual("queue_error", out["status"])
         self.assertEqual([], d.receipts.lines)      # nothing landed, so nothing is claimed in the doc
-        self.assertEqual("delivering:claude-api:0", list(d.claims.states.values())[0])   # bound, lease given up
+        self.assertEqual("delivering:claude-api:0:", list(d.claims.states.values())[0])   # bound, lease given up
         d.queue = Queue()
         self.assertEqual("dispatched", di.decide(hint(), d)["status"])
         self.assertEqual(1, len(d.queue.puts))
@@ -615,6 +691,17 @@ class RetryTest(unittest.TestCase):
             d = deps(docs=Docs(text=text), api_worker=api, receipts=Receipts(drop=True))
             di.decide(hint(), d)
             self.assertEqual(expect.lower() + "_receipt_owed", di.decide(hint(), d)["status"])
+            # Cursor on 07a6b1c: the route then changes and the unwritten wait line was abandoned
+            d.receipts = Receipts()
+            if expect == "QUEUED":
+                laptop_up(d)
+            else:
+                d.api_worker = "claude-api"
+            out = di.decide(hint(), d)
+            self.assertEqual("dispatched", out["status"], out)
+            self.assertEqual([expect, "REQUESTED", "DISPATCHED"], d.receipts.states())
+            self.assertEqual("duplicate", di.decide(hint(), d)["status"])
+            self.assertEqual([expect, "REQUESTED", "DISPATCHED"], d.receipts.states())
 
     def test_a_receipt_id_does_not_carry_the_clock_so_a_retry_finds_its_own_line(self):
         t = di.correlate(FILE, REQUEST, "r1", "claude-api")
@@ -759,10 +846,11 @@ class ScopeTest(unittest.TestCase):
 
 
 class StreamClient:
-    """Enough of a Redis stream to prove the read-back reads the NEWEST entries."""
+    """Enough of a Redis stream to prove the read-back reads the NEWEST entries, and that
+    the put is one atomic append-unless-present call (eval of PUT_ONCE_LUA)."""
 
     def __init__(self):
-        self.streams, self.n = {}, 0
+        self.streams, self.n, self.evals = {}, 0, []
 
     def xadd(self, key, fields):
         self.n += 1
@@ -771,6 +859,16 @@ class StreamClient:
     def xrevrange(self, key, count=None):
         rows = list(reversed(self.streams.get(key, [])))
         return rows[:count] if count else rows
+
+    def eval(self, script, numkeys, key, task_id, lookback, *flat):
+        """What PUT_ONCE_LUA does, in Python, so the test can check the script's shape AND its effect."""
+        self.evals.append((script, numkeys, key, task_id, lookback, flat))
+        assert "XREVRANGE" in script and "XADD" in script and "task_id" in script
+        for _id, fields in self.xrevrange(key, count=int(lookback)):
+            if fields.get("task_id") == task_id:
+                return 0
+        self.xadd(key, dict(zip(flat[0::2], flat[1::2])))
+        return 1
 
 
 class InboxQueueTest(unittest.TestCase):
@@ -811,6 +909,22 @@ class InboxQueueTest(unittest.TestCase):
         self.assertEqual(di.INBOX_LOOKBACK + 101, len(client.streams["fleet:inbox:claude-api"]))
         self.assertTrue(q.has("claude-api", out["task"]))
 
+    def test_the_put_is_one_atomic_append_unless_present_call(self):
+        client = StreamClient()
+        q = di.InboxQueue(client=client)
+        t = di.correlate(FILE, REQUEST, "r1", "claude-api")
+        g = di.gist(REQUEST)
+        self.assertTrue(q.put(t, g, "t1"))
+        self.assertFalse(q.put(t, g, "t2"))                      # already there: not appended
+        self.assertEqual(1, len(client.streams["fleet:inbox:claude-api"]))
+        self.assertEqual(2, len(client.evals))
+        script, numkeys, key, task_id, lookback, flat = client.evals[0]
+        self.assertEqual((1, "fleet:inbox:claude-api", t["task_id"], di.INBOX_LOOKBACK), (numkeys, key, task_id, lookback))
+        self.assertIn("task_id", flat)
+        self.assertEqual(client.streams["fleet:inbox:claude-api"][0][1]["task_id"], t["task_id"])
+        # and put never calls xadd directly - the dedupe and the append are one Redis call
+        self.assertNotIn("self.client.xadd", (REPO / "cloud" / "drive-intake" / "main.py").read_text(encoding="utf-8"))
+
     def test_the_lua_compare_and_set_is_what_advance_runs(self):
         calls = []
 
@@ -836,9 +950,31 @@ class WakeRingTest(unittest.TestCase):
                 ring(t)
             self.assertIn("INBOX_WAKE_URL", str(caught.exception))
 
+    def test_a_200_that_woke_nobody_is_not_a_ring(self):
+        """Cursor on 07a6b1c: #359 answered 200 unknown_agent for claude-api and this treated post() returning as rung."""
+        t = di.correlate(FILE, REQUEST, "r1", "claude-api")
+        for readout in (b'{"enabled": true, "woke": [{"status": "unknown_agent", "woke": false}]}',
+                        b'{"enabled": false, "woke": []}',
+                        b'{"enabled": true, "woke": [{"status": "unconfigured"}]}',
+                        None, b"not json", b'{"woke": [{"status": "woke"}, {"status": "disabled"}]}'):
+            ring = di.WakeRing(url="https://wake/wake", secret="s", post=lambda u, b, h, r=readout: r)
+            with self.assertRaises(RuntimeError, msg=repr(readout)):
+                ring(t)
+        for readout in (b'{"enabled": true, "woke": [{"status": "woke"}]}',
+                        b'{"enabled": true, "woke": [{"status": "duplicate"}]}',
+                        {"woke": [{"status": "woke"}]}):
+            di.WakeRing(url="https://wake/wake", secret="s", post=lambda u, b, h, r=readout: r)(t)
+        d = deps(ring=di.WakeRing(url="https://wake/wake", secret="s",
+                                  post=lambda u, b, h: b'{"woke": [{"status": "unknown_agent"}]}'))
+        out = di.decide(hint(), d)
+        self.assertEqual("queued_not_rung", out["status"], out)
+        self.assertEqual("RuntimeError", out["error"])
+        self.assertEqual(["REQUESTED"], d.receipts.states())       # and DISPATCHED was not written
+
     def test_the_body_carries_the_task_id_as_the_message_id_and_the_signature_verifies(self):
         sent = []
-        ring = di.WakeRing(url="https://wake/wake", secret="s3cret", post=lambda u, b, h: sent.append((u, b, h)))
+        ring = di.WakeRing(url="https://wake/wake", secret="s3cret",
+                           post=lambda u, b, h: (sent.append((u, b, h)), b'{"woke": [{"status": "woke"}]}')[1])
         t = di.correlate(FILE, REQUEST, "r1", "claude-code-cli")
         ring(t)
         ring(t)
@@ -860,7 +996,8 @@ class WakeRingTest(unittest.TestCase):
 
     def test_decide_rings_through_the_adapter_with_the_task_id(self):
         sent = []
-        d = deps(ring=di.WakeRing(url="https://wake/wake", secret="s", post=lambda u, b, h: sent.append(b)))
+        d = deps(ring=di.WakeRing(url="https://wake/wake", secret="s",
+                                  post=lambda u, b, h: (sent.append(b), b'{"woke": [{"status": "woke"}]}')[1]))
         out = di.decide(hint(), d)
         self.assertEqual("dispatched", out["status"], out)
         self.assertEqual(out["task"], json.loads(sent[0].decode("utf-8"))["id"])

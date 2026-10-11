@@ -46,9 +46,11 @@ THE THINGS THAT GO WRONG, AND WHERE EACH IS STOPPED
      is skew, not death - reports in_progress instead of resuming. A dead
      or missing lease is TAKEN by compare-and-set before the inbox is
      touched, so of two resumers exactly one puts (Cursor on 57a23ab and
-     c408819). RESIDUAL, NAMED: a pass whose put itself takes longer than
-     DELIVER_LEASE can be overtaken and both land; one duplicate entry,
-     same task, same worker, and never a second receipt or wake.
+     c408819). A put that outlives its lease is overtaken, and a chain of
+     overtakes would append on every pass - so the put itself is one
+     atomic Redis script: scan the newest entries for the task id, XADD
+     only if absent (PUT_ONCE_LUA). Two servers racing the same stream
+     land one entry (Cursor on 07a6b1c).
      The ring is sent BEFORE the claim moves to rung, so a crash in between
      rings again - safe only because WakeRing sends id=task_id and
      cloud/inbox-wake claims fleet:wake:seen:<agent>:<id> SET NX, so the
@@ -389,9 +391,14 @@ def _now(deps) -> float:
 
 
 def _split(state):
-    """'delivering:claude-api:1000' -> ('delivering', 'claude-api', 1000.0); 'intake' -> ('intake', None, None)."""
+    """'delivering:claude-api:1000:q' -> ('delivering', 'claude-api', 1000.0, 'q').
+
+    The fourth part is how the request got here: 'q' through QUEUED, 'b' through
+    BLOCKED, '' straight from intake. It rides every later state so the line owed
+    for that wait is still written after a crash (Cursor on 07a6b1c).
+    """
     if not state:
-        return None, None, None
+        return None, None, None, ""
     parts = str(state).split(":")
     name = parts[0]
     worker = parts[1] if len(parts) > 1 and parts[1] else None
@@ -401,7 +408,18 @@ def _split(state):
             since = float(parts[2])
         except ValueError:
             since = None
-    return name, worker, since
+    via = parts[3] if len(parts) > 3 and parts[3] in ("q", "b") else ""
+    return name, worker, since, via
+
+
+def _state(phase, worker, since, via) -> str:
+    return "%s:%s:%d:%s" % (phase, worker, int(since or 0), via or "")
+
+
+def _lines_owed(via) -> tuple:
+    """Every receipt line this request passed through, oldest first."""
+    head = (QUEUED,) if via == "q" else (BLOCKED,) if via == "b" else ()
+    return head + (REQUESTED, DISPATCHED)
 
 
 def _advance(deps, key, current, new):
@@ -470,7 +488,7 @@ def decide(hint: dict, deps) -> dict:
         return {"status": "claim_error", "task": tuple_["task_id"], "error": "unreadable"}
     if current == DONE:
         return {"status": "duplicate", "task": tuple_["task_id"], "tuple": tuple_}
-    phase, bound, since = _split(current)
+    phase, bound, since, via = _split(current)
     if bound:
         # A worker was chosen on an earlier pass. Routing is settled; finish THAT delivery.
         recipient, state = bound, REQUESTED
@@ -498,8 +516,10 @@ def decide(hint: dict, deps) -> dict:
     detail = "" if current == INTAKE else "now that a worker is online"
     if phase in (INTAKE, WAIT_QUEUED, WAIT_BLOCKED):
         # Bind the worker BEFORE the put, so a crash or a flip cannot re-put elsewhere.
-        # The lease (the clock, in the state) keeps a second pass from resuming this one.
-        leased = "%s:%s:%d" % (DELIVERING, recipient, int(now))
+        # The lease (the clock, in the state) keeps a second pass from resuming this one,
+        # and the wait it came through rides along so that line stays owed.
+        via = "q" if phase == WAIT_QUEUED else "b" if phase == WAIT_BLOCKED else ""
+        leased = _state(DELIVERING, recipient, now, via)
         if not _advance(deps, key, current, leased):
             out["status"] = "in_progress"
             return out
@@ -514,12 +534,19 @@ def decide(hint: dict, deps) -> dict:
                 out["status"] = "in_progress"
                 return out
             # Dead, missing or given-up lease: TAKE it by compare-and-set before touching
-            # the inbox, so of two resumers exactly one puts (Cursor on c408819).
-            taken = "%s:%s:%d" % (DELIVERING, recipient, int(now))
+            # the inbox, so of two resumers exactly one puts (Cursor on c408819). A put
+            # that outlives its lease is then caught by the queue's own atomic dedupe.
+            taken = _state(DELIVERING, recipient, now, via)
             if not _advance(deps, key, current, taken):
                 out["status"] = "in_progress"
                 return out
             current = taken
+        if via:
+            # The wait line comes first in the trail, so it is (re)attempted before the put;
+            # a no-op when it already read back, and owed again at the end if it still has not.
+            write_receipt(deps, tuple_, text, QUEUED if via == "q" else BLOCKED, deps.at,
+                          "awaiting the laptop" if via == "q" else "no capable worker online")
+            text = with_heading(text)
         try:
             holder = _on_any_inbox(deps, tuple_["task_id"])
             if holder is None:
@@ -531,18 +558,19 @@ def decide(hint: dict, deps) -> dict:
                     if _on_any_inbox(deps, tuple_["task_id"]) is None:
                         # Nothing landed, and this pass knows it: give the lease up (worker kept)
                         # so the next pass may retry at once instead of waiting it out.
-                        _advance(deps, key, current, "%s:%s:0" % (DELIVERING, recipient))
+                        _advance(deps, key, current, _state(DELIVERING, recipient, 0, via))
                         return {"status": "queue_error", "task": tuple_["task_id"],
                                 "error": type(exc).__name__}
         except Unconfigured as exc:
-            _advance(deps, key, current, "%s:%s:0" % (DELIVERING, recipient))
+            _advance(deps, key, current, _state(DELIVERING, recipient, 0, via))
             return {"status": "unconfigured", "task": tuple_["task_id"], "error": str(exc)}
         except Exception as exc:  # noqa: BLE001 - an inbox that cannot be read back is unknown
             return {"status": "queue_unknown", "task": tuple_["task_id"], "error": type(exc).__name__}
-        if not _advance(deps, key, current, ON_INBOX + ":" + recipient):
+        landed_state = _state(ON_INBOX, recipient, now, via)
+        if not _advance(deps, key, current, landed_state):
             out["status"] = "in_progress"
             return out
-        current, phase = ON_INBOX + ":" + recipient, ON_INBOX
+        current, phase = landed_state, ON_INBOX
         out["receipt"] = write_receipt(deps, tuple_, text, REQUESTED, deps.at, detail)
         text = with_heading(text)
     if phase == ON_INBOX:
@@ -558,20 +586,30 @@ def decide(hint: dict, deps) -> dict:
             out["status"] = "queued_not_rung"
             out["error"] = type(exc).__name__
             return out
-        if not _advance(deps, key, current, RUNG + ":" + recipient):
+        rung_state = _state(RUNG, recipient, now, via)
+        if not _advance(deps, key, current, rung_state):
             out["status"] = "in_progress"
             return out
-        current, phase = RUNG + ":" + recipient, RUNG
+        current, phase = rung_state, RUNG
     if phase == RUNG:
-        # A REQUESTED line that never read back is owed too; has() makes this a no-op otherwise.
-        if out.get("receipt") not in ("written", "no_receipt_writer"):
-            out["receipt"] = write_receipt(deps, tuple_, text, REQUESTED, deps.at, detail)
-            text = with_heading(text)
-        out["receipt_dispatched"] = write_receipt(deps, tuple_, text, DISPATCHED, deps.at)
+        # EVERY line this request passed through is owed until it reads back: the wait it
+        # came through (QUEUED or BLOCKED), REQUESTED, then DISPATCHED. has() makes each a
+        # no-op once it is there. dispatched means all of them read back (Cursor on
+        # c408819 and 07a6b1c).
         settled = ("written", "no_receipt_writer")
-        if out.get("receipt") not in settled or out["receipt_dispatched"] not in settled:
+        results = {}
+        for owed in _lines_owed(via):
+            note = ("awaiting the laptop" if owed == QUEUED else
+                    "no capable worker online" if owed == BLOCKED else
+                    detail if owed == REQUESTED else "")
+            results[owed] = write_receipt(deps, tuple_, text, owed, deps.at, note)
+            text = with_heading(text)
+        out["receipt"] = results[REQUESTED]
+        out["receipt_dispatched"] = results[DISPATCHED]
+        out["receipts"] = results
+        if any(result not in settled for result in results.values()):
             # Rung, but the phone cannot see the whole trail yet. Say so; the next pass
-            # writes whichever line is still owed (Cursor on c408819: BOTH lines gate done).
+            # writes whichever line is still owed.
             out["status"] = "dispatched_receipt_owed"
             return out
         _advance(deps, key, current, DONE)
@@ -691,14 +729,27 @@ class WakeRing:
     def signature_for(self, body: bytes) -> str:
         return "sha256=" + hmac.new(self.secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
 
+    RUNG_STATUSES = ("woke", "duplicate")   # #359's two answers that mean the recipient has been rung
+
     def __call__(self, tuple_):
         if not self.url or not self.secret or self.post is None:
             raise Unconfigured("no ring configured (INBOX_WAKE_URL, INBOX_WAKE_SECRET)")
         body = self.body_for(tuple_)
-        self.post(self.url, body, {
+        readout = self.post(self.url, body, {
             "Content-Type": "application/json",
             "X-Hub-Signature-256": self.signature_for(body),
         })
+        # A 200 is not a ring. #359 answers {"woke": [{"status": ...}]}; anything but woke
+        # or duplicate (unknown_agent, unconfigured, disabled) means nobody was rung, and
+        # a post that hands back no readout is not read as a ring either.
+        try:
+            parsed = json.loads(readout.decode("utf-8") if isinstance(readout, bytes) else readout) \
+                if not isinstance(readout, dict) else readout
+            statuses = [str(w.get("status")) for w in (parsed.get("woke") or [])]
+        except Exception as exc:  # noqa: BLE001 - no readout, no ring
+            raise RuntimeError("wake gave no readout: %s" % type(exc).__name__) from exc
+        if not statuses or any(s not in self.RUNG_STATUSES for s in statuses):
+            raise RuntimeError("wake refused: %s" % (",".join(statuses) or "empty"))
 
 
 class MemoryClaims:
@@ -730,6 +781,21 @@ class MemoryClaims:
 # Compare-and-set in one round trip, so two passes cannot both win a transition.
 CAS_LUA = ("if redis.call('get', KEYS[1]) == ARGV[1] then "
            "redis.call('set', KEYS[1], ARGV[2], 'EX', ARGV[3]) return 1 else return 0 end")
+
+# Append-unless-present in one round trip: scan the newest ARGV[2] entries of the
+# stream for field task_id == ARGV[1]; XADD the rest of ARGV only if none matches.
+PUT_ONCE_LUA = (
+    "local rows = redis.call('XREVRANGE', KEYS[1], '+', '-', 'COUNT', ARGV[2]) "
+    "for _, row in ipairs(rows) do "
+    "  local f = row[2] "
+    "  for i = 1, #f, 2 do "
+    "    if f[i] == 'task_id' and f[i + 1] == ARGV[1] then return 0 end "
+    "  end "
+    "end "
+    "local args = {} "
+    "for i = 3, #ARGV do args[#args + 1] = ARGV[i] end "
+    "redis.call('XADD', KEYS[1], '*', unpack(args)) "
+    "return 1")
 
 
 class RedisClaims:
@@ -788,7 +854,10 @@ class InboxQueue:
                 return True
         return False
 
-    def put(self, tuple_, gist_, at):
+    def put(self, tuple_, gist_, at) -> bool:
+        """Append unless the newest INBOX_LOOKBACK entries already hold this task id - in ONE
+        Redis call, so a put that outlived its lease and a resumer's put cannot both land
+        (Cursor on 07a6b1c). True when added, False when it was already there."""
         if self.client is None:
             raise Unconfigured("no Redis client for fleet:inbox")
         fields = {
@@ -800,7 +869,12 @@ class InboxQueue:
             "request_id": tuple_["request_id"], "task_id": tuple_["task_id"],
             "recipient_id": tuple_["recipient_id"],
         }
-        self.client.xadd("fleet:inbox:" + tuple_["recipient_id"], fields)
+        flat = []
+        for name, value in fields.items():
+            flat.extend((name, value))
+        added = self.client.eval(PUT_ONCE_LUA, 1, "fleet:inbox:" + tuple_["recipient_id"],
+                                 tuple_["task_id"], INBOX_LOOKBACK, *flat)
+        return bool(added)
 
 
 class Deps:
