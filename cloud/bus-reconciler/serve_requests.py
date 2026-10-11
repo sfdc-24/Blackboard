@@ -57,46 +57,68 @@ MAX_PER_RUN = int(os.environ.get("REQUEST_MAX_PER_RUN", str(bus_request.MAX_PER_
 # and renewed every pass, so a worker that dies frees it within three minutes.
 WORKER_LOCK_KEY = "gov:worker:lock"
 ONE_PASS_LOCK_SECONDS = 300          # the job's one-pass task timeout
-LIVE_LOCK_SECONDS = 180              # renewed each pass; covers a slow pass of many appends and read-backs
+# Renewed before the board read and before EVERY append, not only between passes (Copilot on 6dc6f86: one
+# pass can make up to MAX_PER_RUN appends, each of which may block for minutes), so the TTL only has to
+# outlast one board call. A worker that dies frees it within five minutes.
+LIVE_LOCK_SECONDS = 300
+
+# COMPARE-AND-RENEW and COMPARE-AND-DELETE, each ONE Redis command. A GET followed by a SET or a DELETE can
+# act on a key that expired and was taken by another execution in between (Cursor on 6dc6f86: keep_lock put
+# bus-requests-a back over bus-requests-b, and drop_lock deleted b). In Lua the compare and the write are
+# one step on the server.
+RENEW_LUA = ("if redis.call('get', KEYS[1]) == ARGV[1] then "
+             "return redis.call('set', KEYS[1], ARGV[1], 'EX', tonumber(ARGV[2])) else return false end")
+DROP_LUA = ("if redis.call('get', KEYS[1]) == ARGV[1] then "
+            "return redis.call('del', KEYS[1]) else return 0 end")
+
+
+class LockLost(Exception):
+    """Another execution holds gov:worker:lock now: stop this pass before the next board write."""
+
+
+def _text(value):
+    return value.decode("utf-8", "replace") if isinstance(value, bytes) else value
 
 
 def take_lock(conn, me, ttl) -> str | None:
     """None when `me` holds the worker lock now; else who holds it. Held by `me` already is a retried
-    task of this same execution, which takes it back. Raises only what Redis raises."""
+    task of this same execution, which takes it back - by compare-and-renew, never a plain SET."""
     if conn.set(WORKER_LOCK_KEY, me, nx=True, ex=ttl):
         return None
-    held = conn.get(WORKER_LOCK_KEY)
-    held = held.decode("utf-8", "replace") if isinstance(held, bytes) else held
-    if held == me:
-        conn.set(WORKER_LOCK_KEY, me, ex=ttl)
+    if conn.eval(RENEW_LUA, 1, WORKER_LOCK_KEY, me, int(ttl)):
         return None
-    return held or "(expired while checking - try again)"
+    return _text(conn.get(WORKER_LOCK_KEY)) or "(expired while checking - try again)"
 
 
 def keep_lock(conn, me, ttl) -> bool:
     """Renew the lock for another `ttl`; False when someone else holds it now. A Redis error keeps the
-    loop going: every op is still claimed at most once by its run marker, so a blip costs no double write."""
+    pass going: every op is still claimed at most once by its run marker, so a blip costs no double write."""
     try:
-        held = conn.get(WORKER_LOCK_KEY)
-        held = held.decode("utf-8", "replace") if isinstance(held, bytes) else held
-        if held is None:                       # expired: take it back only if nobody else has
-            return bool(conn.set(WORKER_LOCK_KEY, me, nx=True, ex=ttl))
-        if held != me:
-            return False
-        conn.set(WORKER_LOCK_KEY, me, ex=ttl)
-        return True
+        if conn.eval(RENEW_LUA, 1, WORKER_LOCK_KEY, me, int(ttl)):
+            return True
+        # Not ours. If it expired and nobody took it, take it back - with NX, so never over a new holder.
+        return bool(conn.set(WORKER_LOCK_KEY, me, nx=True, ex=ttl))
     except Exception:                                                    # noqa: BLE001
         return True
 
 
 def drop_lock(conn, me):
     try:
-        held = conn.get(WORKER_LOCK_KEY)
-        held = held.decode("utf-8", "replace") if isinstance(held, bytes) else held
-        if held == me:
-            conn.delete(WORKER_LOCK_KEY)
+        conn.eval(DROP_LUA, 1, WORKER_LOCK_KEY, me)
     except Exception:                                                    # noqa: BLE001
         pass
+
+
+def guarded(append, renew):
+    """The appender, renewing the lock before every board write and stopping the pass if it is lost."""
+    if renew is None:
+        return append
+
+    def write(spec):
+        if not renew():
+            raise LockLost("gov:worker:lock is held by another execution; %s not written" % spec.get("row_id"))
+        return append(spec)
+    return write
 
 
 def appender(env):
@@ -167,7 +189,8 @@ def main() -> int:
         return 0
     try:
         if until is None:
-            one_pass(conn, env, execution, with_git=True)
+            one_pass(conn, env, execution, with_git=True,
+                     renew=lambda: keep_lock(conn, me, lock_ttl))
             return 0
         return live(conn, env, execution, me, until, interval, lock_ttl)
     finally:
@@ -198,7 +221,8 @@ def live(conn, env, execution, me, until, interval, lock_ttl) -> int:
         now = datetime.datetime.now(datetime.timezone.utc)
         with_git = last_git is None or (now - last_git).total_seconds() >= git_every
         try:
-            one_pass(conn, env, execution, with_git=with_git, quiet=True)
+            one_pass(conn, env, execution, with_git=with_git, quiet=True,
+                     renew=lambda: keep_lock(conn, me, lock_ttl))
         except Exception as error:                                       # noqa: BLE001
             # One bad pass (a board flap, a lost reply) must not end the meeting's channel.
             log.warning("pass failed: %s", type(error).__name__)
@@ -229,12 +253,15 @@ def _loop_until(text):
     return when if when.tzinfo else when.replace(tzinfo=datetime.timezone.utc)
 
 
-def one_pass(conn, env, execution, with_git=True, quiet=False):
+def one_pass(conn, env, execution, with_git=True, quiet=False, renew=None):
     """Read the board (and GitHub), answer what is allowed, beat the heartbeat. One pass."""
     now = datetime.datetime.now(datetime.timezone.utc)
     bus_request.heartbeat(conn, "running", now=now, execution=execution)
     since = (now - datetime.timedelta(minutes=WINDOW_MINUTES)).strftime("%Y-%m-%dT%H:%M:%SZ")
     rows = bus_reconcile.board_rows(env, since=since)
+    # The board read can take minutes; the lock is renewed after it, and before each append below.
+    if renew is not None and not renew():
+        raise LockLost("gov:worker:lock was taken during the board read; this pass answers nothing")
     if not quiet:
         log.info("window since=%s: %d board row(s)", since, len(rows))
     # THE GIT CHANNEL (scripts/git_requests.py): requests from the GitHub bot accounts the access list
@@ -249,7 +276,7 @@ def one_pass(conn, env, execution, with_git=True, quiet=False):
             log.info("git channel: %d request row(s)", len(git))
         rows = list(rows) + git
 
-    out = bus_request.handle(rows, conn, now=now, append=appender(env), max_per_run=MAX_PER_RUN)
+    out = bus_request.handle(rows, conn, now=now, append=guarded(appender(env), renew), max_per_run=MAX_PER_RUN)
     if not quiet or out["answered"] or out["capped"]:
         log.info("requests: %s", bus_request.summary(out))
     for item in out["answered"]:

@@ -98,9 +98,12 @@ newest `AYA_RESULT` row on the board instead, or ask the operator.
 **When the worker answers at all.** `bus-requests` is a Cloud Run *job*, not a service. It answers
 while an execution is running: in **live mode** for a call (`LOOP_UNTIL=<ISO time>`, every
 `LOOP_INTERVAL` seconds, default 10 — the exact command is in `cloud/bus-reconciler/REQUESTS.md`
-§2b), or for one pass when executed without it. There is no standing schedule as of 2026-10-11: a
-request posted while nothing is running waits, and after 30 minutes is refused as stale. Starting it
-needs `gcloud` on the project; that is the operator's step.
+§2b), or for one pass when executed without it. **There IS a standing schedule:** Cloud Scheduler job
+`bus-requests-every-4h` (`58 */4 * * *`, UTC) starts a live execution every four hours (read back by the
+laptop claude-code-cli session on 2026-10-11; an earlier version of this page said there was none, and
+that is how a second execution came to be started beside the 20:58Z one). A request posted while nothing
+is running waits, and after 30 minutes is refused as stale. Starting one by hand needs `gcloud` on the
+project, and a look at `gcloud run jobs executions list --job bus-requests` first: one worker at a time.
 
 ## What is proved, and what is not
 
