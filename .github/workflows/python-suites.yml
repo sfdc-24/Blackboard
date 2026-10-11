@@ -154,6 +154,7 @@ on:
       - "tests/test_drive_intake.py"
       - "cloud/claude-api-worker/**"
       - "tests/test_claude_api_worker.py"
+      - "tests/test_claude_api_lane.py"
       - ".github/workflows/python-suites.yml"
   push:
     branches: [main]
@@ -289,6 +290,7 @@ on:
       - "tests/test_drive_intake.py"
       - "cloud/claude-api-worker/**"
       - "tests/test_claude_api_worker.py"
+      - "tests/test_claude_api_lane.py"
       - ".github/workflows/python-suites.yml"
 
 permissions:
@@ -376,7 +378,8 @@ jobs:
                    tests/test_agent_waker.py \
                    tests/test_board_governor.py \
                    tests/test_drive_intake.py \
-                   tests/test_claude_api_worker.py; do
+                   tests/test_claude_api_worker.py \
+                   tests/test_claude_api_lane.py; do
             if [ -f "$t" ]; then echo "present : $t"; else echo "absent  : $t"; fi
           done
 
@@ -486,7 +489,7 @@ jobs:
           set -euo pipefail
           if [ -f tests/test_claude_api_worker.py ]; then
             python_bin="$(command -v python3)"
-            sudo unshare -n -- "$python_bin" -m unittest tests.test_claude_api_worker -v
+            sudo unshare -n -- "$python_bin" -m unittest tests.test_claude_api_worker tests.test_claude_api_lane -v
           else
             echo "not on this branch; skipping"
           fi
