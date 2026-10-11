@@ -127,6 +127,8 @@ on:
       - "tests/test_bus_reconcile.py"
       - "scripts/bus_request.py"
       - "tests/test_bus_request.py"
+      - "scripts/redis_gov.py"
+      - "tests/test_redis_gov_verify.py"
       - "scripts/sf360.py"
       - "tests/test_org_publish.py"
       - "scripts/org_publish.py"
@@ -214,6 +216,8 @@ on:
       - "tests/test_bus_reconcile.py"
       - "scripts/bus_request.py"
       - "tests/test_bus_request.py"
+      - "scripts/redis_gov.py"
+      - "tests/test_redis_gov_verify.py"
       - "scripts/roster_seed.py"
       - "tests/test_roster_seed.py"
       - "tests/test_image_layout.py"
@@ -1032,6 +1036,19 @@ jobs:
           if [ -f tests/test_bus_request.py ]; then
             python_bin="$(command -v python3)"
             sudo unshare -n -- "$python_bin" -B -m unittest tests.test_bus_request -v
+          else
+            echo "not on this branch; skipping"
+          fi
+
+      # Generation digest audit. Flag off, synthetic hashes only: no Redis, no network.
+      # A stored string must not come back; missing, extra, changed, movement, partial
+      # and timeout must not look like a pass.
+      - name: "redis gov: generation digest audit returns no stored strings (no network)"
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_redis_gov_verify.py ]; then
+            python_bin="$(command -v python3)"
+            sudo unshare -n -- "$python_bin" -B -m unittest tests.test_redis_gov_verify -v
           else
             echo "not on this branch; skipping"
           fi
