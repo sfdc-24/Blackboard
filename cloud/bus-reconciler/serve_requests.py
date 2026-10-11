@@ -50,6 +50,53 @@ for _name, _default in (("REDIS_CA_CERT_PATH", MOUNTED_CA), ("REDIS_AUTH_FILE", 
 # silence is the failure mode this fleet keeps paying for.
 WINDOW_MINUTES = int(os.environ.get("REQUEST_WINDOW_MINUTES", "120"))
 MAX_PER_RUN = int(os.environ.get("REQUEST_MAX_PER_RUN", str(bus_request.MAX_PER_RUN)))
+# ONE WORKER AT A TIME. On 2026-10-11 a second live execution (bus-requests-27gvw) was started beside one
+# already serving (bus-requests-kdn8k). Both answered GEMINI-REDIS-20261011T221508Z-8f6635 over the same
+# snapshot, under one RESULT Row_ID; append.py read back two copies and exited 2 in both, and the side
+# channel had no worker from 22:15Z. The lock is under gov:, which no agent may write. Its TTL is short
+# and renewed every pass, so a worker that dies frees it within three minutes.
+WORKER_LOCK_KEY = "gov:worker:lock"
+ONE_PASS_LOCK_SECONDS = 300          # the job's one-pass task timeout
+LIVE_LOCK_SECONDS = 180              # renewed each pass; covers a slow pass of many appends and read-backs
+
+
+def take_lock(conn, me, ttl) -> str | None:
+    """None when `me` holds the worker lock now; else who holds it. Held by `me` already is a retried
+    task of this same execution, which takes it back. Raises only what Redis raises."""
+    if conn.set(WORKER_LOCK_KEY, me, nx=True, ex=ttl):
+        return None
+    held = conn.get(WORKER_LOCK_KEY)
+    held = held.decode("utf-8", "replace") if isinstance(held, bytes) else held
+    if held == me:
+        conn.set(WORKER_LOCK_KEY, me, ex=ttl)
+        return None
+    return held or "(expired while checking - try again)"
+
+
+def keep_lock(conn, me, ttl) -> bool:
+    """Renew the lock for another `ttl`; False when someone else holds it now. A Redis error keeps the
+    loop going: every op is still claimed at most once by its run marker, so a blip costs no double write."""
+    try:
+        held = conn.get(WORKER_LOCK_KEY)
+        held = held.decode("utf-8", "replace") if isinstance(held, bytes) else held
+        if held is None:                       # expired: take it back only if nobody else has
+            return bool(conn.set(WORKER_LOCK_KEY, me, nx=True, ex=ttl))
+        if held != me:
+            return False
+        conn.set(WORKER_LOCK_KEY, me, ex=ttl)
+        return True
+    except Exception:                                                    # noqa: BLE001
+        return True
+
+
+def drop_lock(conn, me):
+    try:
+        held = conn.get(WORKER_LOCK_KEY)
+        held = held.decode("utf-8", "replace") if isinstance(held, bytes) else held
+        if held == me:
+            conn.delete(WORKER_LOCK_KEY)
+    except Exception:                                                    # noqa: BLE001
+        pass
 
 
 def appender(env):
@@ -101,10 +148,33 @@ def main() -> int:
     from bus import load_env                                             # noqa: PLC0415
     env = load_env()
     execution = os.environ.get("CLOUD_RUN_EXECUTION", "")
+    me = execution or "local-%d" % os.getpid()
     until = _loop_until(os.environ.get("LOOP_UNTIL", ""))
-    if until is None:
-        one_pass(conn, env, execution, with_git=True)
+    interval = max(5, min(60, int(os.environ.get("LOOP_INTERVAL", "10"))))
+    lock_ttl = ONE_PASS_LOCK_SECONDS if until is None else max(LIVE_LOCK_SECONDS, interval * 6)
+    try:
+        holder = take_lock(conn, me, lock_ttl)
+    except Exception as error:                                           # noqa: BLE001
+        # Without the lock this run could race another; and a Redis that cannot take a SET cannot claim a
+        # request's run marker either, so nothing would have been answered anyway.
+        log.error("could not take the worker lock (%s): not running", type(error).__name__)
+        return 1
+    if holder is not None:
+        # Not an error: the worker that holds it is answering. Exit 0 so this does not read as a failure.
+        log.warning("another worker holds %s (%s): this execution does not run. One worker at a time - "
+                    "two over one board answer a request twice. It frees within %ds of that worker stopping.",
+                    WORKER_LOCK_KEY, holder, lock_ttl)
         return 0
+    try:
+        if until is None:
+            one_pass(conn, env, execution, with_git=True)
+            return 0
+        return live(conn, env, execution, me, until, interval, lock_ttl)
+    finally:
+        drop_lock(conn, me)
+
+
+def live(conn, env, execution, me, until, interval, lock_ttl) -> int:
     # LIVE MODE, for a meeting. Mr. Salam, 2026-10-08: "Do not create barriers in agent's ability to read,
     # write, share ideas, propose changes during the meeting (without audio) ... like a background task
     # that runs as side conversation." A request posted during the call is answered within about
@@ -116,13 +186,15 @@ def main() -> int:
     # whatever this loop intends (the job's default spec is 5 minutes - see REQUESTS.md).
     import git_requests                                                  # noqa: PLC0415
     git_every = git_requests.poll_seconds(os.environ.get("GITHUB_READ_TOKEN") or None)
-    interval = max(5, min(60, int(os.environ.get("LOOP_INTERVAL", "10"))))
     started = datetime.datetime.now(datetime.timezone.utc)
     hard_stop = started + datetime.timedelta(minutes=int(os.environ.get("LOOP_MAX_MINUTES", "240")))
     stop = min(until, hard_stop)
     log.info("live mode: every %ds, GitHub every %ds, until %s", interval, git_every, stop.strftime("%H:%M:%SZ"))
     last_git, passes = None, 0
     while datetime.datetime.now(datetime.timezone.utc) < stop:
+        if not keep_lock(conn, me, lock_ttl):
+            log.error("lost %s to another worker: stopping so only one answers", WORKER_LOCK_KEY)
+            break
         now = datetime.datetime.now(datetime.timezone.utc)
         with_git = last_git is None or (now - last_git).total_seconds() >= git_every
         try:
@@ -130,6 +202,12 @@ def main() -> int:
         except Exception as error:                                       # noqa: BLE001
             # One bad pass (a board flap, a lost reply) must not end the meeting's channel.
             log.warning("pass failed: %s", type(error).__name__)
+        except SystemExit as stop_code:
+            # An UNCONFIRMED APPEND (append.py exit 2, logged above as APPEND UNCONFIRMED) ends this pass,
+            # not the meeting. It used to end both: on 2026-10-11 one duplicate RESULT took the side
+            # channel down from 22:15Z. Going on is safe: the op behind that row was claimed once by its
+            # run marker, and a row that did not land gets the UNKNOWN notice after the claim's grace window.
+            log.error("pass ended by exit %s; the live channel continues", stop_code.code)
         if with_git:
             last_git = now
         passes += 1
