@@ -601,6 +601,20 @@ class RedisRequests(unittest.TestCase):
 
     REQ = {"op": "set", "key": "proj:k", "val": "v", "field": None, "count": None}
 
+    def setUp(self):
+        # The cloud runner provides the durable posting claim; these tests stand in for it. The one
+        # test about the default restores the real function, which refuses.
+        self._real_reserve = aw.reserve_redis_side_effect
+        aw.reserve_redis_side_effect = lambda answers_id: True
+
+    def tearDown(self):
+        aw.reserve_redis_side_effect = self._real_reserve
+
+    def receipt(self, me, answers=""):
+        """The one line fleet_agent prints for THIS request, and nothing else counts."""
+        return "  VERIFIED on the board: Row_ID=%s Source_Tag=%s Target_Surface=bus-reconciler" % (
+            aw.request_id(me, answers), me)
+
     def _run(self, out, calls=None, code=0):
         """Replace subprocess.run with one that records argv and answers `out` with exit `code`."""
         class Done:
@@ -684,14 +698,13 @@ class RedisRequests(unittest.TestCase):
     def test_post_request_goes_through_fleet_agent_request_and_trusts_only_the_read_back(self):
         calls = []
         real = aw.subprocess.run
-        aw.subprocess.run = self._run(
-            "  request X: set proj:k\n  VERIFIED on the board: Row_ID=GEMINI-REDIS-1 Source_Tag=gemini", calls)
+        aw.subprocess.run = self._run("  request X: set proj:k\n" + self.receipt("gemini"), calls)
         try:
             state, rid = aw.post_request("gemini", {"project": "FLEET"},
                                          dict(self.REQ, val="v|with pipe"), verbose=False)
         finally:
             aw.subprocess.run = real
-        self.assertEqual(("posted", "GEMINI-REDIS-1"), (state, rid))
+        self.assertEqual(("posted", aw.request_id("gemini", "")), (state, rid))
         argv = calls[0]
         self.assertTrue(argv[1].endswith(os.path.join("scripts", "fleet_agent.py")))
         self.assertEqual(["request", "set", "proj:k", "--tag", "gemini", "--project", "FLEET",
@@ -709,17 +722,22 @@ class RedisRequests(unittest.TestCase):
 
     def test_what_fleet_agent_refused_before_posting_is_refused_here_too(self):
         # The tool says "refused before posting" (its own gates, or an id already used by a different
-        # request) and "NOT SENT" (the board could not be read first): nothing was appended.
-        for out in ("  refused before posting: request id already used by a different request",
-                    "  NOT SENT: the board could not be read before posting"):
-            with self.subTest(out=out):
+        # request) with exit 2, and "NOT SENT" (the board could not be read first) with exit 1:
+        # nothing was appended. The words and the exit code must agree; words alone with exit 0 are
+        # a contradiction, and a contradiction is unconfirmed (Aya's supplement to #367).
+        for out, code, expect in (
+            ("  refused before posting: request id already used by a different request", 2, "refused"),
+            ("  NOT SENT: the board could not be read before posting", 1, "refused"),
+            ("  refused before posting: request id already used by a different request", 0, "unconfirmed"),
+        ):
+            with self.subTest(out=out, code=code):
                 real = aw.subprocess.run
-                aw.subprocess.run = self._run(out)
+                aw.subprocess.run = self._run(out, code=code)
                 try:
                     state, why = aw.post_request("grok", {"project": "FLEET"}, self.REQ, False)
                 finally:
                     aw.subprocess.run = real
-                self.assertEqual("refused", state)
+                self.assertEqual(expect, state)
 
     def test_the_named_agents_carry_the_flag_and_the_rules(self):
         for tag in ("gemini", "grok"):
@@ -781,7 +799,7 @@ class RedisRequests(unittest.TestCase):
             with self.subTest(op=op, key=key):
                 calls = []
                 real = aw.subprocess.run
-                aw.subprocess.run = self._run("  VERIFIED on the board: Row_ID=%s Source_Tag=gemini" % asked, calls)
+                aw.subprocess.run = self._run(self.receipt("gemini"), calls)
                 try:
                     state, rid = aw.post_request("gemini", {"project": "FLEET"},
                                                  dict(self.REQ, op=op, key=key, val="v"), False)
@@ -877,7 +895,7 @@ class RedisRequests(unittest.TestCase):
         calls = []
         asked = aw.request_id("gemini", "ASK-1")
         real = aw.subprocess.run
-        aw.subprocess.run = self._run("  VERIFIED on the board: Row_ID=%s Source_Tag=gemini" % asked, calls)
+        aw.subprocess.run = self._run(self.receipt("gemini", "ASK-1"), calls)
         try:
             text, rid, state, sentence, note = aw.redis_hook(
                 "gemini", aw.AGENTS["gemini"], "Done.\nREDIS-OP|op=set|key=proj:k|val=v", "ASK-1",
@@ -920,6 +938,87 @@ class RedisRequests(unittest.TestCase):
         self.assertEqual(("malformed", ""), (state, rid))
         self.assertIn("a repeated field", sentence)
         self.assertIn("could not be posted", text)
+
+    def test_a_receipt_that_is_not_this_requests_is_unconfirmed_never_posted(self):
+        # Aya's supplement to #367: "posted" means THIS request's receipt and nothing contradicting it.
+        asked = aw.request_id("gemini", "")
+        for out in ("  VERIFIED on the board: Row_ID=GEMINI-REDIS-other Source_Tag=gemini Target_Surface=bus-reconciler",
+                    "  VERIFIED on the board: Row_ID=%s Source_Tag=grok Target_Surface=bus-reconciler" % asked,
+                    "  VERIFIED on the board: Row_ID=%s Source_Tag=gemini Target_Surface=grok" % asked,
+                    self.receipt("gemini") + "\n  NOT SENT: the board could not be read",
+                    self.receipt("gemini") + "\n" + self.receipt("gemini")):
+            with self.subTest(out=out[-60:]):
+                real = aw.subprocess.run
+                aw.subprocess.run = self._run(out)
+                try:
+                    state, why = aw.post_request("gemini", {"project": "FLEET"}, self.REQ, False)
+                finally:
+                    aw.subprocess.run = real
+                self.assertEqual("unconfirmed", state)
+
+    def test_without_a_durable_posting_claim_a_request_is_refused_before_the_subprocess(self):
+        # Outside the cloud runner nothing can fence a retry, so the adapter fails closed.
+        aw.reserve_redis_side_effect = self._real_reserve
+        self.assertFalse(aw.reserve_redis_side_effect("ASK-1"))
+        calls = []
+        real = aw.subprocess.run
+        aw.subprocess.run = self._run(self.receipt("gemini", "ASK-1"), calls)
+        try:
+            text, rid, state, sentence, note = aw.redis_hook(
+                "gemini", aw.AGENTS["gemini"], "Done.\nREDIS-OP|op=set|key=proj:k|val=v", "ASK-1",
+                model_cut=False, verbose=False)
+        finally:
+            aw.subprocess.run = real
+        self.assertEqual(([], "refused"), (calls, state))
+        self.assertIn("durable posting claim", sentence)
+        self.assertEqual(aw.request_id("gemini", "ASK-1"), rid)
+
+    def test_a_refused_key_takes_no_claim_and_a_cut_reply_takes_none_either(self):
+        taken = []
+        aw.reserve_redis_side_effect = lambda answers_id: taken.append(answers_id) or True
+        for text, cut in (("REDIS-OP|op=xrange|key=gov:audit|count=5", False),
+                          ("REDIS-OP|op=del|key=proj:sho", True)):
+            with self.subTest(text=text):
+                _, rid, state, sentence, note = aw.redis_hook("gemini", aw.AGENTS["gemini"], text, "ASK-9",
+                                                              model_cut=cut, verbose=False)
+                self.assertIn(state, ("refused", "cut"))
+        self.assertEqual([], taken, "the claim is taken only for a request that will be sent")
+
+    def test_each_op_takes_exactly_its_fields(self):
+        for text in ("REDIS-OP|op=get|key=proj:x|val=1",            # a read with a value
+                     "REDIS-OP|op=del|key=proj:x|count=3",          # a delete with a count
+                     "REDIS-OP|op=hset|key=proj:h|val=v",           # an hset with no field
+                     "REDIS-OP|op=xadd|key=conf:side:1|val=v|count=2",
+                     "REDIS-OP|op=set|key=proj:x|field=f|val=v"):
+            with self.subTest(text=text):
+                req, body = aw.redis_request(text)
+                self.assertIsNone(req)
+                self.assertIn("takes exactly", body)
+        for text in ("REDIS-OP|op=xrange|key=conf:side:1", "REDIS-OP|op=xrange|key=conf:side:1|count=8",
+                     "REDIS-OP|op=hset|key=proj:h|field=f|val=v", "REDIS-OP|op=del|key=proj:x",
+                     "REDIS-OP|op=hgetall|key=proj:h"):
+            with self.subTest(text=text):
+                req, _ = aw.redis_request(text)
+                self.assertIsNotNone(req, text)
+
+    def test_verbose_output_is_scrubbed_and_the_key_masked(self):
+        import contextlib
+        import io
+        real = aw.subprocess.run
+        aw.subprocess.run = self._run("  request X: set proj:k token AKIAIOSFODNN7EXAMPLE seen\n"
+                                      "  UNCONFIRMED: not found after the append", code=3)
+        captured = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(captured):
+                state, why = aw.post_request("gemini", {"project": "FLEET"}, self.REQ, verbose=True)
+        finally:
+            aw.subprocess.run = real
+        self.assertEqual("unconfirmed", state)
+        printed = captured.getvalue()
+        self.assertIn("[key]", printed)
+        self.assertNotIn("proj:k", printed)
+        self.assertNotIn("AKIA", printed)
+        self.assertNotIn("AKIA", why)
 
     def test_an_agent_without_the_flag_is_told_nothing_and_posts_nothing(self):
         for tag, cfg in aw.AGENTS.items():

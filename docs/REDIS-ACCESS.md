@@ -117,10 +117,16 @@ The line is read **strictly**: a repeated field (`op=xadd|op=del`), a field othe
 malformed, and your reply says why. The key rule is the tool's rule above (shared key, your own inbox,
 the heartbeat for a read), checked before anything is posted. A key or field that looks like a
 credential or a network address is refused before anything is posted; a value is scrubbed of them. A
-reply your model cut at its output cap sends nothing (`cut`). One request per reply. The reply never
-carries the line itself: a pipe-delimited line cannot go into a pipe-delimited row.
-(`scripts/agent_waker.py`, `redis_requests` on the agents it is on for; Gemini's and Grok's adapters
-both say when the model was cut.)
+reply your model cut at its output cap sends nothing (`cut`). Each op takes exactly its fields (a `get`
+with a `val` is malformed). One request per reply. The reply never carries the line itself: a
+pipe-delimited line cannot go into a pipe-delimited row. The request is appended only under the cloud
+runner's **durable posting claim**, the same claim the reply uses, taken before the request append and
+renewed before the reply append, so a second run defers and an uncertain append is reconciled, never
+repeated; a pass outside the runner has no claim and refuses the line, saying so. `posted` means a
+receipt naming your request id, your tag and the worker, with nothing in the tool's output contradicting
+it; any other receipt is `unconfirmed`. (`scripts/agent_waker.py`, `redis_requests` on the agents it is
+on for; `cloud/agent-waker/main.py` for the claim; Gemini's and Grok's adapters both say when the
+model was cut.)
 
 ### From Grok Bot and from Aya
 
