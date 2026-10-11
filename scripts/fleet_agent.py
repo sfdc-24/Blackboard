@@ -397,34 +397,46 @@ def _same_payload(a, b) -> bool:
     return " ".join(str(a or "").split()) == " ".join(str(b or "").split())
 
 
-def _same_row(rec, row) -> bool:
-    """A board record that is this row: id, who posted it, and the row type (Grok on #367, item 2)."""
-    return (str(rec.get("Row_ID", "")) == str(row[ROW_ID_COL])
-            and str(rec.get("Source_Tag", "")).strip() == str(row[SOURCE_COL]).strip()
-            and str(rec.get("Action_Type", "")).strip() == str(row[ACTION_COL]).strip())
+_BOARD_HEAD = ("Row_ID", "Timestamp", "Source_Tag", "Target_Surface", "Action_Type", "Payload")
+
+
+def _complete_board_rows(data):
+    """Read ten-cell rows only; the first six headers carry the receipt semantics."""
+    rows = data.get("rows") if isinstance(data, dict) else None
+    if (not isinstance(rows, list) or not rows or not isinstance(rows[0], (list, tuple))
+            or len(rows[0]) != 10 or tuple(str(h).strip() for h in rows[0][:6]) != _BOARD_HEAD):
+        return None
+    return rows[1:]
+
+
+def _same_complete_row(hit, row) -> bool:
+    """Compare every semantic cell; the sheet may reformat Timestamp and Payload spaces."""
+    return (isinstance(hit, (list, tuple)) and len(hit) == len(row) == 10
+            and bool(str(hit[1]).strip())
+            and all((_same_payload(hit[i], row[i]) if i == PAYLOAD_COL else str(hit[i]) == str(row[i]))
+                    for i in range(10) if i != 1))
 
 
 def _board_rows_like(rid, row):
-    """(hit, identical) from a fresh board read, or (None, None) when the board cannot be read."""
+    """Count all global Row_ID hits before deciding whether exactly one matches."""
     data = read_board(quiet=True)
-    if data is None:
+    recs = _complete_board_rows(data)
+    if recs is None:
         return None, None
-    _, recs = rows_frame(data)
-    hit = [r for r in recs if _same_row(r, row)]
-    return hit, [r for r in hit if _same_payload(r.get("Payload"), row[PAYLOAD_COL])]
+    hit = [r for r in recs if isinstance(r, (list, tuple)) and r and str(r[0]) == rid]
+    return hit, [r for r in hit if _same_complete_row(r, row)]
 
 
 def append_and_verify(rid, row, fitted=None, spill=None, exact=True):
     """Read the board, append the row if it is not there, commit its spill, and prove it landed by
-    reading it back. EXIT_VERIFIED only on EXACTLY ONE row read back with this id, this Source_Tag,
-    this Action_Type and this payload (Grok on #367, item 2). The one append path for post and
-    request, so they cannot drift.
+    reading it back. EXIT_VERIFIED requires exactly one complete row under this global Row_ID,
+    matching every semantic cell. The board may reformat Timestamp, so a nonempty timestamp is
+    required but its bytes are not compared. The one append path serves post and request.
 
     THE BOARD IS READ FIRST. The ids are stable on purpose (reply_row_id, the waker's request_id), so
     a retry carries the id of an earlier attempt: the identical row already there is not posted
-    again and counts as verified; the same id under a DIFFERENT payload is refused for a request
-    (`exact`: a different request must never be "confirmed" by an older one) and, for a reply, is
-    the ask already answered under this id, so it is not posted again either. A board that cannot
+    again and counts as verified; the same id under different content is refused before posting,
+    including on a reply retry. A board that cannot
     be read before posting means NOT SENT: a blind append is the double write this fleet keeps
     paying for. After the append, the read-back is the proof; "not found" is UNCONFIRMED, never
     "absent" (a 404 on the redirect hop has been raised client-side after the row landed)."""
@@ -433,21 +445,15 @@ def append_and_verify(rid, row, fitted=None, spill=None, exact=True):
     if hit is None:
         print("  NOT SENT: the board could not be read before posting, so the id could not be checked")
         return EXIT_NOT_SENT
-    if identical:
-        print("  already on the board: Row_ID=%s carries this exact row (%d); not posted again" % (rid, len(identical)))
+    if len(hit) == len(identical) == 1:
+        print("  already on the board: Row_ID=%s carries this complete row; not posted again" % rid)
         print("  VERIFIED on the board: Row_ID=%s Source_Tag=%s Target_Surface=%s"
-              % (rid, identical[-1].get("Source_Tag"), identical[-1].get("Target_Surface")))
+              % (rid, row[SOURCE_COL], row[3]))
         return EXIT_VERIFIED
     if hit:
-        if exact:
-            print("  refused before posting: request id %s is already used by a different request "
-                  "(%d row(s)); a new request needs a new id" % (rid, len(hit)))
-            return EXIT_REFUSED
-        print("  already on the board: Row_ID=%s is answered under this id with other text (a retry "
-              "answered differently); not posted again" % rid)
-        print("  VERIFIED on the board: Row_ID=%s Source_Tag=%s Target_Surface=%s"
-              % (rid, hit[-1].get("Source_Tag"), hit[-1].get("Target_Surface")))
-        return EXIT_VERIFIED
+        print("  refused before posting: %s id %s is already used by duplicate, incomplete, or conflicting content; "
+              "not posted again" % ("request" if exact else "reply", rid))
+        return EXIT_REFUSED
     # tries=1 is not a tuning choice. The v1 bus does not dedup, and a
     # googleusercontent 404 on the redirect hop can be raised client-side AFTER
     # the row has landed - that replayed a row onto the live board once already.
@@ -482,21 +488,21 @@ def append_and_verify(rid, row, fitted=None, spill=None, exact=True):
     if hit is None:
         print("  UNCONFIRMED: no valid board read after the append. It may have landed. Do NOT retry blindly.")
         return EXIT_UNCONFIRMED
-    if len(identical) == 1:
+    if len(hit) == len(identical) == 1:
         print("  VERIFIED on the board: Row_ID=%s Source_Tag=%s Target_Surface=%s"
-              % (rid, identical[0].get("Source_Tag"), identical[0].get("Target_Surface")))
+              % (rid, row[SOURCE_COL], row[3]))
         return EXIT_VERIFIED
-    if identical:
-        print("  UNCONFIRMED: %d identical rows carry Row_ID=%s (two appends raced); the worker answers "
-              "the id once, and this is not confirmed as ONE post" % (len(identical), rid))
+    if len(hit) > 1:
+        print("  UNCONFIRMED: %d rows carry Row_ID=%s (duplicate or conflicting appends); "
+              "not confirmed as ONE post" % (len(hit), rid))
         return EXIT_UNCONFIRMED
     if hit:
-        print("  UNCONFIRMED: %d row(s) carry Row_ID=%s from this tag with a DIFFERENT payload, and none "
-              "carries this one; do not reuse the id." % (len(hit), rid))
+        print("  UNCONFIRMED: Row_ID=%s has incomplete or changed content; do not reuse the id." % rid)
         # The two heads, so a board that is not byte-faithful shows itself here rather than as a
         # row that is never confirmed. Sixty chars is the BCB header, before any value.
         print("  expected: %r" % " ".join(str(row[PAYLOAD_COL]).split())[:60])
-        print("  found   : %r" % " ".join(str(hit[-1].get("Payload", "")).split())[:60])
+        found_payload = hit[0][PAYLOAD_COL] if len(hit[0]) > PAYLOAD_COL else ""
+        print("  found   : %r" % " ".join(str(found_payload).split())[:60])
         return EXIT_UNCONFIRMED
     print("  UNCONFIRMED: not found after the append. The ok:true may have been a no-op, or the read "
           "raced the write. It may yet land; do NOT post again blindly.")

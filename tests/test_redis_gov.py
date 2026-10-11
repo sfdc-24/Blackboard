@@ -779,6 +779,18 @@ class FleetAgentRequestOnTheBoard(unittest.TestCase):
             code = self.fa.cmd_request(args)
         return code, out.getvalue()
 
+    def post_row(self, rid="GEMINI-WAKE-1"):
+        return [rid, "2026-10-11T00:00:00.000000Z", "gemini", "grok;ALL", "DONE",
+                "BCB|v=1|id=%s|phase=DONE|text=first answer" % rid,
+                "OPEN", "FLEET", "first answer", ""]
+
+    def run_post_row(self, row):
+        import contextlib, io
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = self.fa.append_and_verify(row[0], row, exact=False)
+        return code, out.getvalue()
+
     def test_a_new_request_is_appended_once_and_read_back_as_exactly_one_row(self):
         code, out = self.run_request(self.args())
         self.assertEqual((self.fa.EXIT_VERIFIED, 1), (code, len(self.appends)))
@@ -813,7 +825,7 @@ class FleetAgentRequestOnTheBoard(unittest.TestCase):
         self.assertNotIn("silent no-op", out)
         self.assertNotIn("VERIFIED", out)
 
-    def test_two_identical_rows_after_the_append_is_a_race_and_UNCONFIRMED_then_converges(self):
+    def test_two_identical_rows_after_the_append_stay_unconfirmed(self):
         def fetch_twice(url, payload, tries=1):
             self.appends.append(payload["sheetRow"])
             self.board["rows"].append(list(payload["sheetRow"]))
@@ -822,43 +834,104 @@ class FleetAgentRequestOnTheBoard(unittest.TestCase):
         self.fa._bus_fetch = fetch_twice
         code, out = self.run_request(self.args())
         self.assertEqual(self.fa.EXIT_UNCONFIRMED, code)
-        self.assertIn("2 identical rows", out)
+        self.assertIn("2 rows", out)
         code, out = self.run_request(self.args())            # the retry finds them and appends nothing
-        self.assertEqual((self.fa.EXIT_VERIFIED, 1), (code, len(self.appends)))
-        self.assertIn("already on the board", out)
+        self.assertEqual((self.fa.EXIT_REFUSED, 1), (code, len(self.appends)))
+        self.assertIn("duplicate", out)
 
     def test_a_row_from_another_tag_or_of_another_type_is_not_this_row(self):
-        # Same id and payload, posted by grok: not gemini's row. Appended, then exactly one read back.
+        # The global id is occupied; a tag or phase clash cannot verify a new request.
         rid, row = self.fa.request_row("gemini", "set", "proj:k", val="one", rid="REQ-T-0005")
         other = list(row)
         other[self.fa.SOURCE_COL] = "grok"
         self.board["rows"].append(other)
         code, out = self.run_request(self.args(rid="REQ-T-0005"))
-        self.assertEqual((self.fa.EXIT_VERIFIED, 1), (code, len(self.appends)))
+        self.assertEqual((self.fa.EXIT_REFUSED, 0), (code, len(self.appends)))
+        self.assertNotIn("VERIFIED", out)
         as_phase = list(row)
         as_phase[self.fa.ACTION_COL] = "DONE"
         self.board["rows"] = [list(self.HEAD), as_phase]
         self.appends.clear()
         code, out = self.run_request(self.args(rid="REQ-T-0005"))
-        self.assertEqual((self.fa.EXIT_VERIFIED, 1), (code, len(self.appends)), "a phase row is not a request")
+        self.assertEqual((self.fa.EXIT_REFUSED, 0), (code, len(self.appends)))
+        self.assertNotIn("VERIFIED", out)
 
-    def test_a_reply_retried_with_other_text_is_the_ask_already_answered_not_a_second_row(self):
-        # The post path (exact=False): post_reply's id is stable per ask; a retry that answered
-        # differently finds the earlier reply and does not post again.
+    def test_a_reply_retried_with_other_text_is_refused_not_verified_or_reposted(self):
         import contextlib, io
-        row = ["GEMINI-WAKE-1", "2026-10-11T00:00:00.000000Z", "gemini", "grok;ALL", "DONE",
-               "BCB|v=1|id=GEMINI-WAKE-1|phase=DONE|text=first answer", "", "FLEET", "g", ""]
+        row = self.post_row()
         self.board["rows"].append(list(row))
         again = list(row)
         again[self.fa.PAYLOAD_COL] = "BCB|v=1|id=GEMINI-WAKE-1|phase=DONE|text=second answer"
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             code = self.fa.append_and_verify("GEMINI-WAKE-1", again, exact=False)
-        self.assertEqual((self.fa.EXIT_VERIFIED, []), (code, self.appends))
-        self.assertIn("answered under this id", out.getvalue())
+        self.assertEqual((self.fa.EXIT_REFUSED, []), (code, self.appends))
+        self.assertNotIn("VERIFIED", out.getvalue())
         with contextlib.redirect_stdout(io.StringIO()):
             code = self.fa.append_and_verify("GEMINI-WAKE-1", again, exact=True)
         self.assertEqual(self.fa.EXIT_REFUSED, code, "a request under a used id is refused")
+
+    def test_plain_post_duplicate_identical_preflight_rows_are_not_verified(self):
+        row = self.post_row()
+        self.board["rows"].extend((list(row), list(row)))
+        code, out = self.run_post_row(row)
+        self.assertEqual((self.fa.EXIT_REFUSED, []), (code, self.appends))
+        self.assertIn("duplicate", out)
+        self.assertNotIn("VERIFIED", out)
+
+    def test_plain_post_global_id_clashes_are_refused_before_append(self):
+        row = self.post_row()
+        for index, value in ((2, "grok"), (4, "RESULT"), (3, "cursor;ALL")):
+            with self.subTest(index=index):
+                other = list(row)
+                other[index] = value
+                self.board["rows"] = [list(self.HEAD), other]
+                self.appends.clear()
+                code, out = self.run_post_row(row)
+                self.assertEqual((self.fa.EXIT_REFUSED, []), (code, self.appends))
+                self.assertNotIn("VERIFIED", out)
+
+    def test_plain_post_exact_plus_conflicting_same_id_after_append_is_unknown(self):
+        row = self.post_row()
+        def fetch_with_clash(url, payload, tries=1):
+            self.appends.append(payload["sheetRow"])
+            self.board["rows"].append(list(payload["sheetRow"]))
+            other = list(payload["sheetRow"])
+            other[2] = "grok"
+            self.board["rows"].append(other)
+            return "ok:true"
+        self.fa._bus_fetch = fetch_with_clash
+        code, out = self.run_post_row(row)
+        self.assertEqual((self.fa.EXIT_UNCONFIRMED, 1), (code, len(self.appends)))
+        self.assertIn("UNCONFIRMED", out)
+        self.assertNotIn("VERIFIED", out)
+
+    def test_plain_post_checks_complete_semantic_row_and_tolerates_timestamp_format(self):
+        row = self.post_row()
+        code, out = self.run_post_row(row)
+        self.assertEqual((self.fa.EXIT_VERIFIED, 1), (code, len(self.appends)))
+        self.assertIn("VERIFIED", out)
+        self.board["rows"][-1][1] = "10/11/2026 00:00"
+        code, out = self.run_post_row(row)
+        self.assertEqual((self.fa.EXIT_VERIFIED, 1), (code, len(self.appends)))
+        self.board["rows"] = [list(self.HEAD), row[:-1]]
+        self.appends.clear()
+        code, out = self.run_post_row(row)
+        self.assertEqual((self.fa.EXIT_REFUSED, []), (code, self.appends))
+        self.assertNotIn("VERIFIED", out)
+
+    def test_plain_post_other_recipient_in_readback_is_unconfirmed(self):
+        row = self.post_row()
+        def fetch_wrong_recipient(url, payload, tries=1):
+            self.appends.append(payload["sheetRow"])
+            other = list(payload["sheetRow"])
+            other[3] = "cursor;ALL"
+            self.board["rows"].append(other)
+            return "ok:true"
+        self.fa._bus_fetch = fetch_wrong_recipient
+        code, out = self.run_post_row(row)
+        self.assertEqual((self.fa.EXIT_UNCONFIRMED, 1), (code, len(self.appends)))
+        self.assertNotIn("VERIFIED", out)
 
     def test_the_caller_names_the_id_the_tool_does_not_make_one_up(self):
         with self.assertRaises(ValueError) as caught:
