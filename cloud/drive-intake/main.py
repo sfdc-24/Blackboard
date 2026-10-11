@@ -64,8 +64,15 @@ THE THINGS THAT GO WRONG, AND WHERE EACH IS STOPPED
      duplicate whatever Redis remembers; a REQUESTED line names the worker
      whose inbox holds it and the pass resumes from on_inbox with no put;
      a QUEUED or BLOCKED line restores the wait the request came through.
-     RESIDUAL, NAMED: a request whose receipts never landed has no durable
-     record, and after the keys expire Redis has forgotten it too.
+     Below the doc there is one more record that does not expire: the
+     inbox stream itself. When the put marker is gone, the holder is
+     found by scanning every worker's stream (INBOX_FULL_SCAN deep) and
+     the atomic put scans its own stream before the XADD, so a put that
+     landed with no receipt and no marker is still not put again
+     (Cursor on b47305f). RESIDUALS, NAMED: an entry deeper than
+     INBOX_FULL_SCAN, and a wake whose DISPATCHED line fails to land for
+     the whole 30 days of the claim - after that the task is rung once
+     more, because the other choice is a request that is never rung.
      The ring is sent BEFORE the claim moves to rung, so a crash in between
      rings again - safe only because WakeRing sends id=task_id and
      cloud/inbox-wake claims fleet:wake:seen:<agent>:<id> SET NX, so the
@@ -863,15 +870,31 @@ CAS_LUA = ("if redis.call('get', KEYS[1]) == ARGV[1] then "
 # from any server, however deep the first entry is buried - adds nothing. A scan
 # of the newest N entries was the earlier dedupe; Cursor buried the entry under
 # 500 newer ones and it appended again (13af1f7).
+#
+# The marker expires (every fleet: key does) and the stream does not, so when the
+# SET NX wins - the first put, or a put after the marker aged out - the stream
+# itself is scanned for the task id before the XADD, newest first, up to
+# INBOX_FULL_SCAN entries (Cursor on b47305f: marker gone, entry buried, second
+# copy). The task id is ARGV[3+] field 'task_id'; the scan reads it from there.
 PUT_ONCE_LUA = (
     "if redis.call('SET', KEYS[2], ARGV[1], 'NX', 'EX', ARGV[2]) then "
+    "  local task = '' "
+    "  for i = 3, #ARGV - 1, 2 do if ARGV[i] == 'task_id' then task = ARGV[i + 1] end end "
+    "  local rows = redis.call('XREVRANGE', KEYS[1], '+', '-', 'COUNT', ARGV[#ARGV]) "
+    "  for _, row in ipairs(rows) do "
+    "    local f = row[2] "
+    "    for i = 1, #f, 2 do "
+    "      if f[i] == 'task_id' and f[i + 1] == task then return 0 end "
+    "    end "
+    "  end "
     "  local args = {} "
-    "  for i = 3, #ARGV do args[#args + 1] = ARGV[i] end "
+    "  for i = 3, #ARGV - 1 do args[#args + 1] = ARGV[i] end "
     "  redis.call('XADD', KEYS[1], '*', unpack(args)) "
     "  return 1 "
     "end "
     "return 0")
 PUT_TTL = 2 * CLAIM_TTL   # the marker must outlive the claim, or a claim that aged out re-puts
+INBOX_FULL_SCAN = 100000  # how deep a marker-miss looks into a stream; beyond this is named, not closed
 
 
 class RedisClaims:
@@ -924,7 +947,23 @@ class InboxQueue:
         raw = self.client.get("fleet:intake:put:" + task_id)
         if isinstance(raw, bytes):
             raw = raw.decode("utf-8", "replace")
-        return raw or None
+        if raw:
+            return raw
+        # Marker gone (it expires; the stream does not): look in every worker's stream,
+        # newest first, INBOX_FULL_SCAN deep, and put the marker back when found
+        # (Cursor on b47305f: an entry with no marker and no receipt was put again).
+        for worker in WORKERS:
+            rows = self.client.xrevrange("fleet:inbox:" + worker, count=INBOX_FULL_SCAN) or ()
+            for _entry_id, fields in rows:
+                value = fields.get("task_id")
+                if value is None:
+                    value = fields.get(b"task_id")
+                if isinstance(value, bytes):
+                    value = value.decode("utf-8", "replace")
+                if value == task_id:
+                    self.client.set("fleet:intake:put:" + task_id, worker, nx=True, ex=PUT_TTL)
+                    return worker
+        return None
 
     def has(self, recipient, task_id):
         return self.holder(task_id) == recipient
@@ -950,7 +989,7 @@ class InboxQueue:
             flat.extend((name, value))
         added = self.client.eval(PUT_ONCE_LUA, 2, "fleet:inbox:" + tuple_["recipient_id"],
                                  "fleet:intake:put:" + tuple_["task_id"],
-                                 tuple_["recipient_id"], PUT_TTL, *flat)
+                                 tuple_["recipient_id"], PUT_TTL, *flat, INBOX_FULL_SCAN)
         return bool(added)
 
 

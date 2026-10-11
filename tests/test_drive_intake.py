@@ -872,15 +872,27 @@ class StreamClient:
     def get(self, key):
         return self.__dict__.setdefault("kv", {}).get(key)
 
-    def eval(self, script, numkeys, stream, marker, worker, ttl, *flat):
+    def set(self, key, value, nx=False, ex=None):
+        kv = self.__dict__.setdefault("kv", {})
+        if nx and key in kv:
+            return None
+        kv[key] = value
+        return True
+
+    def eval(self, script, numkeys, stream, marker, worker, ttl, *rest):
         """What PUT_ONCE_LUA does, in Python, so the test can check the script's shape AND its effect."""
-        self.evals.append((script, numkeys, stream, marker, worker, ttl, flat))
-        assert "'SET', KEYS[2]" in script and "'NX'" in script and "XADD" in script
+        flat, depth = rest[:-1], int(rest[-1])
+        self.evals.append((script, numkeys, stream, marker, worker, ttl, flat, depth))
+        assert "'SET', KEYS[2]" in script and "'NX'" in script and "XREVRANGE" in script and "XADD" in script
         kv = self.__dict__.setdefault("kv", {})
         if marker in kv:
             return 0
         kv[marker] = worker
-        self.xadd(stream, dict(zip(flat[0::2], flat[1::2])))
+        fields = dict(zip(flat[0::2], flat[1::2]))
+        for _id, row in self.xrevrange(stream, count=depth):
+            if row.get("task_id") == fields["task_id"]:
+                return 0
+        self.xadd(stream, fields)
         return 1
 
 
@@ -955,9 +967,18 @@ class InboxQueueTest(unittest.TestCase):
         self.assertFalse(q.put(t, g, "t2"))                      # already there: not appended
         self.assertEqual(1, len(client.streams["fleet:inbox:claude-api"]))
         self.assertEqual(2, len(client.evals))
-        script, numkeys, stream, marker, worker, ttl, flat = client.evals[0]
+        script, numkeys, stream, marker, worker, ttl, flat, depth = client.evals[0]
         self.assertEqual((2, "fleet:inbox:claude-api", "fleet:intake:put:" + t["task_id"], "claude-api", di.PUT_TTL),
                          (numkeys, stream, marker, worker, ttl))
+        self.assertEqual(di.INBOX_FULL_SCAN, depth)
+        # marker gone, entry present: the script's own scan refuses the second copy
+        client.kv.clear()
+        self.assertFalse(q.put(t, g, "t3"))
+        self.assertEqual(1, len(client.streams["fleet:inbox:claude-api"]))
+        self.assertEqual("claude-api", q.holder(t["task_id"]))      # and holder() found it by scan
+        client.kv.clear()
+        self.assertEqual("claude-api", q.holder(t["task_id"]))
+        self.assertEqual("claude-api", client.kv["fleet:intake:put:" + t["task_id"]])   # marker put back
         self.assertGreater(di.PUT_TTL, di.CLAIM_TTL)             # the marker outlives the claim
         self.assertIn("task_id", flat)
         self.assertEqual("claude-api", q.holder(t["task_id"]))
@@ -1144,6 +1165,40 @@ class TrailTest(unittest.TestCase):
         self.assertEqual(1, len(fresh.queue.puts))
         self.assertTrue(":q" in list(fresh.claims.states.values())[0] or
                         list(fresh.claims.states.values()) == [di.DONE])
+
+    def test_a_put_with_no_receipt_and_no_marker_is_still_not_put_again(self):
+        """Cursor on b47305f: QUEUED stored, REQUESTED never, put landed, marker and claim gone,
+        laptop fresh -> two copies on the laptop's stream; BLOCKED the same on claude-api; and
+        the empty trail, same path, one copy on EACH stream."""
+        client = StreamClient()
+        shapes = (
+            (REQUEST + "Use the sf CLI.\n", "claude-code-cli", True),     # QUEUED stored, laptop later up
+            (REQUEST, "claude-api", False),                               # BLOCKED stored, api named later
+            (REQUEST + "\nno receipts at all\n", "claude-api", True),     # empty trail, laptop fresh
+        )
+        for text, worker, laptop in shapes:
+            client = StreamClient()
+            t = di.correlate(FILE, text, "r1", worker)
+            # the put landed...
+            q = di.InboxQueue(client=client)
+            self.assertTrue(q.put(t, di.gist(text), "t0"))
+            for i in range(600):
+                client.xadd("fleet:inbox:" + worker, {"task_id": "task-%016x" % i})
+            client.kv.clear()                                        # ...the marker expired
+            # ...and the doc shows only the wait line (or nothing)
+            line = ("QUEUED" if "sf CLI" in text else "BLOCKED") + " - task " + t["task_id"] + \
+                   " - request x - rev y - recipient " + worker + " - by drive-intake - t\n"
+            doc = text + ("" if "no receipts" in text else "\nRECEIPTS\n" + line)
+            d = deps(docs=Docs(text=doc, revision="r9"), queue=di.InboxQueue(client=client),
+                     api_worker="claude-api" if worker == "claude-api" else "claude-api")
+            if laptop:
+                laptop_up(d)
+            out = di.decide(hint(), d)
+            self.assertEqual("dispatched", out["status"], (text[:30], out))
+            copies = [f for s in client.streams.values() for _, f in s if f.get("task_id") == t["task_id"]]
+            self.assertEqual(1, len(copies), (text[:30], list(client.streams)))
+            self.assertEqual([worker], [c["recipient_id"] for c in d.ring.calls])
+            self.assertEqual("REQUESTED", [s for s in d.receipts.states() if s != "QUEUED" and s != "BLOCKED"][0])
 
     def test_the_marker_gone_and_the_claim_back_at_delivering_is_still_one_copy(self):
         """Cursor on 96b645c: deleting fleet:intake:put:<task> with the entry buried appended again."""
