@@ -129,6 +129,15 @@ on:
       - "tests/test_bus_request.py"
       - "scripts/redis_gov.py"
       - "tests/test_redis_gov_verify.py"
+      - "tests/test_redis_gov.py"
+      - "scripts/redis_acl.json"
+      - "scripts/git_requests.py"
+      - "tests/test_git_requests.py"
+      - "cloud/bus-reconciler/serve_requests.py"
+      - "tests/test_live_mode.py"
+      - "cloud/bus-reconciler/redis_archive.py"
+      - "cloud/bus-reconciler/archive.sh"
+      - "tests/test_redis_archive.py"
       - "scripts/sf360.py"
       - "tests/test_org_publish.py"
       - "scripts/org_publish.py"
@@ -218,6 +227,15 @@ on:
       - "tests/test_bus_request.py"
       - "scripts/redis_gov.py"
       - "tests/test_redis_gov_verify.py"
+      - "tests/test_redis_gov.py"
+      - "scripts/redis_acl.json"
+      - "scripts/git_requests.py"
+      - "tests/test_git_requests.py"
+      - "cloud/bus-reconciler/serve_requests.py"
+      - "tests/test_live_mode.py"
+      - "cloud/bus-reconciler/redis_archive.py"
+      - "cloud/bus-reconciler/archive.sh"
+      - "tests/test_redis_archive.py"
       - "scripts/roster_seed.py"
       - "tests/test_roster_seed.py"
       - "tests/test_image_layout.py"
@@ -1039,6 +1057,32 @@ jobs:
           else
             echo "not on this branch; skipping"
           fi
+
+      # The governed Redis path end to end, and the live worker around it. Until 2026-10-11 none of
+      # these four files ran in CI: PR 390's lock and one-answer tests and PR 392's after= tests were
+      # green here only because nothing executed them. Each suite is offline (fake Redis, fake board,
+      # fake bucket), proved by the empty network namespace.
+      - name: "redis gov, git requests, live mode, archive: the governed path and its worker (no network)"
+        run: |
+          set -euo pipefail
+          python_bin="$(command -v python3)"
+          # Each suite with the code it guards. A suite is skipped ONLY when that code is absent too: a
+          # branch that deletes the suite and keeps the code fails here (Copilot on 9cbcda6; the Pi1 step
+          # refuses the same shape).
+          for pair in "test_redis_gov:scripts/redis_gov.py" \
+                      "test_git_requests:scripts/git_requests.py" \
+                      "test_live_mode:cloud/bus-reconciler/serve_requests.py" \
+                      "test_redis_archive:cloud/bus-reconciler/redis_archive.py"; do
+            suite="${pair%%:*}"; code="${pair#*:}"
+            if [ -f "tests/${suite}.py" ]; then
+              sudo unshare -n -- "$python_bin" -B -m unittest "tests.${suite}" -v
+            elif [ -f "$code" ]; then
+              echo "::error::${code} is on this branch but tests/${suite}.py is not: the code would ship ungated"
+              exit 1
+            else
+              echo "tests/${suite}.py and ${code} are both absent on this branch; skipping"
+            fi
+          done
 
       # Generation digest audit. Flag off, synthetic hashes only: no Redis, no network.
       # A stored string must not come back; missing, extra, changed, movement, partial
