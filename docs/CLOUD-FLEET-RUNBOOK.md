@@ -175,10 +175,11 @@ accounts - a share nobody but the owner can do.
    `fleet:spend:<day>` moved by one reservation; the tick after: `idle`.
 3. `claude-api-worker/deploy.sh lane on`, laptop ON with
    `python scripts/redis_inbox.py beat --every 240` running. A new doc routes
-   to claude-code-cli; the next tick rings one row `CAW-WAKE-<task>` on the
-   board, no doc text in it; `accept --task` and `done --task` become the
-   ACCEPTED and SUCCEEDED lines by claude-code-cli; the api worker reports
-   `taken`.
+   to claude-code-cli; the next tick's line is `idle` (nothing landed on
+   `fleet:inbox:claude-api`) and its lane record rang one row `CAW-WAKE-<task>`
+   on the board, no doc text in it; `accept --task` and `done --task` become the
+   ACCEPTED and SUCCEEDED lines by claude-code-cli. `taken` is a different
+   outcome: some other writer already has that task's trail.
 
 **Rollback** is the flag, never a redeploy: `deploy.sh off`, `worker off`,
 `lane off`. A doc already claimed keeps its claim (30 days) and its receipts;
@@ -186,9 +187,10 @@ turning a flag back on resumes from the doc's own trail.
 
 **What a health line means.** drive-intake `/healthz`: `ok` only when the
 watch channel is live or the last poll is inside three ticks; `poll: unknown`
-is "never polled", not "fine". The worker prints one JSON line per pass:
-`idle`, `ran` (with `considered`), `lane_only`, or `disabled`; `no_store`
-means Redis or Docs did not wire - read the job's env back.
+is "never polled", not "fine". The worker's pass is one JSON line: `idle`,
+`ran` (with `considered`), `lane_only`, or `disabled`. `no_store` on that line
+means Redis or Docs did not wire; `no_redis` and `no_docs` are printed before
+the pass when the import itself failed. Read the job's env back.
 
 **Cost lines.** The worker spends only under a reservation in the shared day
 ledger; the lane spends nothing; a laptop beat is one request row plus one

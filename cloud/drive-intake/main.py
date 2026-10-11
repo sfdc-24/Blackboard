@@ -687,7 +687,8 @@ def decide(hint: dict, deps) -> dict:
         for owed in _lines_owed(via):
             note = ("awaiting the laptop" if owed == QUEUED else
                     "no capable worker online" if owed == BLOCKED else
-                    detail if owed == REQUESTED else "")
+                    detail if owed == REQUESTED else
+                    str(getattr(deps.ring, "receipt_note", "") or "").replace("{worker}", recipient))
             results[owed] = write_receipt(deps, tuple_, text, owed, deps.at, note)
             text = with_heading(text)
         out["receipt"] = results[REQUESTED]
@@ -746,29 +747,58 @@ def hints_from_push(headers: dict) -> list:
     return [{"file_id": found.group(1), "folder_id": ""}] if found else [{"file_id": "", "poll": True}]
 
 
+# A decide() result after which a later pass has nothing left to do for this doc as it stands. An
+# edit re-lists the doc anyway. Everything else is unfinished and the doc is kept for the next poll.
+FINISHED = frozenset(("dispatched", "duplicate", "disabled", "bad_file_id", "out_of_scope", "no_revision",
+                      "too_large", "no_request", "bad_recipient", "bad_correlation"))
+
+
 def poll(deps) -> list:
-    """The changes feed, which is also the recovery path for a notification never delivered."""
+    """The changes feed, which is also the recovery path for a notification never delivered.
+
+    ONE WRITER, AFTER EVERYTHING (Cursor on 0bee083). The feed lists and writes nothing. Every doc
+    it lists is decided, and so is every doc an earlier poll left unfinished - queued for the
+    laptop, blocked, in progress, a receipt still owed, a read that failed - because those are no
+    longer in the feed's window and would otherwise never be seen again. The poll goes on record,
+    with the feed's own watermark, only when no hint raised and the pending set was kept.
+    """
     if not deps.enabled:
         return []
-    if deps.changes is None:
+    if deps.changes is None or deps.claims is None:
         return [{"status": "no_store", "task": None}]
     try:
-        changed = deps.changes(deps.folder_id) or []
+        listed = deps.changes(deps.folder_id) or []
     except Exception as exc:  # noqa: BLE001
         return [{"status": "read_error", "task": None, "error": type(exc).__name__}]
-    out, undecided = [], False
-    for c in changed:
+    if isinstance(listed, dict):
+        hints, watermark = list(listed.get("hints") or []), listed.get("watermark")
+    else:
+        hints, watermark = list(listed), None
+    try:
+        pending = [{"file_id": f, "folder_id": ""} for f in sorted(deps.claims.pending() or ())]
+    except Exception as exc:  # noqa: BLE001 - the unfinished cannot be found: nothing goes on record
+        return [{"status": "pending_unreadable", "task": None, "error": type(exc).__name__}]
+    out, seen, undecided = [], set(), False
+    for raw in pending + hints:
         try:
-            out.append(decide({"file_id": (c or {}).get("file_id") or "",
-                               "folder_id": (c or {}).get("folder_id") or ""}, deps))
+            file_id = str((raw or {}).get("file_id") or "")
+            folder = str((raw or {}).get("folder_id") or "")
+            if not file_id or file_id in seen:
+                continue
+            seen.add(file_id)
+            result = decide({"file_id": file_id, "folder_id": folder}, deps)
+            out.append(result)
+            if result.get("status") in FINISHED:
+                deps.claims.pending_remove(file_id)
+            else:
+                deps.claims.pending_add(file_id)
         except Exception as exc:  # noqa: BLE001 - one hint's failure must not lose the others
             undecided = True
             out.append({"status": "decide_error", "task": None, "error": type(exc).__name__})
     if not undecided:
-        # On record only when the feed listed AND every hint was decided: a poll recorded over an
-        # undecided hint would move the next poll's window past the doc it failed on.
+        now = _now(deps)
         try:
-            deps.claims.note_poll(_now(deps))
+            deps.claims.note_poll(now, watermark if watermark is not None else now)
         except Exception:  # noqa: BLE001 - health will read unknown; the intake itself is done
             pass
     return out
@@ -838,6 +868,18 @@ def handle(method: str, path: str, headers: dict, body: bytes, deps) -> tuple:
 def no_ring(_tuple):
     """The default ring: not configured. A ring that silently succeeds would write DISPATCHED."""
     raise Unconfigured("no ring configured (INBOX_WAKE_URL)")
+
+
+def polled_ring(_tuple):
+    """The ring when the worker POLLS its inbox (DRIVE_INTAKE_RING=polled): the put is the hand-off,
+    the stream entry under the put marker its evidence, and nothing else is rung. cloud/claude-api-
+    worker reads fleet:inbox:claude-api every tick and the laptop lane rings claude-code-cli itself,
+    so with #359 undeployed this is the transport that exists (Cursor on 0bee083: a deploy with no
+    wake variables could never reach DISPATCHED). Chosen by name in the deploy, never by default."""
+    return None
+
+
+polled_ring.receipt_note = "on fleet:inbox:{worker}, which the worker polls; no wake rung"
 
 
 class WakeRing:
@@ -913,8 +955,21 @@ class MemoryClaims:
     def last_poll(self):
         return self.beats.get("poll")
 
-    def note_poll(self, now):
+    def watermark(self):
+        return self.beats.get("watermark")
+
+    def note_poll(self, now, watermark=None):
         self.beats["poll"] = float(now)
+        self.beats["watermark"] = float(now if watermark is None else watermark)
+
+    def pending(self):
+        return set(self.beats.setdefault("pending", set()))
+
+    def pending_add(self, file_id):
+        self.beats.setdefault("pending", set()).add(file_id)
+
+    def pending_remove(self, file_id):
+        self.beats.setdefault("pending", set()).discard(file_id)
 
 
 # Compare-and-set in one round trip, so two passes cannot both win a transition.
@@ -997,8 +1052,32 @@ class RedisClaims:
         except (TypeError, ValueError):
             return None
 
-    def note_poll(self, now):
+    def note_poll(self, now, watermark=None):
         self.client.set("fleet:intake:poll:last", "%d" % int(now), ex=CLAIM_TTL)
+        self.client.set("fleet:intake:poll:watermark", "%d" % int(now if watermark is None else watermark),
+                        ex=CLAIM_TTL)
+
+    def watermark(self):
+        """fleet:intake:poll:watermark - where the last poll got to (not when it ran)."""
+        raw = self.client.get("fleet:intake:poll:watermark")
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", "replace")
+        try:
+            return float(raw) if raw is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    # fleet:intake:pending - the docs an earlier poll left unfinished, revisited every poll.
+    def pending(self):
+        members = self.client.smembers("fleet:intake:pending") or ()
+        return {m.decode("utf-8", "replace") if isinstance(m, bytes) else str(m) for m in members}
+
+    def pending_add(self, file_id):
+        self.client.sadd("fleet:intake:pending", file_id)
+        self.client.expire("fleet:intake:pending", CLAIM_TTL)
+
+    def pending_remove(self, file_id):
+        self.client.srem("fleet:intake:pending", file_id)
 
 
 class InboxQueue:
@@ -1144,6 +1223,13 @@ def deps_from_env(environ=None, client=None, docs=None, feed=None, post=None) ->
     is opened here, so a test can read exactly what a deploy would wire."""
     environ = os.environ if environ is None else environ
     ring_url, ring_secret = environ.get("INBOX_WAKE_URL") or "", environ.get("INBOX_WAKE_SECRET") or ""
+    ring_mode = (environ.get("DRIVE_INTAKE_RING") or "").strip().lower()
+    if ring_url and ring_secret:
+        ring = WakeRing(ring_url, ring_secret, post=post)
+    elif ring_mode == "polled":
+        ring = polled_ring
+    else:
+        ring = no_ring
     return Deps(
         enabled=enabled_from_env(environ),
         docs=docs,
@@ -1151,7 +1237,7 @@ def deps_from_env(environ=None, client=None, docs=None, feed=None, post=None) ->
         claims=RedisClaims(client) if client is not None else None,
         queue=InboxQueue(client) if client is not None else None,
         changes=feed,
-        ring=WakeRing(ring_url, ring_secret, post=post) if ring_url and ring_secret else no_ring,
+        ring=ring,
         folder_id=environ.get("DRIVE_INTAKE_FOLDER_ID") or "",
         channel_token=environ.get("DRIVE_INTAKE_CHANNEL_TOKEN") or "",
         poll_token=environ.get("DRIVE_INTAKE_POLL_TOKEN") or "",
