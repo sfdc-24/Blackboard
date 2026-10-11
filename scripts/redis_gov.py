@@ -89,14 +89,20 @@ VERIFY_FLAG = "REDIS_GOV_VERIFY"
 # bus_request.HEARTBEAT_KEY. Repeated here so this module does not import the worker.
 HEARTBEAT_READ_KEY = "gov:worker:heartbeat"
 MAX_AUDIT_MANIFEST_BYTES = 65536
-# Truly paged. Page size 8. A read is at most one batch of 128. The absolute generation ceiling
-# is 512 listed documents (64 pages), shared with #296 head 9a0d8f85. The 326-document board
-# (41 pages) is under that ceiling and is delivered, not refused. 2048 and 65536 do not rise.
+# Truly paged. Page size 8. A read is at most one batch of 128. The manifest cap is the measured
+# UTF-8 size of the submitted manifest, keys form or pages form, and it does not rise.
+# The honest maximum for the fixture's document shape replaces the old 512-document ceiling.
+# That shape is one item shard and one action shard per conference pull request, plus the eight
+# rollup documents (three repos, three turn rows, meta, closed). 233 such pull requests are 474
+# documents: pages-form manifest 65400 bytes, keys-form manifest 64089 bytes. 234 pull requests
+# are 476 documents and 65671 pages-form bytes, over the cap. 252 pull requests are the old 512
+# documents and 69238 keys-form bytes, which also does not fit. The 326-document inventory is
+# 44928 pages-form bytes and stays inside the cap. 2048 does not rise.
 PAGE_SIZE = 8
 MAX_AUDIT_BATCH = 128
-MAX_GENERATION_DOCS = 512
+MAX_GENERATION_DOCS = 474
 MAX_AUDIT_KEYS = MAX_AUDIT_BATCH
-MAX_AUDIT_PAGES = MAX_GENERATION_DOCS // PAGE_SIZE
+MAX_AUDIT_PAGES = (MAX_GENERATION_DOCS + PAGE_SIZE - 1) // PAGE_SIZE
 # Per-document canonical cap. Checked with HLEN/HSTRLEN before HGETALL. Shared with the writer.
 # The manifest-root preimage is not a stored hash value. A 41-page preimage is 2787 bytes and
 # the head stores only its SHA-256, so this cap is not applied to that preimage.
@@ -350,6 +356,58 @@ def execute(conn, acl: dict, raw_tag: str, via: str, op: str, key: str, field: s
             result["partial"] = True
             result["timeout"] = _is_timeout(error)
         return _attach_verify_ids(result, op, echoed_generation, echoed_correlation)
+
+
+def complete_receipt(conn, acl, raw_tag, via, prefix, raw_value, enc, generation, correlation,
+                     head, now=None) -> dict:
+    """The backend complete receipt. The site calls this, not a local writer receipt.
+
+    Signature: complete_receipt(conn, acl, raw_tag, via, prefix, raw_value, enc, generation,
+    correlation, head, now=None) -> dict.
+
+    Publish and ACTION both require ``backend_receipt_accepts`` of this dict. That is true
+    only when ``ok`` and ``page_ok`` are both true, the union is complete, ``manifest_root``
+    equals ``head_manifest_root``, and the head is unchanged (``moved`` is false and
+    ``head_generation`` is the generation id). ``page_ok`` means every page in this receipt
+    verified, so a full pass keeps it true. One page returns ``page_ok`` true and ``ok`` false.
+
+    REDIS_GOV_VERIFY off returns a refusal with ``ok`` false and does not read documents.
+    A missing receipt is not this function's return; ``backend_receipt_accepts(None)`` is false.
+    The receipt carries counts and digests only. It has no listed key names.
+    """
+    return execute(conn, acl, raw_tag, via, VERIFY_OP, prefix, raw_value=raw_value, enc=enc,
+                   generation=generation, correlation=correlation, head=head, now=now)
+
+
+def backend_receipt_accepts(receipt) -> bool:
+    """True only for a complete backend receipt the site may publish or mark ACTION ready.
+
+    None, a flag-off refusal, a single page, a moved head, and a root mismatch are false.
+    A full pass has page_ok true. The gate accepts that.
+    """
+    if not isinstance(receipt, dict):
+        return False
+    if receipt.get("ok") is not True or receipt.get("page_ok") is not True:
+        return False
+    if receipt.get("partial") or receipt.get("moved") or receipt.get("timeout"):
+        return False
+    if receipt.get("refused") or receipt.get("error"):
+        return False
+    coverage = receipt.get("coverage") or {}
+    if coverage.get("covered") is not True:
+        return False
+    root = receipt.get("manifest_root") or ""
+    head_root = receipt.get("head_manifest_root") or ""
+    if not re.fullmatch(r"[0-9a-f]{64}", root) or root != head_root:
+        return False
+    if int(receipt.get("page_count") or 0) < 2:
+        return False
+    generation = receipt.get("generation") or ""
+    if not re.fullmatch(r"[0-9a-f]{64}", generation):
+        return False
+    if receipt.get("head_generation") != generation:
+        return False
+    return True
 
 
 def _read(conn, acl, who, raw_tag, via, op, key, count, now) -> dict:
@@ -763,8 +821,10 @@ def _publish_audit(entries, generation, correlation, coverage, partial, moved, t
                    root_digest_hex="", head_root=""):
     """The receipt haudit returns. Counts and digests only. No listed key name, no stored string.
 
-    ``page_ok`` means the supplied page matched. ``ok`` is full-generation acceptance and also
-    requires the head root. Partial or incomplete is never ok. ``extra`` is not a keyspace claim."""
+    ``page_ok`` is true when every page read in this receipt verified. A full receipt has
+    ``page_ok`` and ``ok`` both true. One page has ``page_ok`` true and ``ok`` false. ``ok``
+    also requires the full 0..N-1 union, the recomputed root, and an unchanged head.
+    Partial or incomplete is never ok. ``extra`` is not a keyspace claim."""
     digest, length = _audit_report(entries)
     out = {
         "ok": False,
@@ -983,7 +1043,7 @@ def _read_in_batches(conn, head, names, before):
 
 def _audit_generation(conn, acl, who, raw_tag, via, prefix, field, raw_value, enc,
                       generation, correlation, head, now) -> dict:
-    """Receipt for a paged manifest. Root serialization is #296 head 45916666. Ceiling is 9a0d8f85.
+    """Receipt for a paged manifest. Root serialization is #296 head 45916666. Ceiling is 474.
 
     The head is bound from the generation namespace. generation, manifest_root, page_count and
     listed are read before any document and again after every manifest page and every batch.

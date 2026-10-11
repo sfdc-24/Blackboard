@@ -234,6 +234,49 @@ class CanonicalUtf8(unittest.TestCase):
         self.assertEqual(171, len(two_root))
         self.assertEqual("12a5f441a619a1da3f97c767f43f03936502d260012ef9085a50104585113e5e",
                          gov.root_digest([page_a, page_b], 2))
+        # C21. page_ok means every page in the receipt verified. One page is page_ok and not ok.
+        # A full receipt is page_ok and ok together. C20. Flag off, or no receipt, does not accept.
+        self.assertFalse(gov.backend_receipt_accepts(None))
+        self.assertFalse(gov.backend_receipt_accepts({}))
+        off = AuditRedis()
+        gen = generation("a")
+        prefix = prefix_for(gen)
+        one = {prefix + "a": {"x": "1"}, prefix + "b": {"y": "\u00e9"}}
+        for key, mapping in one.items():
+            put_hash(off, key, mapping)
+        expected = {key: spec(mapping) for key, mapping in one.items()}
+        put_hash(off, "proj:pr-board:v1:head", dict(head_binding(expected), generation=gen))
+        os.environ.pop(gov.VERIFY_FLAG, None)
+        refused = gov.complete_receipt(
+            off, ACL, "cursor", "pr-board", prefix, b64_manifest(expected), "b64", gen,
+            "cid-vector-off", "proj:pr-board:v1:head")
+        self.assertFalse(refused["ok"])
+        self.assertFalse(gov.backend_receipt_accepts(refused))
+        self.assertEqual(0, off.fetches)
+        os.environ[gov.VERIFY_FLAG] = "1"
+        page = gov.complete_receipt(
+            off, ACL, "cursor", "pr-board", prefix, b64_manifest(expected), "b64", gen,
+            "cid-vector-page", "proj:pr-board:v1:head")
+        self.assertTrue(page["page_ok"], page)
+        self.assertFalse(page["ok"], page)
+        self.assertEqual(1, page["page_count"])
+        self.assertFalse(gov.backend_receipt_accepts(page))
+        full_conn = AuditRedis()
+        full_gen = generation("c")
+        full_prefix = prefix_for(full_gen)
+        planted = {full_prefix + "k%02d" % n: {"n": str(n)} for n in range(9)}
+        for key, mapping in planted.items():
+            put_hash(full_conn, key, mapping)
+        full_expected = {key: spec(mapping) for key, mapping in planted.items()}
+        put_hash(full_conn, "proj:pr-board:v1:head",
+                 dict(head_binding(full_expected), generation=full_gen))
+        full = gov.complete_receipt(
+            full_conn, ACL, "cursor", "pr-board", full_prefix, b64_manifest(full_expected), "b64",
+            full_gen, "cid-vector-full", "proj:pr-board:v1:head")
+        self.assertTrue(full["page_ok"], full)
+        self.assertTrue(full["ok"], full)
+        self.assertTrue(gov.backend_receipt_accepts(full))
+        os.environ.pop(gov.VERIFY_FLAG, None)
 
     def test_a_stored_nfd_hash_matches_the_nfc_digest_and_hides_the_text(self):
         os.environ[gov.VERIFY_FLAG] = "1"
@@ -621,8 +664,8 @@ class GenerationAudit(unittest.TestCase):
     def test_a_manifest_over_the_cap_is_refused_and_never_ok(self):
         conn = AuditRedis()
         gen = generation("0")
-        # Short proj: keys so 513 documents stay under the 65536-byte manifest cap and the
-        # refusal is the 512-document ceiling, not the byte cap.
+        # Short proj: keys so one document past the fixture-shape ceiling stays under the
+        # 65536-byte manifest cap. The refusal is the document ceiling, not the byte cap.
         prefix = "proj:g:" + gen[:16] + ":"
         expected = {}
         for n in range(gov.MAX_GENERATION_DOCS + 1):
@@ -650,6 +693,49 @@ class GenerationAudit(unittest.TestCase):
         self.assertEqual(0, conn.scans)
         self.assertEqual("cid-over-cap", out["correlation"])
         self.assertNotIn("ab" * 32, out["refused"])
+
+    def test_a_manifest_at_the_byte_cap_passes_and_one_byte_over_is_refused(self):
+        gen = generation("a")
+        prefix = prefix_for(gen)
+        count = 296
+        base = 92
+        payload = {"v": "0"}
+        digest, length = gov.payload_digest(payload)
+        self.assertEqual(9, length)
+
+        def specs_for(bumped):
+            found = {}
+            for n in range(count):
+                extra = base + (1 if n < bumped else 0)
+                found[prefix + "k%03d" % n + ("x" * extra)] = {"sha256": digest, "len": length}
+            return found
+
+        under = specs_for(110)
+        over = specs_for(111)
+        under_raw = json.dumps({"keys": under}, sort_keys=True, separators=(",", ":")).encode()
+        over_raw = json.dumps({"keys": over}, sort_keys=True, separators=(",", ":")).encode()
+        self.assertEqual(gov.MAX_AUDIT_MANIFEST_BYTES, len(under_raw))
+        self.assertEqual(gov.MAX_AUDIT_MANIFEST_BYTES + 1, len(over_raw))
+        self.assertLess(count, gov.MAX_GENERATION_DOCS)
+        conn = AuditRedis()
+        planted = {key: payload for key in under}
+        self._plant(conn, gen, planted)
+        out = gov.complete_receipt(
+            conn, ACL, "cursor", "pr-board", prefix, b64_manifest(under), "b64", gen,
+            "cid-byte-under", "proj:pr-board:v1:head")
+        self.assertTrue(out["page_ok"], out)
+        self.assertTrue(out["ok"], out)
+        self.assertTrue(gov.backend_receipt_accepts(out))
+        self.assertEqual(count, conn.fetches)
+        before = conn.fetches
+        refused = gov.complete_receipt(
+            conn, ACL, "cursor", "pr-board", prefix, b64_manifest(over), "b64", gen,
+            "cid-byte-over", "proj:pr-board:v1:head")
+        self.assertFalse(refused["ok"])
+        self.assertFalse(gov.backend_receipt_accepts(refused))
+        self.assertIn("byte cap", refused["refused"])
+        self.assertEqual(before, conn.fetches)
+        self.assertEqual(0, conn.scans)
 
     def test_a_single_page_is_page_ok_and_never_ok(self):
         conn = AuditRedis()
@@ -895,7 +981,19 @@ class GenerationAudit(unittest.TestCase):
         self.assertEqual(out["manifest_root"], out["head_manifest_root"])
         self.assertEqual(report_hex, out["digest"])
         self.assertEqual(37178, out["length"])
-        self.assertEqual(fetches_before + 326, conn.fetches)
+        pages_blob = json.dumps({"pages": pages}, sort_keys=True, separators=(",", ":")).encode()
+        self.assertEqual(44928, len(pages_blob))
+        self.assertLess(len(pages_blob), gov.MAX_AUDIT_MANIFEST_BYTES)
+        self.assertLess(len(documents), gov.MAX_GENERATION_DOCS)
+        accepted = gov.complete_receipt(
+            conn, ACL, "cursor", "pr-board", prefix, b64_manifest(specs), "b64", gen,
+            "cid-board-326-complete", "proj:pr-board:v1:head")
+        self.assertTrue(accepted["page_ok"], accepted)
+        self.assertTrue(accepted["ok"], accepted)
+        self.assertTrue(gov.backend_receipt_accepts(accepted))
+        self.assertEqual(out["manifest_root"], accepted["manifest_root"])
+        self.assertEqual(out["digest"], accepted["digest"])
+        self.assertEqual(fetches_before + 652, conn.fetches)
         self.assertEqual(0, conn.scans)
         self.assertEqual({"keys": 0, "scan": 0, "eval": 0}, called)
         blob = json.dumps(out) + gov.summarise(out) + json.dumps(conn.audit())
