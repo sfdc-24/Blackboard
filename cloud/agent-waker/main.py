@@ -463,17 +463,19 @@ def run(argv=None, store=None, waker=None, board_contains=None,
 
     def post_and_record(me, cfg, text, to, answers, verbose, phase="DONE"):
         # The phase is forwarded: an answer to a DISPATCH is a RESULT (Blackboard #297).
-        if answers in reserved_posts:
+        had_request_reservation = answers in reserved_posts
+        if had_request_reservation:
             # The posting claim was taken before the Redis request append (reserve below).
             # It must still be ours and live; then the lease is renewed under compare-and-swap,
             # because the request may have used nearly its whole 400 s before this reply append.
-            reserved_posts.discard(answers)
             held_now = claim_of(box["state"])
             if not (held_now["id"] == answers and held_now["owner"] == owner
                     and held_now["phase"] == "posting" and live(held_now)):
                 return False
             s = dict(box["state"])
-            s["claim_until"] = expiry_after(POST_LEASE_SECONDS)
+            renewed = expiry_after(POST_LEASE_SECONDS)
+            if (s.get("claim_until") or "") < renewed:
+                s["claim_until"] = renewed
             try:
                 persist(s)
             except state_store.Conflict:
@@ -483,9 +485,11 @@ def run(argv=None, store=None, waker=None, board_contains=None,
         ok = original_post(me, cfg, text, to, answers, verbose, phase=phase)
         import agent_waker
         if not ok and ok is agent_waker.NOT_SENT:
-            # The tool never reached its append: nothing is on the board. Release OUR claim, so the
-            # next run asks again instead of quarantining an ask nobody answered (the third
-            # adversarial check on #367). A takeover's claim is not ours to clear.
+            # Only the final reply is definitely unsent. An earlier Redis request may already be
+            # on the board, so its reserved posting claim must remain for the next run to reconcile.
+            if had_request_reservation:
+                return ok
+            # With no earlier request, release only OUR claim so the next run can ask again.
             s = dict(box["state"])
             if s.get("claim_owner") == owner and s.get("inflight") == answers:
                 clear_claim(s)
@@ -495,6 +499,7 @@ def run(argv=None, store=None, waker=None, board_contains=None,
                     pass
             return ok
         if ok:
+            reserved_posts.discard(answers)
             s = dict(box["state"])
             # Confirmed on the board. Record that, and drop the posting claim
             # only when this run still holds it. A takeover's claim is not ours

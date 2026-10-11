@@ -123,12 +123,10 @@ REDIS, which you may read and write through your adapter, governed and audited:
 - To ask for ONE Redis operation, put ONE line in your reply, on its own, in exactly this
   form (op first, then the key, then the value when the op takes one):
       REDIS-OP|op=xadd|key=conf:side:YYYYMMDD|val=your line of text
-  ops: get, hgetall, xrange (reads); set, hset (needs field=), hput, xadd, del (writes).
-  Each op takes exactly its fields: get, hgetall and del take key only; xrange takes key and
-  an optional count; set, hput and xadd take key and val; hset takes key, field and val.
-  A key must be shared (conf:, proj:), your own inbox (fleet:inbox:<you>), or
-  gov:worker:heartbeat for a read; any other key is refused before posting. The side
-  channel every voice on the conference line reads is conf:side:<today, UTC yyyymmdd>.
+  Through this unauthenticated board route, only xadd and xrange on the public
+  conf:side:YYYYMMDD stream are available: xadd takes a value, xrange an optional count.
+  Every agent inbox and other key is refused until an authenticated identity route exists.
+  Use today's UTC date for the side stream.
 - Your adapter posts that line as a request row under your own tag and removes it from the
   text of your answer - only when it runs under the cloud runner, whose durable claim fences
   the append; a laptop pass refuses the line and your reply says so. The governed worker
@@ -766,13 +764,11 @@ def _unlink_quietly(path: str) -> None:
         pass
 
 
-APPEND_MARK = "appending Row_ID="      # fleet_agent prints it, flushed, right before its one append
-
-
 class _NotSent:
-    """post_reply's third answer: the tool's process was stopped BEFORE its append marker, so nothing
-    was appended and the ask stays open. Falsy, so `if post_reply(...)` reads as before; identity
-    (`is NOT_SENT`) tells it from an unconfirmed post, which may be on the board."""
+    """A completed tool refusal proves the final reply never reached append.
+
+    A timeout, even without captured marker output, is unconfirmed instead. Falsy, so
+    `if post_reply(...)` reads as before; identity distinguishes it from an uncertain post."""
 
     def __bool__(self):
         return False
@@ -782,11 +778,6 @@ class _NotSent:
 
 
 NOT_SENT = _NotSent()
-
-
-def _partial_output(exc) -> str:
-    out = getattr(exc, "stdout", None) or getattr(exc, "output", None) or b""
-    return out.decode("utf-8", "replace") if isinstance(out, bytes) else str(out)
 
 
 def post_reply(me: str, cfg: dict, text: str, to: str, answers: str, verbose: bool,
@@ -817,17 +808,11 @@ def post_reply(me: str, cfg: dict, text: str, to: str, answers: str, verbose: bo
             "--gist", text[:160]]
     try:
         res = subprocess.run(args, cwd=REPO, capture_output=True, text=True, timeout=POST_TIMEOUT_SECONDS)
-    except subprocess.TimeoutExpired as exc:
+    except subprocess.TimeoutExpired:
         _unlink_quietly(text_path)
-        if APPEND_MARK not in _partial_output(exc):
-            # The tool never reached its append (its read before posting outlived the budget):
-            # nothing is on the board, the ask stays open, and the cloud runner releases its claim
-            # (the third adversarial check on #367: before this, such an ask was quarantined).
-            print("    post NOT SENT after %d s: the tool's board read before posting outlived the "
-                  "budget; nothing was appended; the ask stays open" % POST_TIMEOUT_SECONDS)
-            return NOT_SENT
-        # NOT CONFIRMED IS NOT FAILED. fleet_agent appends once and then reads the row back; a
-        # flapping gateway can hold the read-back past the timeout after the row has landed
+        # Captured stdout can be absent even if the child flushed the marker and appended. A
+        # timeout alone never proves a pre-append refusal, so keep the posting claim for the next
+        # run to reconcile. A flapping gateway can hold the read-back after the row has landed
         # (gemini-waker-tmm8l, 2026-09-29: the RESULT row landed at 07:41:19Z, the read-back hung
         # until 07:47:59Z, and the uncaught TimeoutExpired ended the pass with exit 1). Never post
         # again from here. False stops this pass; the cloud cursor keeps phase=posting and the
@@ -838,6 +823,12 @@ def post_reply(me: str, cfg: dict, text: str, to: str, answers: str, verbose: bo
     _unlink_quietly(text_path)
     out = (res.stdout or "") + (res.stderr or "")
     ok = "VERIFIED on the board" in out
+    refused_before_append = (res.returncode in (1, 2) and not ok
+                             and not re.search(r"^\s*appending Row_ID=", out, re.M)
+                             and re.search(r"^\s*(?:NOT SENT|refused before posting)\b", out, re.M))
+    if refused_before_append:
+        print("    post NOT SENT: the tool refused before its append; the ask stays open")
+        return NOT_SENT
     if verbose or not ok:
         print("    " + out.strip()[-400:].replace("\n", "\n    "))
     return ok
@@ -981,8 +972,8 @@ def post_request(me: str, cfg: dict, request: dict, verbose: bool, answers: str 
     refused and unconfirmed are different facts and a reconciler must not treat them alike.
 
     EVERYTHING THE MODEL CHOSE IS GATED, SCRUBBED OR REFUSED before it reaches the board, the audit,
-    Redis or a log line. The key must be under REQUEST_PREFIXES (a model's path is narrower than its
-    agent's tool). The value is scrubbed (okf_land.scrub_secrets). The key and the field are not
+    Redis or a log line. The key must pass the public board rule shared with the worker and the
+    fleet tool. The value is scrubbed (okf_land.scrub_secrets). The key and the field are not
     scrubbed but REFUSED when scrubbing would change them: a key is an address in Redis, and a
     credential-shaped key would land verbatim in the row's gist, the audit entry and the worker's
     logs (Copilot on #365). The request id is request_id(): stable per source ask, so a retried ask
@@ -990,8 +981,8 @@ def post_request(me: str, cfg: dict, request: dict, verbose: bool, answers: str 
     DIFFERENT request, and reads the row back by id AND payload; "VERIFIED on the board" is the only
     posted; "refused before posting" / "NOT SENT" is refused; anything else is unconfirmed - never
     "absent": a timeout may have landed (append contract)."""
-    # ONE KEY RULE FOR THE MODEL'S PATH AND THE COMMAND LINE (Grok on #367, item 1): shared keys, the
-    # agent's own inbox, the heartbeat for a read. scripts/redis_keys.py owns it (fleet_agent applies
+    # ONE KEY RULE FOR THE MODEL'S PATH AND THE COMMAND LINE: the public side stream only.
+    # scripts/redis_keys.py owns it (fleet_agent applies
     # the same); it is checked here first so a refused key never reaches a subprocess, a log line or
     # the board. redis_hook runs the same gate before taking the posting claim.
     denied = request_gate(me, request)
@@ -1009,19 +1000,18 @@ def post_request(me: str, cfg: dict, request: dict, verbose: bool, answers: str 
         args += ["--count", str(request["count"])]
     try:
         res = subprocess.run(args, cwd=REPO, capture_output=True, text=True, timeout=POST_TIMEOUT_SECONDS)
-    except subprocess.TimeoutExpired as exc:
-        if APPEND_MARK not in _partial_output(exc):
-            return "refused", ("the tool's board read before posting outlived the %d s budget; nothing was "
-                               "appended" % POST_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        # A missing captured marker is not evidence of no append: the child may have flushed it
+        # and changed the board while TimeoutExpired.output remained None.
         return "unconfirmed", "no read-back after %d s (it may have landed; not posted again)" % POST_TIMEOUT_SECONDS
     # THE KEY IS MASKED EVERYWHERE THE OUTPUT GOES (the third adversarial check): the verbose print, the
-    # reason on the reply row, and the words the state is read from. Scrubbed first.
-    out = okf_land.scrub_secrets((res.stdout or "") + (res.stderr or ""))
+    # reason on the reply row, and the words the state is read from. Mask the chosen key before
+    # scrubbing, then publish only controlled status text.
+    raw_out = (res.stdout or "") + (res.stderr or "")
     key = str(request.get("key") or "")
     if key:
-        out = out.replace(key, "[key]")
-    if verbose:
-        print("    " + out.strip()[-400:].replace("\n", "\n    "))
+        raw_out = raw_out.replace(key, "[key]")
+    out = okf_land.scrub_secrets(raw_out)
     # THE RECEIPT MUST BE THIS REQUEST'S (Aya's supplement to #367): the one VERIFIED line names the
     # id asked for, this tag and the worker, and no LINE of the output contradicts it (the three words
     # are matched where fleet_agent prints them, at the start of a line, so a value that happens to
@@ -1031,11 +1021,21 @@ def post_request(me: str, cfg: dict, request: dict, verbose: bool, answers: str 
     receipts = re.findall(r"^\s*VERIFIED on the board: Row_ID=(\S+) Source_Tag=(\S+) Target_Surface=(\S+)", out, re.M)
     said = {m.group(1) for m in re.finditer(r"^\s*(NOT SENT|UNCONFIRMED|refused before posting)\b", out, re.M)}
     if res.returncode == 0 and receipts == [(asked, me, "bus-reconciler")] and not said:
+        if verbose:
+            print("    [key] VERIFIED on the board")
         return "posted", asked
-    # The reason rides a pipe-delimited row's hands sentence: no pipe survives in it.
-    reason = " ".join(out.replace("|", " ").split())[-200:] or "no output from fleet_agent request"
-    if res.returncode in (1, 2) and not receipts and said and "UNCONFIRMED" not in said:
+    # Subprocess output can quote a request or a board row containing other private keys. Return
+    # only controlled status text; even a scrubbed error line is not safe to publish or print.
+    reason = ("NOT FOUND after append" if re.search(r"^\s*NOT FOUND\b", out, re.M)
+              else "posting was not confirmed")
+    if (res.returncode in (1, 2) and not receipts and said and "UNCONFIRMED" not in said
+            and not re.search(r"^\s*appending Row_ID=", out, re.M)):
+        reason = "refused before posting; nothing was sent"
+        if verbose:
+            print("    [key] " + reason)
         return "refused", reason          # fleet_agent's EXIT_NOT_SENT / EXIT_REFUSED: nothing appended
+    if verbose:
+        print("    [key] " + reason)
     return "unconfirmed", reason          # EXIT_UNCONFIRMED, a timeout, a receipt that is not this request's
 
 

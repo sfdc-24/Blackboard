@@ -332,7 +332,8 @@ def default_post_id(prefix: str, tag: str, phase: str, text: str, moment=None) -
 
     Row ids are global and verified as exactly one row (d53079b), so the old minute-resolution
     default made a second post in the same minute a refusal (the fourth adversarial check on #367).
-    The digest makes two different posts differ and a retry of the same post repeat its id."""
+    The digest makes two different posts in one second differ. The timestamp changes across seconds;
+    a retry that must keep the same row id must pass an explicit --id."""
     stamp = (moment or dt.datetime.now(dt.timezone.utc)).strftime("%Y%m%dT%H%M%SZ")
     digest = hashlib.sha256(("%s\n%s\n%s" % (tag, phase, text or "")).encode("utf-8")).hexdigest()[:6]
     return "%s-%s-%s" % (prefix, stamp, digest)
@@ -401,7 +402,7 @@ EXIT_VERIFIED, EXIT_NOT_SENT, EXIT_REFUSED, EXIT_UNCONFIRMED = 0, 1, 2, 3
 
 # WHAT A REQUEST MAY NAME THROUGH THIS TOOL, on the waker's path and on the command line alike:
 # scripts/redis_keys.py, one rule in one file (Grok on #367, item 1). Re-exported here for callers.
-from redis_keys import key_allowed_for, SHARED_PREFIXES, OWN_INBOX_PREFIX, SHARED_READ_KEYS  # noqa: E402,F401
+from redis_keys import key_allowed_for  # noqa: E402
 
 
 def _same_payload(a, b) -> bool:
@@ -440,22 +441,31 @@ def _matching_rows(rid, tries=1):
     waker's 400 s budget, so a slow gateway could spend the whole budget before anything was sent,
     while the waker said "it may have landed" about a row that never was. `match` is a substring
     over the whole row (a later row quoting the id matches too), so the caller still compares
-    Row_ID exactly. One try before the append: a flapping gateway is told NOT SENT at once and the
-    budget is kept for the append and the read-back. No header comes back from a filtered read, so
-    the cells are compared by position, the A:J layout every writer here uses."""
+    Row_ID exactly. No `limit` is safe here: later rows quoting an id could hide its exact row
+    behind the cap. Require the known filtered-read metadata and data-row shape; a gateway that
+    ignores `match` is UNKNOWN, not an empty board. One try before the append preserves the budget."""
     env = _bus_load_env()
     try:
         body = _bus_fetch(env["BUS_URL"], {"action": "read", "secret": env["BUS_SECRET"], "title": BOARD,
-                                           "match": str(rid), "limit": 200}, tries=tries)
-        rows = json.loads(body).get("rows")
+                                           "match": str(rid)}, tries=tries)
+        answer = json.loads(body)
     except Exception:  # noqa: BLE001 - a transport failure is not an empty board
         return None
-    if not isinstance(rows, list):
+    if not isinstance(answer, dict) or answer.get("ok") is not True or answer.get("title") != BOARD:
         return None
-    # A filtered read carries no header; a gateway that ignores the filter returns the whole board
-    # with one. Either way the caller compares Row_ID exactly, so the header is simply dropped.
-    if rows and isinstance(rows[0], (list, tuple)) and rows[0] and str(rows[0][0]).strip() == "Row_ID":
-        rows = rows[1:]
+    rows, filtered, total = answer.get("rows"), answer.get("filtered"), answer.get("total")
+    if (not isinstance(rows, list) or type(filtered) is not int or filtered != len(rows)
+            or type(total) is not int or total < filtered or filtered == 200):
+        # A gateway with the former 200-row cap can report an apparently valid 200-row slice
+        # while hiding an exact row or duplicate. An exact saturation is unknown, never absent.
+        return None
+    # The filtered endpoint returns data rows only. A header, unfiltered row, or malformed cell
+    # shape means its match contract was not established; fail before the append.
+    if any(not isinstance(row, (list, tuple)) or len(row) < BOARD_WIDTH
+           or _ten_cells(row) is None
+           or not any(str(rid).casefold() in str(cell).casefold() for cell in row)
+           for row in rows):
+        return None
     return rows
 
 
@@ -521,9 +531,8 @@ def append_and_verify(rid, row, fitted=None, spill=None, exact=True):
     # googleusercontent 404 on the redirect hop can be raised client-side AFTER
     # the row has landed - that replayed a row onto the live board once already.
     # The read-back below is what closes the loop, not this response.
-    # THE MARKER BEFORE THE APPEND. A caller that kills this process on its budget reads the partial
-    # output: no marker means nothing was appended (NOT SENT, try again later); the marker means the
-    # append may have landed (UNCONFIRMED, never post again blindly). Flushed, so it is there.
+    # THE MARKER BEFORE THE APPEND. It helps diagnose a partial run, but missing captured output
+    # on a parent timeout cannot prove no append. The caller keeps that outcome unconfirmed.
     print("  appending Row_ID=%s" % rid, flush=True)
     try:
         body = _bus_fetch(
@@ -548,7 +557,7 @@ def append_and_verify(rid, row, fitted=None, spill=None, exact=True):
         except Exception as exc:  # noqa: BLE001
             print("  SPILL_UNCONFIRMED: %s: %s" % (type(exc).__name__, exc))
             print("  The row is already posted. The object name is the row id plus the sha256, so "
-                  "a later commit of the same text reuses it and cannot overwrite a different one.")
+                  "a later commit using the same row id and text reuses it without overwriting another.")
 
     # D-4: the response is not the proof. Read the row back: exactly one identical row.
     hit, identical, why = _board_rows_like(rid, row, tries=2)

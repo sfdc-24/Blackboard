@@ -1164,11 +1164,29 @@ class TheRequestAppendIsFenced(unittest.TestCase):
     def test_outside_the_runner_the_adapter_has_no_claim_and_refuses(self):
         self.assertFalse(aw.reserve_redis_side_effect("A"))
 
+    def test_reply_not_sent_after_request_reservation_keeps_unknown_and_prevents_replay(self):
+        """The final reply's preflight says nothing about an earlier Redis request append."""
+        class RequestThenNoReply(_RequestingWaker):
+            def post_reply(self, me, cfg, text, to, answers, verbose, phase="DONE"):
+                return aw.NOT_SENT
+
+        store = MemStore({"watermark": "2026-09-24T02:00:00Z", "answered_ids": []})
+        calls, posts, requests = [], [], []
+        w = RequestThenNoReply(calls, posts=posts, requests=requests)
+        w.reply_on_board = lambda rid: False
+        main.run(store=store, waker=w, now="2026-09-24T05:00:00Z")
+        self.assertEqual((["A"], ["A"], []), (calls, requests, posts))
+        self.assertEqual(("A", "posting"), (store.state.get("inflight"), store.state.get("claim_phase")))
+        main.run(store=store, waker=w, now="2026-09-24T05:10:00Z")
+        self.assertEqual((["A"], ["A"], []), (calls, requests, posts), "no second dispatch")
+        main.run(store=store, waker=w, now="2026-09-24T05:20:00Z")
+        self.assertEqual((["A"], ["A"], []), (calls, requests, posts))
+        self.assertIn("A", store.state.get("unknown_ids") or [], "expired uncertain posting is held")
+
     def test_a_reply_the_tool_never_appended_releases_the_claim_so_the_next_run_asks_again(self):
-        """The third adversarial check on #367: a timeout BEFORE the tool's append marker means nothing
-        is on the board; before this it kept phase=posting and the next run quarantined an ask that
-        nobody had answered. Now post_reply says NOT_SENT, the runner clears its own claim, and the
-        next run calls the model and posts."""
+        """A positively established final-reply preflight refusal may release an ordinary claim.
+        A timeout with missing captured output is not such proof, and a reserved Redis request is
+        never released by the final reply's refusal."""
         class NotSentOnce(_ClaimingWaker):
             def post_reply(self, me, cfg, text, to, answers, verbose, phase="DONE"):
                 if not getattr(self, "sent_once", False):

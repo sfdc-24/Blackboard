@@ -599,7 +599,7 @@ class RedisRequests(unittest.TestCase):
     governed namespaces, a cut reply sends nothing, and every outcome is its own state on the row.
     """
 
-    REQ = {"op": "set", "key": "proj:k", "val": "v", "field": None, "count": None}
+    REQ = {"op": "xadd", "key": "conf:side:20261011", "val": "v", "field": None, "count": None}
 
     def setUp(self):
         # The cloud runner provides the durable posting claim; these tests stand in for it. The one
@@ -698,7 +698,7 @@ class RedisRequests(unittest.TestCase):
     def test_post_request_goes_through_fleet_agent_request_and_trusts_only_the_read_back(self):
         calls = []
         real = aw.subprocess.run
-        aw.subprocess.run = self._run("  request X: set proj:k\n" + self.receipt("gemini"), calls)
+        aw.subprocess.run = self._run("  request X: xadd conf:side:20261011\n" + self.receipt("gemini"), calls)
         try:
             state, rid = aw.post_request("gemini", {"project": "FLEET"},
                                          dict(self.REQ, val="v|with pipe"), verbose=False)
@@ -707,14 +707,14 @@ class RedisRequests(unittest.TestCase):
         self.assertEqual(("posted", aw.request_id("gemini", "")), (state, rid))
         argv = calls[0]
         self.assertTrue(argv[1].endswith(os.path.join("scripts", "fleet_agent.py")))
-        self.assertEqual(["request", "set", "proj:k", "--tag", "gemini", "--project", "FLEET",
+        self.assertEqual(["request", "xadd", "conf:side:20261011", "--tag", "gemini", "--project", "FLEET",
                           "--id", aw.request_id("gemini", ""), "--val", "v|with pipe"], argv[2:])
 
     def test_post_request_without_the_read_back_is_unconfirmed_not_refused(self):
         real = aw.subprocess.run
         aw.subprocess.run = self._run("  append said: ok:true\n  NOT FOUND after append")
         try:
-            state, why = aw.post_request("grok", {"project": "FLEET"}, dict(self.REQ, op="get", val=None), False)
+            state, why = aw.post_request("grok", {"project": "FLEET"}, dict(self.REQ, op="xrange", val=None), False)
         finally:
             aw.subprocess.run = real
         self.assertEqual("unconfirmed", state)
@@ -745,7 +745,7 @@ class RedisRequests(unittest.TestCase):
                 cfg = aw.AGENTS[tag]
                 self.assertTrue(cfg.get("redis_requests"))
                 self.assertIn("REDIS-OP|op=xadd|key=conf:side:YYYYMMDD", cfg["doctrine"])
-                self.assertIn("your own inbox (fleet:inbox:<you>)", cfg["doctrine"])
+                self.assertIn("Every agent inbox and other key is refused", cfg["doctrine"])
                 self.assertIn("redis_state=posted", cfg["doctrine"])
                 self.assertIn("governed Redis request", aw.hands_note(tag, cfg))
 
@@ -767,7 +767,7 @@ class RedisRequests(unittest.TestCase):
             aw.subprocess.run = real
         self.assertEqual([], calls, "no subprocess, so no row and no log line")
 
-    def test_a_key_that_is_not_shared_or_its_own_inbox_is_refused_before_anything_is_posted(self):
+    def test_a_key_other_than_the_public_stream_is_refused_before_anything_is_posted(self):
         # Grok on #367 (item 1): the access list grants read `*`, so through this hook a model could
         # have gov:audit or ANOTHER agent's inbox read and its contents posted onto the board. One
         # rule, owned by fleet_agent, for the model's path and the command line alike.
@@ -782,9 +782,9 @@ class RedisRequests(unittest.TestCase):
                         state, why = aw.post_request("gemini", {"project": "FLEET"},
                                                      dict(self.REQ, op=op, key=key, val="v"), False)
                         self.assertEqual("refused", state)
-                        self.assertIn("nothing else through this tool", why)
+                        self.assertIn("only the public shared side stream", why)
                         self.assertNotIn(key, why, "the refused key is not echoed")
-            # the heartbeat may be read, never written
+            # The heartbeat is not available over this unauthenticated board route.
             state, why = aw.post_request("gemini", {"project": "FLEET"},
                                          dict(self.REQ, op="set", key="gov:worker:heartbeat", val="v"), False)
             self.assertEqual("refused", state)
@@ -792,17 +792,17 @@ class RedisRequests(unittest.TestCase):
             aw.subprocess.run = real
         self.assertEqual([], calls, "no subprocess, so no row, no audit entry and no log line")
 
-    def test_shared_keys_its_own_inbox_and_the_heartbeat_read_go_through(self):
+    def test_public_side_stream_reads_and_writes_go_through(self):
         asked = aw.request_id("gemini", "")
-        for op, key in (("xadd", "conf:side:20261011"), ("get", "proj:x"), ("xrange", "fleet:inbox:gemini"),
-                        ("xadd", "fleet:inbox:gemini"), ("get", "gov:worker:heartbeat")):
+        for op, key in (("xadd", "conf:side:20261011"), ("xrange", "conf:side:20261011")):
             with self.subTest(op=op, key=key):
                 calls = []
                 real = aw.subprocess.run
                 aw.subprocess.run = self._run(self.receipt("gemini"), calls)
                 try:
                     state, rid = aw.post_request("gemini", {"project": "FLEET"},
-                                                 dict(self.REQ, op=op, key=key, val="v"), False)
+                                                 dict(self.REQ, op=op, key=key,
+                                                      val="v" if op == "xadd" else None), False)
                 finally:
                     aw.subprocess.run = real
                 self.assertEqual(("posted", asked, 1), (state, rid, len(calls)))
@@ -860,7 +860,7 @@ class RedisRequests(unittest.TestCase):
         real = aw.subprocess.run
         aw.subprocess.run = self._run("  append said: ok:true\n  COULD NOT VERIFY")
         try:
-            state, why = aw.post_request("grok", {"project": "FLEET"}, dict(self.REQ, op="get", val=None), False)
+            state, why = aw.post_request("grok", {"project": "FLEET"}, dict(self.REQ, op="xrange", val=None), False)
         finally:
             aw.subprocess.run = real
         self.assertEqual("unconfirmed", state)
@@ -898,7 +898,7 @@ class RedisRequests(unittest.TestCase):
         aw.subprocess.run = self._run(self.receipt("gemini", "ASK-1"), calls)
         try:
             text, rid, state, sentence, note = aw.redis_hook(
-                "gemini", aw.AGENTS["gemini"], "Done.\nREDIS-OP|op=set|key=proj:k|val=v", "ASK-1",
+                "gemini", aw.AGENTS["gemini"], "Done.\nREDIS-OP|op=xadd|key=conf:side:20261011|val=v", "ASK-1",
                 model_cut=False, verbose=False)
         finally:
             aw.subprocess.run = real
@@ -906,7 +906,7 @@ class RedisRequests(unittest.TestCase):
         self.assertEqual(asked, calls[0][calls[0].index("--id") + 1], "the id asked for")
         self.assertEqual(("Done.", "posted", asked), (text, state, rid), "the id read back")
         self.assertIn("as row %s" % asked, sentence)
-        self.assertIn("proj:k", note, "a posted key may be logged: it passed every gate")
+        self.assertIn("conf:side:20261011", note, "a posted key may be logged: it passed every gate")
 
     def test_a_refused_key_reaches_neither_the_sentence_nor_the_log_line(self):
         calls = []
@@ -983,42 +983,71 @@ class RedisRequests(unittest.TestCase):
         self.assertIsNotNone(req, "an empty field is absent, not a shape error")
         self.assertIsNone(req["val"])
 
-    def test_a_timeout_before_the_append_marker_is_refused_and_after_it_unconfirmed(self):
-        # The third adversarial check on #367: a slow board read before the append used to be read as
-        # "it may have landed". fleet_agent prints its marker right before the one append.
+    def test_a_timeout_is_unconfirmed_even_when_the_captured_marker_is_missing(self):
+        # TimeoutExpired.output can be None after a child flushed its marker and appended.
         def raising(partial):
             def run(args, **kw):
                 raise aw.subprocess.TimeoutExpired(cmd=args, timeout=1, output=partial)
             return run
         real = aw.subprocess.run
         try:
-            aw.subprocess.run = raising("  request X: set proj:k\n")
-            state, why = aw.post_request("gemini", {"project": "FLEET"}, self.REQ, False)
-            self.assertEqual("refused", state)
-            self.assertIn("nothing was appended", why)
-            aw.subprocess.run = raising(b"  request X: set proj:k\n  appending Row_ID=X\n")
-            state, why = aw.post_request("gemini", {"project": "FLEET"}, self.REQ, False)
-            self.assertEqual("unconfirmed", state)
-            self.assertIn("may have landed", why)
+            for partial in (None, "  request X: xadd conf:side:20261011\n",
+                            b"  appending Row_ID=X\n"):
+                with self.subTest(partial=partial):
+                    aw.subprocess.run = raising(partial)
+                    state, why = aw.post_request("gemini", {"project": "FLEET"}, self.REQ, False)
+                    self.assertEqual("unconfirmed", state)
+                    self.assertIn("may have landed", why)
         finally:
             aw.subprocess.run = real
 
-    def test_post_reply_tells_not_sent_from_not_confirmed_on_a_timeout(self):
+    def test_post_reply_timeout_is_unknown_and_only_a_completed_refusal_is_not_sent(self):
         def raising(partial):
             def run(args, **kw):
                 raise aw.subprocess.TimeoutExpired(cmd=args, timeout=1, output=partial)
             return run
         real = aw.subprocess.run
         try:
-            aw.subprocess.run = raising("  reading the board first\n")
-            res = aw.post_reply("gemini", {"project": "FLEET"}, "text", "grok;ALL", "ASK-1", False)
-            self.assertIs(aw.NOT_SENT, res)
-            self.assertFalse(res, "falsy, so every `if post_reply(...)` reads as before")
-            aw.subprocess.run = raising("  appending Row_ID=GEMINI-WAKE-x\n")
-            res = aw.post_reply("gemini", {"project": "FLEET"}, "text", "grok;ALL", "ASK-1", False)
-            self.assertIs(False, res)
+            for partial in (None, "  reading the board first\n",
+                            "  appending Row_ID=GEMINI-WAKE-x\n"):
+                with self.subTest(partial=partial):
+                    aw.subprocess.run = raising(partial)
+                    res = aw.post_reply("gemini", {"project": "FLEET"}, "text", "grok;ALL", "ASK-1", False)
+                    self.assertIs(False, res)
+            aw.subprocess.run = self._run("  NOT SENT: the board could not be read", code=1)
+            self.assertIs(aw.NOT_SENT, aw.post_reply(
+                "gemini", {"project": "FLEET"}, "text", "grok;ALL", "ASK-1", False))
         finally:
             aw.subprocess.run = real
+
+    def test_a_local_child_can_write_then_timeout_with_no_reported_output(self):
+        """Reproduce the timing with a local file; the adapter still treats absent output as unknown."""
+        import tempfile
+        from pathlib import Path
+        real = aw.subprocess.run
+        with tempfile.TemporaryDirectory() as directory:
+            proof = Path(directory) / "child-wrote.txt"
+
+            def timed_out_after_side_effect(args, **kw):
+                child = ("import pathlib,sys,time; pathlib.Path(sys.argv[1]).write_text('wrote'); "
+                         "print('appending Row_ID=X', flush=True); time.sleep(5)")
+                with self.assertRaises(aw.subprocess.TimeoutExpired):
+                    real([sys.executable, "-c", child, str(proof)], timeout=1,
+                         capture_output=True, text=True)
+                self.assertEqual("wrote", proof.read_text())
+                # A parent can lose the child's captured bytes despite its flush and side effect.
+                raise aw.subprocess.TimeoutExpired(cmd=args, timeout=1, output=None)
+
+            aw.subprocess.run = timed_out_after_side_effect
+            try:
+                state, _ = aw.post_request("gemini", {"project": "FLEET"}, self.REQ, False)
+                self.assertEqual("unconfirmed", state)
+                proof.unlink()
+                self.assertIs(False, aw.post_reply(
+                    "gemini", {"project": "FLEET"}, "text", "grok;ALL", "ASK-1", False))
+                self.assertEqual("wrote", proof.read_text())
+            finally:
+                aw.subprocess.run = real
 
     def test_without_a_durable_posting_claim_a_request_is_refused_before_the_subprocess(self):
         # Outside the cloud runner nothing can fence a retry, so the adapter fails closed.
@@ -1029,7 +1058,7 @@ class RedisRequests(unittest.TestCase):
         aw.subprocess.run = self._run(self.receipt("gemini", "ASK-1"), calls)
         try:
             text, rid, state, sentence, note = aw.redis_hook(
-                "gemini", aw.AGENTS["gemini"], "Done.\nREDIS-OP|op=set|key=proj:k|val=v", "ASK-1",
+                "gemini", aw.AGENTS["gemini"], "Done.\nREDIS-OP|op=xadd|key=conf:side:20261011|val=v", "ASK-1",
                 model_cut=False, verbose=False)
         finally:
             aw.subprocess.run = real
@@ -1069,7 +1098,7 @@ class RedisRequests(unittest.TestCase):
         import contextlib
         import io
         real = aw.subprocess.run
-        aw.subprocess.run = self._run("  request X: set proj:k token AKIAIOSFODNN7EXAMPLE seen\n"
+        aw.subprocess.run = self._run("  request X: xadd conf:side:20261011 token AKIAIOSFODNN7EXAMPLE seen\n"
                                       "  UNCONFIRMED: not found after the append", code=3)
         captured = io.StringIO()
         try:
@@ -1080,7 +1109,7 @@ class RedisRequests(unittest.TestCase):
         self.assertEqual("unconfirmed", state)
         printed = captured.getvalue()
         self.assertIn("[key]", printed)
-        self.assertNotIn("proj:k", printed)
+        self.assertNotIn("conf:side:20261011", printed)
         self.assertNotIn("AKIA", printed)
         self.assertNotIn("AKIA", why)
 

@@ -467,8 +467,9 @@ class EndToEndThroughTheBoardWorker(unittest.TestCase):
         self.now = datetime.datetime(2026, 10, 8, 2, 0, tzinfo=datetime.timezone.utc)
 
     def row(self, tag, payload, req="REQ-0001", ts="2026-10-08T01:59:00Z"):
-        return ["ROW-" + req, ts, tag, "bus-reconciler", "AYA_REQ",
-                "BCB|v=1|id=%s|req=%s|%s" % (req, req, payload), "", "", "", ""]
+        return [req, ts, tag, "bus-reconciler", "AYA_REQ",
+                "BCB|v=1|id=%s|req=%s|%s|from=%s|to=bus-reconciler" % (req, req, payload, tag),
+                "", "", "", ""]
 
     def run_rows(self, rows, conn=None):
         conn = conn if conn is not None else FakeRedis()
@@ -476,26 +477,41 @@ class EndToEndThroughTheBoardWorker(unittest.TestCase):
         out = self.br.handle(rows, conn, now=self.now, append=out_rows.append)
         return out, out_rows, conn
 
-    def test_grok_writes_and_the_result_is_one_row(self):
+    def test_grok_appends_to_the_public_stream_and_the_result_is_one_row(self):
         out, rows, conn = self.run_rows([self.row(
-            "grok", "do=redis-op|op=set|key=conf:2026-10-07:scorecard|val=Z3JlZW4=|enc=b64")])
-        self.assertEqual("green", conn.data["conf:2026-10-07:scorecard"])
+            "grok", "do=redis-op|op=xadd|key=conf:side:20261011|val=Z3JlZW4=|enc=b64")])
+        self.assertEqual("green", conn.data["conf:side:20261011"][0][1]["text"])
         self.assertEqual(1, len(rows), "one RESULT row, no separate receipt")
         self.assertEqual("AYA_RESULT", rows[0]["action_type"])
-        self.assertIn("OK set conf:2026-10-07:scorecard", rows[0]["payload"])
+        self.assertIn("OK xadd conf:side:20261011", rows[0]["payload"])
         self.assertEqual("grok", rows[0]["target_surface"], "answered under its own tag")
         self.assertEqual("OK", out["answered"][0]["status"])
         self.assertEqual("grok", conn.audit()[-1]["actor"])
         self.assertTrue(conn.audit()[-1]["via"].startswith("REQ-0001/"), "the audit names the row")
 
-    def test_each_agent_he_named_reaches_redis_through_the_board(self):
-        rows = [self.row(tag, "do=redis-op|op=set|key=fleet:hello:%s|val=aGk=|enc=b64" % tag, req="REQ-%04d" % n)
+    def test_each_agent_he_named_reaches_the_public_stream_through_the_board(self):
+        rows = [self.row(tag, "do=redis-op|op=xadd|key=conf:side:20261011|val=aGk=|enc=b64", req="REQ-%04d" % n)
                 for n, tag in enumerate(("chatgpt-codex-desktop", "grok", "cursor", "gemini",
                                          "codex", "aya"), start=1)]
         out, written, conn = self.run_rows(rows)
         self.assertEqual(["OK"] * 6, [a["status"] for a in out["answered"]])
-        for tag in ("chatgpt-codex-desktop", "grok", "cursor", "gemini", "codex", "aya"):
-            self.assertEqual("hi", conn.data["fleet:hello:%s" % tag])
+        self.assertEqual(["hi"] * 6, [e["text"] for _, e in conn.data["conf:side:20261011"]])
+
+    def test_public_stream_accepts_ten_cells_and_blank_sheet_padding(self):
+        """The live board reads twelve columns, with empty K:L after the ten request cells."""
+        for padding in ((), ("", ""), (" ", None)):
+            with self.subTest(padding=padding):
+                write = self.row("gemini", "do=redis-op|op=xadd|key=conf:side:20261011|val=Z3JlZW4=|enc=b64",
+                                 req="REQ-PAD-W")
+                read = self.row("gemini", "do=redis-op|op=xrange|key=conf:side:20261011|count=1",
+                                req="REQ-PAD-R")
+                write.extend(padding)
+                read.extend(padding)
+                out, written, conn = self.run_rows([write, read])
+                self.assertEqual(["OK", "OK"], [a["status"] for a in out["answered"]])
+                self.assertEqual([], out["refused"])
+                self.assertEqual("green", conn.data["conf:side:20261011"][0][1]["text"])
+                self.assertIn("green", written[1]["payload"])
 
     def test_the_row_fleet_agent_builds_is_the_row_the_worker_answers(self):
         """The tool and the worker agree, proved on the real row - not a hand-written one.
@@ -524,78 +540,76 @@ class EndToEndThroughTheBoardWorker(unittest.TestCase):
 
     def test_every_principal_and_alias_in_the_access_list_is_answered_under_its_own_tag(self):
         """AYA'S ACCEPTANCE TEST, PER AGENT, OFFLINE (Grok on #367, item 5). For EVERY tag the access
-        list knows - each principal and each alias, read from the list so a principal added later is
-        covered the day it is added - through the row fleet_agent builds under that tag: write its own
-        marker, read it back, find both in the audit under the canonical actor and the raw tag, record
-        the latency the worker measured, and be refused on a forbidden write (the tool refuses it
-        before a row exists; a row written by hand is refused by the governor and audited as such)."""
+        list knows, append a public message, read it back, and reject a protected write before Redis
+        is touched. The tool also refuses that write before posting a row."""
         import datetime
         import fleet_agent
         import redis_gov
         acl = redis_gov.load_acl()
         aliases = acl.get("aliases", {})
-        tags = list(acl["principals"]) + list(aliases)
+        # milestones-sync is a service principal whose ACL cannot write conf:, not a fleet agent.
+        tags = [tag for tag in list(acl["principals"]) + list(aliases)
+                if "conf:" in acl["principals"][aliases.get(tag, tag)]["write"]]
         self.assertGreaterEqual(len(tags), 15, "the list the owner set names many agents")
         when = self.now - datetime.timedelta(minutes=1)
         rows, plan = [], {}
         for n, tag in enumerate(tags, start=1):
             canonical = aliases.get(tag, tag)
-            writes = acl["principals"][canonical]["write"]
-            marker_key = ("conf:accept:%s" if "conf:" in writes else writes[0] + "accept:%s") % tag
             marker = "accepted by %s at %s" % (tag, when.isoformat())
-            rows.append(fleet_agent.request_row(tag, "set", marker_key, val=marker, now=when,
+            rows.append(fleet_agent.request_row(tag, "xadd", "conf:side:20261011", val=marker, now=when,
                                                 rid="REQ-ACC-%04d-W" % n)[1])
-            rows.append(fleet_agent.request_row(tag, "get", marker_key, now=when, rid="REQ-ACC-%04d-R" % n)[1])
+            rows.append(fleet_agent.request_row(tag, "xrange", "conf:side:20261011", count=1,
+                                                now=when, rid="REQ-ACC-%04d-R" % n)[1])
             with self.assertRaises(ValueError, msg=tag):           # the tool refuses it before a row exists
                 fleet_agent.request_row(tag, "set", "v1:bus:row:%s" % tag, val="forged", now=when,
                                         rid="REQ-ACC-%04d-F" % n)
             rows.append(self.row(tag, "do=redis-op|op=set|key=v1:bus:row:%s|val=Zm9yZ2Vk|enc=b64" % tag,
                                  req="REQ-ACC-%04d-F" % n, ts=when.strftime("%Y-%m-%dT%H:%M:%SZ")))
-            plan[tag] = (canonical, marker_key, marker)
+            plan[tag] = (canonical, marker)
         conn, written = FakeRedis(), []
         # three rows per tag is more than one run's MAX_PER_RUN; the cap is a flood rule, not the subject
         out = self.br.handle(rows, conn, now=self.now, append=written.append, max_per_run=len(rows))
-        self.assertEqual(["OK", "OK", "REFUSED"] * len(tags), [a["status"] for a in out["answered"]])
+        self.assertEqual(["OK", "OK"] * len(tags), [a["status"] for a in out["answered"]])
+        self.assertEqual(len(tags), len(out["refused"]))
         self.assertEqual([t for t in tags for _ in range(3)], [r["target_surface"] for r in written],
                          "each answered under its own tag, refusal included")
         latencies = {}
         for i, tag in enumerate(tags):
-            canonical, marker_key, marker = plan[tag]
+            canonical, marker = plan[tag]
             wrote, read, forged = written[3 * i], written[3 * i + 1], written[3 * i + 2]
-            self.assertEqual(marker, conn.data[marker_key], tag)
-            self.assertIn("OK set %s" % marker_key, wrote["payload"])
+            self.assertIn("OK xadd conf:side:20261011", wrote["payload"])
             self.assertIn(marker, read["payload"], "the read came back on the board")
             self.assertIn("REFUSED", forged["payload"])
             self.assertNotIn("v1:bus:row:%s" % tag, conn.data)
             mine = [e for e in conn.audit() if e["raw_tag"] == tag]
-            self.assertEqual([canonical] * 3, [e["actor"] for e in mine], "audited under the canonical actor")
-            self.assertEqual([("set", "1"), ("get", "1"), ("set", "0")], [(e["op"], e["ok"]) for e in mine], tag)
-            self.assertEqual(marker_key, mine[0]["key"])
-            lat = [a["latency_ms"] for a in out["answered"][3 * i:3 * i + 3]]
+            self.assertEqual([canonical] * 2, [e["actor"] for e in mine], "audited under the canonical actor")
+            self.assertEqual([("xadd", "1"), ("xrange", "1")], [(e["op"], e["ok"]) for e in mine], tag)
+            self.assertEqual("conf:side:20261011", mine[0]["key"])
+            lat = [a["latency_ms"] for a in out["answered"][2 * i:2 * i + 2]]
             self.assertTrue(all(isinstance(x, int) and x >= 0 for x in lat), lat)
             latencies[tag] = lat
-        print("\n  acceptance latency_ms (set, get, refused) per tag: %s"
+        print("\n  acceptance latency_ms (xadd, xrange) per tag: %s"
               % ", ".join("%s=%s" % (t, "/".join(str(x) for x in l)) for t, l in latencies.items()))
 
     def test_the_tool_names_what_an_agent_may_ask_for_and_nothing_else(self):
-        """Grok on #367 (item 1): shared keys, the agent's own inbox (canonical, so aya's is Codex's),
-        the heartbeat for a read. Another agent's inbox and the audit stream are refused by the tool,
-        on the command line and on the waker's path alike, before any row exists."""
+        """The public stream is the only board key; even a claimed own inbox is refused."""
         import fleet_agent
-        ok = (("gemini", "xadd", "conf:side:20261011"), ("gemini", "get", "proj:x"),
-              ("gemini", "xrange", "fleet:inbox:gemini"), ("aya", "xadd", "fleet:inbox:chatgpt-codex-desktop"),
-              ("grok", "get", "gov:worker:heartbeat"), ("grok", "hgetall", "proj:milestones:m3"))
+        ok = (("gemini", "xadd", "conf:side:20261011"), ("aya", "xrange", "conf:side:20261011"))
         denied = (("gemini", "xrange", "fleet:inbox:grok"), ("gemini", "get", "fleet:inbox:gemini-x"),
                   ("grok", "set", "gov:worker:heartbeat"), ("grok", "xrange", "gov:audit"),
                   ("grok", "get", "v1:agent:gemini:inbox"), ("aya", "get", "fleet:inbox:aya"),
-                  ("grok", "get", "fleet:status"))
+                   ("grok", "get", "fleet:status"), ("gemini", "xrange", "fleet:inbox:gemini"),
+                   ("aya", "xadd", "fleet:inbox:chatgpt-codex-desktop"),
+                   ("gemini", "get", "proj:x"), ("grok", "hgetall", "proj:milestones:m3"),
+                   ("gemini", "xadd", "conf:side:20261399"), ("gemini", "set", "conf:side:20261011"))
         for tag, op, key in ok:
             with self.subTest(tag=tag, op=op, key=key):
                 self.assertEqual("", fleet_agent.key_allowed_for(tag, op, key))
-                fleet_agent.request_row(tag, op, key, val="v", rid="REQ-KEY-0001")
+                fleet_agent.request_row(tag, op, key, val="v" if op == "xadd" else None,
+                                        rid="REQ-KEY-0001")
         for tag, op, key in denied:
             with self.subTest(tag=tag, op=op, key=key):
-                self.assertIn("nothing else through this tool", fleet_agent.key_allowed_for(tag, op, key))
+                self.assertIn("only the public shared side stream", fleet_agent.key_allowed_for(tag, op, key))
                 with self.assertRaises(ValueError):
                     fleet_agent.request_row(tag, op, key, val="v", rid="REQ-KEY-0002")
 
@@ -606,44 +620,115 @@ class EndToEndThroughTheBoardWorker(unittest.TestCase):
         out, rows, conn = self.run_rows([self.row("grok", "do=redis-op|op=set|key=fleet:x|val=a|b")])
         self.assertNotIn("fleet:x", conn.data)
         self.assertEqual(1, len(out["refused"]))
-        self.assertIn("no field name", rows[0]["payload"])
+        self.assertIn("only the public shared side stream", rows[0]["payload"])
+        self.assertNotIn("fleet:x", rows[0]["payload"])
         self.assertEqual(2, self.br.nameless_segments("BCB|v=1|do=redis-op|op=set|key=k|val=a|b|c"))
         self.assertEqual(0, self.br.nameless_segments("BCB|v=1|do=redis-op|op=set|key=k|val=YQ==|enc=b64"))
+        import git_requests
+        git_row = git_requests.GitRow(self.row(
+            "grok", "do=redis-op|op=set|key=conf:side:20261011|val=a|b", req="GH-test-1"))
+        git_out, git_written, git_conn = self.run_rows([git_row])
+        self.assertEqual(1, len(git_out["refused"]))
+        self.assertIn("no field name", git_written[0]["payload"])
+        self.assertEqual({}, git_conn.data, "Git ambiguity is refused before a run claim")
 
     def test_a_stranger_with_the_same_tool_gets_no_row_and_writes_nothing(self):
         import datetime
         import fleet_agent
         when = self.now - datetime.timedelta(minutes=1)    # a request from the future is refused
-        _, row = fleet_agent.request_row("stranger", "set", "conf:x", val="v", now=when, rid="REQ-FA-0009")
+        _, row = fleet_agent.request_row("stranger", "xadd", "conf:side:20261011", val="v",
+                                         now=when, rid="REQ-FA-0009")
         out, written, conn = self.run_rows([row])
         self.assertEqual([], written)
-        self.assertNotIn("conf:x", conn.data)
+        self.assertNotIn("conf:side:20261011", conn.data)
 
     def test_a_read_comes_back_in_the_result(self):
         conn = FakeRedis()
-        conn.set("fleet:status", "amber")
+        conn.xadd("conf:side:20261011", {"text": "amber", "by": "gemini"})
         out, rows, _ = self.run_rows(
-            [self.row("cursor", "do=redis-op|op=get|key=fleet:status")], conn)
+            [self.row("cursor", "do=redis-op|op=xrange|key=conf:side:20261011|count=1")], conn)
         self.assertIn("amber", rows[0]["payload"])
 
     def test_a_raw_value_is_refused_and_the_row_says_how_to_send_it(self):
         """Grok on #367 (row 2cc985ed): the worker stored a raw value, and a raw value with a pipe had
         already been split on the board, so what it stored was a truncation nobody asked for."""
-        out, rows, conn = self.run_rows([self.row("grok", "do=redis-op|op=set|key=fleet:x|val=raw text")])
-        self.assertNotIn("fleet:x", conn.data)
+        out, rows, conn = self.run_rows([self.row("grok", "do=redis-op|op=xadd|key=conf:side:20261011|val=raw text")])
+        self.assertNotIn("conf:side:20261011", conn.data)
         self.assertEqual(1, len(out["refused"]), "refused before the governor, like a stale request")
         self.assertEqual(1, len(rows), "a recognised sender is told")
         self.assertIn("REFUSED", rows[0]["payload"])
-        self.assertIn("enc=b64", rows[0]["payload"])
+        self.assertIn("only the public shared side stream", rows[0]["payload"])
         self.assertEqual("grok", rows[0]["target_surface"])
 
-    def test_a_protected_write_is_refused_on_the_board_and_in_the_audit(self):
+    def test_a_protected_write_is_refused_before_the_claim_and_redis(self):
         out, rows, conn = self.run_rows([self.row(
             "gemini", "do=redis-op|op=set|key=v1:bus:row:R-1|val=Zm9yZ2Vk|enc=b64")])
         self.assertNotIn("v1:bus:row:R-1", conn.data)
         self.assertIn("REFUSED", rows[0]["payload"])
-        self.assertEqual("REFUSED", out["answered"][0]["status"])
-        self.assertEqual("0", conn.audit()[-1]["ok"])
+        self.assertEqual([], out["answered"])
+        self.assertEqual([], conn.audit())
+        self.assertNotIn(self.br.run_marker(self.br.parse_request(self.row(
+            "gemini", "do=redis-op|op=set|key=v1:bus:row:R-1|val=Zm9yZ2Vk|enc=b64"))), conn.data)
+
+    def test_spoofed_board_tags_cannot_read_or_write_private_keys(self):
+        """A caller can claim Gemini (or any ACL principal); the worker must ignore that claim
+        for key authority, including an inbox whose name matches the forged tag."""
+        import copy
+        conn = FakeRedis()
+        conn.set("fleet:inbox:gemini", "private-gemini-secret")
+        conn.set("fleet:inbox:grok", "private-grok-secret")
+        conn.set("proj:private", "private-project-secret")
+        conn.xadd("gov:audit", {"text": "private-audit-secret"})
+        before = copy.deepcopy(conn.data)
+        cases = (("get", "fleet:inbox:gemini"), ("get", "fleet:inbox:grok"),
+                 ("get", "proj:private"), ("xrange", "gov:audit"),
+                 ("xadd", "fleet:inbox:grok"), ("xadd", "fleet:inbox:gemini"),
+                 ("set", "proj:private"))
+        rows = []
+        for n, (op, key) in enumerate(cases):
+            value = "|val=cHJpdmF0ZS13cml0ZS1zZWNyZXQ=|enc=b64" if op in ("xadd", "set") else ""
+            rows.append(self.row("gemini", "do=redis-op|op=%s|key=%s%s" % (op, key, value),
+                                 req="REQ-PRIVATE-%02d" % n))
+        out, written, _ = self.run_rows(rows, conn)
+        self.assertEqual([], out["answered"])
+        self.assertEqual(len(cases), len(out["refused"]))
+        self.assertEqual(before, conn.data, "no marker, read audit, or operation reached Redis")
+        published = repr(written) + repr(out)
+        for private in ("fleet:inbox:", "proj:private", "gov:audit", "private-",
+                        "cHJpdmF0ZS13cml0ZS1zZWNyZXQ="):
+            self.assertNotIn(private, published)
+        self.assertTrue(all("only the public shared side stream" in r["payload"] for r in written))
+
+    def test_malformed_and_duplicate_board_fields_do_not_claim_or_leak(self):
+        conn = FakeRedis()
+        payloads = (
+            "do=redis-op|op=xrange|key=conf:side:20261011|key=fleet:inbox:grok",
+            "do=redis-op|op=xadd|key=conf:side:20261011|val=c2VjcmV0|enc=b64|val=cHJpdmF0ZQ==",
+            "do=redis-op|op=xrange|key=conf:side:20261011|field=private-secret",
+            "do=redis-op|op=xrange|key=conf:side:20261011|count=9999999999999999999999999999999",
+            "do=redis-op|op=xrange|key=conf:side:20261011|unknown=private-secret",
+        )
+        rows = [self.row("gemini", payload, req="REQ-MAL-%02d" % n)
+                for n, payload in enumerate(payloads)]
+        wrong_target = self.row("gemini", "do=redis-op|op=xrange|key=conf:side:20261011",
+                                req="REQ-MAL-TARGET")
+        wrong_target[3] = "grok"
+        rows.append(wrong_target)
+        wrong_source = self.row("gemini", "do=redis-op|op=xrange|key=conf:side:20261011",
+                                req="REQ-MAL-SOURCE")
+        wrong_source[5] = wrong_source[5].replace("from=gemini", "from=grok")
+        rows.append(wrong_source)
+        extra_cell = self.row("gemini", "do=redis-op|op=xrange|key=conf:side:20261011",
+                              req="REQ-MAL-CELLS")
+        extra_cell.extend(["", "private-secret"])
+        rows.append(extra_cell)
+        out, written, _ = self.run_rows(rows, conn)
+        self.assertEqual([], out["answered"])
+        self.assertEqual(len(rows), len(out["refused"]))
+        self.assertEqual({}, conn.data, "rejections are before markers and every Redis operation")
+        published = repr(written) + repr(out)
+        for private in ("fleet:inbox:grok", "private-secret", "c2VjcmV0", "cHJpdmF0ZQ=="):
+            self.assertNotIn(private, published)
 
     def test_a_STALE_request_from_an_access_list_agent_is_told_why(self):
         """Refused before the op is even considered - and still answered, because the sender is
@@ -666,13 +751,13 @@ class EndToEndThroughTheBoardWorker(unittest.TestCase):
         self.assertEqual(1, len(out["refused"]))
 
     def test_a_replayed_request_id_does_nothing_the_second_time(self):
-        first = self.row("grok", "do=redis-op|op=set|key=fleet:x|val=MQ==|enc=b64")
+        first = self.row("grok", "do=redis-op|op=xadd|key=conf:side:20261011|val=MQ==|enc=b64")
         out, rows, conn = self.run_rows([first])
         answered_row = [rows[0]["row_id"], "2026-10-08T01:59:30Z", "bus-reconciler", "grok",
                         "AYA_RESULT", rows[0]["payload"], "", "", "", ""]
         out2, rows2, _ = self.run_rows([first, answered_row], conn)
         self.assertEqual([], rows2, "already answered: no second write, no second row")
-        self.assertEqual(1, len([e for e in conn.audit() if e["op"] == "set"]))
+        self.assertEqual(1, len([e for e in conn.audit() if e["op"] == "xadd"]))
 
     def test_the_probe_still_works_exactly_as_before(self):
         out, rows, conn = self.run_rows([self.row("aya", "do=redis-synthetic-probe")])
@@ -709,12 +794,12 @@ class EndToEndThroughTheBoardWorker(unittest.TestCase):
         self.assertIn("latency_ms", loops["answered"], "the entrypoint reads latency_ms - keep it")
         conn = FakeRedis()
         out, _, _ = self.run_rows([
-            self.row("grok", "do=redis-op|op=set|key=fleet:x|val=MQ==|enc=b64", req="REQ-0001"),
+            self.row("grok", "do=redis-op|op=xadd|key=conf:side:20261011|val=MQ==|enc=b64", req="REQ-0001"),
             self.row("cursor", "do=redis-op|op=set|key=v1:bus:row:1|val=eA==|enc=b64", req="REQ-0002"),
             self.row("aya", "do=redis-synthetic-probe", req="REQ-0003"),
-            self.row("a-stranger", "do=redis-op|op=get|key=fleet:x", req="REQ-0004"),
+            self.row("a-stranger", "do=redis-op|op=xrange|key=conf:side:20261011", req="REQ-0004"),
         ], conn)
-        self.assertEqual(3, len(out["answered"]))
+        self.assertEqual(2, len(out["answered"]))
         for item in out["answered"]:
             missing = loops["answered"] - set(item)
             self.assertEqual(set(), missing, "answer %s lacks %s" % (item.get("req_id"), missing))
@@ -748,6 +833,89 @@ class NothingLeaks(unittest.TestCase):
             line = gov.summarise(out)
             self.assertNotIn("|", line)
             self.assertNotIn("\n", line)
+
+
+class FilteredReadCompleteness(unittest.TestCase):
+    """A match result must cover every occurrence of an exact row id before any append."""
+
+    def setUp(self):
+        import fleet_agent
+        self.fa = fleet_agent
+        self.real = fleet_agent._bus_fetch, fleet_agent._bus_load_env
+        fleet_agent._bus_load_env = lambda: {"BUS_URL": "https://bus.test/x", "BUS_SECRET": "s"}
+        self.rid = "REQ-HIDDEN-1"
+        self.row = fleet_agent.request_row("gemini", "xadd", "conf:side:20261011", val="one",
+                                            rid=self.rid)[1]
+        self.quotes = [["QUOTE-%04d" % n, self.row[1], "grok", "ALL", "OPEN",
+                        "a later row quotes " + self.rid, "", "", "", ""] for n in range(200)]
+
+    def tearDown(self):
+        self.fa._bus_fetch, self.fa._bus_load_env = self.real
+
+    def filtered_fetch(self, rows, appends):
+        def fetch(url, payload, tries=1):
+            if payload["action"] == "append":
+                appends.append(payload["sheetRow"])
+                return "ok:true"
+            self.assertEqual(self.rid, payload["match"])
+            self.assertNotIn("limit", payload, "a cap hides exact rows behind quotations")
+            return json.dumps({"ok": True, "title": self.fa.BOARD, "rows": rows,
+                               "filtered": len(rows), "total": len(rows) + 1})
+        return fetch
+
+    def test_exact_row_behind_two_hundred_quotations_is_not_reappended(self):
+        appends = []
+        self.fa._bus_fetch = self.filtered_fetch([self.row] + self.quotes, appends)
+        code = self.fa.append_and_verify(self.rid, self.row)
+        self.assertEqual((self.fa.EXIT_VERIFIED, []), (code, appends))
+
+    def test_complete_empty_filter_appends_once_and_verifies_readback(self):
+        rows, appends = [], []
+        def fetch(url, payload, tries=1):
+            if payload["action"] == "append":
+                appends.append(payload["sheetRow"])
+                rows.append(payload["sheetRow"])
+                return "ok:true"
+            return json.dumps({"ok": True, "title": self.fa.BOARD, "rows": rows,
+                               "filtered": len(rows), "total": len(rows) + 1})
+        self.fa._bus_fetch = fetch
+        code = self.fa.append_and_verify(self.rid, self.row)
+        self.assertEqual((self.fa.EXIT_VERIFIED, [self.row]), (code, appends))
+
+    def test_hidden_duplicate_is_unconfirmed_and_not_reappended(self):
+        appends = []
+        self.fa._bus_fetch = self.filtered_fetch([self.row, self.row] + self.quotes, appends)
+        code = self.fa.append_and_verify(self.rid, self.row)
+        self.assertEqual((self.fa.EXIT_UNCONFIRMED, []), (code, appends))
+
+    def test_endpoint_ignoring_match_and_honoring_limit_is_not_an_empty_board(self):
+        appends = []
+        def fetch(url, payload, tries=1):
+            if payload["action"] == "append":
+                appends.append(payload["sheetRow"])
+                return "ok:true"
+            # The self-hosted read accepts limit, ignores match and does not return the filtered
+            # endpoint's metadata. It may return only a tail with no exact row in sight.
+            return json.dumps({"ok": True, "title": self.fa.BOARD, "kind": "sheet",
+                               "rows": [list(FleetAgentRequestOnTheBoard.HEAD)] + self.quotes,
+                               "total_rows": 202})
+        self.fa._bus_fetch = fetch
+        code = self.fa.append_and_verify(self.rid, self.row)
+        self.assertEqual((self.fa.EXIT_NOT_SENT, []), (code, appends))
+
+    def test_two_hundred_apparent_matches_without_completeness_proof_fail_closed(self):
+        appends = []
+        def fetch(url, payload, tries=1):
+            if payload["action"] == "append":
+                appends.append(payload["sheetRow"])
+                return "ok:true"
+            # A capped endpoint can label a 200-row tail as filtered even while an earlier exact
+            # row is hidden. The shape alone must not authorize another append.
+            return json.dumps({"ok": True, "title": self.fa.BOARD, "rows": self.quotes,
+                               "filtered": 200, "total": 202})
+        self.fa._bus_fetch = fetch
+        code = self.fa.append_and_verify(self.rid, self.row)
+        self.assertEqual((self.fa.EXIT_NOT_SENT, []), (code, appends))
 
 
 class FleetAgentRequestOnTheBoard(unittest.TestCase):
@@ -789,7 +957,7 @@ class FleetAgentRequestOnTheBoard(unittest.TestCase):
 
     def args(self, rid="REQ-T-0001", val="one"):
         import argparse
-        return argparse.Namespace(tag="gemini", op="set", key="proj:k", val=val, field=None,
+        return argparse.Namespace(tag="gemini", op="xadd", key="conf:side:20261011", val=val, field=None,
                                   count=None, project="FLEET", id=rid)
 
     def run_request(self, args):
@@ -861,7 +1029,7 @@ class FleetAgentRequestOnTheBoard(unittest.TestCase):
 
     def test_a_row_from_another_tag_or_of_another_type_is_not_this_row(self):
         # The global id is occupied; a tag or phase clash cannot verify a new request.
-        rid, row = self.fa.request_row("gemini", "set", "proj:k", val="one", rid="REQ-T-0005")
+        rid, row = self.fa.request_row("gemini", "xadd", "conf:side:20261011", val="one", rid="REQ-T-0005")
         other = list(row)
         other[self.fa.SOURCE_COL] = "grok"
         self.board["rows"].append(other)
@@ -984,8 +1152,9 @@ class FleetAgentRequestOnTheBoard(unittest.TestCase):
             code = self.fa.append_and_verify("GEMINI-WAKE-2", row, exact=False)
         self.assertEqual(self.fa.EXIT_VERIFIED, code)
 
-    def test_a_non_blank_cell_past_the_tenth_is_not_this_row(self):
-        rid, row = self.fa.request_row("gemini", "set", "proj:k", val="one", rid="REQ-T-0007")
+    def test_a_non_blank_cell_past_the_tenth_is_not_this_row_and_an_eleventh_named_column_is_NOT_SENT(self):
+        rid, row = self.fa.request_row("gemini", "xadd", "conf:side:20261011", val="one",
+                                       rid="REQ-T-0007")
         self.board["rows"].append(list(row) + ["", "stray"])            # same id, something in L
         code, out = self.run_request(self.args(rid="REQ-T-0007"))
         self.assertEqual((self.fa.EXIT_REFUSED, []), (code, self.appends), "a row with a non-blank L is not this row")
@@ -1028,11 +1197,11 @@ class FleetAgentRequestOnTheBoard(unittest.TestCase):
 
     def test_the_caller_names_the_id_the_tool_does_not_make_one_up(self):
         with self.assertRaises(ValueError) as caught:
-            self.fa.request_row("gemini", "set", "proj:k", val="v")
+            self.fa.request_row("gemini", "xadd", "conf:side:20261011", val="v")
         self.assertIn("request id is required", str(caught.exception))
         with self.assertRaises(SystemExit):
-            self.fa.build_parser().parse_args(["request", "get", "proj:k", "--tag", "gemini"])
-        ns = self.fa.build_parser().parse_args(["request", "get", "proj:k", "--tag", "gemini", "--id", "R-0001"])
+            self.fa.build_parser().parse_args(["request", "xrange", "conf:side:20261011", "--tag", "gemini"])
+        ns = self.fa.build_parser().parse_args(["request", "xrange", "conf:side:20261011", "--tag", "gemini", "--id", "R-0001"])
         self.assertEqual("R-0001", ns.id)
 
 

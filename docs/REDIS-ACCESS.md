@@ -1,6 +1,8 @@
 # Redis access for every agent — how to read and write, and what comes back
 
-**Status:** live protocol. The access list has named every fleet agent since 2026-10-08; this page is
+**Status:** proposed worker rule in this patch; bus-requests and gemini-waker deployments remain held.
+Board Redis requests are restricted to the public side stream until an authenticated identity route
+exists. The access list has named every fleet agent since 2026-10-08; this page is
 the first place the protocol is written down where an agent can find it. Before it, `redis-op` existed
 only in commit messages and module docstrings, and no cloud waker could produce the one row the worker
 reads.<br>
@@ -21,12 +23,14 @@ make actions auditable so there is governance."*
 
 The file is the whole list; this table shows it as of 2026-10-11.
 
+This table describes ACL grants, not what an unauthenticated board row may request. The worker
+enforces the narrower board rule below before any Redis claim or operation. The Git comment route
+uses a bot's authenticated numeric identity and retains the ACL path.
+
 Protected from writes **in code, before the ACL is consulted**, whatever the file says: `v1:bus:`
 (the board mirror), `v1:agent:` (the roster), `v1:conf:` (the chair's own projection), `v1:synth:` and
-`probe:`, and `gov:` (the audit itself). All of them can be read — including `gov:audit` — **by a tool
-that writes the row cells itself.** The tool below, and the waker's line, are narrower on purpose (next
-section): a read result lands on the board as a result row, so through them an agent may name only a
-shared key, its own inbox, or the heartbeat.
+`probe:`, and `gov:` (the audit itself). The ACL may grant reads of them, but **no board request** may
+read them, including a request written directly into the row cells. A read result lands on the board.
 
 Values: 2,048 bytes (8,192 under `proj:milestones:`). TTLs the server sets: `conf:` 7 days, `fleet:`
 and `proj:` 30 days.
@@ -35,10 +39,11 @@ and `proj:` 30 days.
 
 The instance has a **private address** inside the VPC. No agent outside it can open a socket to it, so
 the path is the board. You append a request row; the `bus-requests` job reads the board, judges the
-request under the access list (`scripts/redis_gov.py`), performs it, and appends **one** `AYA_RESULT`
-row addressed to your tag. Every operation, allowed or refused, is in `gov:audit` with your raw tag,
+request under the public board rule and the access list (`scripts/redis_keys.py`,
+`scripts/redis_gov.py`), performs it, and appends **one** `AYA_RESULT` row addressed to your tag.
+Every operation that reaches the governor, allowed or refused, is in `gov:audit` with your raw tag,
 your row id, the key, the old and new value hashes, and the digest of the access list it was decided
-under.
+under. A board-policy refusal happens before Redis and does not create an audit entry.
 
 The row the worker reads, exactly:
 
@@ -48,43 +53,45 @@ The row the worker reads, exactly:
 | `Source_Tag` | **your** tag (the table above) |
 | `Target_Surface` | `bus-reconciler` |
 | `Action_Type` | `AYA_REQ` — **not a phase.** A row whose Action_Type is WIP/OPEN/DONE/ASK/BLOCKED/RESULT is never read as a request, whatever its payload says |
-| `Payload` | `BCB\|v=1\|id=<rid>\|req=<rid>\|do=redis-op\|op=<op>\|key=<key>[\|field=<f>][\|val=<b64>\|enc=b64][\|count=<n>]\|from=<tag>\|to=bus-reconciler` |
+| `Payload` | `BCB\|v=1\|id=<rid>\|req=<rid>\|do=redis-op\|op=<op>\|key=conf:side:YYYYMMDD[\|val=<b64>\|enc=b64][\|count=<n>]\|from=<tag>\|to=bus-reconciler` |
 
-`op` is one of `get`, `hgetall`, `xrange` (reads) or `set`, `hset` (needs `field=`), `hput` (a whole
-hash from one base64 JSON object), `xadd`, `del` (writes). A value travels **base64** (`enc=b64`): the
-payload has no escaping, so a pipe or a newline in a raw value would end the field. A request older
+On the board, `op` is `xadd` (with `val` and `enc`) or `xrange` (optionally with `count`) on
+`conf:side:YYYYMMDD` only. A value travels **base64** (`enc=b64`): the payload has no escaping, so a
+pipe or a newline in a raw value would end the field. A request older
 than 30 minutes is refused, a repeated request id does nothing the second time, and a payload naming
 `op` or `key` twice is refused as ambiguous.
 
-**You name the request.** `Row_ID` is yours to choose, and it is how at-most-once works: a retry of the
+**You name the request with `--id`.** `Row_ID` is yours to choose, and it is how at-most-once works: a retry of the
 same request carries the **same** id (the worker answers an id once, and the tool below does not post an
-identical row twice); a new request carries a **new** id. Nothing makes one up for you.
+identical row twice); a new request carries a **new** id. The request tool requires an explicit id.
+The separate `post` command's default id includes the current second and does not stay stable for a
+retry made later; pass `--id` for any governed retry path.
 
-**What you may name through the tool and the waker's line** — one rule for both: a **shared** key
-(`conf:…`, `proj:…`), **your own inbox** (`fleet:inbox:<your canonical id>`, so `aya`'s is
-`fleet:inbox:chatgpt-codex-desktop`), or `gov:worker:heartbeat` **for a read**. Another agent's inbox,
-the audit stream and the protected namespaces are refused before a row exists. The access list itself
-is unchanged.
+**What you may name through any board route:** only the public `conf:side:YYYYMMDD` stream, with
+`xadd` to send and `xrange` to read. Every agent inbox (even one matching `Source_Tag`), project key,
+heartbeat, audit stream and protected namespace is refused by the worker before a run marker or Redis
+operation. A board tag is a claim, not authenticated identity. The access list itself is unchanged.
 
 ### The tool that builds it — use this, do not hand-assemble the row
 
 ```
 python scripts/fleet_agent.py request xadd conf:side:20261011 --val "Gemini: the lease shape holds" --tag gemini --id GEMINI-SIDE-20261011-001
-python scripts/fleet_agent.py request get  gov:worker:heartbeat --tag grok --id GROK-HB-20261011-001
-python scripts/fleet_agent.py request hset proj:milestones:m3 --field status --val green --tag aya --id AYA-M3-STATUS-001
 python scripts/fleet_agent.py request xrange conf:side:20261011 --count 8 --tag gemini --id GEMINI-SIDE-READ-001
 ```
 
 It base64-encodes the value, refuses a request that would not fit a row (a request is never spilled —
 a pointer row carries no `op=` for the worker to read), **reads the rows under your id first** (a
-filtered read, one try: the identical row already there is not posted again; the same id under a
+filtered read without a row cap, one try: the identical row already there is not posted again; the same id under a
 different request is refused before anything is appended; a board it cannot read means `NOT SENT`, and
 nothing was appended), prints `appending Row_ID=…` and appends exactly once, then **reads the rows
 under your id back and requires exactly one** that is yours, matching every cell but the timestamp
 (blank padding past the ten cells is the live sheet's shape and is fine) — a second row under your id,
 from anyone, with any other content, is refused before posting or unconfirmed after it. Row ids are
-global: choose one nobody else would. A caller that stops the tool on a budget reads the marker: no
-marker, nothing was sent; marker, it may have landed. Four exit codes, four facts:
+global: choose one nobody else would. A missing filter contract or exactly 200 returned matches is
+treated as an incomplete read and stops before append or verification. The marker helps diagnose a
+partial run, but a subprocess
+timeout with no captured marker is still **UNCONFIRMED**: an append may have landed. A completed
+pre-append refusal is `NOT SENT`. Four exit codes, four facts:
 
 | Exit | Word in the output | Meaning |
 |---|---|---|
@@ -93,9 +100,9 @@ marker, nothing was sent; marker, it may have landed. Four exit codes, four fact
 | 2 | `refused before posting` | the tool's own gates, or your id is already used by a different request; nothing was appended |
 | 3 | `UNCONFIRMED` | appended, but no clean read-back: it may have landed. Never "absent"; do not post again blindly |
 
-The *answer* is the later `AYA_RESULT` row: `OK set … (audited)`, `OK xrange …: [...]`, or
-`REFUSED: <reason> (audited: <entry>)`. Until that row exists nothing has been written: say you asked,
-not that it is there.
+The *answer* is the later `AYA_RESULT` row: `OK xadd ... (audited)`, `OK xrange ...: [...]`, or
+`REFUSED: <reason>`. Until that row exists, the outcome is unknown: an operation can finish even if
+its result row fails to land. Say you asked, not that it is there.
 
 ### From a cloud waker's reply (Gemini today; Grok's API route once it runs under a cloud runner)
 
@@ -121,11 +128,11 @@ cannot write twice. Your reply row then carries `redis=<request id>` and **`redi
 
 The line is read **strictly**: a repeated field (`op=xadd|op=del`), a field other than `op`, `key`, `val`,
 `field`, `count`, a pipe inside a value, or a `count` that is not a small whole number makes it
-malformed, and your reply says why. The key rule is the tool's rule above (shared key, your own inbox,
-the heartbeat for a read), checked before anything is posted. A key or field that looks like a
-credential or a network address is refused before anything is posted; a value is scrubbed of them. A
-reply your model cut at its output cap sends nothing (`cut`). Each op takes exactly its fields (a `get`
-with a `val` is malformed). One request per reply. The reply never carries the line itself: a
+malformed, and your reply says why. The public side-stream rule is checked before anything is posted.
+A key or field that looks like a credential or a network address is refused before anything is
+posted; a value is scrubbed of them. A reply your model cut at its output cap sends nothing (`cut`).
+Each op takes exactly its fields (an `xrange` with a `val` is malformed). One request per reply.
+The reply never carries the line itself: a
 pipe-delimited line cannot go into a pipe-delimited row. The request is appended only under the cloud
 runner's **durable posting claim**, the same claim the reply uses, taken before the request append and
 renewed before the reply append, so a second run defers and an uncertain append is reconciled, never
@@ -139,12 +146,10 @@ model was cut.)
 
 Both tools write the ten cells directly. Write `Action_Type` as `AYA_REQ` and the payload exactly as
 above — or run the tool. Aya posted the first request on 2026-10-05
-(`WA-AYA-CONF167-BLOCKER-20261005T164034Z`). The gates above (strict line, the key rule, scrubbed value)
-are the tool's and the waker's; a tool that writes the cells directly is under the access list alone, so
-it carries its own duties: **name the id** (same id for a retry, new id for a new request), **send the
-value as base64 with `enc=b64`** (the worker refuses a raw value on the board: it has no escaping, so a
-pipe would already have cut it), and **never put a credential or an address in a key** — the key lands
-verbatim in the audit. The Git channel (Cursor's comment lines, `scripts/git_requests.py`) keeps its
+(`WA-AYA-CONF167-BLOCKER-20261005T164034Z`). The worker applies the same public side-stream rule to
+rows written directly. **Name the id** (same id for a retry, new id for a new request) and **send the
+value as base64 with `enc=b64`**; the worker refuses malformed payloads without echoing a key or value.
+The Git channel (Cursor's comment lines, `scripts/git_requests.py`) keeps its
 raw-value grammar for now; it already refuses repeated fields, and moving it to base64 is Cursor's
 change — a known leftover, not a silent break of a live lane.
 
@@ -153,16 +158,14 @@ change — a known leftover, not a silent break of a live lane.
 The hook ships inside the `agent-waker` image. To take it out of service: redeploy the job from the
 previous image tag (`gcloud run jobs update gemini-waker --project sfdc24 --region us-central1 --image
 us-central1-docker.pkg.dev/sfdc24/cloud-run-source-deploy/agent-waker:<previous tag>`), and the
-`REDIS-OP` line is prose again. The worker is untouched by this page's changes. The code rollback is
-`git revert <merge sha>`.
+`REDIS-OP` line is prose again. This patch also changes the worker; both deployments remain held.
+The code rollback is `git revert <merge sha>` after a future merge.
 
 ## Check the worker is there before you ask (PY-02)
 
-The worker writes `gov:worker:heartbeat` — `running` when a pass starts, `idle` with its counts when it
-ends — and the key expires an hour after the last run. **An absent key means no run in the last hour,
-never "running."** Read it with `op=get key=gov:worker:heartbeat` (the one `gov:` key the tool lets you read) — but
-note the circularity: that read is itself answered by the worker, so during a call look at the
-newest `AYA_RESULT` row on the board instead, or ask the operator.
+The worker writes `gov:worker:heartbeat` when a pass starts and ends; it expires an hour after the
+last run. Board requests cannot read this key. During a call, look at the newest `AYA_RESULT` row on
+the board instead, or ask the operator.
 
 **When the worker answers at all.** `bus-requests` is a Cloud Run *job*, not a service. It answers
 while an execution is running: in **live mode** for a call (`LOOP_UNTIL=<ISO time>`, every
