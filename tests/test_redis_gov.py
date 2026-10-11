@@ -599,6 +599,17 @@ class EndToEndThroughTheBoardWorker(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     fleet_agent.request_row(tag, op, key, val="v", rid="REQ-KEY-0002")
 
+    def test_a_segment_with_no_field_name_is_ambiguous_on_the_board_and_on_the_git_channel(self):
+        """A pipe inside a raw value leaves a nameless segment; the value was cut before the worker
+        read it, and an OK for the part before the pipe is an OK for a value nobody asked for (the
+        third adversarial check on #367). Refused on every channel, never resolved."""
+        out, rows, conn = self.run_rows([self.row("grok", "do=redis-op|op=set|key=fleet:x|val=a|b")])
+        self.assertNotIn("fleet:x", conn.data)
+        self.assertEqual(1, len(out["refused"]))
+        self.assertIn("no field name", rows[0]["payload"])
+        self.assertEqual(2, self.br.nameless_segments("BCB|v=1|do=redis-op|op=set|key=k|val=a|b|c"))
+        self.assertEqual(0, self.br.nameless_segments("BCB|v=1|do=redis-op|op=set|key=k|val=YQ==|enc=b64"))
+
     def test_a_stranger_with_the_same_tool_gets_no_row_and_writes_nothing(self):
         import datetime
         import fleet_agent

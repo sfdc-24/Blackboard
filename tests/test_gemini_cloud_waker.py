@@ -1092,6 +1092,26 @@ class TheRequestAppendIsFenced(unittest.TestCase):
         self.assertIn("A", store.state.get("answered_ids") or [])
         self.assertEqual(store.state.get("claim_phase") or "", "", "the claim is released after the reply")
 
+    def test_the_lease_taken_at_reserve_covers_both_appends_and_what_runs_between(self):
+        # 460 s covered one append; the request may take 400 s, then okf_land, then the reply append.
+        store = MemStore({"watermark": "2026-09-24T02:00:00Z", "answered_ids": []})
+        seen = []
+
+        class Recording(_RequestingWaker):
+            def main(self, argv):
+                orig = self.reserve_redis_side_effect
+
+                def reserve(rid):
+                    ok = orig(rid)
+                    seen.append(store.state.get("claim_until"))
+                    return ok
+                self.reserve_redis_side_effect = reserve
+                return super().main(argv)
+        w = Recording([], posts=[], requests=[])
+        w.reply_on_board = lambda rid: False
+        main.run(store=store, waker=w, now="2026-09-24T05:00:00Z")
+        self.assertEqual(["2026-09-24T05:15:20Z"], seen, "2 * 400 s + 120 s from the reserve")
+
     def test_a_second_run_during_the_request_append_defers_and_quarantines_nothing(self):
         from datetime import datetime, timedelta, timezone
         start = datetime(2026, 9, 24, 5, 0, tzinfo=timezone.utc)

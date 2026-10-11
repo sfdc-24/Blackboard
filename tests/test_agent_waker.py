@@ -826,7 +826,7 @@ class RedisRequests(unittest.TestCase):
         request = dict(self.REQ, op="get", key="proj:AKIAIOSFODNN7EXAMPLE", val=None)
         state, why = aw.post_request("gemini", {"project": "FLEET"}, request, False)
         self.assertEqual("refused", state)
-        notes = {s: aw.request_note(request, s, why if s != "posted" else "GEMINI-REDIS-1")
+        notes = {s: aw.request_note(request, s, {"posted": "GEMINI-REDIS-1", "cut": ""}.get(s, why))
                  for s in aw.REQUEST_STATES}
         for s, note in notes.items():
             with self.subTest(state=s):
@@ -924,7 +924,7 @@ class RedisRequests(unittest.TestCase):
         for carried in (sentence, note):
             self.assertNotIn("gov:audit", carried)
 
-    def test_a_malformed_line_is_its_own_state_with_no_id(self):
+    def test_a_malformed_line_is_its_own_state_and_still_carries_the_asks_id(self):
         calls = []
         real = aw.subprocess.run
         aw.subprocess.run = self._run("", calls)
@@ -935,7 +935,7 @@ class RedisRequests(unittest.TestCase):
         finally:
             aw.subprocess.run = real
         self.assertEqual([], calls)
-        self.assertEqual(("malformed", ""), (state, rid))
+        self.assertEqual(("malformed", aw.request_id("grok", "ASK-2")), (state, rid))
         self.assertIn("a repeated field", sentence)
         self.assertIn("could not be posted", text)
 
@@ -955,6 +955,33 @@ class RedisRequests(unittest.TestCase):
                 finally:
                     aw.subprocess.run = real
                 self.assertEqual("unconfirmed", state)
+
+    def test_the_three_words_count_only_at_the_start_of_a_line_and_the_reason_carries_no_key_or_pipe(self):
+        real = aw.subprocess.run
+        aw.subprocess.run = self._run("  request X: set proj:k\n" + self.receipt("gemini")
+                                      + "\n  note: the word UNCONFIRMED inside a sentence is not a verdict")
+        try:
+            state, rid = aw.post_request("gemini", {"project": "FLEET"}, self.REQ, False)
+        finally:
+            aw.subprocess.run = real
+        self.assertEqual("posted", state)
+        aw.subprocess.run = self._run("  UNCONFIRMED: Row_ID=X has changed content; do not reuse the id.\n"
+                                      "  expected: 'BCB|v=1|id=X|req=X|do=redis-op|op=set|key=proj:k'", code=3)
+        try:
+            state, why = aw.post_request("gemini", {"project": "FLEET"}, self.REQ, False)
+        finally:
+            aw.subprocess.run = real
+        self.assertEqual("unconfirmed", state)
+        self.assertNotIn("|", why, "the reason rides a pipe-delimited row")
+        self.assertNotIn("proj:k", why, "the key is masked everywhere the output goes")
+
+    def test_an_empty_val_on_a_write_is_said_as_such_and_never_sent(self):
+        req, body = aw.redis_request("REDIS-OP|op=set|key=proj:k|val=")
+        self.assertIsNone(req)
+        self.assertIn("a write with no val", body)
+        req, _ = aw.redis_request("REDIS-OP|op=get|key=proj:k|val=")
+        self.assertIsNotNone(req, "an empty field is absent, not a shape error")
+        self.assertIsNone(req["val"])
 
     def test_without_a_durable_posting_claim_a_request_is_refused_before_the_subprocess(self):
         # Outside the cloud runner nothing can fence a retry, so the adapter fails closed.
@@ -1057,7 +1084,28 @@ class AnAdapterThatDoesNotSayIsTreatedAsCut(unittest.TestCase):
         bare_ask.last_finish = None
         self.assertFalse(getattr(bare_ask, "last_finish", None) == "MAX_TOKENS" or not hasattr(bare_ask, "last_finish"))
         source = open(aw.__file__, encoding="utf-8").read()
-        self.assertIn('model_cut = finish == "MAX_TOKENS" or not hasattr(asker, "last_finish")', source)
+        self.assertIn('finish_known = hasattr(asker, "last_finish")', source)
+        self.assertIn("finish_known=finish_known", source)
+
+    def test_an_adapter_that_does_not_say_gets_no_request_sent_but_its_reply_is_not_marked_cut(self):
+        # The hook fails closed; the row marker (model_cut) stays what the adapter said - here, nothing.
+        real_reserve, real_run = aw.reserve_redis_side_effect, aw.subprocess.run
+        calls = []
+        aw.reserve_redis_side_effect = lambda a: True
+        aw.subprocess.run = lambda args, **kw: calls.append(args)
+        try:
+            text, rid, state, sentence, note = aw.redis_hook(
+                "gemini", aw.AGENTS["gemini"], "Done.\nREDIS-OP|op=set|key=proj:k|val=v", "ASK-7",
+                model_cut=False, verbose=False, finish_known=False)
+        finally:
+            aw.reserve_redis_side_effect, aw.subprocess.run = real_reserve, real_run
+        self.assertEqual(([], "cut", "Done."), (calls, state, text))
+        self.assertIn("does not say whether the reply was cut", sentence)
+        # and a reply that IS cut keeps its own sentence
+        _, _, state2, sentence2, _ = aw.redis_hook("gemini", aw.AGENTS["gemini"], "REDIS-OP|op=get|key=proj:k",
+                                                   "ASK-7", model_cut=True, verbose=False, finish_known=True)
+        self.assertEqual("cut", state2)
+        self.assertIn("output cap", sentence2)
 
 
 class GrokSaysWhenItWasCut(unittest.TestCase):

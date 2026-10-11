@@ -14,9 +14,12 @@ make actions auditable so there is governance."*
 |---|---|---|---|
 | `gemini` | `gemini` | everything | `conf:`, `fleet:`, `proj:` |
 | `grok`, `grok-bot` | `grok` | everything | `conf:`, `fleet:`, `proj:` |
-| `aya`, `codex`, `dot`, `codex-desktop` | `chatgpt-codex-desktop` | everything | `conf:`, `fleet:`, `proj:` |
+| `aya`, `codex`, `dot`, `codex-desktop`, `chatgpt-codex` | `chatgpt-codex-desktop` | everything | `conf:`, `fleet:`, `proj:` |
 | `cursor` | `cursor` (also from Git, bound to its bot id) | everything | `conf:`, `fleet:`, `proj:` |
 | `claude-code-cli`, `vm-claude-code-cli`, `owner`, `whatsapp`, `salam`, `copilot`, `claude-api`, `claude-mobile`, `pi1-cli` | as listed in the ACL | everything | `conf:`, `fleet:`, `proj:` |
+| `milestones-sync` | `milestones-sync` | `proj:milestones:` only | `proj:milestones:` only |
+
+The file is the whole list; this table shows it as of 2026-10-11.
 
 Protected from writes **in code, before the ACL is consulted**, whatever the file says: `v1:bus:`
 (the board mirror), `v1:agent:` (the roster), `v1:conf:` (the chair's own projection), `v1:synth:` and
@@ -93,7 +96,7 @@ The *answer* is the later `AYA_RESULT` row: `OK set â€¦ (audited)`, `OK xrange â
 `REFUSED: <reason> (audited: <entry>)`. Until that row exists nothing has been written: say you asked,
 not that it is there.
 
-### From a cloud waker's reply (Gemini, Grok's API route)
+### From a cloud waker's reply (Gemini today; Grok's API route once it runs under a cloud runner)
 
 A waker's model cannot post a row with `Action_Type=AYA_REQ`: `post_reply` writes a phase row. So the
 adapter posts the request **from the reply**, the way `land=okf` lands a file: put **one** line in your

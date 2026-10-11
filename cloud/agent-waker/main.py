@@ -96,6 +96,10 @@ CURSOR = os.environ.get("CURSOR_NAME") or "%s_waker" % AGENT.replace("-", "_")
 CLAIM_LEASE_SECONDS = int(os.environ.get("CLAIM_LEASE_SECONDS") or 600)
 POST_TIMEOUT_SECONDS = 400
 POST_LEASE_SECONDS = POST_TIMEOUT_SECONDS + 60
+# The lease taken at reserve covers the request append, what runs between the two appends (okf_land
+# may open a PR) and the reply append: two post timeouts and a margin (the third adversarial check
+# on #367 found 460 s short of that). post_and_record renews it once more before the reply.
+RESERVE_LEASE_SECONDS = 2 * POST_TIMEOUT_SECONDS + 120
 
 
 def _field(row, name: str) -> str:
@@ -430,8 +434,8 @@ def run(argv=None, store=None, waker=None, board_contains=None,
     original_reserve = getattr(waker, "reserve_redis_side_effect", None)
     reserved_posts = set()
 
-    def begin_post(answers_id: str) -> bool:
-        """Write phase=posting and renew the lease, then the append may start.
+    def begin_post(answers_id: str, span: int = POST_LEASE_SECONDS) -> bool:
+        """Write phase=posting and renew the lease to at least `span` from now, then the append may start.
 
         An ownership check after the subprocess has been launched cannot
         pull the append back. The renewed lease is at least the post
@@ -446,7 +450,7 @@ def run(argv=None, store=None, waker=None, board_contains=None,
             return False
         s = dict(box["state"])
         s["claim_phase"] = "posting"
-        renewed = expiry_after(POST_LEASE_SECONDS)
+        renewed = expiry_after(span)
         if (s.get("claim_until") or "") < renewed:
             s["claim_until"] = renewed
         try:
@@ -502,7 +506,7 @@ def run(argv=None, store=None, waker=None, board_contains=None,
         here, so a later run reconciles or defers this source row instead of calling the model and
         the Redis operation again after an uncertain append. The reply append that follows renews
         the lease once more (post_and_record)."""
-        if not begin_post(answers_id):
+        if not begin_post(answers_id, span=RESERVE_LEASE_SECONDS):
             return False
         reserved_posts.add(answers_id)
         return True

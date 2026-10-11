@@ -1,10 +1,13 @@
 """What a request may name through the fleet's tool and through a waker's REDIS-OP line.
 
 ONE RULE, ONE FILE, stdlib only, copied into every image that carries either caller (Grok on #367,
-item 1, 2026-10-11). Narrower than the access list on purpose: the list grants every principal read
-`*` (the owner's 2026-10-08 instruction), and a read result lands on the board as a RESULT row, so a
-request for another agent's inbox or the audit stream would copy it onto the board. The list itself
-is unchanged; a tool that writes the row cells directly is under the list alone.
+item 1, 2026-10-11). This is a filter on what a model's line or a command line may NAME; the access
+list, applied by the worker, decides, and is narrower for some principals (milestones-sync may name
+any proj: key here and is refused outside proj:milestones: there). It is narrower than the list where
+it matters: the list grants every principal read `*` (the owner's 2026-10-08 instruction), and a
+read result lands on the board as a RESULT row, so a request for another agent's inbox or the audit
+stream would copy it onto the board. The list itself is unchanged; a tool that writes the row cells
+directly is under the list alone.
 
 - a SHARED key: the conference channel (conf:) and the projects (proj:), shared by design;
 - the agent's OWN inbox: fleet:inbox:<canonical agent id>, one per agent (#359), the alias map of
@@ -26,8 +29,9 @@ ACL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "redis_acl.j
 
 def aliases(path: str = ACL_FILE) -> dict:
     """The access list's alias map, or {} where the file is absent (an image that copies this module
-    without the list: a canonical tag then names itself, and an alias is refused its inbox until the
-    list is there - refused, never widened)."""
+    without the list, the board-watcher's). Then a tag names its own inbox under the tag as given: a
+    canonical tag is unchanged; an alias (aya) may name fleet:inbox:aya, which is nobody's inbox, and
+    not fleet:inbox:chatgpt-codex-desktop, which is its own. Nothing of another agent's opens."""
     try:
         with open(path, encoding="utf-8") as fh:
             return dict(json.load(fh).get("aliases") or {})

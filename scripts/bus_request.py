@@ -136,6 +136,7 @@ def parse_request(row):
         "enc": field(payload, "enc"),
         "count": field(payload, "count"),
         "repeated": repeated_keys(payload),
+        "nameless": nameless_segments(payload),
         # Where the row came from: "git" only for a row git_requests built from an authenticated
         # comment (its type says so; no cell can), "board" for everything else.
         "channel": getattr(row, "channel", "board"),
@@ -155,6 +156,15 @@ def repeated_keys(payload) -> list:
             out.append(name)
         seen.add(name)
     return out
+
+
+def nameless_segments(payload) -> int:
+    """Segments after the BCB envelope with no field name: what a pipe inside a raw value leaves
+    behind. A request carrying one is AMBIGUOUS on every channel, the Git one included (the third
+    adversarial check on #367): the value was cut at the pipe before this worker read it, and an OK
+    for the part before the pipe is an OK for a value nobody asked for."""
+    parts = str(payload or "").split("|")
+    return sum(1 for part in parts[1:] if "=" not in part and part.strip() != "")
 
 
 def recognised(req, acl) -> bool:
@@ -262,6 +272,9 @@ def refusals(req, now, already, acl=None) -> list:
     if req.get("action") == "redis-op" and req.get("repeated"):
         out.append("ambiguous: the field(s) %s appear more than once"
                    % ", ".join(safe(k)[:20] for k in req["repeated"][:5]))
+    if req.get("action") == "redis-op" and req.get("nameless"):
+        out.append("ambiguous: %d segment(s) with no field name, which is what a pipe inside a value "
+                   "leaves behind; send the value as base64 with enc=b64" % req["nameless"])
     # A RAW VALUE ON THE BOARD IS REFUSED (Grok on #367, board row 2cc985ed). The payload has no
     # escaping, so a raw value holding a pipe was split into fields before this worker read the row,
     # and what reached Redis was the part before the pipe: a truncation with an OK and an audit entry.
