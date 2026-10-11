@@ -22,6 +22,14 @@
 #     CLAUDE_API_WORKER_AUTHORIZED_UNTIL_UTC     his authorization deadline, ...Z; no call at or after it
 #   PHONE_DOC_INTAKE_ENABLED (#374) is a SECOND intake over the two originals, inside this job. Never
 #   on together with drive-intake's flag: `pilot on` and the intake's `on` refuse each other (below).
+#   THE PILOT ANSWERS ONE REVIEWED REQUEST (#386). PHONE_DOC_PILOT_TARGET names it: a JSON object of
+#   exactly five strings (source_doc_id, source_revision, request_id, task_id, recipient_id), taken
+#   from the review that approved the request. With the pilot flag on and no usable target the job
+#   stops on every tick (pilot_target_invalid) and answers nothing. So `pilot on` takes the target
+#   from this shell, judges it as the worker will, sets the flag and the target in ONE update and
+#   reads the job back. Never with the lane: `pilot on` and `lane on` refuse each other.
+#   `pilot off` turns the pilot, its target AND the worker off: with the pilot off, a worker left
+#   on reads the whole inbox, and an off verb must not widen what runs.
 #
 # WHAT IS THE OWNER'S
 #   1. The same Drive share as drive-intake: the two originals (Editor) and the folder (Viewer) with
@@ -35,7 +43,9 @@
 #   bash cloud/claude-api-worker/deploy.sh run       # execute once and wait (one pass)
 #   bash cloud/claude-api-worker/deploy.sh readback  # what is actually deployed, printed
 #   bash cloud/claude-api-worker/deploy.sh cost      # the cost inputs as deployed; what `worker on` would refuse on
-#   bash cloud/claude-api-worker/deploy.sh worker on|off   lane on|off   pilot on|off   # the flags, nothing else
+#   bash cloud/claude-api-worker/deploy.sh worker on|off   lane on|off   # the flags, nothing else
+#   PHONE_DOC_PILOT_TARGET='{"source_doc_id":...}' bash cloud/claude-api-worker/deploy.sh pilot on   # ONE request; worker on comes after
+#   bash cloud/claude-api-worker/deploy.sh pilot off       # the pilot, its target and the worker, all off
 
 set -euo pipefail
 
@@ -324,12 +334,78 @@ worker_on() {
   flag CLAUDE_API_WORKER_ENABLED on
 }
 
+# The pilot's one request, judged as phone_intake.target_from_env judges it (#386): an object of
+# exactly these five strings, a doc that is one of the two originals, the recipient claude-api.
+# A target the worker would refuse prints the reason and nothing else. A good one is printed back
+# as one line with no space in it, which is what the job is given and what the read-back looks for.
+# Never looser than the worker: tests/test_telephone_deploy.py holds it against the worker's reader.
+PILOT_TARGET_PY='
+import json, re, sys
+
+FIELDS = ("source_doc_id", "source_revision", "request_id", "task_id", "recipient_id")
+DOC_IDS = ("1pKWJYbJzMqxSA9Vy_PSR93BU2OAAgP-N3WBEkCj7oj4", "17Q2vBYvxs8PIu-sXXWj67HAU_DL2RfB9-SoQbpeDoWQ")
+SHAPES = (("source_revision", r"[A-Za-z0-9_.:-]{1,128}"), ("request_id", r"[A-Za-z0-9_.:-]{8,128}"),
+          ("task_id", r"task-[0-9a-f]{16}"))
+
+def canonical(raw):
+    """The target as one line and no reason, or None and the reason."""
+    if not raw.strip():
+        return None, "empty"
+    try:
+        target = json.loads(raw)
+    except ValueError:
+        return None, "not JSON"
+    if not isinstance(target, dict) or set(target) != set(FIELDS):
+        return None, "not an object of exactly " + ", ".join(FIELDS)
+    if any(not isinstance(target[name], str) for name in FIELDS):
+        return None, "a field that is not a string"
+    if target["source_doc_id"] not in DOC_IDS:
+        return None, "source_doc_id is not one of the two originals"
+    if target["recipient_id"] != "claude-api":
+        return None, "recipient_id is not claude-api"
+    for name, shape in SHAPES:
+        if not re.fullmatch(shape, target[name]):
+            return None, name + " is not in the shape the worker accepts"
+    return json.dumps({name: target[name] for name in FIELDS}, separators=(",", ":")), ""
+
+if __name__ == "__main__":
+    line, why = canonical(sys.stdin.read())
+    if line is None:
+        sys.stderr.write("PHONE_DOC_PILOT_TARGET: %s\n" % why)
+        sys.exit(3)
+    if sys.argv[1:] == ["flags"]:
+        # What gcloud reads through --flags-file: the flag and its target, one update.
+        line = json.dumps({"--update-env-vars": {"PHONE_DOC_INTAKE_ENABLED": "on", "PHONE_DOC_PILOT_TARGET": line}})
+    print(line)
+'
+
+pilot_off() {
+  # One update and no read before it: an off verb that waits on a read-back can be refused by an
+  # outage. The worker goes off with the pilot. With the pilot off and its target cleared, a worker
+  # left on reads the whole inbox instead of the one request; with the target left behind it stops
+  # on every tick (pilot_flags_invalid). Neither is what off means. `worker on` brings it back.
+  "$GCLOUD" run jobs update "$JOB" --project "$PROJECT" --region "$REGION" \
+    --update-env-vars "PHONE_DOC_INTAKE_ENABLED=off,CLAUDE_API_WORKER_ENABLED=off,PHONE_DOC_PILOT_TARGET="
+  echo "PHONE_DOC_INTAKE_ENABLED=off, CLAUDE_API_WORKER_ENABLED=off and no pilot target on ${JOB}"
+}
+
 pilot_on() {
   # The pilot is a SECOND intake over the two originals. With drive-intake's flag on as well, one
   # request becomes two tasks (two revisions of the same words), two calls and two answers in the
   # doc, and the pilot's inbox filter checkpoints the worker past the service's rows for good.
   # A service that cannot be read back is not a service that is off: refuse on that too.
-  local other
+  # And it answers ONE request (#386): no usable target, no flag. The flag and the target go in one
+  # update, and the job is read back after it.
+  # THE TARGET NEVER RIDES ON A COMMAND LINE. It is JSON: quotes and commas. Measured on a Windows
+  # laptop, 2026-10-11, with `gcloud meta test --arg-dict` (no API call): gcloud.cmd falls apart on a
+  # quote inside an argument ("'C:\Users\...\Cloud' is not recognized"), and cmd.exe eats the carets
+  # of gcloud's ^@^ form. --flags-file is gcloud's own answer (gcloud topic flags-file): the same
+  # value arrived whole through gcloud.cmd. cygpath, because a Windows gcloud does not know /tmp.
+  local target other mine held flags status=0
+  if ! target="$(printf "%s" "${PHONE_DOC_PILOT_TARGET:-}" | "$PYTHON" -c "$PILOT_TARGET_PY" | tr -d "\r")" || [ -z "$target" ]; then
+    echo "refused: pilot on needs PHONE_DOC_PILOT_TARGET in this shell, the one reviewed request as the worker reads it" >&2
+    exit 2
+  fi
   if ! other="$(env_lines services "$INTAKE_SERVICE")"; then
     echo "refused: ${INTAKE_SERVICE} could not be read back, so its intake flag is unknown; one intake at a time" >&2
     exit 2
@@ -338,7 +414,48 @@ pilot_on() {
     echo "refused: ${INTAKE_SERVICE} has DRIVE_INTAKE_ENABLED=on; one intake at a time (cloud/drive-intake/deploy.sh off first)" >&2
     exit 2
   fi
-  flag PHONE_DOC_INTAKE_ENABLED on
+  if ! mine="$(env_lines jobs "$JOB")"; then
+    echo "refused: ${JOB} could not be read back, so its lane flag is unknown; the pilot and the lane never run together" >&2
+    exit 2
+  fi
+  if grep -qx "CLAUDE_API_LANE_ENABLED=on" <<<"$mine"; then
+    echo "refused: ${JOB} has CLAUDE_API_LANE_ENABLED=on; with the pilot on as well the job stops on every tick (lane off first)" >&2
+    exit 2
+  fi
+  flags="$(mktemp)"
+  if command -v cygpath >/dev/null 2>&1; then
+    flags="$(cygpath -m "$flags")"
+  fi
+  printf "%s" "$target" | "$PYTHON" -c "$PILOT_TARGET_PY" flags | tr -d "\r" >"$flags"
+  "$GCLOUD" run jobs update "$JOB" --project "$PROJECT" --region "$REGION" --flags-file "$flags" || status=$?
+  rm -f "$flags"
+  # A failed update is not proof that nothing was written, so it is turned off again rather than
+  # left unknown. A clean one is not proof of what was written, so the job is read back: anything
+  # but this flag and this target, to the character, is turned off again too.
+  if [ "$status" -ne 0 ] || ! held="$(env_lines jobs "$JOB")" || ! grep -qx "PHONE_DOC_INTAKE_ENABLED=on" <<<"$held" ||
+      ! grep -qxF "PHONE_DOC_PILOT_TARGET=${target}" <<<"$held"; then
+    echo "${JOB} does not hold the target that was sent (gcloud exit ${status}), or could not be read back; the pilot goes off again" >&2
+    pilot_off >&2
+    exit 1
+  fi
+  echo "PHONE_DOC_INTAKE_ENABLED=on on ${JOB} for the one request ${target}"
+  grep -qx "CLAUDE_API_WORKER_ENABLED=on" <<<"$held" ||
+    echo "the worker is off: nothing is called until worker on, and the pass after it reads this request only"
+}
+
+lane_on() {
+  # The lane and the pilot never run together (#386): with both on, or with a pilot target still
+  # set, the job stops on every tick (pilot_flags_invalid) and neither does anything.
+  local mine
+  if ! mine="$(env_lines jobs "$JOB")"; then
+    echo "refused: ${JOB} could not be read back, so its pilot flag is unknown; the lane and the pilot never run together" >&2
+    exit 2
+  fi
+  if grep -Eqx "PHONE_DOC_INTAKE_ENABLED=on|PHONE_DOC_PILOT_TARGET=.+" <<<"$mine"; then
+    echo "refused: ${JOB} has the pilot on or its target still set; with the lane on as well the job stops on every tick (pilot off first)" >&2
+    exit 2
+  fi
+  flag CLAUDE_API_LANE_ENABLED on
 }
 
 case "${1:-}" in
@@ -350,7 +467,7 @@ case "${1:-}" in
   readback) readback ;;
   cost) cost_readback ;;
   worker) case "${2:-}" in on) worker_on ;; off) flag CLAUDE_API_WORKER_ENABLED off ;; *) echo "worker on|off" >&2; exit 2 ;; esac ;;
-  lane) case "${2:-}" in on|off) flag CLAUDE_API_LANE_ENABLED "$2" ;; *) echo "lane on|off" >&2; exit 2 ;; esac ;;
-  pilot) case "${2:-}" in on) pilot_on ;; off) flag PHONE_DOC_INTAKE_ENABLED off ;; *) echo "pilot on|off" >&2; exit 2 ;; esac ;;
-  *) sed -n '2,38p' "$0"; exit 2 ;;
+  lane) case "${2:-}" in on) lane_on ;; off) flag CLAUDE_API_LANE_ENABLED off ;; *) echo "lane on|off" >&2; exit 2 ;; esac ;;
+  pilot) case "${2:-}" in on) pilot_on ;; off) pilot_off ;; *) echo "pilot on|off" >&2; exit 2 ;; esac ;;
+  *) sed -n '2,48p' "$0"; exit 2 ;;
 esac

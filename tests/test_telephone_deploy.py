@@ -6,6 +6,7 @@ running with the default. So every `environ.get("NAME")` the two services read m
 script that deploys them, or be on the short list of optional ones, and nothing else.
 """
 import importlib.util
+import io
 import json
 import math
 import os
@@ -15,7 +16,9 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parents[1]
 INTAKE = REPO / "cloud" / "drive-intake"
@@ -24,7 +27,8 @@ WORKER = REPO / "cloud" / "claude-api-worker"
 # read: _int_env(environ, "CAP") is how the cap, the reservation, the heartbeat and the attempt
 # limit are read, and a regex that only sees environ.get misses every one of them.
 ENV_READ = re.compile(
-    r'(?:environ\.get\(\s*"([A-Z0-9_]+)"|(?:_int_env|_float_env|_utc_deadline_env)\(\s*environ\s*,\s*"([A-Z0-9_]+)")'
+    r'(?:environ\.get\(\s*"([A-Z0-9_]+)"|environ\[\s*"([A-Z0-9_]+)"\s*\]'
+    r'|(?:_int_env|_float_env|_utc_deadline_env)\(\s*environ\s*,\s*"([A-Z0-9_]+)")'
 )
 
 # Read by the code, deliberately not set by the deploy: the wake ring until #359 lands, and Cloud
@@ -90,10 +94,50 @@ def load(name, path):
     return module
 
 
-def gate_constant(name):
-    """A constant of the worker script's cost gate, read by running the gate's own source."""
-    namespace = {"__name__": "cost_gate"}
-    exec(quoted((WORKER / "deploy.sh").read_text(encoding="utf-8"), "COST_MISSING_PY"), namespace)
+def find_bash():
+    """A bash that can run a script from this tree, or None.
+
+    On Windows the first bash on a plain PATH is System32's, the WSL launcher. It runs in another
+    filesystem, where C:/... is no path at all, and where WSL is absent or denied it answers every
+    call with an error: all twelve shell tests failed on it. Git for Windows keeps its own bash
+    beside git and off PATH. That one drives these tests; the launcher never does.
+    """
+    found = shutil.which("bash")
+    if os.name != "nt":
+        return found
+
+    def launcher(path):
+        folded = path.lower().replace("/", "\\")
+        return "\\system32\\" in folded or "\\windowsapps\\" in folded
+
+    if found and not launcher(found):
+        return found
+    git = shutil.which("git")
+    for root in list(Path(git).resolve().parents)[:3] if git else []:
+        for candidate in (root / "usr" / "bin" / "bash.exe", root / "bin" / "bash.exe"):
+            if candidate.is_file():
+                return str(candidate)
+    return None
+
+
+BASH = find_bash()
+NO_BASH = "no bash here that can run a script from this tree (the WSL launcher is not one)"
+
+
+def shell_env(**extra):
+    """The environment a script is run in: bash's own directory first, so a bash found beside git
+    rather than on PATH still finds the sed, grep and mktemp that live next to it. Nothing these
+    tests stand in for is found through PATH: gcloud, curl and python are each handed over by name."""
+    path = os.environ.get("PATH", "")
+    if BASH:
+        path = str(Path(BASH).parent) + os.pathsep + path
+    return dict(os.environ, PATH=path, **extra)
+
+
+def gate_constant(name, source="COST_MISSING_PY"):
+    """A constant of one of the worker script's gates, read by running the gate's own source."""
+    namespace = {"__name__": "gate"}
+    exec(quoted((WORKER / "deploy.sh").read_text(encoding="utf-8"), source), namespace)
     return namespace[name]
 
 
@@ -153,7 +197,11 @@ class IntakeDeployTest(unittest.TestCase):
         self.assertLess(trail.index(whole), trail.index("service_url"))
         self.assertLess(trail.index(whole), trail.index("secrets versions access"))
         self.assertNotIn("grep", commands(trail))
-        self.assertIn("curl -sS --fail-with-body", trail)         # an HTTP refusal is not a proof
+        self.assertIn('"$CURL" -sS --fail-with-body', trail)      # an HTTP refusal is not a proof
+        # curl by name and never through PATH: Git for Windows' bash puts its own curl in front of
+        # the stand-in, and three tests then sent the real request (found on f011d08, 2026-10-11).
+        self.assertIn('CURL="${CURL:-curl}"', self.script)
+        self.assertNotRegex(commands(self.script), r"(?m)^\s*curl\b")
         main_text = (INTAKE / "main.py").read_text(encoding="utf-8")
         file_id_ok = re.search(r'FILE_ID_OK = re\.compile\(r"([^"]+)"\)', main_text)
         if file_id_ok:
@@ -203,13 +251,16 @@ class WorkerDeployTest(unittest.TestCase):
     script = (WORKER / "deploy.sh").read_text(encoding="utf-8")
 
     def test_every_env_the_job_reads_is_set_or_declared_optional(self):
-        read = env_names_read(WORKER / "main.py", WORKER / "lane.py")
+        read = env_names_read(WORKER / "main.py", WORKER / "lane.py", WORKER / "phone_intake.py")
+        self.assertIn("PHONE_DOC_PILOT_TARGET", env_names_read(WORKER / "phone_intake.py"))   # read as environ[...]
         read -= {"CLAUDE_API_WORKER_ENABLED", "CLAUDE_API_LANE_ENABLED"}
         missing = read - env_names_set(self.script) - OPTIONAL["claude-api-worker"] - VIA_SECRET_OR_MOUNT
         self.assertEqual(set(), missing)
         self.assertIn("CLAUDE_API_WORKER_ENABLED=off", self.script)
         self.assertIn("CLAUDE_API_LANE_ENABLED=off", self.script)
         self.assertIn("PHONE_DOC_INTAKE_ENABLED=off", self.script)
+        # A deploy leaves no pilot behind: the flag off and the target empty (#386), in the deploy itself.
+        self.assertIn("PHONE_DOC_INTAKE_ENABLED=off,PHONE_DOC_PILOT_TARGET=,", function_body(self.script, "deploy"))
         self.assertIn("REDIS_CONNECT=true", self.script)
         self.assertIn("REDIS_HOST=${REDIS_HOST}", self.script)
 
@@ -273,37 +324,77 @@ class WorkerDeployTest(unittest.TestCase):
         self.assertNotIn("--format 'yaml", env_lines)
 
     def test_the_pilot_intake_is_a_flag_that_refuses_while_the_service_intake_is_on(self):
-        self.assertIn("pilot) case \"${2:-}\" in on) pilot_on ;; off) flag PHONE_DOC_INTAKE_ENABLED off ;;", self.script)
+        self.assertIn("pilot) case \"${2:-}\" in on) pilot_on ;; off) pilot_off ;;", self.script)
         pilot_on = function_body(self.script, "pilot_on")
+        update = pilot_on.index("run jobs update")
         self.assertIn('INTAKE_SERVICE="${INTAKE_SERVICE:-drive-intake}"', self.script)
-        self.assertLess(pilot_on.index('grep -qx "DRIVE_INTAKE_ENABLED=on"'), pilot_on.index("flag PHONE_DOC_INTAKE_ENABLED on"))
+        self.assertLess(pilot_on.index('grep -qx "DRIVE_INTAKE_ENABLED=on"'), update)
         self.assertIn('env_lines services "$INTAKE_SERVICE"', pilot_on)
         self.assertIn("exit 2", pilot_on)
         self.assertIn("pilot on|off", self.script)
+        # #386: one reviewed request or nothing. The target is judged before anything is read or
+        # sent, the flag and the target travel in ONE update, and the job is read back after it.
+        self.assertLess(pilot_on.index('"$PYTHON" -c "$PILOT_TARGET_PY"'), pilot_on.index("env_lines"))
+        self.assertLess(pilot_on.index('grep -qx "CLAUDE_API_LANE_ENABLED=on"'), update)
+        self.assertEqual(1, commands(pilot_on).count("run jobs update"))
+        self.assertNotIn("flag PHONE_DOC_INTAKE_ENABLED on", self.script)        # never the flag without its target
+        # The target reaches gcloud in a file and on no command line: gcloud.cmd breaks on a quote
+        # in an argument and cmd.exe eats the carets of ^@^ (measured, `gcloud meta test --arg-dict`).
+        self.assertIn('--region "$REGION" --flags-file "$flags" || status=$?', pilot_on)
+        self.assertIn('flags="$(cygpath -m "$flags")"', pilot_on)                # a Windows gcloud does not know /tmp
+        self.assertIn('"$PYTHON" -c "$PILOT_TARGET_PY" flags | tr -d "\\r" >"$flags"', pilot_on)
+        self.assertNotIn("^@^", commands(self.script))
+        for line in commands(self.script).split("\n"):
+            if "$GCLOUD" in line or "--update-env-vars" in line or "--set-env-vars" in line:
+                self.assertNotRegex(line, r"\$\{?(target|PHONE_DOC_PILOT_TARGET)\b", line)
+        self.assertLess(update, pilot_on.index('rm -f "$flags"'))
+        self.assertLess(update, pilot_on.index('grep -qxF "PHONE_DOC_PILOT_TARGET=${target}"'))
+        self.assertLess(pilot_on.index('grep -qxF "PHONE_DOC_PILOT_TARGET=${target}"'), pilot_on.index("pilot_off >&2"))
+        # Off is one update, with no read before it, and it never leaves a worker on to read the whole inbox.
+        pilot_off = function_body(self.script, "pilot_off")
+        self.assertNotIn("env_lines", commands(pilot_off))
+        self.assertIn('--update-env-vars "PHONE_DOC_INTAKE_ENABLED=off,CLAUDE_API_WORKER_ENABLED=off,PHONE_DOC_PILOT_TARGET="',
+                      pilot_off)
+        lane_on = function_body(self.script, "lane_on")
+        self.assertIn("lane) case \"${2:-}\" in on) lane_on ;; off) flag CLAUDE_API_LANE_ENABLED off ;;", self.script)
+        self.assertLess(lane_on.index("PHONE_DOC_INTAKE_ENABLED=on|PHONE_DOC_PILOT_TARGET=.+"),
+                        lane_on.index("flag CLAUDE_API_LANE_ENABLED on"))
 
 
 class ShellTest(unittest.TestCase):
+    def test_the_bash_that_drives_these_tests_is_never_the_wsl_launcher(self):
+        # shutil.which("bash") on a plain Windows PATH is C:\Windows\System32\bash.exe. Every shell
+        # test here failed on it (2026-10-11), and none of them was about the script.
+        if os.name != "nt":
+            self.skipTest("a Windows trap")
+        if BASH:
+            self.assertNotIn("\\system32\\", BASH.lower().replace("/", "\\"))
+            self.assertNotIn("\\windowsapps\\", BASH.lower().replace("/", "\\"))
+            said = subprocess.run([BASH, "-c", "printf %s ran"], capture_output=True, text=True, env=shell_env())
+            self.assertEqual("ran", said.stdout, said.stderr)
+
     def test_both_scripts_parse_in_bash_and_show_usage_without_a_verb(self):
-        bash = shutil.which("bash")
+        bash = BASH
         if not bash:
-            self.skipTest("no bash on this box")
+            self.skipTest(NO_BASH)
         for script in (INTAKE / "deploy.sh", WORKER / "deploy.sh"):
-            self.assertEqual(0, subprocess.run([bash, "-n", str(script)], capture_output=True).returncode, script)
-            usage = subprocess.run([bash, str(script)], capture_output=True, text=True, cwd=str(REPO))
+            self.assertEqual(0, subprocess.run([bash, "-n", str(script)], capture_output=True, env=shell_env()).returncode,
+                             script)
+            usage = subprocess.run([bash, str(script)], capture_output=True, text=True, cwd=str(REPO), env=shell_env())
             self.assertEqual(2, usage.returncode, script)
             self.assertIn("deploy.sh setup", usage.stdout, script)
             self.assertNotIn("gcloud", usage.stderr, script)    # usage never calls gcloud
             # The usage is the header, printed by line range: a verb added to the header must still print.
-            last_verb = "deploy.sh trail <doc id>" if script.parent == INTAKE else "pilot on|off"
+            last_verb = "deploy.sh trail <doc id>" if script.parent == INTAKE else "deploy.sh pilot off"
             self.assertIn(last_verb, usage.stdout, script)
             self.assertNotIn("set -euo pipefail", usage.stdout, script)
 
     def test_a_bad_doc_id_never_reaches_gcloud_and_a_good_one_does(self):
-        bash = shutil.which("bash")
+        bash = BASH
         if not bash:
-            self.skipTest("no bash on this box")
+            self.skipTest(NO_BASH)
         # gcloud is a path that does not exist: a call reaching it fails loudly, by name.
-        env = dict(os.environ, GCLOUD="/nonexistent/gcloud")
+        env = shell_env(GCLOUD="/nonexistent/gcloud")
         for bad in ("", "short", "x" * 129, "1gZlJFDD2Wm419YOuolIXC3HXwzXOWYfP/../x", "a b c d e f g h i j"):
             run = subprocess.run([bash, str(INTAKE / "deploy.sh"), "trail", bad], capture_output=True, text=True,
                                  cwd=str(REPO), env=env)
@@ -320,11 +411,32 @@ class ShellTest(unittest.TestCase):
 
 FAKE_GCLOUD = r'''#!/usr/bin/env bash
 # A gcloud that logs every call and answers describe with the JSON it is given. Nothing else runs.
-printf '%s\n' "$*" >> "$FAKE_LOG"
+# A --flags-file is logged as what the file holds: that is what gcloud would read, and the file is
+# gone by the time a test looks. A file that cannot be read fails the call, as gcloud's does.
+line="$*"
+previous=""
+for word in "$@"; do
+  if [ "$previous" = "--flags-file" ]; then
+    held="$(cat "$word")" || { echo "ERROR: (gcloud) --flags-file [$word] not found." >&2; exit 1; }
+    line="${line/"$word"/"$held"}"
+  fi
+  previous="$word"
+done
+printf '%s\n' "$line" >> "$FAKE_LOG"
 case "$*" in
-  *"value(status.url)"*) echo "https://drive-intake-fake-uc.a.run.app" ;;
+  *"--flags-file"*)
+    if [ -n "${FAKE_FLAGS_UPDATE_FAILS:-}" ]; then echo "ERROR: (gcloud.run.jobs.update) ABORTED: Conflict for resource" >&2; exit 1; fi ;;
+esac
+case "$*" in
+  *"value(status.url)"*) echo "https://drive-intake.invalid" ;;
   *"serviceAccountName"*) printf '%s\n' "$FAKE_STUDIO_SA" ;;
-  *"run jobs describe"*"--format json"*) describe "${FAKE_JOB_FAILS:-}" "$FAKE_JOB_JSON" job ;;
+  *"run jobs describe"*"--format json"*)
+    # What the job holds once an update has been sent, when a test says what that is.
+    if [ -n "${FAKE_JOB_AFTER:-}" ] && grep -q "^run jobs update" "$FAKE_LOG"; then
+      describe "${FAKE_JOB_AFTER_FAILS:-}" "$FAKE_JOB_AFTER" job
+    else
+      describe "${FAKE_JOB_FAILS:-}" "$FAKE_JOB_JSON" job
+    fi ;;
   *"run services describe"*"--format json"*) describe "${FAKE_SERVICE_FAILS:-}" "$FAKE_SERVICE_JSON" service ;;
   *"secrets versions access"*) printf '%s' "tok-123" ;;
   *"auth print-identity-token"*) printf '%s' "idt-456" ;;
@@ -342,7 +454,7 @@ FAKE_DESCRIBE = r'''describe() {
   esac
 }
 '''
-FAKE_GCLOUD = FAKE_GCLOUD.replace('printf', FAKE_DESCRIBE + 'printf', 1)
+FAKE_GCLOUD = FAKE_GCLOUD.replace('line="$*"', FAKE_DESCRIBE + 'line="$*"', 1)
 # curl as curl behaves: an HTTP error is exit 0 unless --fail-with-body asked for 22.
 FAKE_CURL = r'''#!/usr/bin/env bash
 printf 'curl %s\n' "$*" >> "$FAKE_LOG"
@@ -387,7 +499,28 @@ UNUSABLE = (
 
 
 def env_items(**values):
-    return ",".join('{"name":"%s","value":"%s"}' % item for item in values.items())
+    """The env list of a describe answer. json.dumps, not a format string: a value may hold quotes."""
+    return ",".join(json.dumps({"name": name, "value": value}, separators=(",", ":")) for name, value in values.items())
+
+
+# One reviewed request, as the review hands it over: any key order, any spacing.
+TARGET = {"task_id": "task-0123456789abcdef", "source_doc_id": "17Q2vBYvxs8PIu-sXXWj67HAU_DL2RfB9-SoQbpeDoWQ",
+          "recipient_id": "claude-api", "request_id": "REQ-20261011-01", "source_revision": "a" * 64}
+# The one line the script makes of it and the job is given: the worker's own field order, no space.
+TARGET_LINE = ('{"source_doc_id":"17Q2vBYvxs8PIu-sXXWj67HAU_DL2RfB9-SoQbpeDoWQ","source_revision":"%s",'
+               '"request_id":"REQ-20261011-01","task_id":"task-0123456789abcdef","recipient_id":"claude-api"}' % ("a" * 64))
+PILOT_SENT = {"PHONE_DOC_INTAKE_ENABLED": "on", "PHONE_DOC_PILOT_TARGET": TARGET_LINE}
+PILOT_OFF_UPDATE = "--update-env-vars PHONE_DOC_INTAKE_ENABLED=off,CLAUDE_API_WORKER_ENABLED=off,PHONE_DOC_PILOT_TARGET="
+
+
+def pilot_sent(call):
+    """What a `pilot on` update hands gcloud: the env in its flags file, or None for any other call.
+    The whole call is checked: the target rides in the file and nowhere on the command line."""
+    head, flags, held = call.partition(" --flags-file ")
+    if not flags or not head.startswith("run jobs update claude-api-worker ") or "env-vars" in head:
+        return None
+    sent = json.loads(held)
+    return sent["--update-env-vars"] if list(sent) == ["--update-env-vars"] else None
 
 
 class FakeGcloudTest(unittest.TestCase):
@@ -397,9 +530,9 @@ class FakeGcloudTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.bash = shutil.which("bash")
+        cls.bash = BASH
         if not cls.bash:
-            raise unittest.SkipTest("no bash on this box")
+            raise unittest.SkipTest(NO_BASH)
         cls.tmp = Path(tempfile.mkdtemp(prefix="fake-gcloud-"))
         for name, text in (("gcloud", FAKE_GCLOUD), ("curl", FAKE_CURL), ("crlf-python", FAKE_CRLF_PYTHON)):
             (cls.tmp / name).write_text(text, encoding="utf-8", newline="\n")
@@ -410,18 +543,30 @@ class FakeGcloudTest(unittest.TestCase):
     def tearDownClass(cls):
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
-    def verb(self, script, *args, job=None, service=None, studio_sa="studio-sa@sfdc24.iam.gserviceaccount.com",
-             **fakes):
+    def verb(self, script, *args, job=None, service=None, after=None,
+             studio_sa="studio-sa@sfdc24.iam.gserviceaccount.com", **fakes):
         type(self).calls += 1
         log = self.tmp / ("calls-%d.log" % self.calls)
-        env = dict(os.environ, GCLOUD=(self.tmp / "gcloud").as_posix(),
-                   PATH=str(self.tmp) + os.pathsep + os.environ.get("PATH", ""),
-                   FAKE_LOG=log.as_posix(), FAKE_STUDIO_SA=studio_sa,
-                   FAKE_JOB_JSON=JOB_JSON % env_items(**(job or {})),
-                   FAKE_SERVICE_JSON=SERVICE_JSON % env_items(**(service or {})), **fakes)
+        if after is not None:
+            fakes["FAKE_JOB_AFTER"] = JOB_JSON % env_items(**after)
+        # gcloud AND curl by name. Neither is left to PATH: the bash Git for Windows ships puts its
+        # own directories first, and a stand-in found through PATH is then not the one that runs.
+        env = shell_env(GCLOUD=(self.tmp / "gcloud").as_posix(), CURL=(self.tmp / "curl").as_posix(),
+                        FAKE_LOG=log.as_posix(), FAKE_STUDIO_SA=studio_sa,
+                        FAKE_JOB_JSON=JOB_JSON % env_items(**(job or {})),
+                        FAKE_SERVICE_JSON=SERVICE_JSON % env_items(**(service or {})), **fakes)
+        if "PHONE_DOC_PILOT_TARGET" not in fakes:
+            env.pop("PHONE_DOC_PILOT_TARGET", None)              # only a test that names a target has one
         run = subprocess.run([self.bash, str(script), *args], capture_output=True, text=True, cwd=str(REPO), env=env)
         calls = log.read_text(encoding="utf-8").splitlines() if log.exists() else []
         return run, calls
+
+    def pilot_on(self, target=TARGET, held=TARGET_LINE, flag="on", job=None, **fakes):
+        """`pilot on` with a target in the shell; `held` and `flag` are what the job holds afterwards."""
+        after = dict(job or {}, PHONE_DOC_INTAKE_ENABLED=flag, PHONE_DOC_PILOT_TARGET=held)
+        if target is not None:
+            fakes["PHONE_DOC_PILOT_TARGET"] = target if isinstance(target, str) else json.dumps(target, indent=1)
+        return self.verb(WORKER / "deploy.sh", "pilot", "on", job=job, after=after, **fakes)
 
     def test_worker_on_refuses_the_fail_closed_defaults_and_flips_once_they_are_set(self):
         run, calls = self.verb(WORKER / "deploy.sh", "worker", "on", job=DEFAULTS)
@@ -464,16 +609,115 @@ class FakeGcloudTest(unittest.TestCase):
                                  and "DRIVE_INTAKE_ENABLED=on" in c]), calls)
         run, calls = self.verb(INTAKE / "deploy.sh", "off", job=dict(PHONE_DOC_INTAKE_ENABLED="on"))   # off is always allowed
         self.assertEqual(0, run.returncode, run.stderr)
-        run, calls = self.verb(WORKER / "deploy.sh", "pilot", "on", service=dict(DRIVE_INTAKE_ENABLED="on"))
+        run, calls = self.pilot_on(service=dict(DRIVE_INTAKE_ENABLED="on"))
         self.assertEqual(2, run.returncode, run.stderr)
         self.assertIn("one intake at a time", run.stderr)
         self.assertEqual([], [c for c in calls if "run jobs update" in c])
-        run, calls = self.verb(WORKER / "deploy.sh", "pilot", "on", service=dict(DRIVE_INTAKE_ENABLED="off"))
+        run, calls = self.pilot_on(service=dict(DRIVE_INTAKE_ENABLED="off"))
         self.assertEqual(0, run.returncode, run.stderr)
-        self.assertEqual(1, len([c for c in calls if c.startswith("run jobs update claude-api-worker")
-                                 and "PHONE_DOC_INTAKE_ENABLED=on" in c]), calls)
-        run, calls = self.verb(WORKER / "deploy.sh", "pilot", "on", service={})           # no service: nothing to collide with
+        self.assertEqual(1, len([c for c in calls if pilot_sent(c) == PILOT_SENT]), calls)
+        run, calls = self.pilot_on(service={})                                            # no service: nothing to collide with
         self.assertEqual(0, run.returncode, run.stderr)
+
+    def test_pilot_on_needs_the_one_request_and_sends_it_with_the_flag_in_one_update(self):
+        # #386: the flag alone leaves a job that stops on every tick (pilot_target_invalid). f011d08
+        # sent the flag alone. No target in the shell is a refusal before anything is read or sent.
+        run, calls = self.pilot_on(target=None)
+        self.assertEqual(2, run.returncode, run.stderr)
+        self.assertIn("PHONE_DOC_PILOT_TARGET: empty", run.stderr)
+        self.assertIn("pilot on needs PHONE_DOC_PILOT_TARGET", run.stderr)
+        self.assertEqual([], calls)
+        for bad, why in ((dict(TARGET, source_doc_id="1gZlJFDD2Wm419YOuolIXC3HXwzXOWYfP"), "not one of the two originals"),
+                         (dict(TARGET, recipient_id="claude-code-cli"), "recipient_id is not claude-api"),
+                         (dict(TARGET, task_id="task-XYZ"), "task_id is not in the shape"),
+                         ({k: v for k, v in TARGET.items() if k != "source_revision"}, "not an object of exactly"),
+                         ("{not json", "not JSON")):
+            run, calls = self.pilot_on(target=bad)
+            self.assertEqual(2, run.returncode, (bad, run.stderr))
+            self.assertIn(why, run.stderr, bad)
+            self.assertEqual([], calls, bad)
+        # The good one, handed over with its keys in another order and spread over lines: one
+        # update, the flag and the target together, the target as the one line the job will hold.
+        run, calls = self.pilot_on()
+        self.assertEqual(0, run.returncode, run.stderr)
+        updates = [c for c in calls if "run jobs update" in c]
+        self.assertEqual(1, len(updates), calls)
+        self.assertEqual(PILOT_SENT, pilot_sent(updates[0]), updates)
+        self.assertEqual(TARGET, json.loads(TARGET_LINE))
+        self.assertIn("for the one request " + TARGET_LINE, run.stdout)
+        self.assertIn("the worker is off: nothing is called until worker on", run.stdout)
+        self.assertLess(calls.index(updates[0]), max(i for i, c in enumerate(calls) if "run jobs describe" in c))   # read back after
+        run, calls = self.pilot_on(job=dict(CLAUDE_API_WORKER_ENABLED="on"))
+        self.assertEqual(0, run.returncode, run.stderr)
+        self.assertNotIn("the worker is off", run.stdout)
+
+    def test_pilot_on_turns_the_pilot_off_again_when_the_job_does_not_hold_what_was_sent(self):
+        # A quote lost between this shell and gcloud (gcloud.cmd is a batch file) leaves a target the
+        # worker refuses on every tick. The job is read back, and a pilot that cannot be confirmed
+        # is turned off again, the worker with it.
+        lost_quotes = TARGET_LINE.replace('"', "")
+        for held, flag, how in ((lost_quotes, "on", ""), (TARGET_LINE + " ", "on", ""), ("", "on", ""),
+                                (TARGET_LINE, "off", ""), (TARGET_LINE, "on", "denied"), (TARGET_LINE, "on", "garbage")):
+            run, calls = self.pilot_on(held=held, flag=flag, FAKE_JOB_AFTER_FAILS=how)
+            self.assertEqual(1, run.returncode, (held, flag, how, run.stderr))
+            self.assertIn("the pilot goes off again", run.stderr)
+            updates = [c for c in calls if "run jobs update" in c]
+            self.assertEqual(2, len(updates), calls)
+            self.assertEqual(PILOT_SENT, pilot_sent(updates[0]), updates)
+            self.assertTrue(updates[1].endswith(PILOT_OFF_UPDATE), updates)
+            self.assertNotIn("for the one request", run.stdout)
+        # An update gcloud reports as failed is not proof that nothing was written: off again, unread.
+        run, calls = self.pilot_on(FAKE_FLAGS_UPDATE_FAILS="1")
+        self.assertEqual(1, run.returncode, run.stderr)
+        self.assertIn("gcloud exit 1", run.stderr)
+        updates = [c for c in calls if "run jobs update" in c]
+        self.assertEqual(2, len(updates), calls)
+        self.assertTrue(updates[1].endswith(PILOT_OFF_UPDATE), updates)
+        self.assertEqual([], [c for c in calls[calls.index(updates[0]):] if "describe" in c], calls)
+        self.assertNotIn("for the one request", run.stdout)
+
+    def test_pilot_off_is_one_update_with_no_read_and_takes_the_worker_with_it(self):
+        # With the pilot off and the target cleared, a worker left on reads the whole inbox; with
+        # the target left behind it stops on every tick. And an off verb never waits on a read.
+        for fails in ("", "denied", "down"):
+            run, calls = self.verb(WORKER / "deploy.sh", "pilot", "off", job=dict(CLAUDE_API_WORKER_ENABLED="on"),
+                                   FAKE_JOB_FAILS=fails, FAKE_SERVICE_FAILS=fails)
+            self.assertEqual(0, run.returncode, run.stderr)
+            self.assertEqual(1, len(calls), calls)
+            self.assertTrue(calls[0].startswith("run jobs update claude-api-worker "), calls)
+            self.assertTrue(calls[0].endswith(PILOT_OFF_UPDATE), calls)
+            self.assertIn("CLAUDE_API_WORKER_ENABLED=off", run.stdout)
+
+    def test_the_lane_and_the_pilot_refuse_each_other(self):
+        # #386: both on, or the lane on beside a target that is still set, is pilot_flags_invalid
+        # on every tick. Each on verb reads the job back and refuses; an unreadable job is a refusal.
+        for job in (dict(PHONE_DOC_INTAKE_ENABLED="on", PHONE_DOC_PILOT_TARGET=TARGET_LINE),
+                    dict(PHONE_DOC_INTAKE_ENABLED="on"),
+                    dict(PHONE_DOC_INTAKE_ENABLED="off", PHONE_DOC_PILOT_TARGET=TARGET_LINE)):
+            run, calls = self.verb(WORKER / "deploy.sh", "lane", "on", job=job)
+            self.assertEqual(2, run.returncode, (job, run.stderr))
+            self.assertIn("pilot off first", run.stderr)
+            self.assertEqual([], [c for c in calls if "run jobs update" in c], job)
+        for how in ("denied", "down", "garbage", "list"):
+            run, calls = self.verb(WORKER / "deploy.sh", "lane", "on", FAKE_JOB_FAILS=how)
+            self.assertEqual(2, run.returncode, how + run.stderr)
+            self.assertIn("could not be read back", run.stderr, how)
+            self.assertEqual([], [c for c in calls if "run jobs update" in c], how)
+            run, calls = self.pilot_on(FAKE_JOB_FAILS=how)
+            self.assertEqual(2, run.returncode, how + run.stderr)
+            self.assertIn("could not be read back", run.stderr, how)
+            self.assertEqual([], [c for c in calls if "run jobs update" in c], how)
+        for job in (dict(PHONE_DOC_INTAKE_ENABLED="off"), dict(PHONE_DOC_INTAKE_ENABLED="off", PHONE_DOC_PILOT_TARGET="")):
+            run, calls = self.verb(WORKER / "deploy.sh", "lane", "on", job=job)
+            self.assertEqual(0, run.returncode, run.stderr)
+            self.assertEqual(1, len([c for c in calls if c.endswith("--update-env-vars CLAUDE_API_LANE_ENABLED=on")]), calls)
+        run, calls = self.verb(WORKER / "deploy.sh", "lane", "off", FAKE_JOB_FAILS="denied")     # off never waits on a read
+        self.assertEqual(0, run.returncode, run.stderr)
+        self.assertEqual(1, len(calls), calls)
+        run, calls = self.pilot_on(job=dict(CLAUDE_API_LANE_ENABLED="on"))
+        self.assertEqual(2, run.returncode, run.stderr)
+        self.assertIn("lane off first", run.stderr)
+        self.assertEqual([], [c for c in calls if "run jobs update" in c])
 
     def test_studio_grants_the_discovered_account_and_prints_the_url_never_the_token(self):
         run, calls = self.verb(INTAKE / "deploy.sh", "studio")
@@ -483,7 +727,7 @@ class FakeGcloudTest(unittest.TestCase):
                                  and member in c and "--role roles/run.invoker" in c]), calls)
         self.assertEqual(1, len([c for c in calls if c.startswith("secrets add-iam-policy-binding DRIVE_INTAKE_POLL_TOKEN")
                                  and member in c and "secretmanager.secretAccessor" in c]), calls)
-        self.assertIn("--update-env-vars STUDIO_TELEPHONE_URL=https://drive-intake-fake-uc.a.run.app "
+        self.assertIn("--update-env-vars STUDIO_TELEPHONE_URL=https://drive-intake.invalid "
                       "--update-secrets STUDIO_TELEPHONE_TOKEN=DRIVE_INTAKE_POLL_TOKEN:latest", run.stdout)
         self.assertNotIn("tok-123", run.stdout + run.stderr)
         self.assertEqual([], [c for c in calls if "secrets versions access" in c or "run services update" in c
@@ -500,7 +744,7 @@ class FakeGcloudTest(unittest.TestCase):
         self.assertEqual(1, len(curls), calls)
         self.assertIn("-H Authorization: Bearer idt-456", curls[0])
         self.assertIn("-H X-Drive-Intake-Poll-Token: tok-123", curls[0])
-        self.assertIn("https://drive-intake-fake-uc.a.run.app/trail?doc=" + DOC, curls[0])
+        self.assertIn("https://drive-intake.invalid/trail?doc=" + DOC, curls[0])   # .invalid: no stand-in gone missing can reach a host
         self.assertEqual('{"status":"ok","enabled":true}\n', run.stdout)
         self.assertNotIn("tok-123", run.stdout)
 
@@ -535,8 +779,7 @@ class FakeGcloudTest(unittest.TestCase):
             self.assertEqual(2, run.returncode, how + run.stderr)
             self.assertIn("could not be read back", run.stderr, how)
             self.assertEqual([], [c for c in calls if "run services update" in c], how)
-            run, calls = self.verb(WORKER / "deploy.sh", "pilot", "on", service=dict(DRIVE_INTAKE_ENABLED="on"),
-                                   FAKE_SERVICE_FAILS=how)
+            run, calls = self.pilot_on(service=dict(DRIVE_INTAKE_ENABLED="on"), FAKE_SERVICE_FAILS=how)
             self.assertEqual(2, run.returncode, how + run.stderr)
             self.assertIn("could not be read back", run.stderr, how)
             self.assertEqual([], [c for c in calls if "run jobs update" in c], how)
@@ -552,9 +795,9 @@ class FakeGcloudTest(unittest.TestCase):
         run, calls = self.verb(INTAKE / "deploy.sh", "on", FAKE_JOB_FAILS="notfound")
         self.assertEqual(0, run.returncode, run.stderr)
         self.assertEqual(1, len([c for c in calls if "run services update" in c and "DRIVE_INTAKE_ENABLED=on" in c]), calls)
-        run, calls = self.verb(WORKER / "deploy.sh", "pilot", "on", FAKE_SERVICE_FAILS="notfound")
+        run, calls = self.pilot_on(FAKE_SERVICE_FAILS="notfound")
         self.assertEqual(0, run.returncode, run.stderr)
-        self.assertEqual(1, len([c for c in calls if "run jobs update" in c and "PHONE_DOC_INTAKE_ENABLED=on" in c]), calls)
+        self.assertEqual(1, len([c for c in calls if pilot_sent(c) == PILOT_SENT]), calls)
         run, calls = self.verb(WORKER / "deploy.sh", "worker", "on", FAKE_JOB_FAILS="notfound")    # no job: nothing to turn on
         self.assertEqual(2, run.returncode, run.stderr)
         self.assertEqual([], [c for c in calls if "run jobs update" in c])
@@ -567,9 +810,17 @@ class FakeGcloudTest(unittest.TestCase):
         self.assertEqual(2, run.returncode, run.stderr)
         self.assertIn("one intake at a time", run.stderr)
         self.assertEqual([], [c for c in calls if "run services update" in c])
-        run, calls = self.verb(WORKER / "deploy.sh", "pilot", "on", service=dict(DRIVE_INTAKE_ENABLED="on"), **crlf)
+        run, calls = self.pilot_on(service=dict(DRIVE_INTAKE_ENABLED="on"), **crlf)
         self.assertEqual(2, run.returncode, run.stderr)
+        self.assertIn("one intake at a time", run.stderr)
         self.assertEqual([], [c for c in calls if "run jobs update" in c])
+        # The target is printed by that python too: a carriage return left on it would be sent to
+        # the job inside the value, and the read-back would then never find the line it sent.
+        run, calls = self.pilot_on(**crlf)
+        self.assertEqual(0, run.returncode, run.stderr)
+        self.assertEqual(1, len([c for c in calls if pilot_sent(c) == PILOT_SENT]), calls)
+        run, calls = self.verb(WORKER / "deploy.sh", "lane", "on", job=dict(PHONE_DOC_INTAKE_ENABLED="on"), **crlf)
+        self.assertEqual(2, run.returncode, run.stderr)
         run, calls = self.verb(WORKER / "deploy.sh", "worker", "on", job=SET, **crlf)        # and a good job still flips
         self.assertEqual(0, run.returncode, run.stderr)
         run, calls = self.verb(WORKER / "deploy.sh", "worker", "on", job=DEFAULTS, **crlf)
@@ -687,6 +938,90 @@ class CostGateTest(unittest.TestCase):
         self.assertEqual(NOW, self.wk._utc_deadline_env(at, "CLAUDE_API_WORKER_AUTHORIZED_UNTIL_UTC"))
         self.assertEqual(1, len(self.problems(at, NOW)))
         self.assertEqual([], self.problems(at, NOW - 1))
+
+
+class PilotTargetGateTest(unittest.TestCase):
+    """The target check in `pilot on` against the reader it stands in front of (#386): what the
+    script passes, phone_intake.target_from_env must pass, and the one line the script sends must
+    read back as the same request. The script may refuse more; it may never pass more."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.canonical = staticmethod(gate_constant("canonical", "PILOT_TARGET_PY"))
+        cls.wk = load("claude_api_worker_for_pilot", WORKER / "main.py")
+        cls.pilot = cls.wk.pilot                                  # phone_intake, as the worker itself holds it
+
+    def worker_reads(self, raw):
+        try:
+            return self.pilot.target_from_env({"PHONE_DOC_PILOT_TARGET": raw})
+        except self.pilot.TargetUnavailable:
+            return None
+
+    def test_the_two_originals_and_the_five_fields_are_the_workers_own(self):
+        self.assertEqual(self.pilot.DOC_IDS, gate_constant("DOC_IDS", "PILOT_TARGET_PY"))
+        self.assertEqual(self.pilot.TARGET_FIELDS, gate_constant("FIELDS", "PILOT_TARGET_PY"))
+        self.assertEqual(TARGET, self.worker_reads(json.dumps(TARGET)))      # the fixture is one the worker takes
+        self.assertEqual((TARGET_LINE, ""), self.canonical(json.dumps(TARGET, indent=1)))
+        self.assertEqual(TARGET, self.worker_reads(TARGET_LINE))
+        # The one line holds nothing a shell or gcloud's ^@^ form could split on unseen.
+        self.assertNotRegex(TARGET_LINE, r"[\s@^'\\]")
+
+    def test_the_check_is_never_looser_than_the_worker_and_the_line_it_sends_is_the_same_request(self):
+        other_doc = self.pilot.DOC_IDS[0]
+        cells = [TARGET, dict(TARGET, source_doc_id=other_doc)]
+        for name, values in (
+                ("source_doc_id", ("", "1gZlJFDD2Wm419YOuolIXC3HXwzXOWYfP", other_doc + " ", other_doc.lower(), other_doc + "\n")),
+                ("source_revision", ("", "r", "a" * 128, "a" * 129, "a b", "a,b", "a@b", "a\n", "rev:1.2-3_4")),
+                ("request_id", ("", "short", "REQ-0001", "R" * 128, "R" * 129, "REQ 0001", "REQ-0001\n", "req.1:2-3_4")),
+                ("task_id", ("", "task-", "task-0123456789abcde", "task-0123456789abcdef0", "task-0123456789ABCDEF",
+                             "TASK-0123456789abcdef", "task-0123456789abcdef\n")),
+                ("recipient_id", ("", "claude", "claude-api ", "Claude-API", "claude-code-cli"))):
+            cells += [dict(TARGET, **{name: value}) for value in values]
+            cells += [dict(TARGET, **{name: wrong}) for wrong in (None, 7, True, ["x"], {"x": "y"})]
+        cells += [{k: v for k, v in TARGET.items() if k != name} for name in TARGET]      # a field short
+        cells.append(dict(TARGET, extra="x"))                                             # a field over
+        raws = [json.dumps(cell) for cell in cells]
+        raws += ["", " ", "null", "[]", "7", '"x"', "{", json.dumps([TARGET]), json.dumps(TARGET) + "x",
+                 json.dumps(TARGET).replace('"claude-api"', '"claude\\u002dapi"'),        # an escape the reader resolves
+                 json.dumps(TARGET)[:-1] + ',"task_id":"task-ffffffffffffffff"}',         # a key twice: the last one wins
+                 "\n" + json.dumps(TARGET, indent=4) + "\n"]
+        passed = refused = 0
+        for raw in raws:
+            line, why = self.canonical(raw)
+            read = self.worker_reads(raw)
+            if line is None:
+                refused += 1
+                self.assertTrue(why, raw)
+                # Refused by the script and taken by the worker would be a good pilot turned away.
+                self.assertIsNone(read, raw)
+                continue
+            passed += 1
+            self.assertIsNotNone(read, raw)                           # never looser
+            self.assertEqual(read, self.worker_reads(line), raw)      # the line sent is the request given
+            self.assertNotRegex(line, r"[\s@^'\\]", raw)
+        self.assertGreaterEqual(passed, 8)                            # the sweep is not vacuous either way
+        self.assertGreater(refused, 40)
+
+    def test_what_the_verbs_refuse_to_leave_behind_is_what_stops_the_worker(self):
+        # The control for pilot on, lane on and pilot off: each state they refuse to make, or clear,
+        # is one main() answers by stopping before it reads anything. Flags as the JOB would hold them.
+        def stops(worker="off", lane="off", pilot="off", target=""):
+            said = io.StringIO()
+            env = {"CLAUDE_API_WORKER_ENABLED": worker, "CLAUDE_API_LANE_ENABLED": lane,
+                   "PHONE_DOC_INTAKE_ENABLED": pilot, "PHONE_DOC_PILOT_TARGET": target}
+            with mock.patch.dict(os.environ, env), redirect_stdout(said):
+                code = self.wk.main()
+            return code, json.loads(said.getvalue().splitlines()[0])["status"]
+
+        self.assertEqual((1, "pilot_target_invalid"), stops(worker="on", pilot="on"))                 # the flag alone: f011d08
+        self.assertEqual((1, "pilot_target_invalid"), stops(worker="on", pilot="on", target=TARGET_LINE.replace('"', "")))
+        self.assertEqual((1, "pilot_flags_invalid"), stops(worker="on", pilot="on", lane="on", target=TARGET_LINE))
+        self.assertEqual((1, "pilot_flags_invalid"), stops(lane="on", pilot="on", target=TARGET_LINE))
+        self.assertEqual((1, "pilot_flags_invalid"), stops(lane="on", target=TARGET_LINE))
+        self.assertEqual((1, "pilot_flags_invalid"), stops(worker="on", target=TARGET_LINE))         # the flag off, the target left
+        # And what `pilot on` leaves before `worker on`, and what `pilot off` leaves: a job that does nothing.
+        self.assertEqual((0, "disabled"), stops(pilot="on", target=TARGET_LINE))
+        self.assertEqual((0, "disabled"), stops())
 
 
 if __name__ == "__main__":

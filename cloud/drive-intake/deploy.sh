@@ -85,6 +85,10 @@ STUDIO_SERVICE="${STUDIO_SERVICE:-sfdc24-studio-controller}"
 WORKER_JOB="${WORKER_JOB:-claude-api-worker}"
 # A Drive file id, the same shape main.py's FILE_ID_OK accepts; anything else never reaches curl.
 DOC_ID_OK='^[A-Za-z0-9_-]{10,128}$'
+# By name, as gcloud is. A curl found through PATH is whichever one the shell puts first, and Git
+# for Windows' bash puts its own in front of everything it is handed: a test that gives this script
+# a stand-in must be able to name it, or the real one runs and the request leaves the box.
+CURL="${CURL:-curl}"
 
 # The env of a deployed resource, one NAME=VALUE per line, read back from the job or the service
 # that RUNS, never from this shell. Python parses the JSON (jobs are the v2 shape, services the
@@ -246,7 +250,7 @@ readback() {
   echo "healthz:"
   # A user account's identity token (no --audiences: that flag is for service accounts) is accepted
   # by a private Cloud Run service when the account holds run.invoker, which the project owner does.
-  curl -s -H "Authorization: Bearer $("$GCLOUD" auth print-identity-token)" "${url}/healthz"; echo
+  "$CURL" -s -H "Authorization: Bearer $("$GCLOUD" auth print-identity-token)" "${url}/healthz"; echo
   echo "a scheduler with no lastAttemptTime has never attempted; poll reads unknown until the first tick"
 }
 
@@ -308,7 +312,7 @@ trail() {
   fi
   url="$(service_url)"
   token="$("$GCLOUD" secrets versions access latest --secret DRIVE_INTAKE_POLL_TOKEN --project "$PROJECT")"
-  curl -sS --fail-with-body -H "Authorization: Bearer $("$GCLOUD" auth print-identity-token)" \
+  "$CURL" -sS --fail-with-body -H "Authorization: Bearer $("$GCLOUD" auth print-identity-token)" \
     -H "X-Drive-Intake-Poll-Token: ${token}" "${url}/trail?doc=${doc}" || status=$?
   echo
   if [ "$status" -ne 0 ]; then

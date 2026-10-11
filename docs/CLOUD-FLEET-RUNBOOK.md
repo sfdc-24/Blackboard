@@ -183,7 +183,7 @@ accounts - a share nobody but the owner can do.
    outcome: some other writer already has that task's trail.
 
 **Rollback** is the flag, never a redeploy: `deploy.sh off`, `worker off`,
-`lane off`. A doc already claimed keeps its claim (30 days) and its receipts;
+`lane off`, `pilot off`. A doc already claimed keeps its claim (30 days) and its receipts;
 turning a flag back on resumes from the doc's own trail.
 
 **The cost inputs (#374), without which the worker calls nothing.** Five values
@@ -220,6 +220,34 @@ pilot is on, and `claude-api-worker/deploy.sh pilot on` refuses while the
 service's flag is on. Turn one off before the other goes on. Either verb also
 refuses when it cannot read the other side back: a denied or failed `describe`
 is not "off". Only a resource gcloud says does not exist counts as off.
+
+**The pilot answers one reviewed request (#386).** With the pilot flag on, the
+worker reads `PHONE_DOC_PILOT_TARGET`: a JSON object of exactly five strings
+(`source_doc_id`, `source_revision`, `request_id`, `task_id`, `recipient_id`),
+handed over by the review that approved the request. Flag on and no usable
+target, and the job stops on every tick (`pilot_target_invalid`) and answers
+nothing. So the target is given to the verb, in the shell:
+
+    PHONE_DOC_PILOT_TARGET='{"source_doc_id":"...","source_revision":"...","request_id":"...","task_id":"task-...","recipient_id":"claude-api"}' \
+      bash cloud/claude-api-worker/deploy.sh pilot on
+    bash cloud/claude-api-worker/deploy.sh worker on      # only now can a pass call, and it reads that request only
+    bash cloud/claude-api-worker/deploy.sh pilot off      # the pilot, its target AND the worker, all off
+
+`pilot on` judges the target as the worker will (a doc that is one of the two
+originals, recipient `claude-api`, the id shapes) before anything is read or
+sent, refuses while drive-intake's flag or the lane's flag is on, sends the
+flag and the target in one update, and reads the job back: a job that does not
+hold that flag and that target, to the character, is turned off again. The
+target goes to gcloud in a `--flags-file` and never on a command line: on a
+Windows laptop `gcloud.cmd` breaks on a quote inside an argument and `cmd.exe`
+eats the carets of gcloud's `^@^` form (measured 2026-10-11 with
+`gcloud meta test --arg-dict`, which calls no API). `pilot on` before `worker
+on` is the order: with the worker on first, its passes read the whole inbox
+until the pilot goes on. `pilot off` takes the worker off with it for the same
+reason, in one update and with no read before it; `worker on` brings the
+ordinary worker back. `lane on` refuses while the pilot is on or a target is
+still set: the pilot and the lane together are `pilot_flags_invalid` on every
+tick. A `deploy` leaves no pilot behind: flag off, target empty.
 
 **Step 4: the trail on the call page (#376, site #309).** drive-intake answers
 `GET /trail?doc=<id>` (poll token, then flag, then id) with the doc's receipt
