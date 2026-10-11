@@ -402,15 +402,21 @@ def _claimed(req, state, age, conn, append, already, out, budget, acl, clock) ->
     """A request that already has a marker. Never runs the op. Appends at most the one UNKNOWN notice, and
     only for a bare claim (no append ever attempted) past its grace. Returns the budget left."""
     rid = req["req_id"]
-    if state in ("answered", "answering", "unreadable") or (state == "claimed" and age < CLAIM_GRACE_SECONDS):
+    # A LEGACY marker (written by the image before 6dc6f86: the row id alone, no time, never updated after
+    # the answer) cannot tell "died before answering" from "answered, and this snapshot is stale". The old
+    # image appended its OK right after the op, so a legacy marker is far more often an answered request:
+    # it is SILENT, never the UNKNOWN notice (Cursor on 2d9a669: the notice landed on top of an OK).
+    if (state in ("answered", "answering", "unreadable", "legacy")
+            or (state == "claimed" and age < CLAIM_GRACE_SECONDS)):
         why = {"answered": "already answered: its RESULT row is on the board",
                "answering": "an answer was attempted (append unconfirmed); never appended twice under one Row_ID",
                "unreadable": "the run marker could not be read; not run and not answered, retried next pass",
+               "legacy": "claimed by the previous image, which cannot say whether it answered; silent, not run",
                }.get(state) or "in flight: another run claimed it %ds ago" % max(0, int(age))
         out["refused"].append({"req_id": rid, "why": [why]})
         return budget
-    # A bare claim past its grace, or one from before claims carried a time: the claimant died between the
-    # claim and any answer. One notice, under the same ANSWERING rule as every other row.
+    # A bare claim past its grace: the claimant died between the claim and any answer. One notice, under
+    # the same ANSWERING rule as every other row.
     out["refused"].append({"req_id": rid, "why": ["already claimed: Redis holds this request's run marker"]})
     already.add(rid)
     if not (append and recognised(req, acl)):
@@ -467,7 +473,10 @@ def handle(rows, conn, now=None, append=None, max_per_run=MAX_PER_RUN, clock=tim
         # Judging it again let a request claimed at 29:00 be answered "REFUSED ... older than 30 minutes"
         # after its op had run (Cursor on 6dc6f86) - under the same Row_ID as the answer it may have had.
         is_op = req["action"] == "redis-op" and bool(_REQ_ID.match(req["req_id"] or ""))
-        if is_op and req["req_id"] not in already:
+        # EVERY redis-op request is checked against its marker, RESULT row on the board or not. A git
+        # request is not stopped by a RESULT row (anyone can append one), so skipping the marker when the
+        # snapshot showed a RESULT let a git haudit be answered twice (Cursor on 2d9a669).
+        if is_op:
             state, age = marker_state(conn, run_marker(req), clock)
             if state != "none":
                 budget = _claimed(req, state, age, conn, append, already, out, budget, acl, clock)
@@ -512,10 +521,18 @@ def handle(rows, conn, now=None, append=None, max_per_run=MAX_PER_RUN, clock=tim
         if req["action"] == "redis-op" and (req.get("op") or "").strip().lower() == redis_gov.VERIFY_OP:
             # The public Sheet is not the haudit route. Do not run the manifest and do not publish
             # a receipt. Counts and digests stay with the in-process caller. C11.
+            # The withheld notice is an answer under the RESULT Row_ID like any other: it takes the mark
+            # first (Cursor on 2d9a669: it did not, and a second pass appended it again).
             if append:
-                append(row_for(RESULT_ACTION, req,
-                               "HAUDIT withheld. Request and receipt stay off the board.",
-                               "HAUDIT withheld"))
+                if _mark_answering(conn, req, nx=True):
+                    append(row_for(RESULT_ACTION, req,
+                                   "HAUDIT withheld. Request and receipt stay off the board.",
+                                   "HAUDIT withheld"))
+                    _mark_answered(conn, req)
+                else:
+                    out["refused"].append({"req_id": req["req_id"],
+                                           "why": ["the run marker could not be set; no withheld row"]})
+                    continue
             already.add(req["req_id"])
             out["answered"].append({"req_id": req["req_id"], "status": "REFUSED",
                                     "op": req.get("op"), "key": "",

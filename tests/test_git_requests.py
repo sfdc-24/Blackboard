@@ -24,6 +24,16 @@ CURSOR_ID = 206951365
 BOTS = {str(CURSOR_ID): "cursor"}
 
 
+def _result_row(spec):
+    """A RESULT row as the board would show the one just appended (only the cells handle() reads)."""
+    req = ""
+    for part in str(spec.get("payload", "")).split("|"):
+        if part.startswith("answers="):
+            req = part[len("answers="):]
+    return [spec.get("row_id", "R"), "2026-10-08T14:29:30Z", "bus-reconciler", "cursor", "AYA_RESULT",
+            spec.get("payload") or "BCB|v=1|answers=%s" % req, "", "", "", ""]
+
+
 def comment(body, cid=9001, uid=CURSOR_ID, utype="Bot", login="cursor[bot]", at="2026-10-08T14:25:00Z"):
     return {"id": cid, "body": body, "created_at": at, "updated_at": at,
             "html_url": "https://github.com/sfdc-24/Blackboard/pull/342#issuecomment-%d" % cid,
@@ -127,8 +137,10 @@ class ItRunsThroughTheSameGovernance(unittest.TestCase):
         # The run marker is what stops it; the board RESULT alone is a claim anyone can append and
         # must not (Cursor on 237562f - see test_a_forged_result_row_cannot_stop_a_git_request).
         conn.set(br.run_marker(br.parse_request(rows[0])), "earlier run")
-        out = br.handle([done] + rows, conn, now=NOW, append=[].append)
+        posted = []
+        out = br.handle([done] + rows, conn, now=NOW, append=posted.append)
         self.assertEqual([], out["answered"])
+        self.assertEqual([], posted, "no row on top of the answer (Cursor on 2d9a669: [].append hid one)")
         self.assertIsNone(conn.get("conf:2026-10-08:git:cursor"))
 
     def test_a_lost_result_row_does_not_run_the_write_again_or_answer_twice(self):
@@ -162,9 +174,12 @@ class ItRunsThroughTheSameGovernance(unittest.TestCase):
         conn = FakeRedis()
         rows = gr.rows_from_comments("Blackboard", [comment(SET)], BOTS)
         req_id = br.parse_request(rows[0])["req_id"]
-        conn.set(br.run_marker(br.parse_request(rows[0])), "x")
+        # A bare claim in the current format, past its grace. (A legacy claim, "x", is silent now: the
+        # previous image cannot say whether it answered - Cursor on 2d9a669.)
+        conn.set(br.run_marker(br.parse_request(rows[0])), "x|%d" % int(NOW.timestamp()))
         posted = []
-        br.handle(rows, conn, now=NOW, append=posted.append)
+        br.handle(rows, conn, now=NOW, append=posted.append,
+                  clock=lambda: NOW.timestamp() + br.CLAIM_GRACE_SECONDS + 1)
         self.assertIsNone(conn.get("conf:2026-10-08:git:cursor"))
         self.assertIn("UNKNOWN", posted[0]["payload"])
         self.assertNotIn("already run once", posted[0]["payload"])
@@ -314,6 +329,48 @@ class ItRunsThroughTheSameGovernance(unittest.TestCase):
                       clock=lambda k=k: NOW.timestamp() + br.CLAIM_GRACE_SECONDS + 10 + 60 * k)
         self.assertEqual(1, len(posted))
         self.assertIn("NOT RUN AGAIN", posted[0]["payload"])
+
+    def test_a_withheld_haudit_is_answered_once_on_the_board_and_on_git(self):
+        board = ["ROW-REQ-HAUD01", "2026-10-08T14:29:00Z", "cursor", "bus-reconciler", "AYA_REQ",
+                 "BCB|v=1|id=REQ-HAUD01|req=REQ-HAUD01|do=redis-op|op=haudit|key=proj:x", "", "", "", ""]
+        git = gr.rows_from_comments("Blackboard", [comment(
+            "BCB|v=1|do=redis-op|op=haudit|key=proj:x", cid=9002)], BOTS)
+        for rows in ([board], git):
+            conn, posted = FakeRedis(), []
+            br.handle(rows, conn, now=NOW, append=posted.append, clock=lambda: NOW.timestamp())
+            self.assertEqual(1, len(posted))
+            self.assertIn("withheld", posted[0]["payload"])
+            # The second pass sees the first answer in its snapshot (git: not a stop by itself) or not.
+            br.handle(rows + [_result_row(posted[0])], conn, now=NOW, append=posted.append,
+                      clock=lambda: NOW.timestamp() + 999)
+            br.handle(rows, conn, now=NOW, append=posted.append, clock=lambda: NOW.timestamp() + 999)
+            self.assertEqual(1, len(posted), "withheld once, on %s" % ("git" if rows is git else "board"))
+
+    def test_an_unconfirmed_withheld_haudit_is_not_appended_again(self):
+        board = ["ROW-REQ-HAUD02", "2026-10-08T14:29:00Z", "cursor", "bus-reconciler", "AYA_REQ",
+                 "BCB|v=1|id=REQ-HAUD02|req=REQ-HAUD02|do=redis-op|op=haudit|key=proj:x", "", "", "", ""]
+        conn = FakeRedis()
+
+        def unconfirmed(spec):
+            raise SystemExit(2)
+        with self.assertRaises(SystemExit):
+            br.handle([board], conn, now=NOW, append=unconfirmed, clock=lambda: NOW.timestamp())
+        posted = []
+        br.handle([board], conn, now=NOW, append=posted.append, clock=lambda: NOW.timestamp() + 999)
+        self.assertEqual([], posted, "the first may have landed; its Row_ID is not appended again")
+
+    def test_a_legacy_marker_is_silent_whether_or_not_the_snapshot_shows_the_answer(self):
+        rows = gr.rows_from_comments("Blackboard", [comment(SET)], BOTS)
+        rid = br.parse_request(rows[0])["req_id"]
+        answered = {"payload": "BCB|v=1|answers=%s|text=OK set" % rid, "row_id": "BUS-RECONCILER-RESULT-%s" % rid}
+        for snapshot in (rows, [_result_row(answered)] + rows):
+            conn, posted = FakeRedis(), []
+            conn.set(br.run_marker(br.parse_request(rows[0])), "BUS-ROW-FROM-THE-OLD-IMAGE")
+            out = br.handle(snapshot, conn, now=NOW, append=posted.append,
+                            clock=lambda: NOW.timestamp() + 99999)
+            self.assertEqual([], posted)
+            self.assertEqual([], out["answered"])
+            self.assertIsNone(conn.get("conf:2026-10-08:git:cursor"), "and the op is not run")
 
     def test_no_answering_mark_no_append(self):
         conn = FakeRedis()
