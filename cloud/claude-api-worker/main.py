@@ -563,6 +563,8 @@ def consider(entry_id, fields: dict, deps) -> dict:
         deps.claims.advance(task_id, current, _state(STATE_ACCEPTED, 0, max(0, attempt - 1), rejected))  # lease given up
         out["status"] = "accepted_receipt_owed"
         return out
+    if not _pilot_approval_live(deps, fields):
+        return _stop_unstarted_for_approval(deps, tuple_, text, current, out)
 
     # The cap, BEFORE the call. Price and a conservative maximum are required.
     # Receipt I/O can cross midnight or the authorization cutoff. Redis checks its own
@@ -595,6 +597,9 @@ def consider(entry_id, fields: dict, deps) -> dict:
         deps.claims.advance(task_id, current, _state(STATE_CAPPED, day, max(0, attempt - 1), rejected))
         out["status"] = "capped"
         return out
+    if not _pilot_approval_live(deps, fields):
+        return _stop_unstarted_for_approval(deps, tuple_, text, current, out,
+                                            day=day, reserve_cents=reserve_cents)
 
     # ONE call. Whatever it returns is kept BEFORE the receipt is written (guard 2).
     out["ran"] = True
@@ -657,6 +662,42 @@ def _spent(deps, day):
         return int(deps.ledger.spent(day))
     except Exception:  # noqa: BLE001
         return "?"
+
+
+def _pilot_approval_live(deps, fields):
+    inbox = deps.inbox
+    if getattr(inbox, "target", None) is None:
+        return True  # the ordinary non-pilot worker is unchanged
+    try:
+        return inbox.target_approved_now(fields)
+    except Exception:
+        return False
+
+
+def _stop_unstarted_for_approval(deps, tuple_, text, current, out, day=None, reserve_cents=0):
+    """The provider was not called; release only a confirmed admission reservation."""
+    if reserve_cents:
+        try:
+            deps.ledger.settle(day, -int(reserve_cents))
+            out["ledger"] = "unstarted_reservation_released"
+        except Exception:
+            out["status"] = "approval_unconfirmed_reservation_unknown"
+            return out  # uncertain ledger state requires manual reconciliation
+    out["receipt"] = write_receipt(deps, tuple_, text, FAILED, deps.at,
+                                   "pilot approval not confirmed before inference; no provider call")
+    if out["receipt"] in ("written", "no_receipt_writer"):
+        try:
+            moved = deps.claims.advance(tuple_["task_id"], current, STATE_DONE)
+        except Exception:
+            moved = False
+        if not moved:
+            out["status"] = "approval_unconfirmed_claim_unknown"
+            return out
+        _mark_done(deps, tuple_["task_id"])
+        out["status"] = "approval_unconfirmed"
+    else:
+        out["status"] = "approval_unconfirmed_receipt_owed"
+    return out
 
 
 def _refund(deps, day, reserve_cents):
@@ -867,6 +908,8 @@ def _api_pass(deps, now) -> dict:
         pass
     try:
         entries = list(deps.inbox.read(WORKER, INBOX_LOOKBACK) or [])
+    except pilot.TargetUnavailable:
+        return {"status": "target_unavailable", "considered": []}
     except Exception as exc:  # noqa: BLE001
         return {"status": "inbox_error", "error": type(exc).__name__, "considered": []}
     considered, calls = [], 0
@@ -1365,6 +1408,18 @@ def main():  # pragma: no cover - the job entry point
     if not enabled_from_env() and not lane_enabled_from_env():
         print(json.dumps({"status": "disabled"}))
         return 0
+    pilot_enabled = enabled_from_env() and os.environ.get("PHONE_DOC_INTAKE_ENABLED") == "on"
+    target = None
+    if (os.environ.get("PHONE_DOC_PILOT_TARGET") and not pilot_enabled) or (
+            pilot_enabled and lane_enabled_from_env()):
+        print(json.dumps({"status": "pilot_flags_invalid"}))
+        return 1
+    if pilot_enabled:
+        try:
+            target = pilot.target_from_env(os.environ)
+        except pilot.TargetUnavailable:
+            print(json.dumps({"status": "pilot_target_invalid"}))
+            return 1
     sys.path.insert(0, HERE)
     client = None
     try:
@@ -1379,12 +1434,14 @@ def main():  # pragma: no cover - the job entry point
     except Exception as exc:  # noqa: BLE001
         print(json.dumps({"status": "no_docs", "error": type(exc).__name__}))
     board = AppendBoard() if os.environ.get("BUS_URL") and os.environ.get("BUS_SECRET") else None
-    pilot_enabled = enabled_from_env() and os.environ.get("PHONE_DOC_INTAKE_ENABLED") == "on"
-    intake = pilot.run_prepass(client, docs, enabled=True) if pilot_enabled else None
+    intake = pilot.run_prepass(client, docs, enabled=True, target=target) if pilot_enabled else None
+    if pilot_enabled and not pilot.target_ready(intake, target):
+        print(json.dumps({"status": "pilot_hold", "intake": intake}, sort_keys=True))
+        return 1
     deps = deps_from_env(client=client, docs=docs, board=board)
     if pilot_enabled and client is not None and docs is not None:
-        # API entries from these two Docs only; other queued work cannot call the model.
-        deps.inbox = pilot.PilotInbox(deps.inbox, client)
+        # Only the exact approved tuple can reach the ordinary worker path.
+        deps.inbox = pilot.PilotInbox(deps.inbox, client, target=target)
         deps.pilot_docs = pilot.PilotDocs(docs)
     out = run_once(deps)
     if pilot_enabled:

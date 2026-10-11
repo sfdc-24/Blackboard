@@ -30,6 +30,8 @@ DOC_IDS = (
     "17Q2vBYvxs8PIu-sXXWj67HAU_DL2RfB9-SoQbpeDoWQ",
 )
 DOC_SET = frozenset(DOC_IDS)
+TARGET_FIELDS = ("source_doc_id", "source_revision", "request_id", "task_id", "recipient_id")
+TARGET_LOOKBACK = 500
 BASELINE_TTL = 30 * 86400
 APPROVAL_TTL = 30 * 86400
 BEGIN = "BEGIN OWNER REQUEST"
@@ -47,6 +49,27 @@ RECEIPT = re.compile(
 
 class OutOfScope(ValueError):
     pass
+
+
+class TargetUnavailable(ValueError):
+    """A pinned pilot task cannot be selected without touching other work."""
+
+
+def target_from_env(environ):
+    """A pilot run must name one reviewed request, never a generic inbox pass."""
+    try:
+        target = json.loads(environ["PHONE_DOC_PILOT_TARGET"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise TargetUnavailable("missing or malformed pilot target") from exc
+    if (not isinstance(target, dict) or set(target) != set(TARGET_FIELDS) or
+            any(not isinstance(target[name], str) for name in TARGET_FIELDS) or
+            not allowed(target["source_doc_id"]) or
+            target["recipient_id"] != "claude-api" or
+            not di.ID_OK.fullmatch(target["source_revision"]) or
+            not re.fullmatch(r"[A-Za-z0-9_.:-]{8,128}", target["request_id"]) or
+            not re.fullmatch(r"task-[0-9a-f]{16}", target["task_id"])):
+        raise TargetUnavailable("invalid pilot target")
+    return target
 
 
 def allowed(file_id: str) -> bool:
@@ -200,6 +223,48 @@ def _approval_key(file_id, request_id):
     return "fleet:intake:pilot:approved:" + file_id + ":" + request_id
 
 
+def _issued_key(file_id, request_id):
+    # No TTL: an expired or revoked approval must not become a first request again.
+    return "fleet:intake:pilot:issued:" + file_id + ":" + request_id
+
+
+def _record_json(record):
+    return json.dumps(record, sort_keys=True, separators=(",", ":"))
+
+
+APPROVE_ONCE_LUA = (
+    "if redis.call('EXISTS', KEYS[2]) ~= 0 then return 0 end "
+    "if redis.call('EXISTS', KEYS[1]) ~= 0 then return 0 end "
+    "redis.call('SET', KEYS[2], ARGV[1]) "
+    "redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2]) "
+    "return 1")
+
+
+def _issued_matches(client, record):
+    raw = client.get(_issued_key(record["source_doc_id"], record["request_id"]))
+    try:
+        return raw is not None and json.loads(_as_text(raw)) == record
+    except ValueError:
+        return False
+
+
+def _remember_existing(client, record):
+    """Backfill a durable marker while a legacy approval is still present."""
+    key = _issued_key(record["source_doc_id"], record["request_id"])
+    if client.get(key) is None:
+        client.set(key, _record_json(record), nx=True)
+    return _issued_matches(client, record)
+
+
+def _requested_seen(text, record):
+    heading = di.RECEIPTS_HEADING.search(text or "")
+    if heading is None:
+        return False
+    wanted = di.receipt_id_for(record, di.REQUESTED)
+    return any(match.group("id") == wanted
+               for match in RECEIPT.finditer(text[heading.end():]))
+
+
 def _baseline(client, file_id, ids):
     key = _baseline_key(file_id)
     raw = client.get(key)
@@ -242,10 +307,29 @@ def admitted(fields, client) -> bool:
 class PilotInbox:
     """Keep the laptop lane's inbox untouched; admit only approved API tasks."""
 
-    def __init__(self, inbox, client):
-        self.inbox, self.client = inbox, client
+    def __init__(self, inbox, client, target=None):
+        self.inbox, self.client, self.target = inbox, client, target
+
+    def target_approved_now(self, fields):
+        return (self.target is not None and _entry_tuple(fields) == self.target and
+                admitted(fields, self.client) and _issued_matches(self.client, self.target))
 
     def read(self, agent, count):
+        if self.target is not None:
+            if agent != "claude-api" or count <= 0:
+                raise TargetUnavailable("invalid targeted inbox read")
+            # Redis streams have no field index. A bounded, read-only lookup may
+            # refuse a buried target, but it must never advance the shared cursor.
+            rows = self.client.xrevrange("fleet:inbox:claude-api",
+                                         count=min(count, TARGET_LOOKBACK)) or ()
+            matches = []
+            for entry_id, raw in rows:
+                fields = {_as_text(key): _as_text(value) for key, value in raw.items()}
+                if self.target_approved_now(fields):
+                    matches.append((_as_text(entry_id), fields))
+            if len(matches) != 1:
+                raise TargetUnavailable("target absent, outside lookup bound, or duplicated")
+            return matches
         rows = self.inbox.read(agent, count)
         if agent != "claude-api":
             return rows
@@ -257,6 +341,8 @@ class PilotInbox:
         return approved
 
     def checkpoint(self, agent, entry_id):
+        if self.target is not None:
+            return None  # a targeted pass never consumes the ordinary sweep
         return self.inbox.checkpoint(agent, entry_id)
 
 
@@ -276,7 +362,7 @@ class PilotClaims(di.RedisClaims):
         pass
 
 
-def run_prepass(client, raw_docs, *, enabled=False, now=None, at=None) -> list[dict]:
+def run_prepass(client, raw_docs, *, enabled=False, now=None, at=None, target=None) -> list[dict]:
     """One finite poll over exactly two IDs; no wake transport is configured.
 
     Call this before the worker inbox pass, then use PilotInbox and PilotDocs
@@ -304,16 +390,43 @@ def run_prepass(client, raw_docs, *, enabled=False, now=None, at=None) -> list[d
                 outcomes.append({"status": "too_large", "doc": file_id})
                 continue
             blocks = request_blocks(text)
+            if target is not None and client.get(_baseline_key(file_id)) is None:
+                outcomes.append({"status": "baseline_missing", "doc": file_id})
+                continue
             old_ids = _baseline(client, file_id, [block["id"] for block in blocks])
             if old_ids is None:
                 outcomes.append({"status": "baseline_initialized", "doc": file_id})
                 continue
+            if target is not None:
+                if file_id != target["source_doc_id"]:
+                    outcomes.append({"status": "non_target", "doc": file_id})
+                    continue
+                approval = client.get(_approval_key(file_id, target["request_id"]))
+                if approval is not None:
+                    approved = (admitted({**target, "kind": "drive_request"}, client) and
+                                _remember_existing(client, target))
+                    outcomes.append({"status": "already_approved" if approved else "approval_mismatch",
+                                     "doc": file_id, "task": target["task_id"], "admitted": approved})
+                    continue
+                if client.get(_issued_key(file_id, target["request_id"])) is not None:
+                    outcomes.append({"status": "approval_lapsed", "doc": file_id,
+                                     "task": target["task_id"]})
+                    continue
+                selected = [block for block in blocks if block["id"] == target["request_id"]]
+                if (len(selected) != 1 or selected[0]["revision"] != target["source_revision"] or
+                        selected[0] is not blocks[-1] or selected[0]["id"] in old_ids or
+                        di.correlate(file_id, selected[0]["text"], "r", "claude-api")["task_id"]
+                        != target["task_id"]):
+                    outcomes.append({"status": "target_mismatch", "doc": file_id})
+                    continue
             unseen = [block for block in blocks if block["id"] not in old_ids]
             # Keep the first-observation baseline immutable. A separately
             # approved ID is consumed; an unapproved ID stays pending through
             # queue failures and uncertain receipt readback.
             new = [block for block in unseen if
                    client.get(_approval_key(file_id, block["id"])) is None]
+            if target is not None:
+                new = [block for block in new if block["id"] == target["request_id"]]
             if not new:
                 outcomes.append({"status": "duplicate" if unseen else "no_fresh_request",
                                  "doc": file_id})
@@ -327,10 +440,20 @@ def run_prepass(client, raw_docs, *, enabled=False, now=None, at=None) -> list[d
             if client.get(_approval_key(file_id, candidate["id"])) is not None:
                 outcomes.append({"status": "duplicate", "doc": file_id, "task": tuple_["task_id"]})
                 continue
+            if (client.get(_issued_key(file_id, candidate["id"])) is not None or
+                    _requested_seen(text, tuple_) or
+                    client.get("fleet:intake:put:" + tuple_["task_id"]) is not None):
+                outcomes.append({"status": "approval_lapsed", "doc": file_id,
+                                 "task": tuple_["task_id"]})
+                continue
             expected[file_id] = (candidate["id"], candidate["revision"])
             outcomes.append({"status": "candidate", "doc": file_id, "task": tuple_["task_id"]})
         except Exception as exc:  # failed read/baseline means no admission or spend
             outcomes.append({"status": "intake_error", "doc": file_id, "error": type(exc).__name__})
+    if target is not None and (len(outcomes) != len(DOC_IDS) or any(
+            result.get("status") not in ("candidate", "non_target", "already_approved")
+            for result in outcomes)):
+        return outcomes  # validate both Docs before any targeted queue or approval
     if not expected:
         return outcomes
     docs = PilotDocs(raw_docs, expected)
@@ -353,11 +476,26 @@ def run_prepass(client, raw_docs, *, enabled=False, now=None, at=None) -> list[d
                 if queue.holder(tuple_["task_id"]) == "claude-api":
                     record = {name: tuple_[name] for name in (
                         "source_doc_id", "source_revision", "request_id", "task_id", "recipient_id")}
-                    client.set(_approval_key(file_id, tuple_["request_id"]),
-                               json.dumps(record, sort_keys=True, separators=(",", ":")),
-                               nx=True, ex=APPROVAL_TTL)
-                    outcome["admitted"] = admitted({**record, "kind": "drive_request"}, client)
+                    created = client.eval(APPROVE_ONCE_LUA, 2,
+                                          _approval_key(file_id, tuple_["request_id"]),
+                                          _issued_key(file_id, tuple_["request_id"]),
+                                          _record_json(record), APPROVAL_TTL)
+                    outcome["admitted"] = bool(created) and admitted(
+                        {**record, "kind": "drive_request"}, client)
             except Exception as exc:
                 outcome.update(status="approval_error", error=type(exc).__name__, admitted=False)
         outcomes.append(outcome)
     return outcomes
+
+
+def target_ready(outcomes, target):
+    """Every Doc was checked and only the pinned request is admitted."""
+    return (len(outcomes) in (len(DOC_IDS), len(DOC_IDS) + 1) and
+            sum(result.get("task") == target["task_id"] and result.get("admitted") is True
+                for result in outcomes) == 1 and
+            sum(result.get("status") == "non_target" for result in outcomes) == len(DOC_IDS) - 1 and
+            all((result.get("status") == "non_target" and result.get("doc") != target["source_doc_id"])
+                or (result.get("doc") == target["source_doc_id"] and
+                    result.get("task") == target["task_id"] and
+                    (result.get("status") == "candidate" or result.get("admitted") is True))
+                for result in outcomes))

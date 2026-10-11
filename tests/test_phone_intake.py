@@ -1,8 +1,13 @@
 """Offline tests for the two-Doc pilot; no Google, Redis or model sockets."""
 import importlib.util
+import io
+import json
+import os
 import sys
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -41,6 +46,13 @@ class Redis:
         return True
 
     def eval(self, script, keys, *args):
+        if script == pilot.APPROVE_ONCE_LUA:
+            approval, issued, record, _ttl = args
+            if approval in self.values or issued in self.values:
+                return 0
+            self.values[issued] = record
+            self.values[approval] = record
+            return 1
         if script == di.CAS_LUA:
             key, old, new, _ttl = args
             if self.values.get(key) != old:
@@ -131,6 +143,21 @@ class PhoneIntakeTests(unittest.TestCase):
         self.pass_once()
         self.docs.add_request(self.doc, block())
         return self.pass_once()
+
+    def target(self, request_id="owner-20261011-02", body="Handle the second change."):
+        record = di.correlate(self.doc, block(request_id, body), "r1", "claude-api")
+        record.pop("drive_revision")
+        return pilot.target_from_env({"PHONE_DOC_PILOT_TARGET": json.dumps(record)})
+
+    def targeted_deps(self, target, claims=None, model=None):
+        return worker.Deps(
+            enabled=True,
+            inbox=worker.pilot.PilotInbox(worker.RedisInbox(self.redis), self.redis, target=target),
+            docs=self.docs, receipts=self.docs, claims=claims or worker.MemoryClaims(),
+            ledger=worker.MemoryLedger(), model=model, model_name="offline-mock",
+            folder_id=pilot.FOLDER_ID, now=self.now, at="2026-10-11T05:00:00Z",
+            cap_cents=100, reserve_cents=1, price_in=1, price_out=1, cad_per_usd=1,
+            max_input_tokens=12000, authorized_until=self.now + 3600)
 
     def test_untouched_historical_docs_initialize_then_stay_idle(self):
         self.docs.add_request(self.doc, block("owner-old-0001", "A historical request."))
@@ -224,6 +251,345 @@ class PhoneIntakeTests(unittest.TestCase):
         self.assertEqual(len({row[1]["task_id"] for row in rows}), 2)
         self.assertEqual(sum("SUCCEEDED - task" in text for text in
                              self.docs.documents[self.doc]["text"].splitlines()), 2)
+
+    def test_targeted_pilot_runs_b_without_consuming_older_approved_a(self):
+        self.fresh()  # A is already approved and queued.
+        self.docs.add_request(self.doc, block("owner-20261011-02", "Handle the second change."))
+        self.docs.add_request(pilot.DOC_IDS[1], block("owner-other-0001", "Unrelated Doc."))
+        target = self.target()
+        intake = pilot.run_prepass(self.redis, self.docs, enabled=True, target=target,
+                                   now=self.now, at="2026-10-11T05:00:00Z")
+        self.assertTrue(pilot.target_ready(intake, target), intake)
+        self.assertEqual([row[1]["source_doc_id"] for row in
+                          self.redis.streams["fleet:inbox:claude-api"]], [self.doc, self.doc])
+        calls = []
+
+        def model(_system, prompt):
+            calls.append(prompt)
+            return {"text": "B answer.", "input_tokens": 10, "output_tokens": 5,
+                    "model": "offline-mock", "stop_reason": "end_turn"}
+
+        deps = self.targeted_deps(target, model=model)
+        deps.pilot_docs = pilot.PilotDocs(self.docs)
+        before_cursor = self.redis.values.get("fleet:worker:inbox_scan:claude-api")
+        result = worker.run_once(deps)
+        self.assertEqual((result["calls"], result["considered"][0]["task"]),
+                         (1, target["task_id"]))
+        self.assertEqual(len(calls), 1)
+        self.assertIn("Handle the second change.", calls[0])
+        self.assertNotIn("Summarize the new change.", calls[0])
+        self.assertEqual(self.redis.values.get("fleet:worker:inbox_scan:claude-api"), before_cursor)
+        self.assertNotIn("SUCCEEDED - task " + self.redis.streams["fleet:inbox:claude-api"][0][1]["task_id"],
+                         self.docs.documents[self.doc]["text"])
+        again = worker.run_once(deps)
+        self.assertEqual(again["calls"], 0)
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(pilot.target_ready(pilot.run_prepass(
+            self.redis, self.docs, enabled=True, target=target), target))
+        self.assertEqual(len(self.redis.streams["fleet:inbox:claude-api"]), 2)
+
+    def test_targeted_pilot_rejects_wrong_revision_and_missing_baseline(self):
+        target = self.target()
+        self.docs.add_request(self.doc, block("owner-20261011-02", "Handle the second change."))
+        missing = pilot.run_prepass(self.redis, self.docs, enabled=True, target=target)
+        self.assertFalse(pilot.target_ready(missing, target))
+        self.assertEqual(self.redis.streams, {})
+        self.pass_once()  # historical snapshot only
+        self.docs.add_request(self.doc, block("owner-20261011-03", "A later request."))
+        wrong = dict(target, source_revision="f" * 64)
+        outcome = pilot.run_prepass(self.redis, self.docs, enabled=True, target=wrong)
+        self.assertFalse(pilot.target_ready(outcome, wrong))
+        self.assertEqual(self.redis.streams, {})
+        self.assertEqual(self.docs.appends, [])
+
+    def test_targeted_pilot_validates_both_baselines_before_queueing(self):
+        self.pass_once()
+        self.docs.add_request(self.doc, block("owner-20261011-02", "Handle the second change."))
+        target = self.target()
+        self.redis.values.pop(pilot._baseline_key(pilot.DOC_IDS[1]))
+        outcome = pilot.run_prepass(self.redis, self.docs, enabled=True, target=target)
+        self.assertFalse(pilot.target_ready(outcome, target))
+        self.assertEqual(self.redis.streams, {})
+        self.assertEqual(self.docs.appends, [])
+        self.assertIsNone(self.redis.get(pilot._approval_key(self.doc, target["request_id"])))
+
+    def test_expired_or_revoked_approval_is_not_issued_again_from_old_receipt(self):
+        for cause in ("expired", "revoked"):
+            with self.subTest(cause=cause):
+                self.setUp()
+                self.fresh()
+                self.docs.add_request(self.doc, block("owner-20261011-02", "Handle the second change."))
+                target = self.target()
+                self.assertTrue(pilot.target_ready(pilot.run_prepass(
+                    self.redis, self.docs, enabled=True, target=target), target))
+                approval = pilot._approval_key(self.doc, target["request_id"])
+                issued = pilot._issued_key(self.doc, target["request_id"])
+                self.assertIsNotNone(self.redis.get(issued))
+                row_count = len(self.redis.streams["fleet:inbox:claude-api"])
+                self.redis.values.pop(approval)  # simulated TTL expiry or explicit removal
+                outcome = pilot.run_prepass(self.redis, self.docs, enabled=True, target=target)
+                self.assertFalse(pilot.target_ready(outcome, target))
+                self.assertTrue(any(x["status"] == "approval_lapsed" for x in outcome))
+                self.assertIsNone(self.redis.get(approval))
+                self.assertEqual(len(self.redis.streams["fleet:inbox:claude-api"]), row_count)
+
+    def test_approval_removed_during_accepted_never_reserves_or_calls(self):
+        self.fresh()
+        self.docs.add_request(self.doc, block("owner-20261011-02", "Handle the second change."))
+        target = self.target()
+        self.assertTrue(pilot.target_ready(pilot.run_prepass(
+            self.redis, self.docs, enabled=True, target=target), target))
+        approval = pilot._approval_key(self.doc, target["request_id"])
+        original_append = self.docs.append
+
+        def revoke_at_accept(file_id, revision, receipt_id, receipt):
+            if "ACCEPTED - task" in receipt:
+                self.redis.values.pop(approval, None)
+            return original_append(file_id, revision, receipt_id, receipt)
+
+        self.docs.append = revoke_at_accept
+        calls = []
+        deps = self.targeted_deps(target, model=lambda *_: calls.append(1))
+        deps.pilot_docs = pilot.PilotDocs(self.docs)
+        self.assertGreater(deps.authorized_until, self.now)
+        result = worker.run_once(deps)
+        self.assertEqual(result["considered"][0]["status"], "approval_unconfirmed")
+        self.assertEqual((result["calls"], calls, deps.ledger.days), (0, [], {}))
+        self.assertIn("FAILED - task " + target["task_id"], self.docs.documents[self.doc]["text"])
+        self.assertNotIn("fleet:worker:inbox_scan:claude-api", self.redis.values)
+
+    def test_unreadable_approval_at_accepted_is_reported_as_unconfirmed(self):
+        self.fresh()
+        self.docs.add_request(self.doc, block("owner-20261011-02", "Handle the second change."))
+        target = self.target()
+        self.assertTrue(pilot.target_ready(pilot.run_prepass(
+            self.redis, self.docs, enabled=True, target=target), target))
+        approval = pilot._approval_key(self.doc, target["request_id"])
+        original_append, original_get = self.docs.append, self.redis.get
+        unreadable = False
+
+        def append(file_id, revision, receipt_id, receipt):
+            nonlocal unreadable
+            if "ACCEPTED - task" in receipt:
+                unreadable = True
+            return original_append(file_id, revision, receipt_id, receipt)
+
+        def get(key):
+            if unreadable and key == approval:
+                raise OSError("approval read unavailable")
+            return original_get(key)
+
+        self.docs.append, self.redis.get = append, get
+        calls = []
+        deps = self.targeted_deps(target, model=lambda *_: calls.append(1))
+        deps.pilot_docs = pilot.PilotDocs(self.docs)
+        result = worker.run_once(deps)
+        self.assertEqual(result["considered"][0]["status"], "approval_unconfirmed")
+        self.assertEqual((result["calls"], calls, deps.ledger.days), (0, [], {}))
+        self.assertIn("approval not confirmed", self.docs.documents[self.doc]["text"])
+
+    def test_approval_removed_during_reservation_refunds_unstarted_call(self):
+        self.fresh()
+        self.docs.add_request(self.doc, block("owner-20261011-02", "Handle the second change."))
+        target = self.target()
+        self.assertTrue(pilot.target_ready(pilot.run_prepass(
+            self.redis, self.docs, enabled=True, target=target), target))
+        approval = pilot._approval_key(self.doc, target["request_id"])
+
+        class RevokingLedger(worker.MemoryLedger):
+            def __init__(self, redis):
+                super().__init__()
+                self.redis = redis
+                self.reservations = []
+
+            def reserve(self, day, cents, cap, *args):
+                self.reservations.append(cents)
+                admitted = super().reserve(day, cents, cap, *args)
+                self.redis.values.pop(approval, None)
+                return admitted
+
+        ledger = RevokingLedger(self.redis)
+        calls = []
+        deps = self.targeted_deps(target, model=lambda *_: calls.append(1))
+        deps.pilot_docs = pilot.PilotDocs(self.docs)
+        deps.ledger = ledger
+        self.assertGreater(deps.authorized_until, self.now)
+        result = worker.run_once(deps)
+        self.assertEqual(result["considered"][0]["status"], "approval_unconfirmed")
+        self.assertEqual(result["considered"][0]["ledger"], "unstarted_reservation_released")
+        self.assertEqual((result["calls"], calls), (0, []))
+        self.assertEqual(len(ledger.reservations), 1)
+        self.assertEqual(ledger.days, {"2026-10-10": 0})
+        self.assertEqual(worker.run_once(deps)["status"], "target_unavailable")
+        self.assertNotIn("fleet:worker:inbox_scan:claude-api", self.redis.values)
+
+    def test_unconfirmed_refund_after_approval_loss_keeps_reservation_for_reconciliation(self):
+        self.fresh()
+        self.docs.add_request(self.doc, block("owner-20261011-02", "Handle the second change."))
+        target = self.target()
+        self.assertTrue(pilot.target_ready(pilot.run_prepass(
+            self.redis, self.docs, enabled=True, target=target), target))
+        approval = pilot._approval_key(self.doc, target["request_id"])
+
+        class RefundFails(worker.MemoryLedger):
+            def reserve(self, day, cents, cap, *args):
+                admitted = super().reserve(day, cents, cap, *args)
+                self_redis.values.pop(approval, None)
+                return admitted
+
+            def settle(self, day, delta):
+                raise OSError("refund acknowledgement unavailable")
+
+        self_redis = self.redis
+        calls = []
+        deps = self.targeted_deps(target, model=lambda *_: calls.append(1))
+        deps.pilot_docs = pilot.PilotDocs(self.docs)
+        deps.ledger = RefundFails()
+        result = worker.run_once(deps)
+        self.assertEqual(result["considered"][0]["status"],
+                         "approval_unconfirmed_reservation_unknown")
+        self.assertEqual((result["calls"], calls), (0, []))
+        self.assertEqual(deps.ledger.days, {"2026-10-10": 2})
+        self.assertEqual(worker.run_once(deps)["status"], "target_unavailable")
+
+    def test_targeted_pilot_ignores_concurrent_unrelated_stream_append(self):
+        self.fresh()
+        self.docs.add_request(self.doc, block("owner-20261011-02", "Handle the second change."))
+        target = self.target()
+        self.assertTrue(pilot.target_ready(pilot.run_prepass(
+            self.redis, self.docs, enabled=True, target=target), target))
+        stream = "fleet:inbox:claude-api"
+        unrelated = dict(self.redis.streams[stream][0][1], task_id="task-aaaaaaaaaaaaaaaa")
+        self.redis.streams[stream].append(("1700000000000-99", unrelated))
+        calls = []
+
+        def model(*_):
+            calls.append(1)
+            self.docs.add_request(self.doc, block("owner-20261011-03", "Concurrent C."))
+            return {"text": "B answer.", "input_tokens": 10, "output_tokens": 5,
+                    "model": "offline-mock", "stop_reason": "end_turn"}
+
+        deps = self.targeted_deps(target, model=model)
+        deps.pilot_docs = pilot.PilotDocs(self.docs)
+        self.assertEqual(worker.run_once(deps)["calls"], 1)
+        self.assertEqual(calls, [1])
+        self.assertNotIn("fleet:worker:inbox_scan:claude-api", self.redis.values)
+        self.assertIn("B answer.", self.docs.documents[self.doc]["text"])
+        self.assertNotIn("SUCCEEDED - task task-aaaaaaaaaaaaaaaa", self.docs.documents[self.doc]["text"])
+
+    def test_targeted_pilot_buried_or_duplicate_target_fails_closed(self):
+        self.fresh()
+        self.docs.add_request(self.doc, block("owner-20261011-02", "Handle the second change."))
+        target = self.target()
+        self.assertTrue(pilot.target_ready(pilot.run_prepass(
+            self.redis, self.docs, enabled=True, target=target), target))
+        inbox = pilot.PilotInbox(worker.RedisInbox(self.redis), self.redis, target=target)
+        stream = self.redis.streams["fleet:inbox:claude-api"]
+        stream.append(("1700000000000-99", dict(stream[-1][1])))
+        with self.assertRaises(pilot.TargetUnavailable):
+            inbox.read("claude-api", 500)
+        stream.pop()
+        for n in range(500):
+            stream.append((f"1700000000001-{n}", {"task_id": f"task-{n:016x}"}))
+        with self.assertRaises(pilot.TargetUnavailable):
+            inbox.read("claude-api", 500)
+        deps = self.targeted_deps(target, model=lambda *_: self.fail("model called"))
+        deps.pilot_docs = pilot.PilotDocs(self.docs)
+        self.assertEqual(worker.run_once(deps)["status"], "target_unavailable")
+        self.assertNotIn("fleet:worker:inbox_scan:claude-api", self.redis.values)
+
+    def test_targeted_pilot_wrong_queued_revision_or_approval_never_calls(self):
+        self.fresh()
+        self.docs.add_request(self.doc, block("owner-20261011-02", "Handle the second change."))
+        target = self.target()
+        self.assertTrue(pilot.target_ready(pilot.run_prepass(
+            self.redis, self.docs, enabled=True, target=target), target))
+        row = self.redis.streams["fleet:inbox:claude-api"][-1][1]
+        row["source_revision"] = "f" * 64
+        calls = []
+        deps = self.targeted_deps(target, model=lambda *_: calls.append(1))
+        deps.pilot_docs = pilot.PilotDocs(self.docs)
+        result = worker.run_once(deps)
+        self.assertEqual(result["status"], "target_unavailable")
+        self.assertEqual(result.get("calls", 0), 0)
+        self.assertEqual(calls, [])
+        self.assertEqual(deps.ledger.days, {})
+        self.assertNotIn("fleet:worker:inbox_scan:claude-api", self.redis.values)
+
+    def test_targeted_edit_before_accepted_and_stored_result_retry(self):
+        self.fresh()
+        self.docs.add_request(self.doc, block("owner-20261011-02", "Handle the second change."))
+        target = self.target()
+        self.assertTrue(pilot.target_ready(pilot.run_prepass(
+            self.redis, self.docs, enabled=True, target=target), target))
+        original_append = self.docs.append
+        changed = False
+
+        def edit_at_accept(file_id, revision, receipt_id, receipt):
+            nonlocal changed
+            if not changed and "ACCEPTED - task" in receipt:
+                changed = True
+                doc = self.docs.documents[file_id]
+                doc["text"] = doc["text"].replace("Handle the second change.", "Changed B.")
+                doc["revision_id"] = "r99"
+            return original_append(file_id, revision, receipt_id, receipt)
+
+        self.docs.append = edit_at_accept
+        calls = []
+        deps = self.targeted_deps(target, model=lambda *_: calls.append(1))
+        deps.pilot_docs = pilot.PilotDocs(self.docs)
+        self.assertEqual(worker.run_once(deps)["calls"], 0)
+        self.assertEqual(calls, [])
+        self.assertEqual(deps.ledger.days, {})
+        self.assertNotIn("fleet:worker:inbox_scan:claude-api", self.redis.values)
+
+        # A separate task gets a stored answer but loses its terminal append.
+        # The next targeted pass must write that answer without another call.
+        other = self.target("owner-20261011-04", "A fresh selected task.")
+        self.docs.add_request(self.doc, block("owner-20261011-04", "A fresh selected task."))
+        self.assertTrue(pilot.target_ready(pilot.run_prepass(
+            self.redis, self.docs, enabled=True, target=other), other))
+        failures = 0
+
+        def fail_terminal(file_id, revision, receipt_id, receipt):
+            nonlocal failures
+            if "SUCCEEDED - task" in receipt and failures < 2:
+                failures += 1
+                raise TimeoutError("offline terminal write failure")
+            return original_append(file_id, revision, receipt_id, receipt)
+
+        self.docs.append = fail_terminal
+        model_calls = []
+
+        def answer(*_):
+            model_calls.append(1)
+            return {"text": "Stored answer.", "input_tokens": 10, "output_tokens": 5,
+                    "model": "offline-mock", "stop_reason": "end_turn"}
+
+        retry = self.targeted_deps(other, model=answer)
+        retry.pilot_docs = pilot.PilotDocs(self.docs)
+        first = worker.run_once(retry)
+        second = worker.run_once(retry)
+        self.assertEqual((first["calls"], second["calls"]), (1, 0))
+        self.assertEqual(model_calls, [1])
+        self.assertIn("Stored answer.", self.docs.documents[self.doc]["text"])
+        self.assertNotIn("fleet:worker:inbox_scan:claude-api", self.redis.values)
+
+    def test_pilot_main_requires_target_before_loading_external_clients(self):
+        output = io.StringIO()
+        with patch.dict(os.environ, {"CLAUDE_API_WORKER_ENABLED": "on",
+                                  "PHONE_DOC_INTAKE_ENABLED": "on",
+                                  "PHONE_DOC_PILOT_TARGET": ""}), redirect_stdout(output):
+            self.assertEqual(worker.main(), 1)
+        self.assertIn("pilot_target_invalid", output.getvalue())
+        output = io.StringIO()
+        with patch.dict(os.environ, {"CLAUDE_API_WORKER_ENABLED": "on",
+                                  "PHONE_DOC_INTAKE_ENABLED": "on",
+                                  "CLAUDE_API_LANE_ENABLED": "on",
+                                  "PHONE_DOC_PILOT_TARGET": json.dumps(self.target())}), \
+                redirect_stdout(output):
+            self.assertEqual(worker.main(), 1)
+        self.assertIn("pilot_flags_invalid", output.getvalue())
 
     def test_edited_queued_block_is_superseded_without_using_newer_text(self):
         self.fresh()
@@ -440,7 +806,9 @@ class PhoneIntakeTests(unittest.TestCase):
         self.docs.unknown_readback = False
         self.now += 1
         retry = self.pass_once()
-        self.assertTrue(any(x["status"] == "queued_not_rung" and x.get("admitted") for x in retry))
+        self.assertTrue(any(x["status"] == "approval_lapsed" for x in retry))
+        self.assertFalse(any(key.startswith("fleet:intake:pilot:approved:")
+                             for key in self.redis.values))
         self.assertEqual(len(self.redis.streams["fleet:inbox:claude-api"]), 1)
 
     def test_queue_failure_never_approves_then_recovers(self):
