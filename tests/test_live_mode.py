@@ -65,6 +65,81 @@ def frozen_clock(start):
 START = datetime.datetime(2026, 10, 11, 22, 0, tzinfo=datetime.timezone.utc)
 
 
+class ExpiringRedis(LockRedis):
+    """LockRedis with real TTL semantics on a clock the test moves: a key past its EX is gone for GET,
+    SET NX and the Lua compare alike (Aya on 6dc6f86: the old fake had no expiry at all)."""
+
+    def __init__(self):
+        super().__init__()
+        self.now, self.expires = 0.0, {}
+
+    def _alive(self, key):
+        if key in self.expires and self.now >= self.expires[key]:
+            self.data.pop(key, None)
+            self.expires.pop(key, None)
+
+    def set(self, key, value, nx=False, ex=None):
+        self._alive(key)
+        ok = super().set(key, value, nx=nx, ex=ex)
+        if ok and ex:
+            self.expires[key] = self.now + ex
+        return ok
+
+    def get(self, key):
+        self._alive(key)
+        return super().get(key)
+
+    def eval(self, script, numkeys, key, me, *args):
+        self._alive(key)
+        out = super().eval(script, numkeys, key, me, *args)
+        if script == sr.RENEW_LUA and out:
+            self.expires[key] = self.now + int(args[0])
+        return out
+
+
+class ASlowPassOnARealClock(unittest.TestCase):
+    def test_a_pass_that_outlives_its_lock_writes_nothing_once_another_holds_it(self):
+        conn, written = ExpiringRedis(), []
+        self.assertIsNone(sr.take_lock(conn, "bus-requests-a", 300))
+        write = sr.guarded(written.append, lambda: sr.keep_lock(conn, "bus-requests-a", 300))
+        write({"row_id": "R1"})                                   # renews to now + 300
+        conn.now += 301                                           # one append blocked past the TTL
+        self.assertIsNone(sr.take_lock(conn, "bus-requests-b", 300), "the lock expired; b takes it")
+        with self.assertRaises(sr.LockLost):
+            write({"row_id": "R2"})
+        self.assertEqual([{"row_id": "R1"}], written)
+        self.assertEqual("bus-requests-b", conn.get(sr.WORKER_LOCK_KEY))
+
+    def test_renewal_inside_the_pass_keeps_a_slow_pass_its_lock(self):
+        conn, written = ExpiringRedis(), []
+        sr.take_lock(conn, "bus-requests-a", 300)
+        write = sr.guarded(written.append, lambda: sr.keep_lock(conn, "bus-requests-a", 300))
+        for n in range(5):                                        # five appends, 200 s apart: 1000 s in all
+            conn.now += 200
+            write({"row_id": "R%d" % n})
+            self.assertEqual("bus-requests-a", sr.take_lock(conn, "bus-requests-b", 300), "b is refused")
+            self.assertEqual("bus-requests-a", conn.get(sr.WORKER_LOCK_KEY), "renewed before each write")
+        self.assertEqual(5, len(written))
+
+    def test_an_expired_lock_nobody_took_is_retaken_and_the_pass_goes_on(self):
+        conn, written = ExpiringRedis(), []
+        sr.take_lock(conn, "bus-requests-a", 300)
+        write = sr.guarded(written.append, lambda: sr.keep_lock(conn, "bus-requests-a", 300))
+        conn.now += 400
+        write({"row_id": "R1"})
+        self.assertEqual("bus-requests-a", conn.get(sr.WORKER_LOCK_KEY))
+
+    def test_unknown_ownership_writes_nothing(self):
+        class Down(ExpiringRedis):
+            def eval(self, *a, **k):
+                raise ConnectionError("blip")
+        conn, written = Down(), []
+        self.assertIsNone(sr.keep_lock(conn, "bus-requests-a", 300))
+        with self.assertRaises(sr.LockLost):
+            sr.guarded(written.append, lambda: sr.keep_lock(conn, "bus-requests-a", 300))({"row_id": "R1"})
+        self.assertEqual([], written)
+
+
 class OneWorkerAtATime(unittest.TestCase):
     """2026-10-11: bus-requests-27gvw started beside bus-requests-kdn8k; both answered one request and
     both exited 2 on the duplicate row, and the side channel had no worker from 22:15Z."""
@@ -190,6 +265,20 @@ class OneWorkerAtATime(unittest.TestCase):
         self.assertEqual(0, self.run_main(conn, env, capture))
         self.assertTrue(seen and all(callable(r) for r in seen))
         self.assertTrue(seen[0](), "the renewal a pass gets renews this execution's lock")
+
+    def test_the_live_loop_skips_a_pass_when_ownership_is_unknown_and_keeps_going(self):
+        passes, calls = [], {"n": 0}
+
+        class Flaky(LockRedis):
+            def eval(self, script, numkeys, key, me, *args):
+                calls["n"] += 1
+                if calls["n"] == 2:                       # the first renewal inside the loop
+                    raise ConnectionError("blip")
+                return super().eval(script, numkeys, key, me, *args)
+        env = {"LOOP_UNTIL": "2026-10-11T22:01:00Z", "LOOP_INTERVAL": "10", "CLOUD_RUN_EXECUTION": "bus-requests-a"}
+        conn = Flaky()
+        self.assertEqual(0, self.run_main(conn, env, lambda *a, **k: passes.append(1)))
+        self.assertEqual(5, len(passes), "one of six intervals skipped, the loop not ended")
 
     def test_the_lock_outlasts_one_board_call(self):
         self.assertGreaterEqual(sr.LIVE_LOCK_SECONDS, 300)

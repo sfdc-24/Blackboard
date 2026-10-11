@@ -304,6 +304,17 @@ class ItRunsThroughTheSameGovernance(unittest.TestCase):
         br.handle(rows, conn, now=stale, append=posted.append, clock=lambda: stale.timestamp() + 999)
         self.assertEqual([], posted, "the refusal may have landed; its Row_ID is not appended again")
 
+    def test_the_unknown_notice_is_given_once_however_many_stale_snapshots_follow(self):
+        conn = FakeRedis()
+        rows = gr.rows_from_comments("Blackboard", [comment(SET)], BOTS)
+        conn.set(br.run_marker(br.parse_request(rows[0])), "row-1|%d" % int(NOW.timestamp()))
+        posted = []
+        for k in range(4):                         # the claimant died; four passes, none sees the notice
+            br.handle(rows, conn, now=NOW, append=posted.append,
+                      clock=lambda k=k: NOW.timestamp() + br.CLAIM_GRACE_SECONDS + 10 + 60 * k)
+        self.assertEqual(1, len(posted))
+        self.assertIn("NOT RUN AGAIN", posted[0]["payload"])
+
     def test_no_answering_mark_no_append(self):
         conn = FakeRedis()
         rows = gr.rows_from_comments("Blackboard", [comment(SET)], BOTS)

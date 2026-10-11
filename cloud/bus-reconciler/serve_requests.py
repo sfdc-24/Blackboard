@@ -90,16 +90,17 @@ def take_lock(conn, me, ttl) -> str | None:
     return _text(conn.get(WORKER_LOCK_KEY)) or "(expired while checking - try again)"
 
 
-def keep_lock(conn, me, ttl) -> bool:
-    """Renew the lock for another `ttl`; False when someone else holds it now. A Redis error keeps the
-    pass going: every op is still claimed at most once by its run marker, so a blip costs no double write."""
+def keep_lock(conn, me, ttl):
+    """Renew the lock for another `ttl`. True: ours. False: another execution holds it. None: Redis could
+    not say. FAIL CLOSED (Aya on 6dc6f86): None is not ownership, so nothing is written on it - the caller
+    stops the pass; the live loop skips a pass on None and stops on False."""
     try:
         if conn.eval(RENEW_LUA, 1, WORKER_LOCK_KEY, me, int(ttl)):
             return True
         # Not ours. If it expired and nobody took it, take it back - with NX, so never over a new holder.
         return bool(conn.set(WORKER_LOCK_KEY, me, nx=True, ex=ttl))
     except Exception:                                                    # noqa: BLE001
-        return True
+        return None
 
 
 def drop_lock(conn, me):
@@ -115,8 +116,8 @@ def guarded(append, renew):
         return append
 
     def write(spec):
-        if not renew():
-            raise LockLost("gov:worker:lock is held by another execution; %s not written" % spec.get("row_id"))
+        if renew() is not True:
+            raise LockLost("gov:worker:lock is not provably ours; %s not written" % spec.get("row_id"))
         return append(spec)
     return write
 
@@ -215,9 +216,15 @@ def live(conn, env, execution, me, until, interval, lock_ttl) -> int:
     log.info("live mode: every %ds, GitHub every %ds, until %s", interval, git_every, stop.strftime("%H:%M:%SZ"))
     last_git, passes = None, 0
     while datetime.datetime.now(datetime.timezone.utc) < stop:
-        if not keep_lock(conn, me, lock_ttl):
+        held = keep_lock(conn, me, lock_ttl)
+        if held is False:
             log.error("lost %s to another worker: stopping so only one answers", WORKER_LOCK_KEY)
             break
+        if held is None:
+            # Ownership unknown (a Redis error): no pass, so no write, and try again next interval.
+            log.warning("could not confirm %s; skipping this pass", WORKER_LOCK_KEY)
+            time.sleep(interval)
+            continue
         now = datetime.datetime.now(datetime.timezone.utc)
         with_git = last_git is None or (now - last_git).total_seconds() >= git_every
         try:
@@ -260,8 +267,8 @@ def one_pass(conn, env, execution, with_git=True, quiet=False, renew=None):
     since = (now - datetime.timedelta(minutes=WINDOW_MINUTES)).strftime("%Y-%m-%dT%H:%M:%SZ")
     rows = bus_reconcile.board_rows(env, since=since)
     # The board read can take minutes; the lock is renewed after it, and before each append below.
-    if renew is not None and not renew():
-        raise LockLost("gov:worker:lock was taken during the board read; this pass answers nothing")
+    if renew is not None and renew() is not True:
+        raise LockLost("gov:worker:lock is not provably ours after the board read; this pass answers nothing")
     if not quiet:
         log.info("window since=%s: %d board row(s)", since, len(rows))
     # THE GIT CHANNEL (scripts/git_requests.py): requests from the GitHub bot accounts the access list
