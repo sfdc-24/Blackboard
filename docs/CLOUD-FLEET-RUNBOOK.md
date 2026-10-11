@@ -142,6 +142,22 @@ state proves nothing on its own.
   target, and every read returns all matching rows, so reads slow down as it
   grows. The gateway has no create path; the rollover sheet needs Mr Salam.
 
+## The Redis archive (hourly) and its LEDGER
+
+D5 of `docs/REDIS-PRIMARY.md`, approved by Mr. Salam on 2026-10-11. `redis-central` keeps RDB snapshots
+every hour, has no AOF, and restores a snapshot only through Google's automated recovery; this job is the
+copy we can restore ourselves.
+
+| what | where | flag | script |
+|---|---|---|---|
+| every new entry of `conf:side:*`, `fleet:inbox:*` and `gov:audit`, once an hour, create-only | job `redis-archive` on the bus-reconciler image → `gs://sfdc24-fleet-state/redis-archive/<date>/<hour>/` | `REDIS_ARCHIVE_ENABLED` | `cloud/bus-reconciler/archive.sh` |
+| the LEDGER: per stream the entries archived, newest id, object and SHA-256, and an inbox's unread count after `fleet:cursor:<agent>` | `LEDGER-<execution>.json` beside the objects, and ONE board row (`Action_Type=LEDGER`, addressed to `ledger`, which wakes nobody) | same | same |
+
+**Order:** `setup`, `deploy.sh build`, `deploy`, `dryrun` (writes nothing), `on`, `run`, then
+`verify <the ledger path the run printed>`, then `schedule` (hourly at :05 UTC). **Rollback** is `off`;
+nothing archived is removed. One archiver at a time (`gov:archive:lock`); a run that dies between an
+object and its cursor finds the object next hour and moves on.
+
 ## The broken-telephone path (Drive → intake → worker or laptop → the doc)
 
 The owner's priority one (2026-10-10): he speaks on claude-mobile, it lands in
