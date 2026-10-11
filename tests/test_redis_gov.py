@@ -91,6 +91,25 @@ class FakeRedis:
         import fnmatch
         return [key for key in list(self.data) if fnmatch.fnmatch(key, pattern)]
 
+    def eval(self, script, numkeys, *args):
+        """The bounded confirmation: at most `cap` matching keys, then stop.
+
+        The same rule as redis_gov._BOUND_CONFIRM. The reply does not grow past the cap; one more
+        match sets the truncated flag and is not included."""
+        import fnmatch
+        cap = int(args[0])
+        pattern = args[1].decode("utf-8") if isinstance(args[1], bytes) else str(args[1])
+        found, truncated = [], 0
+        for key in list(self.data):
+            text = key.decode("utf-8") if isinstance(key, bytes) else key
+            if not fnmatch.fnmatch(text, pattern):
+                continue
+            if len(found) >= cap:
+                truncated = 1
+                break
+            found.append(key)
+        return [truncated, found]
+
     def expire(self, key, seconds):
         self.ttls[key] = seconds
         return True

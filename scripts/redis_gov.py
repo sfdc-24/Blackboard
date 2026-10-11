@@ -512,6 +512,71 @@ def _bound_head(prefix: str, generation: str) -> str:
     return head
 
 
+# Confirmation listing. Runs inside the WATCH transaction, so it sees a key inserted after the
+# second scan. SCAN stops once `cap` matches are in hand; the reply is that many names plus a
+# truncated flag, never the rest of the generation. KEYS is not used: it has no result cap.
+_BOUND_CONFIRM = """
+local cap = tonumber(ARGV[1])
+local pattern = ARGV[2]
+local cursor = '0'
+local found = {}
+local truncated = 0
+if cap == nil or cap < 1 then
+  return redis.error_reply('cap')
+end
+repeat
+  local reply = redis.call('SCAN', cursor, 'MATCH', pattern, 'COUNT', cap)
+  cursor = reply[1]
+  local batch = reply[2]
+  for i = 1, #batch do
+    if #found >= cap then
+      truncated = 1
+      break
+    end
+    found[#found + 1] = batch[i]
+  end
+  if truncated == 1 then
+    break
+  end
+until cursor == '0'
+return {truncated, found}
+"""
+
+
+def _bounded_page(raw, prefix, cap):
+    """(names, truncated) from a confirmation page, or None when the page is unusable.
+
+    At most `cap` names are kept. A longer page is truncated and the extra names are not read.
+    Over the cap is not a confirmed set."""
+    if not isinstance(raw, (list, tuple)) or len(raw) != 2:
+        return None
+    flag, listed_raw = raw
+    if isinstance(flag, bytes):
+        try:
+            flag = flag.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    try:
+        truncated = bool(int(flag))
+    except (TypeError, ValueError):
+        return None
+    if isinstance(listed_raw, (str, bytes)) or not isinstance(listed_raw, (list, tuple)):
+        return None
+    names = []
+    for key in listed_raw:
+        if len(names) >= cap:
+            return names, True
+        try:
+            text = _strict_text(key)
+        except UnicodeDecodeError:
+            return None
+        if text.startswith(prefix):
+            names.append(text)
+    if len(listed_raw) > cap:
+        truncated = True
+    return names, truncated
+
+
 def _exec_error(results) -> str:
     """The type name of the first failed command, or "" when every result is a value.
 
@@ -620,11 +685,12 @@ def _audit_generation(conn, acl, who, raw_tag, via, prefix, field, raw_value, en
     """Compare one generation to the caller's digest manifest.
 
     Reads are watched. The head key is derived from the generation namespace and a different head
-    is refused. The key set is listed again inside the confirming transaction, so a key inserted
-    after the second scan still fails the audit. Every command result from that transaction is
-    checked; a queued error is not a pass. A listing that stops early, or a read that does not
-    finish, is partial and is not a pass. TimeoutError is returned as timeout, with the correlation
-    id, and its message is not. Invalid UTF-8 is not decoded with replacement and is not a match."""
+    is refused. The key set is confirmed inside the transaction by a SCAN that stops at the listing
+    cap, so a key inserted after the second scan still fails the audit and a generation over the
+    cap is partial, not a pass. Every command result from that transaction is checked; a queued
+    error is not a pass. A listing that stops early, or a read that does not finish, is partial and
+    is not a pass. TimeoutError is returned as timeout, with the correlation id, and its message is
+    not. Invalid UTF-8 is not decoded with replacement and is not a match."""
     if field:
         raise Refused("haudit takes no field=")
     if not generation:
@@ -725,11 +791,12 @@ def _audit_generation(conn, acl, who, raw_tag, via, prefix, field, raw_value, en
         if not timed_out and not hard_error:
             try:
                 # The second scan has already returned. A key created after it is not watched, so
-                # WATCH on the old set would still confirm. Listing inside this transaction is the
-                # key set at confirmation; any difference is movement and is not a pass.
+                # WATCH on the old set would still confirm. The SCAN below runs at EXEC and stops
+                # at the cap: a finished page that differs is movement, and a page that hits the
+                # cap with keys left over is partial. Neither is a pass. KEYS is not used.
                 pipe.multi()
                 pipe.type(head)
-                pipe.keys(prefix + "*")
+                pipe.eval(_BOUND_CONFIRM, 0, str(MAX_AUDIT_LISTED), prefix + "*")
                 confirmed = pipe.execute(raise_on_error=False)
                 failed = _exec_error(confirmed)
                 if failed or len(confirmed) != 2:
@@ -737,19 +804,17 @@ def _audit_generation(conn, acl, who, raw_tag, via, prefix, field, raw_value, en
                     partial = True
                     head_match = False
                 else:
-                    listed_raw = confirmed[1]
-                    if isinstance(listed_raw, (str, bytes)) or not isinstance(
-                            listed_raw, (list, tuple, set)):
+                    page = _bounded_page(confirmed[1], prefix, MAX_AUDIT_LISTED)
+                    if page is None:
                         hard_error = "ExecError"
                         partial = True
                         head_match = False
                     else:
-                        listed = []
-                        for key in listed_raw:
-                            text = _strict_text(key)
-                            if text.startswith(prefix):
-                                listed.append(text)
-                        if set(listed) != set(found):
+                        listed, truncated_page = page
+                        if truncated_page:
+                            partial = True
+                            head_match = False
+                        elif set(listed) != set(found):
                             moved = True
                             head_match = False
             except Exception as error:

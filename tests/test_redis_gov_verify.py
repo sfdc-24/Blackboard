@@ -70,6 +70,16 @@ def put_hash(conn, key, mapping):
     conn.hset(key, mapping=dict(mapping))
 
 
+def _page_size(result):
+    """How many key names a confirmation command returned, or None when it is not a listing."""
+    if isinstance(result, (list, tuple)) and len(result) == 2 and isinstance(result[1], (list, tuple)):
+        if not isinstance(result[0], (list, tuple, dict)):
+            return len(result[1])
+    if isinstance(result, (list, tuple)) and result and isinstance(result[0], (str, bytes)):
+        return len(result)
+    return None
+
+
 def audit(conn, gen, expected, cid="cid-audit-1", who="cursor", head=None, prefix=None, **kw):
     prefix = prefix or prefix_for(gen)
     head = head or "proj:pr-board:v1:head"
@@ -471,6 +481,69 @@ class GenerationAudit(unittest.TestCase):
         self.assertTrue(good["ok"], good)
         self.assertEqual("match", good["keys"][0]["status"])
         self.assertEqual(spec(text)["sha256"], good["keys"][0]["sha256"])
+
+    def test_confirmation_fetches_at_most_the_cap(self):
+        """300 generation keys, cap 128. The confirmation reply stops at the cap and is not a pass.
+
+        The race test still has to pass: a key inserted after the second scan is movement."""
+        cap = 128
+        self.assertEqual(cap, gov.MAX_AUDIT_LISTED)
+        conn = AuditRedis()
+        gen = generation("f")
+        prefix = prefix_for(gen)
+        for n in range(300):
+            put_hash(conn, prefix + "%03d" % n, {"n": "1"})
+        put_hash(conn, "proj:pr-board:v1:head", {"generation": gen})
+        pulled = {"n": 0}
+
+        def watch(name):
+            real = getattr(conn, name)
+
+            def wrapped(*args, **kwargs):
+                result = real(*args, **kwargs)
+                size = _page_size(result)
+                if size is not None:
+                    pulled["n"] = max(pulled["n"], size)
+                return result
+
+            return wrapped
+
+        for name in ("keys", "scan", "eval"):
+            if hasattr(AuditRedis, name) or name in conn.__dict__:
+                setattr(conn, name, watch(name))
+        one = prefix + "000"
+        out = audit(conn, gen, {one: spec({"n": "1"})}, cid="cid-cap-300")
+        self.assertLessEqual(pulled["n"], cap)
+        self.assertEqual(cap, pulled["n"])
+        self.assertTrue(out["partial"] or not out["ok"])
+        self.assertTrue(out["partial"], out)
+        self.assertFalse(out["ok"])
+        self.assertFalse(out["coverage"]["covered"])
+        self.assertEqual("cid-cap-300", out["correlation"])
+
+        exact = AuditRedis()
+        gen2 = generation("0")
+        prefix2 = prefix_for(gen2)
+        hashes = {prefix2 + "%03d" % n: {"n": "1"} for n in range(cap)}
+        for key, mapping in hashes.items():
+            put_hash(exact, key, mapping)
+        put_hash(exact, "proj:pr-board:v1:head", {"generation": gen2})
+        exact_pulled = {"n": 0}
+        real_eval = exact.eval
+
+        def eval_exact(*args, **kwargs):
+            result = real_eval(*args, **kwargs)
+            exact_pulled["n"] = max(exact_pulled["n"], _page_size(result) or 0)
+            return result
+
+        exact.eval = eval_exact
+        covered = audit(exact, gen2, {key: spec(mapping) for key, mapping in hashes.items()},
+                        cid="cid-cap-exact")
+        self.assertLessEqual(exact_pulled["n"], cap)
+        self.assertTrue(covered["ok"], covered)
+        self.assertFalse(covered["partial"])
+
+        self.test_a_key_inserted_after_the_second_scan_is_not_a_pass()
 
 
 class ScopeAndManifest(unittest.TestCase):
