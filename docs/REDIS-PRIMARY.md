@@ -138,12 +138,40 @@ phase: it is a new door, not a net, and it waits on D1.
   in `gov:audit`; in a call, a voice's line is in `conf:side` under the chair's principal with the voice
   named; a message deliberately left unread is flagged by the next LEDGER row (negative control).
 
-**Phase 3 — the desktop agents get the bridge (needs D1, D2).**
-- `POST /op` on `redis-tool-bridge`; `scripts/redis_inbox.py` sends through it when it can mint a token
-  and falls back as §8.8 says when it cannot or is refused. Cursor's git-channel answers move to PR comments.
-- *Exit tests:* Aya and claude-code-cli each complete a round trip with zero board rows, and `gov:audit`
-  names the **verified** caller; a deliberately broken access-list entry produces the §8.8 fallback and
-  alert, not silence.
+**Phase 3 — the desktop agents get the bridge (needs D1, D2).** Gemini asked (2026-10-11) how the
+bridge's own failures are caught before anyone relies on it, since it is not in the safety-net phase.
+Answer: Phase 3 is two steps, and nobody's traffic moves in the first.
+
+*What is already proved, and what is new.* `POST /op` calls the same `redis_gov.execute` the board route
+calls, so access-list refusals, protected namespaces and the audit are the tested code of
+`tests/test_redis_gov.py`. The bridge adds exactly two layers that can fail on their own: the HTTP
+surface (token, audience, caller allowlist) and the mapping from a **verified** caller to a principal.
+The gate below is aimed at those two.
+
+*3a — the gate (no agent traffic).*
+- CI, with a fake verifier and a fake Redis: every failure has its own status and a reason in the body —
+  401 for a missing or wrong-audience token, 403 `not-a-caller` for a token outside the allowlist,
+  403 `refused` (with `redis_gov`'s reason) for an access-list refusal, 503 for Redis unreachable — and
+  the client treats every non-2xx as a failure it says out loud (§8.8).
+- CI: every caller in the bridge's allowlist maps to a principal in `scripts/redis_acl.json` with write
+  on `fleet:` and `conf:` — the typo that would lock an agent out is caught before deploy.
+- Negative controls against the deployed bridge, from a dedicated canary identity: a wrong-audience
+  token, a caller not on the allowlist, and a canary principal with a deliberately broken entry. Each
+  must produce its exact status, and the broken entry must produce the plain board message and the
+  alert of §8.8.
+- An **hourly canary**: the canary identity writes and reads `fleet:canary:bridge` through `/op`; the
+  LEDGER row carries its result, so a bridge that breaks is reported by the record before an agent
+  meets it — the `/probe` idea, carried through the real path.
+
+*3b — cutover, one agent at a time.*
+- `scripts/redis_inbox.py` sends through the bridge when it can mint a token, with a per-agent switch
+  back to the governed board route. A breaker: after three bridge failures in a row it stays on the board
+  route for 15 minutes and says so in one row, so a broken bridge costs latency, not messages.
+- Cursor's git-channel answers move to PR comments.
+
+*Exit tests:* Aya and claude-code-cli each complete a round trip with zero board rows, and `gov:audit`
+names the **verified** caller; the canary has passed every hour for 48 hours; a deliberately broken
+access-list entry produces the §8.8 fallback and alert, not silence.
 
 **Phase 4 — the Sheet stops being a live channel.** Mr. Salam's 2026-10-09 condition, made checkable: 48
 hours in which every agent's traffic is on Redis, every LEDGER row reconciles with the archive, and no
