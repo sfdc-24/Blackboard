@@ -379,33 +379,85 @@ def complete_receipt(conn, acl, raw_tag, via, prefix, raw_value, enc, generation
                    generation=generation, correlation=correlation, head=head, now=now)
 
 
+def _real_bool(value, expected):
+    """True only for a real bool with this value. 0, 1, and strings are not bools."""
+    return type(value) is bool and value is expected
+
+
+def _as_hex64(value):
+    """A 64-hex str, or None. Numbers and bytes are not coerced, so they cannot reach re.fullmatch."""
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+        return None
+    return value
+
+
 def backend_receipt_accepts(receipt) -> bool:
     """True only for a complete backend receipt the site may publish or mark ACTION ready.
 
     None, a flag-off refusal, a single page, a moved head, and a root mismatch are false.
     A full pass has page_ok true. The gate accepts that.
+
+    Every field this gate reads is typed before it is used. A dict must be a dict, a digest or
+    id must be a str, a count must be a strict int, and a flag must be a real bool. A wrong
+    type returns False and does not raise. Counts have to agree: listed equals the coverage
+    expected, seen, and matched counts; missing, extra, and changed are 0; pages equals
+    page_count; and that count is a full union of indexes 0..N-1 at page size 8, N at least 2.
+    manifest_root and head_manifest_root are non-empty hex strings and equal.
     """
     if not isinstance(receipt, dict):
         return False
-    if receipt.get("ok") is not True or receipt.get("page_ok") is not True:
+    if not _real_bool(receipt.get("ok"), True) or not _real_bool(receipt.get("page_ok"), True):
         return False
-    if receipt.get("partial") or receipt.get("moved") or receipt.get("timeout"):
+    if not _real_bool(receipt.get("partial"), False) or not _real_bool(receipt.get("moved"), False):
+        return False
+    if not _real_bool(receipt.get("timeout"), False):
+        return False
+    if receipt.get("op") != VERIFY_OP or receipt.get("audit") != "ok":
+        return False
+    correlation = receipt.get("correlation")
+    if not isinstance(correlation, str) or not correlation:
+        return False
+    if "refused" in receipt and not isinstance(receipt.get("refused"), str):
+        return False
+    if "error" in receipt and not isinstance(receipt.get("error"), str):
         return False
     if receipt.get("refused") or receipt.get("error"):
         return False
-    coverage = receipt.get("coverage") or {}
-    if coverage.get("covered") is not True:
+    coverage = receipt.get("coverage")
+    if not isinstance(coverage, dict) or not _real_bool(coverage.get("covered"), True):
         return False
-    root = receipt.get("manifest_root") or ""
-    head_root = receipt.get("head_manifest_root") or ""
-    if not re.fullmatch(r"[0-9a-f]{64}", root) or root != head_root:
+    root = _as_hex64(receipt.get("manifest_root"))
+    head_root = _as_hex64(receipt.get("head_manifest_root"))
+    if root is None or head_root is None or root != head_root:
         return False
-    if int(receipt.get("page_count") or 0) < 2:
+    if _as_hex64(receipt.get("digest")) is None or _as_hex64(receipt.get("manifest_digest")) is None:
         return False
-    generation = receipt.get("generation") or ""
-    if not re.fullmatch(r"[0-9a-f]{64}", generation):
+    generation = _as_hex64(receipt.get("generation"))
+    if generation is None or _as_hex64(receipt.get("head_generation")) != generation:
         return False
-    if receipt.get("head_generation") != generation:
+    page_count = _strict_int(receipt.get("page_count"))
+    pages = _strict_int(receipt.get("pages"))
+    listed = _strict_int(receipt.get("listed"))
+    length = _strict_int(receipt.get("length"))
+    if page_count is None or pages is None or listed is None or length is None or length <= 0:
+        return False
+    # pages is the length of the union. Indexes 0..N-1, N at least 2, every page but the last full.
+    if page_count < 2 or page_count != pages or page_count > MAX_AUDIT_PAGES:
+        return False
+    if listed > MAX_GENERATION_DOCS:
+        return False
+    span = (page_count - 1) * PAGE_SIZE
+    if listed <= span or listed > page_count * PAGE_SIZE:
+        return False
+    counts = {}
+    for name in ("expected", "seen", "missing", "extra", "changed", "matched"):
+        got = _strict_int(coverage.get(name))
+        if got is None:
+            return False
+        counts[name] = got
+    if counts["expected"] != listed or counts["seen"] != listed or counts["matched"] != listed:
+        return False
+    if counts["missing"] != 0 or counts["extra"] != 0 or counts["changed"] != 0:
         return False
     return True
 
@@ -637,6 +689,13 @@ def _hex64(value) -> str:
     return text if re.fullmatch(r"[0-9a-f]{64}", text) else ""
 
 
+def _strict_int(value):
+    """An int, or None. Bool and str are not coerced, so page_count='bad' does not raise."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
 def _count_field(raw):
     """A head count, or None when the field is not a small integer. The raw text is not returned."""
     text = _text(raw or "").strip()
@@ -811,8 +870,10 @@ def report_digest(specs) -> tuple:
 
 
 def _audit_report(entries) -> tuple:
-    specs = {entry["key"]: {"sha256": entry.get("sha256") or "", "len": int(entry.get("len") or 0)}
-             for entry in entries}
+    specs = {}
+    for entry in entries:
+        length = _strict_int(entry.get("len"))
+        specs[entry["key"]] = {"sha256": entry.get("sha256") or "", "len": 0 if length is None else length}
     return report_digest(specs)
 
 
@@ -826,6 +887,27 @@ def _publish_audit(entries, generation, correlation, coverage, partial, moved, t
     also requires the full 0..N-1 union, the recomputed root, and an unchanged head.
     Partial or incomplete is never ok. ``extra`` is not a keyspace claim."""
     digest, length = _audit_report(entries)
+    numbers_ok = True
+    counted = {}
+    for name in ("expected", "seen", "missing", "extra", "changed", "matched", "pages"):
+        got = _strict_int(coverage.get(name))
+        if got is None:
+            numbers_ok = False
+            got = 0
+        counted[name] = got
+    raw_page_count = coverage.get("page_count")
+    page_count = _strict_int(raw_page_count)
+    if page_count is None:
+        if raw_page_count is not None:
+            numbers_ok = False
+            page_count = 0
+        else:
+            page_count = counted["pages"]
+    listed = counted["expected"]
+    shown_length = _strict_int(length)
+    if shown_length is None:
+        numbers_ok = False
+        shown_length = 0
     out = {
         "ok": False,
         "page_ok": False,
@@ -838,30 +920,33 @@ def _publish_audit(entries, generation, correlation, coverage, partial, moved, t
         "head_generation": head_generation if re.fullmatch(r"[0-9a-f]{64}", head_generation or "") else "",
         "head_manifest_root": head_root if re.fullmatch(r"[0-9a-f]{64}", head_root or "") else "",
         "coverage": {
-            "expected": int(coverage.get("expected") or 0),
-            "seen": int(coverage.get("seen") or 0),
-            "missing": int(coverage.get("missing") or 0),
-            "extra": int(coverage.get("extra") or 0),
-            "changed": int(coverage.get("changed") or 0),
-            "matched": int(coverage.get("matched") or 0),
+            "expected": counted["expected"],
+            "seen": counted["seen"],
+            "missing": counted["missing"],
+            "extra": counted["extra"],
+            "changed": counted["changed"],
+            "matched": counted["matched"],
             "covered": False,
         },
         "audit": audit or "",
     }
     out["digest"] = digest
-    out["length"] = length
-    out["listed"] = int(coverage.get("expected") or 0)
-    out["pages"] = int(coverage.get("pages") or 0)
+    out["length"] = shown_length
+    out["listed"] = listed
+    out["pages"] = counted["pages"]
     out["manifest_digest"] = (manifest_digest_hex
                               if re.fullmatch(r"[0-9a-f]{64}", manifest_digest_hex or "") else "")
     out["manifest_root"] = (root_digest_hex
                             if re.fullmatch(r"[0-9a-f]{64}", root_digest_hex or "") else "")
-    out["page_count"] = int(coverage.get("page_count") or coverage.get("pages") or 0)
+    out["page_count"] = page_count
+    if not numbers_ok:
+        out["partial"] = True
     page_clean = (out["coverage"]["missing"] == 0 and out["coverage"]["extra"] == 0
                   and out["coverage"]["changed"] == 0
                   and out["coverage"]["matched"] == out["coverage"]["expected"]
                   and out["coverage"]["expected"] > 0 and not out["partial"] and not out["moved"]
-                  and not out["timeout"] and not refused and not error and bool(coverage.get("page_read")))
+                  and not out["timeout"] and not refused and not error and numbers_ok
+                  and bool(coverage.get("page_read")))
     # A single page is page_ok only. Full ok needs the complete 0..N-1 union, N at least 2.
     full = page_clean and bool(coverage.get("complete"))
     out["coverage"]["covered"] = full
@@ -960,24 +1045,24 @@ def _read_listed(pipe, names, records):
 
 
 def _read_in_batches(conn, head, names, before):
-    """Read listed keys in batches of MAX_AUDIT_BATCH. Revalidate the head around every page.
+    """Read listed keys in batches of MAX_AUDIT_BATCH. One WATCH set lasts until the final EXEC.
 
-    The head snapshot was taken before any document. Each batch watches the head and its keys,
-    then reads at most 128 documents, one manifest page at a time. The head is read again after
-    every page, including page 0, and TYPE is confirmed inside EXEC at the end of a clean batch.
-    A head change at any of those points stops the read: later pages and later batches are not
-    fetched, and the result is not ok. There is no KEYS and no SCAN."""
+    The head snapshot was taken before any document. Each batch reads at most 128 documents,
+    one manifest page at a time, and the head is read again after every page. Watches are not
+    reset between batches. TYPE runs once, after the last batch, on the head and every listed
+    key. A change to a document from an earlier batch aborts that confirmation: the receipt is
+    not ok and moved. There is no KEYS and no SCAN. The batch size and the generation ceiling
+    are unchanged."""
     records = {}
     partial = timed_out = bound = moved = False
     hard_error = ""
     snapshot = _head_raw(before)
-    size = MAX_AUDIT_BATCH
-    for start in range(0, len(names), size):
-        batch = names[start:start + size]
-        pipe = conn.pipeline(transaction=True)
-        stop = False
-        try:
-            pipe.watch(head)
+    pipe = conn.pipeline(transaction=True)
+    read_names = []
+    try:
+        pipe.watch(head)
+        for start in range(0, len(names), MAX_AUDIT_BATCH):
+            batch = names[start:start + MAX_AUDIT_BATCH]
             try:
                 now = _hash_head(pipe, head)
             except Exception as error:
@@ -993,12 +1078,13 @@ def _read_in_batches(conn, head, names, before):
                 break
             for name in batch:
                 pipe.watch(name)
+            failed = False
             for page_start in range(0, len(batch), PAGE_SIZE):
                 page = batch[page_start:page_start + PAGE_SIZE]
                 read_partial, timed_out, hard_error, bound = _read_listed(pipe, page, records)
                 partial = partial or read_partial
                 if timed_out or hard_error or bound:
-                    stop = True
+                    failed = True
                     break
                 try:
                     after = _hash_head(pipe, head)
@@ -1008,36 +1094,36 @@ def _read_in_batches(conn, head, names, before):
                         timed_out = True
                     else:
                         hard_error = type(error).__name__
-                    stop = True
+                    failed = True
                     break
                 if _head_raw(after) != snapshot:
                     moved = True
                     partial = True
-                    stop = True
+                    failed = True
                     break
-            if stop:
+            if failed:
                 break
+            read_names.extend(batch)
+        if not (partial or timed_out or hard_error or bound or moved) and len(read_names) == len(names):
             pipe.multi()
             pipe.type(head)
-            for name in batch:
+            for name in read_names:
                 pipe.type(name)
             confirmed = pipe.execute(raise_on_error=False)
-            failed = _exec_error(confirmed)
-            if failed or len(confirmed) != 1 + len(batch):
-                hard_error = failed or "ExecError"
+            failed_exec = _exec_error(confirmed)
+            if failed_exec or len(confirmed) != 1 + len(read_names):
+                hard_error = failed_exec or "ExecError"
                 partial = True
-                break
-        except Exception as error:
-            partial = True
-            if type(error).__name__ == "WatchError":
-                moved = True
-            elif _is_timeout(error):
-                timed_out = True
-            else:
-                hard_error = type(error).__name__
-            break
-        finally:
-            pipe.reset()
+    except Exception as error:
+        partial = True
+        if type(error).__name__ == "WatchError":
+            moved = True
+        elif _is_timeout(error):
+            timed_out = True
+        else:
+            hard_error = type(error).__name__
+    finally:
+        pipe.reset()
     return records, partial, timed_out, hard_error, bound, moved
 
 
@@ -1259,20 +1345,24 @@ def _summarise_verify(result: dict) -> str:
             result["refused"], result.get("audit", "?"))
     cov = result.get("coverage") or {}
     # Counts and digests only. Listed key names are not part of a board line.
+    def shown(value):
+        got = _strict_int(value)
+        return 0 if got is None else got
+
     return ("HAUDIT ok=%d page_ok=%d gen=%s cid=%s listed=%d page_count=%d expected=%d seen=%d "
             "missing=%d extra=%d changed=%d matched=%d covered=%d partial=%d moved=%d timeout=%d "
             "manifest_root=%s manifest=%s digest=%s length=%d%s" % (
                 int(bool(result.get("ok"))), int(bool(result.get("page_ok"))),
                 result.get("generation") or "-", result.get("correlation") or "-",
-                int(result.get("listed") or cov.get("expected") or 0),
-                int(result.get("page_count") or result.get("pages") or 0),
-                int(cov.get("expected") or 0),
-                int(cov.get("seen") or 0), int(cov.get("missing") or 0), int(cov.get("extra") or 0),
-                int(cov.get("changed") or 0), int(cov.get("matched") or 0),
+                shown(result.get("listed") if result.get("listed") is not None else cov.get("expected")),
+                shown(result.get("page_count") if result.get("page_count") is not None else cov.get("pages")),
+                shown(cov.get("expected")),
+                shown(cov.get("seen")), shown(cov.get("missing")), shown(cov.get("extra")),
+                shown(cov.get("changed")), shown(cov.get("matched")),
                 int(bool(cov.get("covered"))), int(bool(result.get("partial"))),
                 int(bool(result.get("moved"))), int(bool(result.get("timeout"))),
                 result.get("manifest_root") or "-", result.get("manifest_digest") or "-",
-                result.get("digest") or "-", int(result.get("length") or 0),
+                result.get("digest") or "-", shown(result.get("length")),
                 (" error=%s" % result["error"]) if result.get("error") else ""))
 
 
