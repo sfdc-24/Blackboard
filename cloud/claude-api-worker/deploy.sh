@@ -84,10 +84,12 @@ setup() {
       --condition None >/dev/null
     echo "granted secretAccessor on ${secret} to ${SA}"
   done
-  # The ticker runs the job (run.invoker on the job) and must be usable by the scheduler agent.
+  # The ticker runs the job (run.invoker on the job). The scheduler agent mints that account's
+  # OAuth token only with Token Creator; without it the tick is created and never attempts
+  # (status -1, no lastAttemptTime). Same grant as scripts/gcp_scheduler_bootstrap.py.
   "$GCLOUD" iam service-accounts add-iam-policy-binding "$INVOKER" --project "$PROJECT" \
     --member "serviceAccount:service-${PROJECT_NUMBER}@gcp-sa-cloudscheduler.iam.gserviceaccount.com" \
-    --role roles/iam.serviceAccountUser >/dev/null
+    --role roles/iam.serviceAccountTokenCreator >/dev/null
   echo "NOW, IN DRIVE (yours): share folder ${FOLDER_ID} (Viewer) and the two originals (Editor) with ${SA}"
 }
 

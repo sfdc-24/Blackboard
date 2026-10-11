@@ -816,8 +816,9 @@ def handle(method: str, path: str, headers: dict, body: bytes, deps) -> tuple:
         out["worker"] = {"claude-code-cli": "online" if alive is not None else "offline",
                          "api": canonical(deps.api_worker) or "none"}
         return 200, out
-    # THE TOKEN BEFORE THE FLAG (the loopback smoke of 2026-10-11): a caller with no token learns
-    # nothing, not even that the flag is off. 401 is the only answer to an unauthenticated POST.
+    # THE TOKEN BEFORE THE FLAG (the loopback smoke of 2026-10-11): on /poll and /hooks/drive a
+    # caller with no token learns nothing, not even that the flag is off. 401 is the answer to
+    # those two POSTs with no token, whatever the flag says.
     if method == "POST" and path == "/hooks/drive":
         if not channel_token_ok(deps.channel_token, headers.get("x-goog-channel-token", "")):
             return 401, {"error": "bad channel token"}
@@ -1182,8 +1183,11 @@ def main():  # pragma: no cover - the server loop
         except Exception as exc:  # noqa: BLE001
             print("drive-intake no docs: %s" % type(exc).__name__)
     Handler.deps = deps_from_env(client=client, docs=docs, feed=feed, post=post)
+    # Unset, this listens on every interface, which Cloud Run requires. The loopback smoke sets
+    # 127.0.0.1 so that run opens nothing else.
+    bind = os.environ.get("DRIVE_INTAKE_BIND") or ""
     port = int(os.environ.get("PORT") or 8080)
-    ThreadingHTTPServer(("", port), Handler).serve_forever()
+    ThreadingHTTPServer((bind, port), Handler).serve_forever()
 
 
 if __name__ == "__main__":  # pragma: no cover

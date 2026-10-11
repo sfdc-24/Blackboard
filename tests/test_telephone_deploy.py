@@ -17,9 +17,10 @@ WORKER = REPO / "cloud" / "claude-api-worker"
 ENV_READ = re.compile(r'environ\.get\("([A-Z_]+)"')
 
 # Read by the code, deliberately not set by the deploy: optional prices, the wake ring until #359
-# lands, the max-tokens knob, and Cloud Run's own PORT.
+# lands, the max-tokens knob, Cloud Run's own PORT, and DRIVE_INTAKE_BIND (unset listens on every
+# interface; the loopback smoke sets 127.0.0.1).
 OPTIONAL = {
-    "drive-intake": {"INBOX_WAKE_URL", "INBOX_WAKE_SECRET", "PORT"},
+    "drive-intake": {"INBOX_WAKE_URL", "INBOX_WAKE_SECRET", "PORT", "DRIVE_INTAKE_BIND"},
     "claude-api-worker": {"CLAUDE_API_WORKER_USD_PER_MTOK_IN", "CLAUDE_API_WORKER_USD_PER_MTOK_OUT",
                           "FLEET_CAD_PER_USD"},
 }
@@ -64,7 +65,8 @@ class IntakeDeployTest(unittest.TestCase):
         self.assertIn("--oidc-service-account-email", self.script)
         self.assertIn("X-Drive-Intake-Poll-Token=", self.script)   # the header main.py reads
         self.assertRegex(self.script, r"services enable[^\n]*docs\.googleapis\.com[^\n]*drive\.googleapis\.com")
-        self.assertIn("gcp-sa-cloudscheduler.iam.gserviceaccount.com", self.script)   # the agent may act as the poller
+        self.assertRegex(self.script, r"gcp-sa-cloudscheduler\.iam\.gserviceaccount\.com\"\s*\\\s*--role roles/iam\.serviceAccountTokenCreator")
+        self.assertNotIn("roles/iam.serviceAccountUser", self.script)   # that role cannot mint the OIDC token
         self.assertNotIn("print-identity-token --audiences", self.script)   # a user account's token has none
         self.assertNotIn("REDIS_HOST=10.", self.script)            # the private address is never committed
         self.assertNotIn("token_hex(32)\" >", self.script)         # a minted token goes to Secret Manager, not a file
@@ -93,6 +95,8 @@ class WorkerDeployTest(unittest.TestCase):
         self.assertNotRegex(self.script, r"claude-(haiku|sonnet|opus)-\d")
         self.assertIn("--max-retries 0", self.script)             # one attempt, no automatic retry
         self.assertRegex(self.script, r"services enable[^\n]*docs\.googleapis\.com[^\n]*drive\.googleapis\.com")
+        self.assertRegex(self.script, r"gcp-sa-cloudscheduler\.iam\.gserviceaccount\.com\"\s*\\\s*--role roles/iam\.serviceAccountTokenCreator")
+        self.assertNotIn("roles/iam.serviceAccountUser", self.script)   # that role cannot mint the OAuth token
         self.assertIn('EGRESS="private-ranges-only"', self.script)
         self.assertNotIn('EGRESS="all-traffic"', self.script)
         self.assertNotIn("--vpc-egress all-traffic", self.script)

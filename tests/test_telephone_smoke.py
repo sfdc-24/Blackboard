@@ -3,7 +3,8 @@
 Every other suite drives the modules through injected adapters. This one runs main() the way the
 image does: drive-intake's real server on a loopback port, and the worker job as a process. It
 proves the wiring that no unit test reaches - the server loop, env parsing, the honest lines when
-Redis and Docs are absent - and it is loopback only: nothing leaves this machine.
+Redis and Docs are absent - and it is loopback only: the server binds 127.0.0.1, and nothing
+leaves this machine.
 """
 import json
 import os
@@ -30,6 +31,26 @@ def free_port() -> int:
     return port
 
 
+def listen_addresses(port: int):
+    """Local addresses in LISTEN for this port, from /proc. None when this box has no tcp table."""
+    paths = [Path(name) for name in ("/proc/net/tcp", "/proc/net/tcp6")]
+    if not any(path.exists() for path in paths):
+        return None
+    hexport = "%04X" % port
+    found = set()
+    for path in paths:
+        try:
+            lines = path.read_text(encoding="ascii").splitlines()[1:]
+        except OSError:
+            continue
+        for line in lines:
+            parts = line.split()
+            ip, hexp = parts[1].split(":")
+            if hexp == hexport and parts[3] == "0A":
+                found.add(ip)
+    return found
+
+
 def clean_env(**extra):
     env = {k: v for k, v in os.environ.items() if not k.startswith(("DRIVE_INTAKE_", "CLAUDE_API_", "REDIS_", "INBOX_WAKE_"))}
     env["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -42,9 +63,9 @@ class IntakeServer:
         self.port = free_port()
         self.proc = subprocess.Popen(
             [sys.executable, "-B", INTAKE],
-            env=clean_env(PORT=str(self.port), DRIVE_INTAKE_ENABLED=flag, DRIVE_INTAKE_POLL_TOKEN="pt",
-                          DRIVE_INTAKE_CHANNEL_TOKEN="ct", DRIVE_INTAKE_FOLDER_ID=FOLDER,
-                          DRIVE_INTAKE_API_WORKER="claude-api"),
+            env=clean_env(PORT=str(self.port), DRIVE_INTAKE_BIND="127.0.0.1", DRIVE_INTAKE_ENABLED=flag,
+                          DRIVE_INTAKE_POLL_TOKEN="pt", DRIVE_INTAKE_CHANNEL_TOKEN="ct",
+                          DRIVE_INTAKE_FOLDER_ID=FOLDER, DRIVE_INTAKE_API_WORKER="claude-api"),
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
     def __enter__(self):
@@ -85,6 +106,9 @@ class IntakeServer:
 class IntakeSmokeTest(unittest.TestCase):
     def test_flag_off_the_server_answers_health_and_refuses_an_unauthenticated_poll(self):
         with IntakeServer("off") as server:
+            addrs = listen_addresses(server.port)
+            if addrs is not None:
+                self.assertEqual({"0100007F"}, addrs)   # 127.0.0.1, nothing else
             status, health = server.get("/healthz")
             self.assertEqual(200, status)
             self.assertFalse(health["ok"])
@@ -101,6 +125,9 @@ class IntakeSmokeTest(unittest.TestCase):
 
     def test_flag_on_with_no_store_around_it_says_no_store_and_never_ok(self):
         with IntakeServer("on") as server:
+            addrs = listen_addresses(server.port)
+            if addrs is not None:
+                self.assertEqual({"0100007F"}, addrs)
             status, health = server.get("/healthz")
             self.assertTrue(health["enabled"])
             self.assertFalse(health["ok"])

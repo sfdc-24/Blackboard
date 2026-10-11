@@ -76,10 +76,12 @@ setup() {
   "$GCLOUD" iam service-accounts describe "$INVOKER" --project "$PROJECT" >/dev/null 2>&1 ||
     "$GCLOUD" iam service-accounts create "$INVOKER_NAME" --project "$PROJECT" \
       --display-name "Drive intake poller: Cloud Scheduler's identity for POST /poll"
-  # Cloud Scheduler mints the poller's OIDC token, so its service agent must be allowed to act as it.
+  # Minting the poller's OIDC token needs Token Creator on the poller. Service Account User
+  # cannot mint tokens; without this the job is created and then never attempts
+  # (status -1, no lastAttemptTime). Same grant as scripts/gcp_scheduler_bootstrap.py.
   "$GCLOUD" iam service-accounts add-iam-policy-binding "$INVOKER" --project "$PROJECT" \
     --member "serviceAccount:service-${PROJECT_NUMBER}@gcp-sa-cloudscheduler.iam.gserviceaccount.com" \
-    --role roles/iam.serviceAccountUser >/dev/null
+    --role roles/iam.serviceAccountTokenCreator >/dev/null
   for secret in "${SECRETS[@]}"; do
     "$GCLOUD" secrets describe "$secret" --project "$PROJECT" >/dev/null 2>&1 ||
       { echo "secret ${secret} does not exist yet; run: deploy.sh tokens (the two tokens) or create it" >&2; continue; }
