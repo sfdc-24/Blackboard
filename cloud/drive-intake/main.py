@@ -48,9 +48,15 @@ THE THINGS THAT GO WRONG, AND WHERE EACH IS STOPPED
      touched, so of two resumers exactly one puts (Cursor on 57a23ab and
      c408819). A put that outlives its lease is overtaken, and a chain of
      overtakes would append on every pass - so the put itself is one
-     atomic Redis script: scan the newest entries for the task id, XADD
-     only if absent (PUT_ONCE_LUA). Two servers racing the same stream
-     land one entry (Cursor on 07a6b1c).
+     atomic Redis script (PUT_ONCE_LUA): SET NX a per-task put marker to
+     the worker, XADD only when that set won. Two servers racing the same
+     stream land one entry; a resume after the first entry is buried
+     under 500 newer ones adds nothing; a claim that aged out while the
+     laptop came back cannot put the same task on a second stream, because
+     the marker outlives the claim (Cursor on 07a6b1c and 13af1f7).
+     Which inbox holds a task is answered from that marker, never from a
+     scan. Lines owed so far are re-attempted BEFORE the ring, so a ring
+     that is refused pass after pass does not keep the doc empty.
      The ring is sent BEFORE the claim moves to rung, so a crash in between
      rings again - safe only because WakeRing sends id=task_id and
      cloud/inbox-wake claims fleet:wake:seen:<agent>:<id> SET NX, so the
@@ -371,11 +377,16 @@ def write_receipt(deps, tuple_: dict, doc_text: str, state: str, at: str, detail
 
 
 def _on_any_inbox(deps, task_id: str):
-    """Which worker's inbox already holds this task, or None. Every stream, newest first.
+    """Which worker's inbox already holds this task, or None.
 
     Cursor on d150d84: looking only at the routed worker's inbox let a resume
-    after a heartbeat flip append the same task to a second worker.
+    after a heartbeat flip append the same task to a second worker. A queue
+    that keeps a put marker answers from it (any depth); one that does not
+    is asked per worker.
     """
+    holder = getattr(deps.queue, "holder", None)
+    if holder is not None:
+        return holder(task_id)
     has = getattr(deps.queue, "has", None)
     if has is None:
         return None
@@ -549,6 +560,18 @@ def decide(hint: dict, deps) -> dict:
             text = with_heading(text)
         try:
             holder = _on_any_inbox(deps, tuple_["task_id"])
+            if holder is not None and holder != recipient:
+                # The task is already on ANOTHER worker's inbox (a claim that aged out while
+                # the laptop came back). That worker has it; rebind to it rather than ring
+                # the one the heartbeat chose now (Cursor on 13af1f7).
+                recipient = holder
+                tuple_["recipient_id"] = holder
+                rebound = _state(DELIVERING, holder, now, via)
+                if not _advance(deps, key, current, rebound):
+                    out["status"] = "in_progress"
+                    return out
+                current = rebound
+                out["tuple"] = tuple_
             if holder is None:
                 try:
                     deps.queue.put(tuple_, gist(text), deps.at)
@@ -571,9 +594,17 @@ def decide(hint: dict, deps) -> dict:
             out["status"] = "in_progress"
             return out
         current, phase = landed_state, ON_INBOX
-        out["receipt"] = write_receipt(deps, tuple_, text, REQUESTED, deps.at, detail)
-        text = with_heading(text)
     if phase == ON_INBOX:
+        # Lines owed so far are re-attempted BEFORE the ring: a ring that keeps being
+        # refused (#359 answering unknown_agent) must not keep the doc empty (Cursor on
+        # 13af1f7). Each is a no-op once it has read back.
+        for owed in _lines_owed(via)[:-1]:
+            note = ("awaiting the laptop" if owed == QUEUED else
+                    "no capable worker online" if owed == BLOCKED else detail)
+            result = write_receipt(deps, tuple_, text, owed, deps.at, note)
+            if owed == REQUESTED:
+                out["receipt"] = result
+            text = with_heading(text)
         # The ring is cloud/inbox-wake's job, and it comes AFTER the put: a ring
         # whose task is not on the queue wakes an agent to find nothing.
         try:
@@ -782,20 +813,21 @@ class MemoryClaims:
 CAS_LUA = ("if redis.call('get', KEYS[1]) == ARGV[1] then "
            "redis.call('set', KEYS[1], ARGV[2], 'EX', ARGV[3]) return 1 else return 0 end")
 
-# Append-unless-present in one round trip: scan the newest ARGV[2] entries of the
-# stream for field task_id == ARGV[1]; XADD the rest of ARGV only if none matches.
+# Append-at-most-once in one round trip. KEYS[1] is the stream, KEYS[2] the task's
+# put marker (fleet:intake:put:<task_id>). The marker is SET NX to the worker the
+# task went to, in the same script as the XADD, so a second put - on any stream,
+# from any server, however deep the first entry is buried - adds nothing. A scan
+# of the newest N entries was the earlier dedupe; Cursor buried the entry under
+# 500 newer ones and it appended again (13af1f7).
 PUT_ONCE_LUA = (
-    "local rows = redis.call('XREVRANGE', KEYS[1], '+', '-', 'COUNT', ARGV[2]) "
-    "for _, row in ipairs(rows) do "
-    "  local f = row[2] "
-    "  for i = 1, #f, 2 do "
-    "    if f[i] == 'task_id' and f[i + 1] == ARGV[1] then return 0 end "
-    "  end "
+    "if redis.call('SET', KEYS[2], ARGV[1], 'NX', 'EX', ARGV[2]) then "
+    "  local args = {} "
+    "  for i = 3, #ARGV do args[#args + 1] = ARGV[i] end "
+    "  redis.call('XADD', KEYS[1], '*', unpack(args)) "
+    "  return 1 "
     "end "
-    "local args = {} "
-    "for i = 3, #ARGV do args[#args + 1] = ARGV[i] end "
-    "redis.call('XADD', KEYS[1], '*', unpack(args)) "
-    "return 1")
+    "return 0")
+PUT_TTL = 2 * CLAIM_TTL   # the marker must outlive the claim, or a claim that aged out re-puts
 
 
 class RedisClaims:
@@ -838,26 +870,26 @@ class InboxQueue:
     def __init__(self, client):
         self.client = client
 
-    def has(self, recipient, task_id):
+    def holder(self, task_id):
+        """The worker whose inbox holds this task, from the put marker, or None.
+
+        The marker, not a scan of the stream, is the answer: a scan sees the newest
+        INBOX_LOOKBACK entries and nothing older (Cursor on 13af1f7)."""
         if self.client is None:
             raise Unconfigured("no Redis client for fleet:inbox")
-        # NEWEST first: the entry a lost response is being settled for is the newest one,
-        # and the oldest 500 of a busy stream never contain it (Cursor on d150d84).
-        rows = self.client.xrevrange("fleet:inbox:" + recipient, count=INBOX_LOOKBACK) or ()
-        for _entry_id, fields in rows:
-            value = fields.get("task_id")
-            if value is None:
-                value = fields.get(b"task_id")
-            if isinstance(value, bytes):
-                value = value.decode("utf-8", "replace")
-            if value == task_id:
-                return True
-        return False
+        raw = self.client.get("fleet:intake:put:" + task_id)
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", "replace")
+        return raw or None
+
+    def has(self, recipient, task_id):
+        return self.holder(task_id) == recipient
 
     def put(self, tuple_, gist_, at) -> bool:
-        """Append unless the newest INBOX_LOOKBACK entries already hold this task id - in ONE
-        Redis call, so a put that outlived its lease and a resumer's put cannot both land
-        (Cursor on 07a6b1c). True when added, False when it was already there."""
+        """Append at most once, in ONE Redis call: the task's put marker is SET NX to the
+        worker and the XADD happens only when that set won, so a put that outlived its
+        lease, a resumer's put, and a put to a second worker after the claim aged out all
+        add nothing (Cursor on 07a6b1c and 13af1f7). True when added, False when not."""
         if self.client is None:
             raise Unconfigured("no Redis client for fleet:inbox")
         fields = {
@@ -872,8 +904,9 @@ class InboxQueue:
         flat = []
         for name, value in fields.items():
             flat.extend((name, value))
-        added = self.client.eval(PUT_ONCE_LUA, 1, "fleet:inbox:" + tuple_["recipient_id"],
-                                 tuple_["task_id"], INBOX_LOOKBACK, *flat)
+        added = self.client.eval(PUT_ONCE_LUA, 2, "fleet:inbox:" + tuple_["recipient_id"],
+                                 "fleet:intake:put:" + tuple_["task_id"],
+                                 tuple_["recipient_id"], PUT_TTL, *flat)
         return bool(added)
 
 

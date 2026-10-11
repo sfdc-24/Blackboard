@@ -94,6 +94,12 @@ class Queue:
     def has(self, recipient, task_id):
         return any(t["recipient_id"] == recipient and t["task_id"] == task_id for t, _, _ in self.puts)
 
+    def holder(self, task_id):
+        for t, _, _ in self.puts:
+            if t["task_id"] == task_id:
+                return t["recipient_id"]
+        return None
+
     def _land(self, tuple_, gist_, at):
         if self.has(tuple_["recipient_id"], tuple_["task_id"]):
             return False
@@ -738,7 +744,10 @@ class RetryTest(unittest.TestCase):
     def test_an_inbox_that_cannot_be_read_back_is_unknown_not_a_second_put(self):
         class Blind(Queue):
             def has(self, recipient, task_id):
-                raise ConnectionError("xrange failed")
+                raise ConnectionError("read-back failed")
+
+            def holder(self, task_id):
+                raise ConnectionError("read-back failed")
         d = deps(queue=Blind())
         out = di.decide(hint(), d)
         self.assertEqual("queue_unknown", out["status"], out)
@@ -860,14 +869,18 @@ class StreamClient:
         rows = list(reversed(self.streams.get(key, [])))
         return rows[:count] if count else rows
 
-    def eval(self, script, numkeys, key, task_id, lookback, *flat):
+    def get(self, key):
+        return self.__dict__.setdefault("kv", {}).get(key)
+
+    def eval(self, script, numkeys, stream, marker, worker, ttl, *flat):
         """What PUT_ONCE_LUA does, in Python, so the test can check the script's shape AND its effect."""
-        self.evals.append((script, numkeys, key, task_id, lookback, flat))
-        assert "XREVRANGE" in script and "XADD" in script and "task_id" in script
-        for _id, fields in self.xrevrange(key, count=int(lookback)):
-            if fields.get("task_id") == task_id:
-                return 0
-        self.xadd(key, dict(zip(flat[0::2], flat[1::2])))
+        self.evals.append((script, numkeys, stream, marker, worker, ttl, flat))
+        assert "'SET', KEYS[2]" in script and "'NX'" in script and "XADD" in script
+        kv = self.__dict__.setdefault("kv", {})
+        if marker in kv:
+            return 0
+        kv[marker] = worker
+        self.xadd(stream, dict(zip(flat[0::2], flat[1::2])))
         return 1
 
 
@@ -909,6 +922,30 @@ class InboxQueueTest(unittest.TestCase):
         self.assertEqual(di.INBOX_LOOKBACK + 101, len(client.streams["fleet:inbox:claude-api"]))
         self.assertTrue(q.has("claude-api", out["task"]))
 
+    def test_an_entry_buried_under_newer_ones_is_still_one_entry_on_resume_or_reroute(self):
+        """Cursor on 13af1f7: after 500 newer entries the resume appended again, and with the claim
+        gone and the laptop fresh the same task went onto a second stream."""
+        client = StreamClient()
+        d = deps(queue=di.InboxQueue(client=client))
+        out = di.decide(hint(), d)
+        self.assertEqual("dispatched", out["status"], out)
+        for i in range(di.INBOX_LOOKBACK + 100):               # bury it
+            client.xadd("fleet:inbox:claude-api", {"task_id": "task-%016x" % i, "by": "newer"})
+        # the crash shape: claim back at delivering, entry buried
+        d.claims.states[key_for()] = "delivering:claude-api:0:"
+        again = di.decide(hint(), d)
+        self.assertEqual("dispatched", again["status"], again)
+        copies = [f for _, f in client.streams["fleet:inbox:claude-api"] if f.get("task_id") == out["task"]]
+        self.assertEqual(1, len(copies))
+        # the aged-out shape: claim gone, laptop fresh, routing would say claude-code-cli
+        d.claims.states.clear()
+        laptop_up(d)
+        rerouted = di.decide(hint(), d)
+        self.assertNotIn("fleet:inbox:claude-code-cli", client.streams)
+        self.assertEqual("claude-api", rerouted["tuple"]["recipient_id"] if rerouted.get("tuple") else "claude-api")
+        self.assertEqual(1, len([f for _, f in client.streams["fleet:inbox:claude-api"] if f.get("task_id") == out["task"]]))
+        self.assertEqual("claude-api", di.InboxQueue(client=client).holder(out["task"]))
+
     def test_the_put_is_one_atomic_append_unless_present_call(self):
         client = StreamClient()
         q = di.InboxQueue(client=client)
@@ -918,9 +955,13 @@ class InboxQueueTest(unittest.TestCase):
         self.assertFalse(q.put(t, g, "t2"))                      # already there: not appended
         self.assertEqual(1, len(client.streams["fleet:inbox:claude-api"]))
         self.assertEqual(2, len(client.evals))
-        script, numkeys, key, task_id, lookback, flat = client.evals[0]
-        self.assertEqual((1, "fleet:inbox:claude-api", t["task_id"], di.INBOX_LOOKBACK), (numkeys, key, task_id, lookback))
+        script, numkeys, stream, marker, worker, ttl, flat = client.evals[0]
+        self.assertEqual((2, "fleet:inbox:claude-api", "fleet:intake:put:" + t["task_id"], "claude-api", di.PUT_TTL),
+                         (numkeys, stream, marker, worker, ttl))
+        self.assertGreater(di.PUT_TTL, di.CLAIM_TTL)             # the marker outlives the claim
         self.assertIn("task_id", flat)
+        self.assertEqual("claude-api", q.holder(t["task_id"]))
+        self.assertIsNone(q.holder("task-0000000000000000"))
         self.assertEqual(client.streams["fleet:inbox:claude-api"][0][1]["task_id"], t["task_id"])
         # and put never calls xadd directly - the dedupe and the append are one Redis call
         self.assertNotIn("self.client.xadd", (REPO / "cloud" / "drive-intake" / "main.py").read_text(encoding="utf-8"))
@@ -970,6 +1011,40 @@ class WakeRingTest(unittest.TestCase):
         self.assertEqual("queued_not_rung", out["status"], out)
         self.assertEqual("RuntimeError", out["error"])
         self.assertEqual(["REQUESTED"], d.receipts.states())       # and DISPATCHED was not written
+
+    def test_a_refused_ring_does_not_keep_the_doc_empty(self):
+        """Cursor on 13af1f7: REQUESTED dropped + #359 answering unknown_agent every time -> the doc
+        stayed empty, because the owed lines were only retried after a ring succeeded."""
+        class DropFirst(Receipts):
+            def append(self, file_id, expected_revision, receipt_id, block):
+                if self.appends == 0:
+                    self.appends += 1
+                    return self.revision                       # said ok, wrote nothing
+                return super().append(file_id, expected_revision, receipt_id, block)
+        refused = di.WakeRing(url="https://wake/wake", secret="s",
+                              post=lambda u, b, h: b'{"woke": [{"status": "unknown_agent"}]}')
+        d = deps(receipts=DropFirst(), ring=refused)
+        self.assertEqual("queued_not_rung", di.decide(hint(), d)["status"])
+        self.assertEqual([], d.receipts.lines)
+        self.assertEqual("queued_not_rung", di.decide(hint(), d)["status"])
+        self.assertEqual(["REQUESTED"], d.receipts.states())    # written on the second pass, ring still refused
+        self.assertEqual(1, len(d.queue.puts))
+        # the same for a wait line that missed on the delivering pass
+        d = deps(docs=Docs(text=REQUEST + "Use the sf CLI.\n"), receipts=DropFirst(), ring=refused)
+        self.assertEqual("queued", di.decide(hint(), d)["status"])
+        laptop_up(d)
+        self.assertEqual("queued_not_rung", di.decide(hint(), d)["status"])
+        self.assertEqual(["QUEUED", "REQUESTED"], d.receipts.states())
+        # and Cursor's exact shape: claim parked at on_inbox:...:q, task on the inbox, doc empty,
+        # ring refused every pass - the wait line must still land before any ring
+        text = REQUEST + "Use the sf CLI.\n"
+        d = deps(docs=Docs(text=text), ring=refused)
+        t = di.correlate(FILE, text, "r1", "claude-code-cli")
+        d.claims.states[key_for(text=text)] = "on_inbox:claude-code-cli:1000:q"
+        d.queue.puts.append((dict(t), di.gist(text), d.at))
+        self.assertEqual("queued_not_rung", di.decide(hint(), d)["status"])
+        self.assertEqual(["QUEUED", "REQUESTED"], d.receipts.states())
+        self.assertEqual(1, len(d.queue.puts))
 
     def test_the_body_carries_the_task_id_as_the_message_id_and_the_signature_verifies(self):
         sent = []
