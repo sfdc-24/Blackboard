@@ -162,14 +162,21 @@ class PilotDocs:
         return view
 
     def append(self, file_id, expected_revision, receipt_id, block):
+        if self.require_expected and file_id not in self.expected:
+            raise OutOfScope("no approved request bound to document append")
         doc = self._read_scoped(file_id)
-        if self.require_expected:
-            if file_id not in self.expected or not focused_text(
-                    doc.get("text") or "", *self.expected[file_id]):
+        receipt = block.lstrip("\n").removeprefix(di.HEADING_TEXT + "\n")
+        # Before a call, an edited request must not reach the model via a
+        # refreshed Drive revision. After a call, its stored result still needs
+        # a terminal receipt even if the owner changed the request meanwhile.
+        if self.require_expected and receipt.startswith("ACCEPTED - task "):
+            if not focused_text(doc.get("text") or "", *self.expected[file_id]):
                 raise OutOfScope("approved request changed before receipt append")
         return self.raw_docs.append(file_id, expected_revision, receipt_id, block)
 
     def has(self, file_id, receipt_id):
+        if self.require_expected and file_id not in self.expected:
+            raise OutOfScope("no approved request bound to document receipt lookup")
         text = self._read_scoped(file_id).get("text") or ""
         heading = di.RECEIPTS_HEADING.search(text)
         if heading is None:

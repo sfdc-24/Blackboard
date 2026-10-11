@@ -289,6 +289,35 @@ class PhoneIntakeTests(unittest.TestCase):
         self.assertEqual(out["considered"][0]["status"], "accepted_receipt_owed")
         self.assertNotIn("SUCCEEDED - task", self.docs.documents[self.doc]["text"])
 
+    def test_edit_during_model_call_still_records_stored_result(self):
+        self.fresh()
+        calls = []
+
+        def model(_system, _prompt):
+            calls.append(1)
+            doc = self.docs.documents[self.doc]
+            doc["text"] = doc["text"].replace(
+                "Summarize the new change.", "Edited while model was running.")
+            doc["revision_id"] = "r99"
+            return {"text": "A short answer.", "input_tokens": 10,
+                    "output_tokens": 5, "model": "offline-mock", "stop_reason": "end_turn"}
+
+        claims = worker.MemoryClaims()
+        deps = worker.Deps(
+            enabled=True, inbox=pilot.PilotInbox(worker.RedisInbox(self.redis), self.redis),
+            docs=self.docs, receipts=self.docs, claims=claims,
+            ledger=worker.MemoryLedger(), model=model, model_name="offline-mock",
+            folder_id=pilot.FOLDER_ID, now=self.now, at="2026-10-11T05:00:00Z",
+            cap_cents=100, reserve_cents=1, price_in=1, price_out=1, cad_per_usd=1,
+            max_input_tokens=12000, authorized_until=self.now + 3600)
+        deps.pilot_docs = pilot.PilotDocs(self.docs)
+        out = worker.run_once(deps)
+        self.assertEqual((out["calls"], out["considered"][0]["status"]), (1, "succeeded"))
+        self.assertEqual(len(calls), 1)
+        self.assertIn("SUCCEEDED - task", self.docs.documents[self.doc]["text"])
+        self.assertIn("A short answer.", self.docs.documents[self.doc]["text"])
+        self.assertTrue(claims.result(out["considered"][0]["task"]))
+
     def test_shared_parser_request_alias_cannot_smuggle_a_different_id(self):
         self.pass_once()
         smuggled = block().replace("REQUEST: owner-20261011-01",
