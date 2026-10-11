@@ -24,7 +24,7 @@ ENV_READ = re.compile(
 # Read by the code, deliberately not set by the deploy: optional prices (the code treats unset as
 # "no price"), the wake ring until #359 lands, and Cloud Run's own PORT. Max tokens is set.
 OPTIONAL = {
-    "drive-intake": {"INBOX_WAKE_URL", "INBOX_WAKE_SECRET", "PORT"},
+    "drive-intake": {"INBOX_WAKE_URL", "INBOX_WAKE_SECRET", "PORT", "DRIVE_INTAKE_BIND"},
     "claude-api-worker": {"CLAUDE_API_WORKER_USD_PER_MTOK_IN", "CLAUDE_API_WORKER_USD_PER_MTOK_OUT",
                           "FLEET_CAD_PER_USD"},
 }
