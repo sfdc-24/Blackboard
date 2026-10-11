@@ -766,6 +766,29 @@ def _unlink_quietly(path: str) -> None:
         pass
 
 
+APPEND_MARK = "appending Row_ID="      # fleet_agent prints it, flushed, right before its one append
+
+
+class _NotSent:
+    """post_reply's third answer: the tool's process was stopped BEFORE its append marker, so nothing
+    was appended and the ask stays open. Falsy, so `if post_reply(...)` reads as before; identity
+    (`is NOT_SENT`) tells it from an unconfirmed post, which may be on the board."""
+
+    def __bool__(self):
+        return False
+
+    def __repr__(self):
+        return "NOT_SENT"
+
+
+NOT_SENT = _NotSent()
+
+
+def _partial_output(exc) -> str:
+    out = getattr(exc, "stdout", None) or getattr(exc, "output", None) or b""
+    return out.decode("utf-8", "replace") if isinstance(out, bytes) else str(out)
+
+
 def post_reply(me: str, cfg: dict, text: str, to: str, answers: str, verbose: bool,
                phase: str = "DONE") -> bool:
     """Write the reply through fleet_agent post, never a hand-built row.
@@ -794,8 +817,15 @@ def post_reply(me: str, cfg: dict, text: str, to: str, answers: str, verbose: bo
             "--gist", text[:160]]
     try:
         res = subprocess.run(args, cwd=REPO, capture_output=True, text=True, timeout=POST_TIMEOUT_SECONDS)
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as exc:
         _unlink_quietly(text_path)
+        if APPEND_MARK not in _partial_output(exc):
+            # The tool never reached its append (its read before posting outlived the budget):
+            # nothing is on the board, the ask stays open, and the cloud runner releases its claim
+            # (the third adversarial check on #367: before this, such an ask was quarantined).
+            print("    post NOT SENT after %d s: the tool's board read before posting outlived the "
+                  "budget; nothing was appended; the ask stays open" % POST_TIMEOUT_SECONDS)
+            return NOT_SENT
         # NOT CONFIRMED IS NOT FAILED. fleet_agent appends once and then reads the row back; a
         # flapping gateway can hold the read-back past the timeout after the row has landed
         # (gemini-waker-tmm8l, 2026-09-29: the RESULT row landed at 07:41:19Z, the read-back hung
@@ -979,7 +1009,10 @@ def post_request(me: str, cfg: dict, request: dict, verbose: bool, answers: str 
         args += ["--count", str(request["count"])]
     try:
         res = subprocess.run(args, cwd=REPO, capture_output=True, text=True, timeout=POST_TIMEOUT_SECONDS)
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as exc:
+        if APPEND_MARK not in _partial_output(exc):
+            return "refused", ("the tool's board read before posting outlived the %d s budget; nothing was "
+                               "appended" % POST_TIMEOUT_SECONDS)
         return "unconfirmed", "no read-back after %d s (it may have landed; not posted again)" % POST_TIMEOUT_SECONDS
     # THE KEY IS MASKED EVERYWHERE THE OUTPUT GOES (the third adversarial check): the verbose print, the
     # reason on the reply row, and the words the state is read from. Scrubbed first.
@@ -1343,14 +1376,25 @@ def main(argv=None) -> int:
             + body
             + okf_note
         )
-        if post_reply(me, cfg, reply, to=sender + ";ALL", answers=src_id,
-                      verbose=args.verbose, phase=reply_phase(row)):
+        posted = post_reply(me, cfg, reply, to=sender + ";ALL", answers=src_id,
+                            verbose=args.verbose, phase=reply_phase(row))
+        if posted:
             state["answered_ids"].append(src_id)
             mod = sys.modules[cfg["module"]]
             usage = getattr(mod.ask, "last_usage", None) or {}
             ok = "    posted, %s tokens" % usage.get("total", "?")
             print(ok)
             log(me, ok)
+        elif posted is NOT_SENT:
+            # Nothing was appended: hold the watermark under this row and go on; the next pass
+            # asks again. Not a break: the gateway was slow for this one read, not proven down.
+            miss = ("    POST NOT SENT for %s: nothing was appended; the watermark is held and the ask "
+                    "stays open for the next pass" % src_id)
+            print(miss)
+            log(me, miss)
+            if floor_ts is None or item["ts"] < floor_ts:
+                floor_ts = item["ts"]
+            continue
         else:
             # NOT CONFIRMED, never FAILED: fleet_agent appends once, and neither a missing read-back
             # nor a timeout proves the row is absent. A FAILED line invites a human to post it again

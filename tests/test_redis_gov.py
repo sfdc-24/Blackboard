@@ -765,9 +765,18 @@ class FleetAgentRequestOnTheBoard(unittest.TestCase):
         self.fa = fleet_agent
         self.board = {"rows": [list(self.HEAD)]}
         self.appends = []
-        self.real = (fleet_agent.read_board, fleet_agent._bus_fetch, fleet_agent._bus_load_env)
+        self.reads = []
+        self.real = (fleet_agent._matching_rows, fleet_agent._bus_fetch, fleet_agent._bus_load_env)
         fleet_agent._bus_load_env = lambda: {"BUS_URL": "https://bus.test/x", "BUS_SECRET": "s"}
-        fleet_agent.read_board = lambda **kw: self.board
+
+        def matching(rid, tries=1):
+            # The bus's filtered read: a case-insensitive substring over the whole row, data rows only.
+            self.reads.append((rid, tries))
+            if self.board is None:
+                return None
+            return [list(r) for r in self.board["rows"][1:]
+                    if rid.lower() in "|".join(str(c) for c in r).lower()]
+        fleet_agent._matching_rows = matching
 
         def fetch(url, payload, tries=1):
             self.appends.append(payload["sheetRow"])
@@ -776,7 +785,7 @@ class FleetAgentRequestOnTheBoard(unittest.TestCase):
         fleet_agent._bus_fetch = fetch
 
     def tearDown(self):
-        self.fa.read_board, self.fa._bus_fetch, self.fa._bus_load_env = self.real
+        self.fa._matching_rows, self.fa._bus_fetch, self.fa._bus_load_env = self.real
 
     def args(self, rid="REQ-T-0001", val="one"):
         import argparse
@@ -822,7 +831,7 @@ class FleetAgentRequestOnTheBoard(unittest.TestCase):
         self.assertNotIn("VERIFIED", out)
 
     def test_a_board_that_cannot_be_read_means_NOT_SENT_not_a_blind_append(self):
-        self.fa.read_board = lambda **kw: None
+        self.board = None
         code, out = self.run_request(self.args())
         self.assertEqual((self.fa.EXIT_NOT_SENT, []), (code, self.appends))
         self.assertIn("NOT SENT", out)
@@ -955,7 +964,6 @@ class FleetAgentRequestOnTheBoard(unittest.TestCase):
         every row, the header included, at the sheet's full width. A pin on exactly ten cells made
         every post NOT SENT on that board (d53079b); the fourth adversarial check on #367 found it."""
         self.board = {"rows": [list(self.HEAD) + ["", ""]]}
-        self.fa.read_board = lambda **kw: self.board
 
         def fetch_wide(url, payload, tries=1):
             self.appends.append(payload["sheetRow"])
@@ -976,21 +984,28 @@ class FleetAgentRequestOnTheBoard(unittest.TestCase):
             code = self.fa.append_and_verify("GEMINI-WAKE-2", row, exact=False)
         self.assertEqual(self.fa.EXIT_VERIFIED, code)
 
-    def test_a_non_blank_cell_past_the_tenth_is_not_this_row_and_an_eleventh_named_column_is_NOT_SENT(self):
+    def test_a_non_blank_cell_past_the_tenth_is_not_this_row(self):
         rid, row = self.fa.request_row("gemini", "set", "proj:k", val="one", rid="REQ-T-0007")
         self.board["rows"].append(list(row) + ["", "stray"])            # same id, something in L
         code, out = self.run_request(self.args(rid="REQ-T-0007"))
         self.assertEqual((self.fa.EXIT_REFUSED, []), (code, self.appends), "a row with a non-blank L is not this row")
-        self.board = {"rows": [list(self.HEAD) + ["Notes"]]}           # an eleventh NAMED column
-        self.fa.read_board = lambda **kw: self.board
-        code, out = self.run_request(self.args(rid="REQ-T-0008"))
+
+    def test_the_reads_are_filtered_one_try_before_the_append_and_the_marker_precedes_it(self):
+        """The third adversarial check on #367: the unfiltered read of a megabytes board, four
+        attempts, ran BEFORE the append inside the waker's budget. Now: a filtered read by id, one try
+        before the append (a flapping gateway is told NOT SENT at once), two for the read-back, and
+        an "appending" marker flushed before the one append, so a caller that stops the process can
+        tell nothing-sent from may-have-landed."""
+        code, out = self.run_request(self.args())
+        self.assertEqual(self.fa.EXIT_VERIFIED, code)
+        self.assertEqual([("REQ-T-0001", 1), ("REQ-T-0001", 2)], self.reads)
+        self.assertLess(out.index("appending Row_ID=REQ-T-0001"), out.index("VERIFIED on the board"))
+        self.board = None
+        self.appends.clear()
+        code, out = self.run_request(self.args(rid="REQ-T-0009"))
         self.assertEqual((self.fa.EXIT_NOT_SENT, []), (code, self.appends))
-        self.assertIn("header is not the ten-named-cell schema", out)
-        self.assertIn("11 cells", out)
-        self.fa.read_board = lambda **kw: None
-        code, out = self.run_request(self.args(rid="REQ-T-0008"))
-        self.assertEqual(self.fa.EXIT_NOT_SENT, code)
-        self.assertIn("could not be read", out)
+        self.assertIn("could not be read (filtered read, 1 try)", out)
+        self.assertNotIn("appending", out, "no marker: nothing was appended")
 
     def test_a_post_that_names_no_id_gets_one_that_differs_per_post_and_repeats_per_retry(self):
         import datetime

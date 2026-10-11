@@ -987,7 +987,8 @@ class APostThatOutlivesItsTimeout(unittest.TestCase):
 
         def hang(args, **kw):
             attempts.append(args)
-            raise subprocess.TimeoutExpired(args, kw.get("timeout"))
+            raise subprocess.TimeoutExpired(args, kw.get("timeout"),
+                                           output=b"  appending Row_ID=GEMINI-WAKE-SLOW-1\n")
 
         store = MemStore({"watermark": "2026-09-29T07:00:00Z", "answered_ids": []})
         saved = (aw.read_since, aw.load_env, aw.log)
@@ -1036,7 +1037,8 @@ class APostThatOutlivesItsTimeout(unittest.TestCase):
         from contextlib import redirect_stdout
 
         def hang(args, **kw):
-            raise subprocess.TimeoutExpired(args, kw.get("timeout"))
+            raise subprocess.TimeoutExpired(args, kw.get("timeout"),
+                                           output=b"  appending Row_ID=GEMINI-WAKE-SLOW-1\n")
         buf = io.StringIO()
         with mock.patch.object(aw.subprocess, "run", side_effect=hang), redirect_stdout(buf):
             self.assertFalse(aw.post_reply("gemini", {"project": "FLEET"}, "t", "grok;ALL", "X", False,
@@ -1161,6 +1163,31 @@ class TheRequestAppendIsFenced(unittest.TestCase):
 
     def test_outside_the_runner_the_adapter_has_no_claim_and_refuses(self):
         self.assertFalse(aw.reserve_redis_side_effect("A"))
+
+    def test_a_reply_the_tool_never_appended_releases_the_claim_so_the_next_run_asks_again(self):
+        """The third adversarial check on #367: a timeout BEFORE the tool's append marker means nothing
+        is on the board; before this it kept phase=posting and the next run quarantined an ask that
+        nobody had answered. Now post_reply says NOT_SENT, the runner clears its own claim, and the
+        next run calls the model and posts."""
+        class NotSentOnce(_ClaimingWaker):
+            def post_reply(self, me, cfg, text, to, answers, verbose, phase="DONE"):
+                if not getattr(self, "sent_once", False):
+                    self.sent_once = True
+                    return aw.NOT_SENT
+                return super().post_reply(me, cfg, text, to, answers, verbose, phase=phase)
+        store = MemStore({"watermark": "2026-09-24T02:00:00Z", "answered_ids": []})
+        calls, posts = [], []
+        w = NotSentOnce(calls, posts=posts)
+        w.reply_on_board = lambda rid: False
+        main.run(store=store, waker=w, now="2026-09-24T05:00:00Z")
+        self.assertEqual((["A"], []), (calls, posts))
+        self.assertEqual("", store.state.get("claim_phase") or "", "the claim is released")
+        self.assertEqual("", store.state.get("inflight") or "")
+        self.assertNotIn("A", store.state.get("unknown_ids") or [], "not quarantined: nothing was sent")
+        self.assertNotIn("A", store.state.get("answered_ids") or [])
+        main.run(store=store, waker=w, now="2026-09-24T05:10:00Z")
+        self.assertEqual((["A", "A"], ["A"]), (calls, posts), "the next run asks again and posts")
+        self.assertIn("A", store.state.get("answered_ids") or [])
 
 
 if __name__ == "__main__":

@@ -983,6 +983,43 @@ class RedisRequests(unittest.TestCase):
         self.assertIsNotNone(req, "an empty field is absent, not a shape error")
         self.assertIsNone(req["val"])
 
+    def test_a_timeout_before_the_append_marker_is_refused_and_after_it_unconfirmed(self):
+        # The third adversarial check on #367: a slow board read before the append used to be read as
+        # "it may have landed". fleet_agent prints its marker right before the one append.
+        def raising(partial):
+            def run(args, **kw):
+                raise aw.subprocess.TimeoutExpired(cmd=args, timeout=1, output=partial)
+            return run
+        real = aw.subprocess.run
+        try:
+            aw.subprocess.run = raising("  request X: set proj:k\n")
+            state, why = aw.post_request("gemini", {"project": "FLEET"}, self.REQ, False)
+            self.assertEqual("refused", state)
+            self.assertIn("nothing was appended", why)
+            aw.subprocess.run = raising(b"  request X: set proj:k\n  appending Row_ID=X\n")
+            state, why = aw.post_request("gemini", {"project": "FLEET"}, self.REQ, False)
+            self.assertEqual("unconfirmed", state)
+            self.assertIn("may have landed", why)
+        finally:
+            aw.subprocess.run = real
+
+    def test_post_reply_tells_not_sent_from_not_confirmed_on_a_timeout(self):
+        def raising(partial):
+            def run(args, **kw):
+                raise aw.subprocess.TimeoutExpired(cmd=args, timeout=1, output=partial)
+            return run
+        real = aw.subprocess.run
+        try:
+            aw.subprocess.run = raising("  reading the board first\n")
+            res = aw.post_reply("gemini", {"project": "FLEET"}, "text", "grok;ALL", "ASK-1", False)
+            self.assertIs(aw.NOT_SENT, res)
+            self.assertFalse(res, "falsy, so every `if post_reply(...)` reads as before")
+            aw.subprocess.run = raising("  appending Row_ID=GEMINI-WAKE-x\n")
+            res = aw.post_reply("gemini", {"project": "FLEET"}, "text", "grok;ALL", "ASK-1", False)
+            self.assertIs(False, res)
+        finally:
+            aw.subprocess.run = real
+
     def test_without_a_durable_posting_claim_a_request_is_refused_before_the_subprocess(self):
         # Outside the cloud runner nothing can fence a retry, so the adapter fails closed.
         aw.reserve_redis_side_effect = self._real_reserve

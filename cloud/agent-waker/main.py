@@ -481,6 +481,19 @@ def run(argv=None, store=None, waker=None, board_contains=None,
         elif not begin_post(answers):
             return False
         ok = original_post(me, cfg, text, to, answers, verbose, phase=phase)
+        import agent_waker
+        if not ok and ok is agent_waker.NOT_SENT:
+            # The tool never reached its append: nothing is on the board. Release OUR claim, so the
+            # next run asks again instead of quarantining an ask nobody answered (the third
+            # adversarial check on #367). A takeover's claim is not ours to clear.
+            s = dict(box["state"])
+            if s.get("claim_owner") == owner and s.get("inflight") == answers:
+                clear_claim(s)
+                try:
+                    persist(s)
+                except state_store.Conflict:
+                    pass
+            return ok
         if ok:
             s = dict(box["state"])
             # Confirmed on the board. Record that, and drop the posting claim

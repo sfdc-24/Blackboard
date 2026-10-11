@@ -410,7 +410,8 @@ def _same_payload(a, b) -> bool:
     return " ".join(str(a or "").split()) == " ".join(str(b or "").split())
 
 
-_BOARD_HEAD = ("Row_ID", "Timestamp", "Source_Tag", "Target_Surface", "Action_Type", "Payload")
+BOARD_HEAD = ("Row_ID", "Timestamp", "Source_Tag", "Target_Surface", "Action_Type", "Payload",
+              "Category", "Project Tag", "Gist", "Sub-Gist")     # the A:J layout, by position
 BOARD_WIDTH = 10        # A:J, the ten named cells every row is written with
 
 
@@ -431,15 +432,31 @@ def _ten_cells(cells):
     return head + [""] * (BOARD_WIDTH - len(head))
 
 
-def _complete_board_rows(data):
-    """The data rows of a board whose header is the ten names (plus blank padding, if any)."""
-    rows = data.get("rows") if isinstance(data, dict) else None
-    if not isinstance(rows, list) or not rows:
+def _matching_rows(rid, tries=1):
+    """The board's rows that mention `rid`, by a FILTERED read, or None when the board could not be read.
+
+    A filtered read, not the whole board (the third adversarial check on #367): the unfiltered read
+    is megabytes, four attempts of two 120 s hops each, and it ran BEFORE the append inside the
+    waker's 400 s budget, so a slow gateway could spend the whole budget before anything was sent,
+    while the waker said "it may have landed" about a row that never was. `match` is a substring
+    over the whole row (a later row quoting the id matches too), so the caller still compares
+    Row_ID exactly. One try before the append: a flapping gateway is told NOT SENT at once and the
+    budget is kept for the append and the read-back. No header comes back from a filtered read, so
+    the cells are compared by position, the A:J layout every writer here uses."""
+    env = _bus_load_env()
+    try:
+        body = _bus_fetch(env["BUS_URL"], {"action": "read", "secret": env["BUS_SECRET"], "title": BOARD,
+                                           "match": str(rid), "limit": 200}, tries=tries)
+        rows = json.loads(body).get("rows")
+    except Exception:  # noqa: BLE001 - a transport failure is not an empty board
         return None
-    header = _ten_cells(rows[0])
-    if header is None or tuple(h.strip() for h in header[:6]) != _BOARD_HEAD:
+    if not isinstance(rows, list):
         return None
-    return rows[1:]
+    # A filtered read carries no header; a gateway that ignores the filter returns the whole board
+    # with one. Either way the caller compares Row_ID exactly, so the header is simply dropped.
+    if rows and isinstance(rows[0], (list, tuple)) and rows[0] and str(rows[0][0]).strip() == "Row_ID":
+        rows = rows[1:]
+    return rows
 
 
 FREE_TEXT_COLS = (PAYLOAD_COL, 8, 9)      # Payload, Gist, Sub-Gist: runs of spaces are the sheet's
@@ -455,20 +472,12 @@ def _same_complete_row(hit, row) -> bool:
                     for i in range(BOARD_WIDTH) if i != 1))
 
 
-def _board_rows_like(rid, row):
+def _board_rows_like(rid, row, tries=1):
     """(hit, identical, why): every row on the board under this Row_ID, those that are this row, and
-    "" - or (None, None, why) when the board could not be read ("unreadable") or its header is not
-    the ten-named-cell schema ("header: <n> cells, begins ...")."""
-    data = read_board(quiet=True)
-    if data is None:
-        return None, None, "the board could not be read"
-    recs = _complete_board_rows(data)
+    "" - or (None, None, why) when the board could not be read."""
+    recs = _matching_rows(rid, tries=tries)
     if recs is None:
-        first = data.get("rows") if isinstance(data, dict) else None
-        head = list(first[0]) if isinstance(first, list) and first and isinstance(first[0], (list, tuple)) else []
-        return None, None, ("the board's header is not the ten-named-cell schema (%s, ...; blank padding past "
-                            "the tenth cell is allowed): it has %d cells and begins %s"
-                            % (", ".join(_BOARD_HEAD[:3]), len(head), [str(h)[:16] for h in head[:6]]))
+        return None, None, "the board could not be read (filtered read, %d tr%s)" % (tries, "y" if tries == 1 else "ies")
     hit = [r for r in recs if isinstance(r, (list, tuple)) and r and str(r[0] if r[0] is not None else "") == rid]
     return hit, [r for r in hit if _same_complete_row(r, row)], ""
 
@@ -487,11 +496,10 @@ def append_and_verify(rid, row, fitted=None, spill=None, exact=True):
     paying for. After the append, the read-back is the proof; "not found" is UNCONFIRMED, never
     "absent" (a 404 on the redirect hop has been raised client-side after the row landed)."""
     fitted = fitted or {}
-    hit, identical, why = _board_rows_like(rid, row)
+    hit, identical, why = _board_rows_like(rid, row, tries=1)
     if hit is None:
-        # Unreadable, or readable but not the schema this tool verifies against: either way the id
-        # cannot be checked, and a blind append is the double write this fleet keeps paying for. Said
-        # precisely, so a changed header is found in the log and not mistaken for a gateway outage.
+        # The id cannot be checked, and a blind append is the double write this fleet keeps paying
+        # for. Nothing was appended: the caller may try again on its next pass.
         print("  NOT SENT: %s; the id could not be checked, nothing was appended" % why)
         return EXIT_NOT_SENT
     if len(hit) == len(identical) == 1:
@@ -513,6 +521,10 @@ def append_and_verify(rid, row, fitted=None, spill=None, exact=True):
     # googleusercontent 404 on the redirect hop can be raised client-side AFTER
     # the row has landed - that replayed a row onto the live board once already.
     # The read-back below is what closes the loop, not this response.
+    # THE MARKER BEFORE THE APPEND. A caller that kills this process on its budget reads the partial
+    # output: no marker means nothing was appended (NOT SENT, try again later); the marker means the
+    # append may have landed (UNCONFIRMED, never post again blindly). Flushed, so it is there.
+    print("  appending Row_ID=%s" % rid, flush=True)
     try:
         body = _bus_fetch(
             _bus_load_env()["BUS_URL"],
@@ -539,7 +551,7 @@ def append_and_verify(rid, row, fitted=None, spill=None, exact=True):
                   "a later commit of the same text reuses it and cannot overwrite a different one.")
 
     # D-4: the response is not the proof. Read the row back: exactly one identical row.
-    hit, identical, why = _board_rows_like(rid, row)
+    hit, identical, why = _board_rows_like(rid, row, tries=2)
     if hit is None:
         print("  UNCONFIRMED: no usable board read after the append (%s). It may have landed. Do NOT retry blindly." % why)
         return EXIT_UNCONFIRMED
