@@ -156,7 +156,20 @@ def one_pass(conn, env, execution, with_git=True, quiet=False):
     now = datetime.datetime.now(datetime.timezone.utc)
     bus_request.heartbeat(conn, "running", now=now, execution=execution)
     since = (now - datetime.timedelta(minutes=WINDOW_MINUTES)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    rows = bus_reconcile.board_rows(env, since=since)
+    # Source read. REQUEST_SOURCE_ROW_IDS fetches those stable row ids (a UUID
+    # or a unique hex prefix). Otherwise the time window. Both go through
+    # bus._fetch_once, which follows /exec's 302 as a bare GET. A copied
+    # Content-Type on that hop is the HTTP 404 that stopped bus-requests-6ct9q
+    # before the rows reached the request handler.
+    source_ids = [
+        part.strip()
+        for part in os.environ.get("REQUEST_SOURCE_ROW_IDS", "").split(",")
+        if part.strip()
+    ]
+    if source_ids:
+        rows = bus_reconcile.source_rows(env, row_ids=source_ids)
+    else:
+        rows = bus_reconcile.source_rows(env, since=since)
     if not quiet:
         log.info("window since=%s: %d board row(s)", since, len(rows))
     # THE GIT CHANNEL (scripts/git_requests.py): requests from the GitHub bot accounts the access list

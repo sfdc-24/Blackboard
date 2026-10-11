@@ -27,6 +27,7 @@
 !/cloud/bus-reconciler
 !/cloud/redis-tool-bridge
 !/cloud/inbox-wake
+!/cloud/board-mirror
 
 !/scripts
 /scripts/*

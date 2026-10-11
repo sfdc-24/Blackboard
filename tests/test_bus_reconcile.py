@@ -145,6 +145,26 @@ class TheReaderShape(unittest.TestCase):
         got = rec.board_rows(None, reader=lambda since, limit: {"rows": [list(A), "junk", None]})
         self.assertEqual(1, len(got))
 
+    def test_source_rows_fetches_each_stable_id(self):
+        """serve_requests reads through source_rows. A row id is not a time window."""
+        calls = []
+
+        def reader(row_ids):
+            calls.append(list(row_ids))
+            return {"rows": [
+                ["53778e84-0000-4000-8000-000000000004", "", "", "", "REVIEW", "CM-20261010-004"],
+                ["bc9e1a16-0000-4000-8000-000000000001", "", "", "", "REVIEW", "GR-20261010-001"],
+                ["aef36ae2-0000-4000-8000-000000000040", "", "", "", "REVIEW", "GEMINI-20261010-0040"],
+            ]}
+
+        got = rec.source_rows(None, row_ids=["53778e84", "bc9e1a16", "aef36ae2"], reader=reader)
+        self.assertEqual([["53778e84", "bc9e1a16", "aef36ae2"]], calls)
+        self.assertEqual(3, len(got))
+        self.assertEqual("CM-20261010-004", got[0][5])
+        window = rec.source_rows(None, since="2026-10-10T00:00:00Z",
+                                 reader=lambda since, limit: {"rows": [list(A)]})
+        self.assertEqual("R-1", window[0][0])
+
 
 class WhatTheFirstRealExecutionTaught(unittest.TestCase):
     """Two defects the first Cloud Run execution found, both of mine."""

@@ -165,12 +165,9 @@ function handleAppend_(body, cfg) {
                           existing_row: dup.row }, 409);
       }
       sheet.appendRow(row);
-      // Queue only. UrlFetch here would add a Cloud Run cold start to the append.
-      try {
-        queueBoardHook_(row, sheet.getLastRow());
-      } catch (hookErr) {
-        console.error('board hook queue failed: ' + hookErr);
-      }
+      // appendRow does not fire onEdit. The installable triggers cover edits
+      // a person makes. A row this request wrote is copied by the one-pass
+      // reconcile on board-mirror, not by a fetch or a trigger created here.
       if (Array.isArray(body.sheetRow)) {
         const trigger = maybeTriggerWorker_(body.sheetRow);
         if (trigger !== 'off' && trigger !== 'not-a-request') {
@@ -461,35 +458,43 @@ function jsonOut_(obj, code) {
     .setMimeType(ContentService.MimeType.JSON);
 }
 
-// ---- BOARD HOOK — copy a new row toward Redis, without slowing the append ----
+// ---- BOARD HOOK — one signed POST per changed-row batch ----
 //
-// Gemini's path: an installable onChange/onEdit on the board sheet POSTs one
-// small signed event to inbox-wake (POST /hooks/board). The secret is the
-// Script Property BOARD_HOOK_SECRET. The URL is BOARD_HOOK_URL. Neither value
-// is in this file.
+// An installable onEdit / onChange, installed once by the owner from the
+// script editor, POSTs the changed rows to board-mirror. This file does not
+// create or delete triggers. The URL is the Script Property BOARD_HOOK_URL.
+// The HMAC secret is BOARD_HOOK_SECRET. The OIDC audience is
+// BOARD_MIRROR_AUDIENCE (the Cloud Run URL). None of those values are in
+// this file.
 //
-// INSTALL ONCE, as the owner, from the script editor. This file does not
-// install them on each request:
-//   ScriptApp.newTrigger('onBoardEdit').forSpreadsheet(ss).onEdit().create();
-//   ScriptApp.newTrigger('onBoardChange').forSpreadsheet(ss).onChange().create();
+// Cloud Run IAM is the door: the call carries an identity token from
+// ScriptApp.getIdentityToken. The HMAC, the timestamp, and the nonce are
+// the second check. One UrlFetchApp.fetch per batch. No retry loop.
 //
-// A change the web app itself makes with appendRow does not fire those
-// triggers. queueBoardHook_ records the event and, if one is not already
-// waiting, creates a single one-shot time trigger a minute out. That trigger
-// POSTs once and deletes itself. It does not reschedule on failure. The Cloud
-// Run reconcile pass is what copies a row this drop missed.
-//
-// Unset BOARD_HOOK_URL or BOARD_HOOK_SECRET: queueBoardHook_ returns without
-// a fetch and without a trigger. Appends stay as they were.
+// appendRow from this web app does not fire onEdit. Those rows wait for
+// board-mirror's one-pass reconcile. Unset URL or secret: no fetch.
 
 function onBoardEdit(e) {
   try {
     if (!e || !e.range) return;
-    var sheet = e.range.getSheet();
-    var sheetRow = e.range.getRow();
-    if (sheetRow < 2) return;
-    var row = sheet.getRange(sheetRow, 1, 1, 10).getValues()[0];
-    postBoardHook_(boardEvent_(row, sheetRow));
+    var range = e.range;
+    var sheet = range.getSheet();
+    var start = range.getRow();
+    var n = range.getNumRows();
+    if (start < 2) {
+      var skip = 2 - start;
+      if (skip >= n) return;
+      start = 2;
+      n = n - skip;
+    }
+    var values = sheet.getRange(start, 1, n, 10).getValues();
+    var events = [];
+    for (var i = 0; i < values.length; i++) {
+      var event = boardEvent_(values[i], start + i);
+      if (event.row_id) events.push(event);
+    }
+    if (!events.length) return;
+    postBoardHook_(events);
   } catch (err) {
     console.error('board hook edit failed: ' + err);
   }
@@ -497,13 +502,18 @@ function onBoardEdit(e) {
 
 function onBoardChange(e) {
   try {
+    var change = String(e && e.changeType || '');
+    // EDIT is onBoardEdit's batch. FORMAT and removals are not new rows.
+    if (change !== 'INSERT_ROW' && change !== 'INSERT_GRID' && change !== 'OTHER') return;
     var ss = e && e.source;
     if (!ss) return;
     var sheet = ss.getSheets()[0];
     var sheetRow = sheet.getLastRow();
     if (sheetRow < 2) return;
     var row = sheet.getRange(sheetRow, 1, 1, 10).getValues()[0];
-    postBoardHook_(boardEvent_(row, sheetRow));
+    var event = boardEvent_(row, sheetRow);
+    if (!event.row_id) return;
+    postBoardHook_([event]);
   } catch (err) {
     console.error('board hook change failed: ' + err);
   }
@@ -524,75 +534,43 @@ function boardEvent_(row, sheetRow) {
   };
 }
 
-function queueBoardHook_(row, sheetRow) {
-  var props = PropertiesService.getScriptProperties();
-  if (!props.getProperty('BOARD_HOOK_URL') || !props.getProperty('BOARD_HOOK_SECRET')) return;
-  var event = boardEvent_(row, sheetRow);
-  if (!event.row_id) return;
-  var cache = CacheService.getScriptCache();
-  var events = [];
+function boardIdentityToken_(audience) {
+  // ScriptApp.getIdentityToken is the OIDC token Cloud Run IAM checks.
+  // It is not a UrlFetch. A service-account token is what this returns when
+  // the script runs as that account. No second fetch on this path.
   try {
-    events = JSON.parse(cache.get('board-hook-queue') || '[]');
-  } catch (err) {
-    events = [];
-  }
-  if (!Array.isArray(events)) events = [];
-  if (events.length >= 20) {
-    console.error('board hook queue full; row_id=' + event.row_id + ' left for reconcile');
-    return;
-  }
-  events.push(event);
-  cache.put('board-hook-queue', JSON.stringify(events), 600);
-  if (cache.get('board-hook-armed')) return;
-  // One shot, a minute out, and only when one is not already armed. Not a
-  // repeating schedule, and not a fetch on the append path. Listing the
-  // project's triggers here would hold the append lock on a slow call.
-  try {
-    ScriptApp.newTrigger('deliverBoardHook_').timeBased().after(60 * 1000).create();
-    cache.put('board-hook-armed', '1', 600);
-  } catch (err) {
-    console.error('board hook trigger failed: ' + err);
-  }
-}
-
-function deliverBoardHook_() {
-  var events = [];
-  try {
-    var cache = CacheService.getScriptCache();
-    try {
-      events = JSON.parse(cache.get('board-hook-queue') || '[]');
-    } catch (err) {
-      events = [];
+    if (typeof ScriptApp.getIdentityToken === 'function') {
+      try {
+        return ScriptApp.getIdentityToken(audience);
+      } catch (inner) {
+        return ScriptApp.getIdentityToken();
+      }
     }
-    cache.remove('board-hook-queue');
-    cache.remove('board-hook-armed');
-    removeBoardHookTriggers_();
-    if (!Array.isArray(events)) return;
-    events.forEach(function (event) {
-      postBoardHook_(event);
-    });
   } catch (err) {
-    console.error('board hook deliver failed: ' + err);
+    console.error('getIdentityToken failed: ' + err);
   }
+  return '';
 }
 
-function removeBoardHookTriggers_() {
-  var triggers = ScriptApp.getProjectTriggers();
-  for (var i = 0; i < triggers.length; i++) {
-    if (triggers[i].getHandlerFunction() === 'deliverBoardHook_') {
-      ScriptApp.deleteTrigger(triggers[i]);
-    }
-  }
-}
-
-function postBoardHook_(event) {
-  if (!event || !event.row_id) return;
+function postBoardHook_(events) {
+  if (!events || !events.length) return;
   var props = PropertiesService.getScriptProperties();
   var url = props.getProperty('BOARD_HOOK_URL');
   var secret = props.getProperty('BOARD_HOOK_SECRET');
+  var audience = props.getProperty('BOARD_MIRROR_AUDIENCE') || url;
   if (!url || !secret) return;
-  var body = JSON.stringify(event);
+  var token = boardIdentityToken_(audience);
+  if (!token) {
+    console.error('board hook has no identity token; left for reconcile');
+    return;
+  }
+  var body = JSON.stringify({
+    ts: Math.floor(Date.now() / 1000),
+    nonce: Utilities.getUuid(),
+    events: events
+  });
   var sig = 'sha256=' + hmacHex_(secret, body);
+  var ids = events.map(function (event) { return event.row_id; }).join(',');
   try {
     var resp = UrlFetchApp.fetch(url, {
       method: 'post',
@@ -600,14 +578,17 @@ function postBoardHook_(event) {
       payload: body,
       muteHttpExceptions: true,
       followRedirects: false,
-      headers: { 'X-Board-Signature-256': sig }
+      headers: {
+        'X-Board-Signature-256': sig,
+        'Authorization': 'Bearer ' + token
+      }
     });
     var code = resp.getResponseCode();
     if (code < 200 || code >= 300) {
-      console.error('board hook failed row_id=' + event.row_id + ' http=' + code);
+      console.error('board hook failed row_id=' + ids + ' http=' + code);
     }
   } catch (err) {
-    console.error('board hook failed row_id=' + event.row_id + ' error=' + err);
+    console.error('board hook failed row_id=' + ids + ' error=' + err);
   }
 }
 

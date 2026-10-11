@@ -135,6 +135,9 @@ on:
       - ".github/workflows/inbox-wake-codex.yml"
       - "gas-bus/Code.js"
       - "gas-bus/appsscript.json"
+      - "tests/test_board_mirror.py"
+      - "cloud/board-mirror/**"
+      - "cloud/bus-reconciler/serve_requests.py"
       - "scripts/sf360.py"
       - "tests/test_org_publish.py"
       - "scripts/org_publish.py"
@@ -216,6 +219,9 @@ on:
       - ".github/workflows/inbox-wake-codex.yml"
       - "gas-bus/Code.js"
       - "gas-bus/appsscript.json"
+      - "tests/test_board_mirror.py"
+      - "cloud/board-mirror/**"
+      - "cloud/bus-reconciler/serve_requests.py"
       - "scripts/roster_seed.py"
       - "tests/test_roster_seed.py"
       - "tests/test_image_layout.py"
@@ -975,6 +981,16 @@ jobs:
           if [ -f tests/test_inbox_wake.py ]; then
             python_bin="$(command -v python3)"
             sudo unshare -n -- "$python_bin" -B tests/test_inbox_wake.py
+          else
+            echo "not on this branch; skipping"
+          fi
+
+      - name: "board mirror is default off, signed, and a separate writer (no network)"
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_board_mirror.py ]; then
+            python_bin="$(command -v python3)"
+            sudo unshare -n -- "$python_bin" -B tests/test_board_mirror.py
           else
             echo "not on this branch; skipping"
           fi

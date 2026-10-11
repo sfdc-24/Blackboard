@@ -83,6 +83,28 @@ def as_mapping(cells) -> dict:
     return out
 
 
+def source_rows(env, row_ids=None, since=None, limit=None, reader=None) -> list:
+    """The board source read serve_requests uses.
+
+    A row id is the stable UUID in column 0, or a unique hex prefix of at least
+    8 characters (53778e84, bc9e1a16, aef36ae2). Each id is read with match=
+    through bus.read_row, which follows /exec's 302 as a bare GET. A copied
+    Content-Type on that hop is HTTP 404, and that 404 is not turned into an
+    empty window: the pass stops before it treats a missed row as nothing.
+    With no ids, this is the time window, on the same follower.
+    """
+    if row_ids:
+        ids = [str(item).strip() for item in row_ids if str(item or "").strip()]
+        if reader is not None:
+            found = reader(row_ids=ids)
+            if isinstance(found, dict):
+                found = found.get("rows") or []
+            return [r for r in found if isinstance(r, list)]
+        from bus import read_row                                        # noqa: PLC0415
+        return [read_row(env, row_id) for row_id in ids]
+    return board_rows(env, since=since, limit=limit, reader=reader)
+
+
 def board_rows(env, since=None, limit=None, reader=None) -> list:
     """The window of the board to compare, from the authoritative gateway.
 

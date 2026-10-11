@@ -11,6 +11,7 @@ urlopen redirect handler is not used.
 """
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -291,6 +292,47 @@ def read_rows(env, title="Blackboard - Alpha DB", tries=4,
             "title": obj.get("title", title),
         }
     raise SystemExit("bus never returned rows")
+
+
+# A stable row id is the UUID in column 0, or a unique hex prefix of it
+# (53778e84 matches 53778e84-.... and does not match 53778e84999).
+_ROW_PREFIX = re.compile(r"^[0-9a-fA-F]{8,64}\Z")
+
+
+def row_matches(row_id, cell) -> bool:
+    """True when cell is that row id, or that id is a unique hex prefix of it."""
+    want = str(row_id or "").strip()
+    got = str(cell or "").strip()
+    if not want or not got:
+        return False
+    if got == want:
+        return True
+    if _ROW_PREFIX.fullmatch(want) and got.lower().startswith(want.lower()):
+        rest = got[len(want):]
+        return rest[:1] in ("", "-")
+    return False
+
+
+def read_row(env, row_id, title="Blackboard - Alpha DB", tries=4):
+    """One data row, fetched by its stable Row_ID through the bare-GET follower.
+
+    The live gateway has match, not a rowId parameter. match is a
+    case-insensitive substring of the whole row, so this sends match=<row id>
+    and then keeps the row whose column 0 is that id (or whose column 0
+    continues a hex prefix of at least 8 characters with a hyphen). Two such
+    rows raise LookupError. A substring that only appears in a payload is not
+    a row. The transport is read_rows, which follows /exec's 302 as a bare
+    GET: no body and no Content-Type on the hop. That copied header is the
+    HTTP 404.
+    """
+    want = str(row_id or "").strip()
+    if not want:
+        raise LookupError("row")
+    found = read_rows(env, title=title, tries=tries, match=want)
+    exact = [row for row in (found.get("rows") or []) if row and row_matches(want, row[0])]
+    if len(exact) != 1:
+        raise LookupError("row")
+    return exact[0]
 
 
 def main():

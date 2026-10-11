@@ -30,20 +30,18 @@ has to come back through that agent's own path, inside five minutes, with the
 laptop closed. The test plan for that is in the pull request, and it is not
 run from here.
 
-THE BOARD MIRROR. INBOX_WAKE_BOARD_MIRROR must be exactly "on". Anything else,
-including unset, leaves POST /hooks/board as a no-op: no signature check, no
-board read, no Redis. The image sets the variable to off. Rollback is that
-variable, not a new build: set INBOX_WAKE_BOARD_MIRROR=off.
-
-When the flag is on, an Apps Script trigger POSTs a small HMAC-SHA256 event
-(secret name BOARD_HOOK_SECRET, value never in this file). The handler checks
-the signature, fetches the row from the board by row_id, and only then writes.
-The claim is one SET NX on fleet:board:mirrored:<row_id>. There is no GET
-before it. The winner XADDs fleet:board:stream and fleet:inbox:<agent>, reads
-each entry back, and returns the stream id and sha256. A mismatch or a Redis
-timeout is an error, not a success. to=all is one board entry and one inbox
-entry per fleet agent. reconcile_once mirrors the last few minutes in a single
-pass and returns. It does not loop and it does not sleep.
+THIS PROCESS READS fleet:inbox:<agent> AND WAKES THAT AGENT. It does not
+write fleet:board:stream and it does not write fleet:inbox:*. Copying a board
+row into Redis is cloud/board-mirror, its own service and its own service
+account (board-mirror@). This account is inbox-wake@sfdc24.iam.gserviceaccount.com.
+It is not redis-tool-bridge@sfdc24.iam.gserviceaccount.com. It has no
+roles/iam.serviceAccountUser, and no roles/redis.admin, roles/redis.editor,
+or roles/redis.viewer. Secret access is roles/secretmanager.secretAccessor
+on REDIS_AUTH_STRING, REDIS_CA_CERT, GITHUB_WEBHOOK_SECRET,
+INBOX_WAKE_SWEEP_TOKEN, and GITHUB_WAKE_TOKEN only. roles/run.invoker is on
+the Cloud Run job gemini-waker only. The parent doorbell still SET NXes
+fleet:wake:seen:* and fleet:wake:receipt:entry:*. This file does not add a
+board write. Nothing here grants a role.
 
 Deploy is not this file's job. The command is in the pull request. Nothing
 here is applied.
@@ -58,7 +56,7 @@ import logging
 import os
 import re
 import urllib.request
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PROJECT = os.environ.get("RUN_PROJECT") or "sfdc24"
@@ -86,29 +84,6 @@ RECEIVED = "RECEIVED"
 DISPATCHED = "DISPATCHED"
 RECEIPT_STATES = (RECEIVED, DISPATCHED)
 RECEIPT_ENTRY_PREFIX = "fleet:wake:receipt:entry:"
-# fleet: is the prefix the ACL already grants. No new grant in this file.
-BOARD_STREAM = "fleet:board:stream"
-MIRROR_PREFIX = "fleet:board:mirrored:"
-INBOX_PREFIX = "fleet:inbox:"
-# scripts/redis_acl.json principals, minus owner (a person) and milestones-sync
-# (not an agent inbox). to=all writes one entry to each of these.
-BOARD_AGENTS = (
-    "claude-code-cli",
-    "chatgpt-codex-desktop",
-    "grok",
-    "gemini",
-    "cursor",
-    "copilot",
-    "claude-api",
-    "claude-mobile",
-    "pi1-cli",
-)
-BOARD_AGENT_SET = frozenset(BOARD_AGENTS)
-BCB_ID = re.compile(r"(?:^|\|)id=([A-Za-z0-9._-]{1,200})(?:\||$)")
-# One pass. A wider window is still this many rows, then the function returns.
-RECONCILE_MAX = 50
-RECONCILE_MINUTES = 10
-STREAM_MAXLEN = 10000
 LOG = logging.getLogger("inbox_wake")
 
 # Canonical ids are scripts/redis_acl.json principals. Aliases are the ones that
@@ -526,330 +501,6 @@ def bearer_ok(secret: str, header: str) -> bool:
     return hmac.compare_digest("Bearer " + secret, header or "")
 
 
-def board_mirror_enabled(environ=None) -> bool:
-    """The mirror flag. Exactly "on". Anything else writes nothing."""
-    environ = os.environ if environ is None else environ
-    return environ.get("INBOX_WAKE_BOARD_MIRROR") == "on"
-
-
-def _text(value) -> str:
-    if isinstance(value, bytes):
-        return value.decode("utf-8", "replace")
-    if value is None:
-        return ""
-    return str(value)
-
-
-def _field(fields, name: str) -> str:
-    if not isinstance(fields, dict):
-        return ""
-    value = fields.get(name)
-    if value is None:
-        value = fields.get(name.encode("utf-8"))
-    return _text(value) if value is not None else ""
-
-
-def bcb_id(payload: str) -> str:
-    match = BCB_ID.search(str(payload or ""))
-    return match.group(1) if match else ""
-
-
-def row_view(cells) -> dict:
-    """One board row as the mirror stores it. Content comes from the cells."""
-    cells = list(cells or [])
-    while len(cells) < 6:
-        cells.append("")
-    payload = _text(cells[5])
-    return {
-        "row_id": _text(cells[0]).strip(),
-        "appended_at": _text(cells[1]),
-        "from": _text(cells[2]),
-        "to": _text(cells[3]),
-        "phase": _text(cells[4]),
-        "payload": payload,
-        "id": bcb_id(payload),
-        "sha256": hashlib.sha256(payload.encode("utf-8")).hexdigest(),
-    }
-
-
-def sheet_row_text(value) -> str:
-    """A locator from the event. Not a source of row content."""
-    if isinstance(value, bool) or value is None:
-        return ""
-    if isinstance(value, int) and 1 <= value <= 1000000:
-        return str(value)
-    text = _text(value).strip()
-    if text.isdigit() and 1 <= int(text) <= 1000000:
-        return str(int(text))
-    return ""
-
-
-def inbox_targets(to_field: str) -> list:
-    """The inbox keys a row addresses. `all` is every fleet agent, once."""
-    tokens = []
-    for part in re.split(r"[;,]", str(to_field or "")):
-        name = part.strip().lower()
-        if name:
-            tokens.append(ALIASES.get(name, name))
-    if not tokens:
-        return []
-    if any(name in ("all", "*") for name in tokens):
-        return list(BOARD_AGENTS)
-    out = []
-    for name in tokens:
-        if name in BOARD_AGENT_SET and name not in out:
-            out.append(name)
-    return out
-
-
-def stream_fields(view: dict, sheet_row: str) -> dict:
-    payload = view["payload"]
-    if len(payload.encode("utf-8")) > 2048:
-        payload = ""
-    return {
-        "row_id": view["row_id"],
-        "sheet_row": sheet_row,
-        "appended_at": view["appended_at"],
-        "from": view["from"],
-        "to": view["to"],
-        "phase": view["phase"],
-        "id": view["id"],
-        "sha256": view["sha256"],
-        "payload": payload,
-    }
-
-
-def _entry_sha(rows, entry_id: str) -> str:
-    for eid, fields in rows or ():
-        if entry_id and _text(eid) != entry_id:
-            continue
-        return _field(fields, "sha256")
-    return ""
-
-
-class RedisBoard:
-    """SET NX is the claim. XADD happens only after that claim is won."""
-
-    def __init__(self, client):
-        self.client = client
-
-    def claim(self, row_id: str, marker: str) -> str:
-        try:
-            wrote = self.client.set(MIRROR_PREFIX + row_id, marker, nx=True, ex=SEEN_TTL)
-        except OSError as exc:
-            LOG.error("board mirror error row_id=%s error=%s", row_id, type(exc).__name__)
-            return "error"
-        except Exception as exc:  # noqa: BLE001 - not a success
-            LOG.error("board mirror error row_id=%s error=%s", row_id, type(exc).__name__)
-            return "error"
-        if wrote:
-            return "claimed"
-        if wrote is None:
-            return "duplicate"
-        LOG.error("board mirror error row_id=%s error=write-rejected", row_id)
-        return "error"
-
-
-def _xadd_checked(client, key: str, fields: dict, expected: str, row_id: str):
-    """XADD, then read that entry back. A mismatch is an error, not a success."""
-    try:
-        entry_id = _text(client.xadd(
-            key, fields, maxlen=STREAM_MAXLEN, approximate=True))
-    except OSError as exc:
-        LOG.error("board mirror error row_id=%s stream=%s error=%s",
-                  row_id, key, type(exc).__name__)
-        return "", "error"
-    except Exception as exc:  # noqa: BLE001
-        LOG.error("board mirror error row_id=%s stream=%s error=%s",
-                  row_id, key, type(exc).__name__)
-        return "", "error"
-    LOG.info("board mirror stream=%s stream_id=%s row_id=%s sha256=%s",
-             key, entry_id, row_id, expected)
-    try:
-        rows = client.xrange(key, min=entry_id, max=entry_id)
-    except OSError as exc:
-        LOG.error("board mirror readback row_id=%s stream=%s error=%s",
-                  row_id, key, type(exc).__name__)
-        return entry_id, "error"
-    except Exception as exc:  # noqa: BLE001
-        LOG.error("board mirror readback row_id=%s stream=%s error=%s",
-                  row_id, key, type(exc).__name__)
-        return entry_id, "error"
-    if _entry_sha(rows, entry_id) != expected:
-        LOG.error("board mirror readback mismatch row_id=%s stream=%s stream_id=%s",
-                  row_id, key, entry_id)
-        return entry_id, "error"
-    return entry_id, "ok"
-
-
-def mirror_row(cells, deps, sheet_row="") -> dict:
-    """Claim the row, then write the board stream and the addressed inboxes.
-
-    The cells are the board's row, already fetched. The event body is not read
-    here. A lost claim writes nothing. A Redis failure returns error and does
-    not delete the claim: deleting it could let a second instance append again.
-    """
-    view = row_view(cells)
-    row_id = view["row_id"]
-    if not ID_OK.fullmatch(row_id):
-        return {"enabled": True, "ok": False, "status": "bad_id", "row_id": row_id}
-    if deps.board is None:
-        return {"enabled": True, "ok": False, "status": "error", "error": "no_store",
-                "row_id": row_id}
-    claim = deps.board.claim(row_id, view["sha256"])
-    if claim == "duplicate":
-        return {"enabled": True, "ok": True, "status": "duplicate", "mirrored": False,
-                "row_id": row_id}
-    if claim != "claimed":
-        return {"enabled": True, "ok": False, "status": "error", "error": "redis",
-                "row_id": row_id}
-    fields = stream_fields(view, sheet_row_text(sheet_row))
-    stream_id, outcome = _xadd_checked(
-        deps.board.client, BOARD_STREAM, fields, view["sha256"], row_id)
-    if outcome != "ok":
-        return {"enabled": True, "ok": False, "status": "error", "error": "redis",
-                "row_id": row_id, "stream_id": stream_id, "sha256": view["sha256"]}
-    inboxes = []
-    for agent in inbox_targets(view["to"]):
-        key = INBOX_PREFIX + agent
-        inbox_id, inbox_outcome = _xadd_checked(
-            deps.board.client, key, fields, view["sha256"], row_id)
-        if inbox_outcome != "ok":
-            return {"enabled": True, "ok": False, "status": "error", "error": "redis",
-                    "row_id": row_id, "stream_id": stream_id, "sha256": view["sha256"],
-                    "inboxes": inboxes}
-        inboxes.append({"key": key, "stream_id": inbox_id, "sha256": view["sha256"]})
-    return {
-        "enabled": True, "ok": True, "status": "mirrored", "mirrored": True,
-        "row_id": row_id, "stream_id": stream_id, "sha256": view["sha256"],
-        "inboxes": inboxes,
-    }
-
-
-def fetch_board_row(row_id, env=None, reader=None):
-    """The row whose Row_ID is exactly row_id. A substring hit is not a row."""
-    if reader is None:
-        import bus  # noqa: PLC0415 - the image copies scripts/bus.py to /app
-        env = bus.load_env() if env is None else env
-        found = bus.read_rows(env, match=row_id)
-        rows = found.get("rows") or []
-    else:
-        rows = reader(row_id) or []
-    exact = [row for row in rows if row and _text(row[0]).strip() == str(row_id)]
-    if len(exact) != 1:
-        raise LookupError("row")
-    return exact[0]
-
-
-def fetch_board_window(since, env=None, reader=None):
-    """Rows since `since`, capped. One read. The caller does not loop."""
-    if reader is None:
-        import bus  # noqa: PLC0415
-        env = bus.load_env() if env is None else env
-        found = bus.read_rows(env, since=since, limit=RECONCILE_MAX)
-        return found.get("rows") or []
-    return list(reader(since) or [])
-
-
-def reconcile_once(deps, minutes=RECONCILE_MINUTES, now=None) -> dict:
-    """Mirror recent rows that lack the SET NX marker. One pass, then return.
-
-    There is no sleep and no second pass. The marker test is the SET NX inside
-    mirror_row, not an EXISTS followed by a write.
-    """
-    if not getattr(deps, "board_mirror", False):
-        return {"enabled": False, "ok": True, "mirrored": [], "skipped": [], "seen": 0}
-    if deps.board is None or deps.board_window is None:
-        return {"enabled": True, "ok": False, "status": "error", "error": "no_store",
-                "mirrored": [], "skipped": [], "seen": 0}
-    try:
-        minutes = int(minutes)
-    except (TypeError, ValueError):
-        minutes = RECONCILE_MINUTES
-    minutes = max(1, min(60, minutes))
-    when = now or datetime.now(timezone.utc)
-    if isinstance(when, str):
-        when = datetime.strptime(when, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-    since = (when - timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    try:
-        rows = list(deps.board_window(since) or [])
-    except Exception as exc:  # noqa: BLE001 - a failed read is not an empty board
-        LOG.error("board mirror reconcile error=%s", type(exc).__name__)
-        return {"enabled": True, "ok": False, "status": "error", "error": type(exc).__name__,
-                "mirrored": [], "skipped": [], "seen": 0, "since": since}
-    rows = rows[:RECONCILE_MAX]
-    mirrored, skipped = [], []
-    failed = False
-    for cells in rows:
-        result = mirror_row(cells, deps)
-        if result.get("status") == "mirrored":
-            mirrored.append({
-                "row_id": result.get("row_id"),
-                "stream_id": result.get("stream_id"),
-                "sha256": result.get("sha256"),
-            })
-        else:
-            if result.get("status") == "error":
-                failed = True
-            skipped.append({"row_id": result.get("row_id"), "status": result.get("status")})
-    return {
-        "enabled": True, "ok": not failed, "status": "error" if failed else "done",
-        "seen": len(rows), "mirrored": mirrored, "skipped": skipped, "since": since,
-    }
-
-
-def _board_status(result) -> int:
-    status = result.get("status")
-    if result.get("ok") and status in ("mirrored", "duplicate", "done", "disabled"):
-        return 200
-    if status == "bad_id":
-        return 400
-    if result.get("error") in ("LookupError", "row"):
-        return 502
-    return 503
-
-
-def handle_board(headers: dict, body: bytes, deps) -> tuple:
-    """POST /hooks/board. Flag off is a no-op before the signature or Redis."""
-    if not getattr(deps, "board_mirror", False):
-        return 200, {"enabled": False, "mirrored": False}
-    header = headers.get("x-board-signature-256", "")
-    if not signature_ok(getattr(deps, "board_secret", "") or "", body, header):
-        return 401, {"error": "bad signature"}
-    try:
-        event = json.loads(body.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return 400, {"ok": False, "status": "bad_json", "error": "bad json"}
-    if not isinstance(event, dict):
-        return 400, {"ok": False, "status": "bad_json", "error": "bad json"}
-    row_id = _text(event.get("row_id")).strip()
-    if not ID_OK.fullmatch(row_id):
-        return 400, {"ok": False, "status": "bad_id", "error": "bad row_id"}
-    fetch = getattr(deps, "board_fetch", None)
-    if fetch is None or deps.board is None:
-        return 503, {"ok": False, "status": "error", "error": "no_store", "row_id": row_id}
-    try:
-        cells = fetch(row_id)
-    except Exception as exc:  # noqa: BLE001 - the event body is not a substitute
-        LOG.error("board mirror fetch row_id=%s error=%s", row_id, type(exc).__name__)
-        return 502, {"ok": False, "status": "error", "error": type(exc).__name__,
-                     "row_id": row_id}
-    if not cells or _text(cells[0]).strip() != row_id:
-        return 502, {"ok": False, "status": "error", "error": "row-mismatch", "row_id": row_id}
-    result = mirror_row(cells, deps, sheet_row=event.get("sheet_row"))
-    return _board_status(result), result
-
-
-def handle_reconcile(headers: dict, deps) -> tuple:
-    """One reconcile pass. Flag off does not read the board."""
-    if not getattr(deps, "board_mirror", False):
-        return 200, {"enabled": False, "mirrored": []}
-    if not bearer_ok(deps.sweep_token, headers.get("authorization", "")):
-        return 401, {"error": "bad sweep token"}
-    result = reconcile_once(deps)
-    return (200 if result.get("ok") else 503), result
-
-
 def handle(method: str, path: str, headers: dict, body: bytes, deps) -> tuple:
     path = path.split("?", 1)[0]
     headers = {k.lower(): v for k, v in (headers or {}).items()}
@@ -868,10 +519,6 @@ def handle(method: str, path: str, headers: dict, body: bytes, deps) -> tuple:
         if not bearer_ok(deps.sweep_token, headers.get("authorization", "")):
             return 401, {"error": "bad sweep token"}
         return 200, {"enabled": True, "woke": sweep(deps)}
-    if method == "POST" and path == "/hooks/board":
-        return handle_board(headers, body, deps)
-    if method == "POST" and path == "/hooks/board/reconcile":
-        return handle_reconcile(headers, deps)
     return 404, {"error": "not found"}
 
 
@@ -934,9 +581,7 @@ def read_inbox(client, agent: str) -> list:
 
 class Deps:
     def __init__(self, enabled=False, seen=None, wakers=None, reader=None,
-                 webhook_secret="", sweep_token="", receipts=None, clock=None,
-                 board_mirror=False, board_secret="", board_fetch=None,
-                 board_window=None, board=None):
+                 webhook_secret="", sweep_token="", receipts=None, clock=None):
         self.enabled = enabled
         self.seen = seen
         self.wakers = wakers or Wakers()
@@ -945,11 +590,6 @@ class Deps:
         self.sweep_token = sweep_token or ""
         self.receipts = receipts
         self.clock = clock
-        self.board_mirror = board_mirror
-        self.board_secret = board_secret or ""
-        self.board_fetch = board_fetch
-        self.board_window = board_window
-        self.board = board
 
 
 def attach_store(deps, client, receipts=None):
@@ -966,26 +606,15 @@ def attach_store(deps, client, receipts=None):
     return deps
 
 
-def _attach_board(deps, client):
-    """Board mirror on the same client. Wake's seen-set is not this path."""
-    deps.board = RedisBoard(client)
-    deps.board_fetch = fetch_board_row
-    deps.board_window = fetch_board_window
-    return deps
-
-
 def deps_from_env() -> Deps:
-    """Build the runtime deps. Redis stays closed until a flag is exactly on.
+    """Build the runtime deps. Redis stays closed until the wake flag is exactly on.
 
-    The wake flag and the mirror flag are independent. Mirror off does not
-    open Redis by itself and does not change a wake. Wake off does not mirror.
+    This service reads fleet:inbox:<agent>. It does not open Redis to write a
+    board row. That writer is cloud/board-mirror.
     """
     on = enabled_from_env()
-    mirror = board_mirror_enabled()
     deps = Deps(
         enabled=on,
-        board_mirror=mirror,
-        board_secret=os.environ.get("BOARD_HOOK_SECRET") or "",
         webhook_secret=os.environ.get("GITHUB_WEBHOOK_SECRET") or "",
         sweep_token=os.environ.get("INBOX_WAKE_SWEEP_TOKEN") or "",
         wakers=Wakers(
@@ -994,15 +623,12 @@ def deps_from_env() -> Deps:
             token_provider=_metadata_token if on else None,
         ),
     )
-    if not on and not mirror:
+    if not on:
         return deps
     client = _redis_client()
     if client is None:
         return deps
-    if on:
-        attach_store(deps, client)
-    if mirror:
-        _attach_board(deps, client)
+    attach_store(deps, client)
     return deps
 
 
