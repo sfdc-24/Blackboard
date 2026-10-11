@@ -378,9 +378,26 @@ def cmd_post(args):
     return append_and_verify(rid, row, fitted, spill)
 
 
+PAYLOAD_COL = 5        # the row list's payload cell; the board's header for it is "Payload"
+
+
+def _same_payload(a, b) -> bool:
+    """Two payload cells that say the same thing. Whitespace-normalised, because the sheet is not
+    byte-faithful about runs of spaces and the comparison must not fail every post over one."""
+    return " ".join(str(a or "").split()) == " ".join(str(b or "").split())
+
+
 def append_and_verify(rid, row, fitted=None, spill=None):
     """Append one row, commit its spill if it has one, and prove it landed by reading it back.
-    0 only on a verified row. The one append path for post and request, so they cannot drift."""
+    0 only on a verified row: one READ BACK with this id AND this payload. The one append path for
+    post and request, so they cannot drift.
+
+    ID AND PAYLOAD, NOT ID ALONE (Grok on #367). The ids are stable on purpose (reply_row_id, the
+    waker's request_id), so a retry carries the id of an earlier row. Matching the id alone
+    "verified" whatever row got there first - an older reply, or a different request - and told the
+    caller its row was posted when it was not. A retry whose append landed finds its own identical
+    row (two rows, one id: said in the line); one whose append silently no-op'd finds only the other
+    row and is told so."""
     fitted = fitted or {}
     # tries=1 is not a tuning choice. The v1 bus does not dedup, and a
     # googleusercontent 404 on the redirect hop can be raised client-side AFTER
@@ -418,10 +435,20 @@ def append_and_verify(rid, row, fitted=None, spill=None):
         return 1
     _, recs = rows_frame(data)
     hit = [r for r in recs if str(r.get("Row_ID", "")) == rid]
-    if hit:
-        print("  VERIFIED on the board: Row_ID=%s Source_Tag=%s Target_Surface=%s"
-              % (rid, hit[-1].get("Source_Tag"), hit[-1].get("Target_Surface")))
+    same = [r for r in hit if _same_payload(r.get("Payload"), row[PAYLOAD_COL])]
+    if same:
+        extra = "" if len(hit) == 1 else " (%d rows carry this id, %d of them this payload)" % (len(hit), len(same))
+        print("  VERIFIED on the board: Row_ID=%s Source_Tag=%s Target_Surface=%s%s"
+              % (rid, same[-1].get("Source_Tag"), same[-1].get("Target_Surface"), extra))
         return 0
+    if hit:
+        print("  ID ALREADY USED: %d row(s) carry Row_ID=%s with a DIFFERENT payload, and none carries "
+              "this one. NOT CONFIRMED: this row is not on the board; do not reuse the id." % (len(hit), rid))
+        # The two heads, so a board that is not byte-faithful shows itself here rather than as a
+        # row that is never confirmed. Sixty chars is the BCB header, before any value.
+        print("  expected: %r" % " ".join(str(row[PAYLOAD_COL]).split())[:60])
+        print("  found   : %r" % " ".join(str(hit[-1].get("Payload", "")).split())[:60])
+        return 1
     print("  NOT FOUND after append — the ok:true was a silent no-op.")
     return 1
 
@@ -466,8 +493,12 @@ def request_row(tag, op, key, val=None, field=None, count=None, project="FLEET",
     if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", tag):
         raise ValueError("tag must be the agent's board tag (letters, digits, . _ -)")
     stamp = now or dt.datetime.now(dt.timezone.utc)
-    rid = rid or "%s-REDIS-%s-%s" % (re.sub(r"[^A-Za-z0-9]", "", tag.upper())[:12],
-                                     stamp.strftime("%Y%m%dT%H%M%SZ"), os.urandom(3).hex())
+    # THE CALLER NAMES THE REQUEST (Grok on #367: this used to make one up from the clock and three
+    # random bytes). A retry is the same id and a new request is a new id; a tool that guesses which
+    # one you meant is a tool that can write twice, and the worker answers an id once.
+    if not rid:
+        raise ValueError("a request id is required (--id): a retry is the same id, a new request is a "
+                         "new id, and this tool does not guess which one you meant")
     if not _REQUEST_ID.match(rid):
         raise ValueError("request id %r is outside the worker's id grammar" % rid)
     parts = ["BCB", "v=1", "id=%s" % rid, "req=%s" % rid, "do=redis-op", "op=%s" % op, "key=%s" % key]
@@ -495,12 +526,37 @@ def request_row(tag, op, key, val=None, field=None, count=None, project="FLEET",
 
 def cmd_request(args):
     """Post one governed Redis request and read the row back. The answer arrives later, as an
-    AYA_RESULT row addressed to --tag; this exit code says only whether the ASK landed."""
+    AYA_RESULT row addressed to --tag; this exit code says only whether the ASK landed.
+
+    THE ID IS CHECKED BEFORE THE APPEND (Grok on #367). The read-back matches id and payload, but a
+    row appended under an id another request already used would still be a second row with that id,
+    and the worker answers an id once. So, read first: the identical row already there = already on
+    the board, not posted again, exit 0 and read back; the same id under a different payload =
+    refused before posting, exit 2; a board that cannot be read = NOT SENT, exit 1, because the check
+    cannot be made and a blind append is the double write this fleet keeps paying for. Every line
+    here is one the waker's post_request reads: VERIFIED is posted, "refused before posting" and
+    NOT SENT are refused, anything else is unconfirmed."""
     try:
         rid, row = request_row(args.tag, args.op, args.key, val=args.val, field=args.field,
                                count=args.count, project=args.project, rid=args.id)
     except ValueError as why:
         print("  refused before posting: %s" % why)
+        return 2
+    data = read_board(quiet=True)
+    if data is None:
+        print("  NOT SENT: the board could not be read before posting, so the id could not be checked")
+        return 1
+    _, recs = rows_frame(data)
+    hit = [r for r in recs if str(r.get("Row_ID", "")) == rid]
+    if hit:
+        same = [r for r in hit if _same_payload(r.get("Payload"), row[PAYLOAD_COL])]
+        if same:
+            print("  already on the board: Row_ID=%s carries this exact request; not posted again" % rid)
+            print("  VERIFIED on the board: Row_ID=%s Source_Tag=%s Target_Surface=%s"
+                  % (rid, same[-1].get("Source_Tag"), same[-1].get("Target_Surface")))
+            return 0
+        print("  refused before posting: request id %s is already used by a different request "
+              "(%d row(s)); a new request needs a new id" % (rid, len(hit)))
         return 2
     print("  request %s: %s %s" % (rid, args.op, args.key))
     return append_and_verify(rid, row)
@@ -560,7 +616,9 @@ def build_parser():
     rq.add_argument("--count", type=int, default=None, help="entries to return, for xrange")
     rq.add_argument("--tag", default="claude-code-cli")
     rq.add_argument("--project", default="FLEET")
-    rq.add_argument("--id", default=None)
+    rq.add_argument("--id", required=True,
+                    help="your request id (letters, digits, . _ -; 4-64 chars): the same id for a retry, "
+                         "a new id for a new request; the tool does not make one up")
     rq.set_defaults(fn=cmd_request)
     return p
 

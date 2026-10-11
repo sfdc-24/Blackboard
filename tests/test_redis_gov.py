@@ -522,6 +522,31 @@ class EndToEndThroughTheBoardWorker(unittest.TestCase):
         self.assertEqual(["gemini", "grok", "chatgpt-codex-desktop"], [e["by"] for e in entries],
                          "written under the canonical principal (aya is Codex's desktop)")
 
+    def test_every_principal_and_alias_in_the_access_list_is_answered_under_its_own_tag(self):
+        """Aya's acceptance test, per agent, offline: for EVERY tag the access list knows - each
+        principal and each alias - the row fleet_agent builds under that tag is answered OK under
+        that tag. Read from the list, not from a copy, so a principal added later is covered on the
+        day it is added."""
+        import datetime
+        import fleet_agent
+        import redis_gov
+        acl = redis_gov.load_acl()
+        aliases = acl.get("aliases", {})
+        tags = list(acl["principals"]) + list(aliases)
+        self.assertGreaterEqual(len(tags), 15, "the list the owner set names many agents")
+        when = self.now - datetime.timedelta(minutes=1)
+        conn, rows = FakeRedis(), []
+        for n, tag in enumerate(tags, start=1):
+            # A key each principal may read under ITS OWN rules (milestones-sync reads one namespace).
+            first = acl["principals"][aliases.get(tag, tag)]["read"][0]
+            key = "fleet:accept" if first == "*" else first + "accept"
+            conn.set(key, "ok")
+            rows.append(fleet_agent.request_row(tag, "get", key, now=when, rid="REQ-ACC-%04d" % n)[1])
+        out, written, conn = self.run_rows(rows, conn)
+        self.assertEqual(["OK"] * len(tags), [a["status"] for a in out["answered"]])
+        self.assertEqual(tags, [r["target_surface"] for r in written], "each answered under its own tag")
+        self.assertTrue(all("ok" in r["payload"] for r in written))
+
     def test_a_stranger_with_the_same_tool_gets_no_row_and_writes_nothing(self):
         import datetime
         import fleet_agent
@@ -649,6 +674,115 @@ class NothingLeaks(unittest.TestCase):
             line = gov.summarise(out)
             self.assertNotIn("|", line)
             self.assertNotIn("\n", line)
+
+
+class FleetAgentRequestOnTheBoard(unittest.TestCase):
+    """The tool's append-and-read-back, against a fake board, for what Grok found on #367: the
+    read-back must match the payload, not the id alone; an id already used by a different request is
+    refused before anything is appended; the caller names the id."""
+
+    HEAD = ["Row_ID", "Timestamp", "Source_Tag", "Target_Surface", "Action_Type", "Payload",
+            "Category", "Project_Tag", "Gist", "Notes"]
+
+    def setUp(self):
+        import fleet_agent
+        self.fa = fleet_agent
+        self.board = {"rows": [list(self.HEAD)]}
+        self.appends = []
+        self.real = (fleet_agent.read_board, fleet_agent._bus_fetch, fleet_agent._bus_load_env)
+        fleet_agent._bus_load_env = lambda: {"BUS_URL": "https://bus.test/x", "BUS_SECRET": "s"}
+        fleet_agent.read_board = lambda **kw: self.board
+
+        def fetch(url, payload, tries=1):
+            self.appends.append(payload["sheetRow"])
+            self.board["rows"].append(list(payload["sheetRow"]))
+            return "ok:true"
+        fleet_agent._bus_fetch = fetch
+
+    def tearDown(self):
+        self.fa.read_board, self.fa._bus_fetch, self.fa._bus_load_env = self.real
+
+    def args(self, rid="REQ-T-0001", val="one"):
+        import argparse
+        return argparse.Namespace(tag="gemini", op="set", key="proj:k", val=val, field=None,
+                                  count=None, project="FLEET", id=rid)
+
+    def test_a_new_request_is_appended_once_and_read_back_by_id_and_payload(self):
+        import contextlib, io
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = self.fa.cmd_request(self.args())
+        self.assertEqual(0, code)
+        self.assertEqual(1, len(self.appends))
+        self.assertIn("VERIFIED on the board: Row_ID=REQ-T-0001", out.getvalue())
+
+    def test_the_identical_request_again_is_not_appended_and_still_reads_back(self):
+        import contextlib, io
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.fa.cmd_request(self.args())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = self.fa.cmd_request(self.args())
+        self.assertEqual(0, code)
+        self.assertEqual(1, len(self.appends), "a retry of the same request appends nothing")
+        self.assertIn("already on the board", out.getvalue())
+        self.assertIn("VERIFIED on the board", out.getvalue())
+
+    def test_the_same_id_with_a_different_request_is_refused_before_anything_is_appended(self):
+        import contextlib, io
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.fa.cmd_request(self.args(val="one"))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = self.fa.cmd_request(self.args(val="two"))
+        self.assertEqual(2, code)
+        self.assertEqual(1, len(self.appends))
+        self.assertIn("refused before posting: request id REQ-T-0001 is already used", out.getvalue())
+        self.assertNotIn("VERIFIED", out.getvalue())
+
+    def test_a_board_that_cannot_be_read_means_NOT_SENT_not_a_blind_append(self):
+        import contextlib, io
+        self.fa.read_board = lambda **kw: None
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = self.fa.cmd_request(self.args())
+        self.assertEqual(1, code)
+        self.assertEqual([], self.appends)
+        self.assertIn("NOT SENT", out.getvalue())
+
+    def test_the_read_back_does_not_count_an_older_row_with_the_same_id_but_another_payload(self):
+        # The append silently no-ops (the gateway said ok:true, nothing landed) while an older,
+        # different row already carries the id: before #367's fix this was "VERIFIED".
+        import contextlib, io
+        rid, old = self.fa.request_row("gemini", "set", "proj:k", val="one", rid="REQ-T-0002")
+        self.board["rows"].append(list(old))
+        _, new = self.fa.request_row("gemini", "set", "proj:k", val="two", rid="REQ-T-0002")
+        self.fa._bus_fetch = lambda url, payload, tries=1: "ok:true"       # lands nothing
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = self.fa.append_and_verify(rid, new)
+        self.assertEqual(1, code)
+        self.assertIn("ID ALREADY USED", out.getvalue())
+        self.assertNotIn("VERIFIED", out.getvalue())
+
+    def test_a_retry_whose_append_landed_is_verified_and_the_second_row_is_said(self):
+        import contextlib, io
+        rid, row = self.fa.request_row("gemini", "set", "proj:k", val="one", rid="REQ-T-0003")
+        self.board["rows"].append(list(row))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = self.fa.append_and_verify(rid, row)
+        self.assertEqual(0, code)
+        self.assertIn("2 rows carry this id, 2 of them this payload", out.getvalue())
+
+    def test_the_caller_names_the_id_the_tool_does_not_make_one_up(self):
+        with self.assertRaises(ValueError) as caught:
+            self.fa.request_row("gemini", "set", "proj:k", val="v")
+        self.assertIn("request id is required", str(caught.exception))
+        with self.assertRaises(SystemExit):
+            self.fa.build_parser().parse_args(["request", "get", "proj:k", "--tag", "gemini"])
+        ns = self.fa.build_parser().parse_args(["request", "get", "proj:k", "--tag", "gemini", "--id", "R-0001"])
+        self.assertEqual("R-0001", ns.id)
 
 
 if __name__ == "__main__":

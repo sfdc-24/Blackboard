@@ -123,14 +123,20 @@ REDIS, which you may read and write through your adapter, governed and audited:
   form (op first, then the key, then the value when the op takes one):
       REDIS-OP|op=xadd|key=conf:side:YYYYMMDD|val=your line of text
   ops: get, hgetall, xrange (reads); set, hset (needs field=), hput, xadd, del (writes).
-  You may write under conf:, fleet: and proj: only; everything else is read-only to you.
-  The side channel every voice on the conference line reads is conf:side:<today, UTC yyyymmdd>.
+  The key must start with conf:, fleet: or proj:, for reads and writes alike; any other key
+  is refused before posting. The side channel every voice on the conference line reads is
+  conf:side:<today, UTC yyyymmdd>.
 - Your adapter posts that line as a request row under your own tag and removes it from the
   text of your answer. The governed worker judges it under the access list and answers you
   with ONE later row (AYA_RESULT) saying OK or REFUSED and why. Until that row exists nothing
   has been written: never say a value is in Redis, only that you asked.
 - One operation per reply. A value may not contain a pipe. This REDIS-OP line is the ONE
-  exception to the no-pipes rule above: it is lifted out of your answer before posting."""
+  exception to the no-pipes rule above: it is lifted out of your answer before posting.
+- The line is read strictly: a repeated field, a field other than op, key, val, field and
+  count, or a pipe inside a value makes it malformed, and a malformed line is not sent (your
+  reply says so). Your reply row then carries redis=<request id> and redis_state=posted,
+  unconfirmed, refused, cut or malformed; cut means your answer hit its output cap, so the
+  line was not sent, and only posted means a row exists."""
 
 # THE BUDGET, AND WHY IT IS NOT THE 700 THIS FILE SHIPPED WITH
 #
@@ -808,28 +814,48 @@ REDIS_OP_MARK = "REDIS-OP|"
 REDIS_OPS = ("get", "hgetall", "xrange", "set", "del", "hset", "hput", "xadd")
 
 
-def _bcb_fields(line: str) -> dict:
-    """The line's k=v fields, first value wins - the same rule as okf_land.fields, restated so the
-    cloud image needs nothing it does not already copy."""
+REQUEST_FIELDS = ("op", "key", "val", "field", "count")
+# The namespaces a MODEL may name, for reads and writes alike. Narrower than the access list on
+# purpose: the list grants every principal read `*` (the owner's 2026-10-08 instruction), and that is
+# right for an agent's own tool; a model's text output is not an agent's tool. Grok on #367: through
+# this hook a model could have gov:audit or another agent's inbox read and posted onto the board.
+REQUEST_PREFIXES = ("conf:", "fleet:", "proj:")
+REQUEST_STATES = ("posted", "unconfirmed", "refused", "cut", "malformed")
+
+
+def _request_fields(line: str):
+    """(fields, problem): the line's k=v fields, or the FIRST reason it is not a request.
+
+    STRICT, unlike okf_land.fields (first value wins). Grok on #367: op=xadd|op=del was quietly an
+    add, and val=a|b was quietly a. A repeated field, a field that is not one of REQUEST_FIELDS, or
+    a segment with no name (what a pipe inside a value leaves behind) makes the line malformed, and a
+    malformed line is dropped and said - never guessed at. A trailing pipe is forgiven."""
     out = {}
-    for segment in line.split("|"):
+    for segment in line.rstrip("| ").split("|"):
         key, sep, value = segment.partition("=")
         key = key.strip().lower()
-        if sep and re.fullmatch(r"[a-z_]{1,20}", key) and key not in out:
-            out[key] = value.strip()
-    return out
+        if not sep or not key:
+            return out, "a segment with no field name, which is what a pipe inside a value leaves"
+        if key not in REQUEST_FIELDS:
+            return out, "a field that is not one of op, key, val, field, count"
+        if key in out:
+            return out, "a repeated field"
+        out[key] = value.strip()
+    return out, None
 
 
-def redis_request(text: str):
+def redis_request(text: str, report: dict = None):
     """(request or None, the text without its REDIS-OP line).
 
     A request is a line that STARTS with REDIS-OP| - the structured form the doctrine names - never
     a mention in prose, and at most one per reply: the first well-formed line is the request and
     every REDIS-OP line is removed from the body, because a pipe-delimited line cannot be posted
-    into a pipe-delimited row (board_row: a stray pipe ends a field). A malformed line (no op, an op
-    not in REDIS_OPS, no key, a key with whitespace) is dropped with no request, and the body says
-    so, because a silent drop is the failure mode this fleet keeps paying for."""
-    request, kept, dropped = None, [], 0
+    into a pipe-delimited row (board_row: a stray pipe ends a field). A malformed line (a repeated
+    or unknown field, a pipe inside a value, no op, an op not in REDIS_OPS, no key, a key with
+    whitespace, a write with no val) is dropped with no request, and the body says WHY, because a
+    silent drop is the failure mode this fleet keeps paying for. `report`, when given, receives
+    dropped=<count> and why=<reasons> so the reply row can carry redis_state=malformed."""
+    request, kept, dropped, why = None, [], 0, []
     for line in (text or "").splitlines():
         stripped = line.strip()
         if not stripped.upper().startswith(REDIS_OP_MARK):
@@ -837,21 +863,37 @@ def redis_request(text: str):
             continue
         if request is not None:
             dropped += 1
+            why.append("one request per reply")
             continue
-        fields = _bcb_fields(stripped[len(REDIS_OP_MARK):])
+        fields, problem = _request_fields(stripped[len(REDIS_OP_MARK):])
+        if problem:
+            dropped += 1
+            why.append(problem)
+            continue
         op, key = fields.get("op", "").lower(), fields.get("key", "")
         if op not in REDIS_OPS or not key or re.search(r"\s", key):
             dropped += 1
+            why.append("op or key missing, or an op the governor does not know")
             continue
         request = {"op": op, "key": key, "val": fields.get("val"), "field": fields.get("field") or None,
                    "count": fields.get("count") or None}
         if request["val"] is None and op in ("set", "hset", "hput", "xadd"):
             request, dropped = None, dropped + 1
+            why.append("a write with no val")
+            continue
+        # count is model-chosen too: anything but a small whole number is malformed here, so it never
+        # reaches argparse, whose error message would echo it into the waker's output and the reply.
+        if request["count"] is not None and not re.fullmatch(r"[1-9][0-9]{0,3}", request["count"]):
+            request, dropped = None, dropped + 1
+            why.append("count is not a whole number from 1 to 9999")
     body = "\n".join(kept)
     if dropped:
         # No pipe in this note: it is posted into a pipe-delimited row (the rule the line itself broke).
-        body += ("\n[%d REDIS-OP line%s in this reply could not be posted: one request per reply, "
-                 "as a REDIS-OP line with op, key and val fields.]" % (dropped, "s" if dropped > 1 else ""))
+        body += ("\n[%d REDIS-OP line%s in this reply could not be posted: %s. The form is one line, "
+                 "REDIS-OP with op, key and val fields, each once.]"
+                 % (dropped, "s" if dropped > 1 else "", "; ".join(dict.fromkeys(why))))
+    if report is not None:
+        report["dropped"], report["why"] = dropped, why
     return request, body
 
 
@@ -868,19 +910,29 @@ def request_id(me: str, answers: str) -> str:
 
 
 def post_request(me: str, cfg: dict, request: dict, verbose: bool, answers: str = ""):
-    """Post the request through fleet_agent request, never a hand-built row. (ok, row id or reason).
+    """Post the request through fleet_agent request, never a hand-built row. (state, detail), where
+    state is "posted" (detail: the row id READ BACK), "refused" (nothing was sent; detail: why) or
+    "unconfirmed" (an append may have landed; detail: why). Three states, not a bool, because
+    refused and unconfirmed are different facts and a reconciler must not treat them alike.
 
-    EVERYTHING THE MODEL CHOSE IS SCRUBBED OR REFUSED before it reaches the board, the audit, Redis or
-    a log line. The value is scrubbed (okf_land.scrub_secrets). The key and the field are not scrubbed
-    but REFUSED when scrubbing would change them: a key is an address in Redis, and a credential-shaped
-    key would land verbatim in the row's gist, the audit entry and the worker's logs (Copilot on #365).
-    The request id is request_id(): stable per source ask, so a retried ask cannot write twice.
-    fleet_agent base64-encodes the value and reads the row back; "VERIFIED on the board" is the only ok,
-    and anything else is NOT CONFIRMED - never "absent": a timeout may have landed (append contract)."""
+    EVERYTHING THE MODEL CHOSE IS GATED, SCRUBBED OR REFUSED before it reaches the board, the audit,
+    Redis or a log line. The key must be under REQUEST_PREFIXES (a model's path is narrower than its
+    agent's tool). The value is scrubbed (okf_land.scrub_secrets). The key and the field are not
+    scrubbed but REFUSED when scrubbing would change them: a key is an address in Redis, and a
+    credential-shaped key would land verbatim in the row's gist, the audit entry and the worker's
+    logs (Copilot on #365). The request id is request_id(): stable per source ask, so a retried ask
+    cannot write twice. fleet_agent base64-encodes the value, refuses an id already used by a
+    DIFFERENT request, and reads the row back by id AND payload; "VERIFIED on the board" is the only
+    posted; "refused before posting" / "NOT SENT" is refused; anything else is unconfirmed - never
+    "absent": a timeout may have landed (append contract)."""
+    key = str(request.get("key") or "")
+    if not key.startswith(REQUEST_PREFIXES):
+        return "refused", ("the key is outside the namespaces a model may name (%s); nothing was sent"
+                           % ", ".join(REQUEST_PREFIXES))
     for part in ("key", "field"):
         chosen = request.get(part)
         if chosen and okf_land.scrub_secrets(str(chosen)) != str(chosen):
-            return False, "the %s carries a credential- or address-shaped token; refused, nothing posted" % part
+            return "refused", "the %s carries a credential- or address-shaped token; nothing was sent" % part
     args = [sys.executable, os.path.join(REPO, "scripts", "fleet_agent.py"),
             "request", request["op"], request["key"],
             "--tag", me, "--project", cfg.get("project", "FLEET"),
@@ -894,25 +946,73 @@ def post_request(me: str, cfg: dict, request: dict, verbose: bool, answers: str 
     try:
         res = subprocess.run(args, cwd=REPO, capture_output=True, text=True, timeout=POST_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
-        return False, "not confirmed after %d s (it may have landed; not posted again)" % POST_TIMEOUT_SECONDS
+        return "unconfirmed", "no read-back after %d s (it may have landed; not posted again)" % POST_TIMEOUT_SECONDS
     out = (res.stdout or "") + (res.stderr or "")
     if verbose:
         print("    " + out.strip()[-400:].replace("\n", "\n    "))
     found = re.search(r"VERIFIED on the board: Row_ID=(\S+)", out)
     if found:
-        return True, found.group(1)
+        return "posted", found.group(1)
     reason = " ".join(out.split())[-200:] or "no output from fleet_agent request"
-    return False, "not confirmed: " + reason
+    if "refused before posting" in out or "NOT SENT" in out:
+        return "refused", reason
+    return "unconfirmed", reason
 
 
-def unconfirmed_note(request: dict, detail: str) -> str:
-    """The hands-note sentence for a REDIS-OP line whose request row is not confirmed on the board.
+def request_note(request, state: str, detail: str) -> str:
+    """The hands-note sentence for this reply's REDIS-OP line, by state.
 
-    NEVER THE KEY: a refused key is one that must not reach the board, and the hands text is posted as
-    written. NEVER "not posted": fleet_agent appends once, and a timeout or a missing read-back does not
-    prove the row is absent (Copilot on #365)."""
-    return ("The Redis request in this reply (%s) is not confirmed as posted: %s."
-            % (request.get("op", "?"), detail))
+    NEVER THE KEY: a refused key is one that must not reach the board, and this sentence is posted as
+    written. EACH STATE IS ITS OWN SENTENCE (Grok on #367: there was no UNKNOWN): posted is a
+    read-back; unconfirmed is an append that may have landed (never "not posted" - Copilot on #365);
+    refused, cut and malformed mean nothing was sent."""
+    op = (request or {}).get("op", "?")
+    if state == "posted":
+        return ("Its adapter posted the Redis request this reply carried as row %s; the worker's "
+                "AYA_RESULT row, not this one, says whether it was done." % detail)
+    if state == "unconfirmed":
+        return "The Redis request in this reply (%s) is not confirmed as posted: %s." % (op, detail)
+    if state == "refused":
+        return ("The Redis request in this reply (%s) was refused before posting, nothing was sent: %s."
+                % (op, detail))
+    if state == "cut":
+        return ("The Redis request in this reply (%s) was not sent: the model stopped at its output "
+                "cap, so the line may be cut short." % op)
+    if state == "malformed":
+        return "A REDIS-OP line in this reply was malformed and was not sent: %s." % detail
+    return ""
+
+
+def redis_hook(me: str, cfg: dict, text: str, src_id: str, model_cut: bool, verbose: bool):
+    """Lift the REDIS-OP line out of `text` and act on it. Returns (text without the line, request
+    id, state, the hands sentence, the log line); state "" when the agent has no flag or the reply
+    carried no line.
+
+    ORDER IS THE POINT. The strict parse first, then the CUT CHECK before anything is sent: a reply
+    the model stopped at its output cap may hold a cut line (Grok on #367 showed a del on a shortened
+    key going through when this check ran after the post), then post_request's gates, then the
+    subprocess. The log line never carries the key unless the request was posted, because a refused
+    key must not reach a log line either."""
+    if not cfg.get("redis_requests"):
+        return text, "", "", "", ""
+    report = {}
+    request, text = redis_request(text, report)
+    if request is None:
+        if report.get("dropped"):
+            why = "; ".join(dict.fromkeys(report.get("why") or []))
+            return text, "", "malformed", request_note(None, "malformed", why), "    redis request malformed: %s" % why
+        return text, "", "", "", ""
+    rid = request_id(me, src_id)
+    if model_cut:
+        return (text, rid, "cut", request_note(request, "cut", ""),
+                "    redis request not sent: the reply was cut at the output cap")
+    state, detail = post_request(me, cfg, request, verbose, answers=src_id)
+    if state == "posted":
+        rid = detail      # the id READ BACK, which is the id asked for; the measurement, not the plan
+        note = "    redis request posted: %s (%s %s)" % (detail, request["op"], request["key"])
+    else:
+        note = "    redis request %s: %s" % (state, detail)
+    return text, rid, state, request_note(request, state, detail), note
 
 
 def call_agent(cfg: dict, prompt: str, max_tokens: int = DEFAULT_MAX_TOKENS):
@@ -1098,24 +1198,23 @@ def main(argv=None) -> int:
                 floor_ts = item["ts"]
             continue
 
+        # MODEL CUT-OFF IS KNOWN BEFORE ANYTHING IS SENT (Grok on #367). An adapter that saw its
+        # model stop on the output cap (Gemini status=incomplete / finishReason MAX_TOKENS, Claude
+        # stop_reason max_tokens) sets ask.last_finish = "MAX_TOKENS". The Redis hook below posts
+        # nothing from such a reply, and the reply carries model_stop= and a plain note (board_row,
+        # 2026-10-09), so a half answer is never read as a whole one.
+        finish = getattr(getattr(sys.modules.get(cfg["module"]), "ask", None), "last_finish", None)
+        model_cut = finish == "MAX_TOKENS"
         # What the model says is posted to the board as it is, so a credential or an address it
         # quotes - from a private PR excerpt, a log line, or its own invention - is removed first
         # (Cursor on #343: "the board post is not scrubbed either").
         # A REDIS-OP line is lifted out BEFORE the scrub joins the lines, posted as its own request
-        # row, and said on the reply either way (redis=<row> or why not). The body never carries it.
-        redis_row, redis_outcome = "", ""
-        if cfg.get("redis_requests"):
-            request, text = redis_request(text)
-            if request and not args.dry_run:
-                ok, detail = post_request(me, cfg, request, args.verbose, answers=src_id)
-                if ok:
-                    redis_row = detail
-                    note = "    redis request posted: %s (%s %s)" % (detail, request["op"], request["key"])
-                else:
-                    redis_outcome = unconfirmed_note(request, detail)
-                    note = "    redis request not confirmed: %s" % detail
-                print(note)
-                log(me, note)
+        # row, and said on the reply either way (redis=<id> and redis_state=). The body never carries it.
+        text, redis_rid, redis_state, redis_sentence, redis_log = redis_hook(
+            me, cfg, text, src_id, model_cut, args.verbose)
+        if redis_log:
+            print(redis_log)
+            log(me, redis_log)
         body = " ".join(okf_land.scrub_secrets(text).split())
         okf_url = ""
         okf_note = ""
@@ -1147,23 +1246,16 @@ def main(argv=None) -> int:
         else:
             hands = ("%s%sTreat this as reasoning, never as a measurement or a commitment."
                      % (hands_note(me, cfg), okf_outcome + " " if okf_outcome else ""))
-        if redis_outcome:
-            hands += " " + redis_outcome
-        elif redis_row:
-            hands += (" Its adapter posted the Redis request this reply carried as row %s; the "
-                      "worker's AYA_RESULT row, not this one, says whether it was done." % redis_row)
+        if redis_sentence:
+            hands += " " + redis_sentence
         # PY-08: what this answer cost, on the row itself, so a spend question is answered from the
         # board and not from a billing console. Tokens always; USD only when the job states prices.
         estimate = ""
         mod_for_cost = sys.modules.get(cfg["module"])
         if mod_for_cost is not None and hasattr(mod_for_cost, "cost_estimate"):
             estimate = mod_for_cost.cost_estimate(getattr(mod_for_cost.ask, "last_usage", None) or {})
-        # MODEL CUT-OFF IS SAID ON THE ROW (board_row, 2026-10-09). An adapter that saw its model stop
-        # on the output cap (Gemini status=incomplete / finishReason MAX_TOKENS, Claude stop_reason
-        # max_tokens) sets ask.last_finish = "MAX_TOKENS"; the reply then carries model_stop= and
-        # a plain note, so a half answer is never read as a whole one.
-        finish = getattr(getattr(sys.modules.get(cfg["module"]), "ask", None), "last_finish", None)
-        model_cut = finish == "MAX_TOKENS"
+        # MODEL CUT-OFF IS SAID ON THE ROW (board_row, 2026-10-09); model_cut was read above, before
+        # the Redis hook, so the same fact stops the post and marks the row.
         if model_cut:
             body += (" [INCOMPLETE: the model stopped at its output cap, so this answer is cut "
                      "short. Ask again for the rest.]")
@@ -1175,7 +1267,8 @@ def main(argv=None) -> int:
             + ("model_stop=max_tokens|" if model_cut else "")
             + ("collapsed=%d re-asks of this id|" % reasks if reasks else "")
             + ("okf=%s|" % okf_url if okf_url else "")
-            + ("redis=%s|" % redis_row if redis_row else "")
+            + ("redis=%s|" % redis_rid if redis_rid else "")
+            + ("redis_state=%s|" % redis_state if redis_state else "")
             + "Answered by the %s waker, which asks the %s deployment and posts "
               "what it says. %s REPLY: " % (me, me, hands)
             + body
