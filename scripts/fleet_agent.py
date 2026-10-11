@@ -37,6 +37,7 @@ USAGE
 import argparse
 import datetime as dt
 import gzip
+import hashlib
 import json
 import os
 import re
@@ -326,6 +327,17 @@ def cmd_dupes(args):
     return 0
 
 
+def default_post_id(prefix: str, tag: str, phase: str, text: str, moment=None) -> str:
+    """The id of a post that named none: the prefix, the second, and six hex of what is posted.
+
+    Row ids are global and verified as exactly one row (d53079b), so the old minute-resolution
+    default made a second post in the same minute a refusal (the fourth adversarial check on #367).
+    The digest makes two different posts differ and a retry of the same post repeat its id."""
+    stamp = (moment or dt.datetime.now(dt.timezone.utc)).strftime("%Y%m%dT%H%M%SZ")
+    digest = hashlib.sha256(("%s\n%s\n%s" % (tag, phase, text or "")).encode("utf-8")).hexdigest()[:6]
+    return "%s-%s-%s" % (prefix, stamp, digest)
+
+
 def cmd_post(args):
     """Write a CORRECTLY SHAPED row. Hand-assembling the array is how three
     rows got mangled on 2026-09-17.
@@ -349,8 +361,8 @@ def cmd_post(args):
     from instances that were demonstrably reading the board.
     """
     tag = args.tag
-    now = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-    rid = args.id or ("%s-%s" % (args.prefix, dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%MZ")))
+    moment = dt.datetime.now(dt.timezone.utc)
+    now = moment.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     to = args.to
     text = args.text
     if getattr(args, "text_file", None):
@@ -359,6 +371,7 @@ def cmd_post(args):
     if not (text or "").strip():
         print("  refusing an empty post: pass text or --text-file with content")
         return 2
+    rid = args.id or default_post_id(args.prefix, tag, args.phase, text, moment)
     header = "BCB|v=1|id=%s|phase=%s|class=%s|from=%s|to=%s|" % (
         rid, args.phase, args.klass, tag, to.replace(";", ","))
     # NEVER TRIM SILENTLY (board_row, 2026-10-09). Every agent's post comes through here, so this is
@@ -398,33 +411,66 @@ def _same_payload(a, b) -> bool:
 
 
 _BOARD_HEAD = ("Row_ID", "Timestamp", "Source_Tag", "Target_Surface", "Action_Type", "Payload")
+BOARD_WIDTH = 10        # A:J, the ten named cells every row is written with
+
+
+def _ten_cells(cells):
+    """A row as it was written: its first ten cells as strings, a shorter row padded with "".
+
+    None when any cell past the tenth is not blank. THE LIVE BOARD IS TWELVE WIDE: one historical
+    malformed append widened Alpha DB from A:J to A:L, and getDataRange() returns every row at the
+    sheet's full width, K and L blank (docs/COMMS-PROTOCOL.md rule 5, scripts/OrderSupervisor.psm1,
+    src/bus_server.py). A pin on exactly ten cells (d53079b) made every post NOT SENT on that board;
+    the fourth adversarial check on #367 caught it before anything was deployed. Blank padding is
+    the shape; a non-blank cell past J is not this row."""
+    if not isinstance(cells, (list, tuple)):
+        return None
+    if any(str(c if c is not None else "").strip() for c in cells[BOARD_WIDTH:]):
+        return None
+    head = [str(c) if c is not None else "" for c in cells[:BOARD_WIDTH]]
+    return head + [""] * (BOARD_WIDTH - len(head))
 
 
 def _complete_board_rows(data):
-    """Read ten-cell rows only; the first six headers carry the receipt semantics."""
+    """The data rows of a board whose header is the ten names (plus blank padding, if any)."""
     rows = data.get("rows") if isinstance(data, dict) else None
-    if (not isinstance(rows, list) or not rows or not isinstance(rows[0], (list, tuple))
-            or len(rows[0]) != 10 or tuple(str(h).strip() for h in rows[0][:6]) != _BOARD_HEAD):
+    if not isinstance(rows, list) or not rows:
+        return None
+    header = _ten_cells(rows[0])
+    if header is None or tuple(h.strip() for h in header[:6]) != _BOARD_HEAD:
         return None
     return rows[1:]
 
 
+FREE_TEXT_COLS = (PAYLOAD_COL, 8, 9)      # Payload, Gist, Sub-Gist: runs of spaces are the sheet's
+
+
 def _same_complete_row(hit, row) -> bool:
-    """Compare every semantic cell; the sheet may reformat Timestamp and Payload spaces."""
-    return (isinstance(hit, (list, tuple)) and len(hit) == len(row) == 10
-            and bool(str(hit[1]).strip())
-            and all((_same_payload(hit[i], row[i]) if i == PAYLOAD_COL else str(hit[i]) == str(row[i]))
-                    for i in range(10) if i != 1))
+    """Compare every semantic cell of the row's ten: the Timestamp must be non-empty but is not
+    compared (the sheet reformats it); the free-text cells are compared with runs of spaces
+    collapsed; the rest byte-exact; blank padding past the tenth cell is ignored."""
+    got, want = _ten_cells(hit), _ten_cells(row)
+    return (got is not None and want is not None and bool(got[1].strip())
+            and all((_same_payload(got[i], want[i]) if i in FREE_TEXT_COLS else got[i] == want[i])
+                    for i in range(BOARD_WIDTH) if i != 1))
 
 
 def _board_rows_like(rid, row):
-    """Count all global Row_ID hits before deciding whether exactly one matches."""
+    """(hit, identical, why): every row on the board under this Row_ID, those that are this row, and
+    "" - or (None, None, why) when the board could not be read ("unreadable") or its header is not
+    the ten-named-cell schema ("header: <n> cells, begins ...")."""
     data = read_board(quiet=True)
+    if data is None:
+        return None, None, "the board could not be read"
     recs = _complete_board_rows(data)
     if recs is None:
-        return None, None
-    hit = [r for r in recs if isinstance(r, (list, tuple)) and r and str(r[0]) == rid]
-    return hit, [r for r in hit if _same_complete_row(r, row)]
+        first = data.get("rows") if isinstance(data, dict) else None
+        head = list(first[0]) if isinstance(first, list) and first and isinstance(first[0], (list, tuple)) else []
+        return None, None, ("the board's header is not the ten-named-cell schema (%s, ...; blank padding past "
+                            "the tenth cell is allowed): it has %d cells and begins %s"
+                            % (", ".join(_BOARD_HEAD[:3]), len(head), [str(h)[:16] for h in head[:6]]))
+    hit = [r for r in recs if isinstance(r, (list, tuple)) and r and str(r[0] if r[0] is not None else "") == rid]
+    return hit, [r for r in hit if _same_complete_row(r, row)], ""
 
 
 def append_and_verify(rid, row, fitted=None, spill=None, exact=True):
@@ -441,22 +487,26 @@ def append_and_verify(rid, row, fitted=None, spill=None, exact=True):
     paying for. After the append, the read-back is the proof; "not found" is UNCONFIRMED, never
     "absent" (a 404 on the redirect hop has been raised client-side after the row landed)."""
     fitted = fitted or {}
-    hit, identical = _board_rows_like(rid, row)
+    hit, identical, why = _board_rows_like(rid, row)
     if hit is None:
-        # Unreadable, or readable but not the ten-cell schema this tool verifies against (the header
-        # is pinned in _complete_board_rows): either way the id cannot be checked, and a blind append
-        # is the double write this fleet keeps paying for. Said precisely, so a changed header is
-        # found in the log and not mistaken for a gateway outage.
-        print("  NOT SENT: the board could not be read before posting, or its header is not the ten-cell "
-              "schema (%s, ...) this tool verifies against; the id could not be checked" % ", ".join(_BOARD_HEAD[:3]))
+        # Unreadable, or readable but not the schema this tool verifies against: either way the id
+        # cannot be checked, and a blind append is the double write this fleet keeps paying for. Said
+        # precisely, so a changed header is found in the log and not mistaken for a gateway outage.
+        print("  NOT SENT: %s; the id could not be checked, nothing was appended" % why)
         return EXIT_NOT_SENT
     if len(hit) == len(identical) == 1:
         print("  already on the board: Row_ID=%s carries this complete row; not posted again" % rid)
         print("  VERIFIED on the board: Row_ID=%s Source_Tag=%s Target_Surface=%s"
               % (rid, row[SOURCE_COL], row[3]))
         return EXIT_VERIFIED
+    if len(hit) > 1:
+        # Something WAS sent, earlier, more than once (a race): not "refused", which means nothing
+        # was ever sent. The worker answers the id once; the board carries the duplicates.
+        print("  UNCONFIRMED: Row_ID=%s is on the board %d times already (an earlier race); not posted "
+              "again; the worker answers the id once" % (rid, len(hit)))
+        return EXIT_UNCONFIRMED
     if hit:
-        print("  refused before posting: %s id %s is already used by duplicate, incomplete, or conflicting content; "
+        print("  refused before posting: %s id %s is already used by different or incomplete content; "
               "not posted again" % ("request" if exact else "reply", rid))
         return EXIT_REFUSED
     # tries=1 is not a tuning choice. The v1 bus does not dedup, and a
@@ -489,9 +539,9 @@ def append_and_verify(rid, row, fitted=None, spill=None, exact=True):
                   "a later commit of the same text reuses it and cannot overwrite a different one.")
 
     # D-4: the response is not the proof. Read the row back: exactly one identical row.
-    hit, identical = _board_rows_like(rid, row)
+    hit, identical, why = _board_rows_like(rid, row)
     if hit is None:
-        print("  UNCONFIRMED: no valid board read after the append. It may have landed. Do NOT retry blindly.")
+        print("  UNCONFIRMED: no usable board read after the append (%s). It may have landed. Do NOT retry blindly." % why)
         return EXIT_UNCONFIRMED
     if len(hit) == len(identical) == 1:
         print("  VERIFIED on the board: Row_ID=%s Source_Tag=%s Target_Surface=%s"

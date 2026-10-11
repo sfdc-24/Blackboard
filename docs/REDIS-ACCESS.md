@@ -75,7 +75,8 @@ python scripts/fleet_agent.py request xrange conf:side:20261011 --count 8 --tag 
 It base64-encodes the value, refuses a request that would not fit a row (a request is never spilled —
 a pointer row carries no `op=` for the worker to read), **reads the board first** (the identical row
 already there is not posted again; the same id under a different request is refused before anything
-is appended; a board it cannot read, or whose header is not the ten-cell schema, means `NOT SENT`),
+is appended; a board it cannot read, or whose header is not the ten named cells (blank padding past them is
+the live sheet's shape and is fine), means `NOT SENT`),
 appends exactly once, and **reads the row back as exactly one row on the whole board** under your
 `Row_ID`, matching every cell but the timestamp — a second row under your id, from anyone, with any
 other content, is refused before posting or unconfirmed after it. Row ids are global: choose one

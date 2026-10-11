@@ -836,8 +836,8 @@ class FleetAgentRequestOnTheBoard(unittest.TestCase):
         self.assertEqual(self.fa.EXIT_UNCONFIRMED, code)
         self.assertIn("2 rows", out)
         code, out = self.run_request(self.args())            # the retry finds them and appends nothing
-        self.assertEqual((self.fa.EXIT_REFUSED, 1), (code, len(self.appends)))
-        self.assertIn("duplicate", out)
+        self.assertEqual((self.fa.EXIT_UNCONFIRMED, 1), (code, len(self.appends)))
+        self.assertIn("2 times already", out)
 
     def test_a_row_from_another_tag_or_of_another_type_is_not_this_row(self):
         # The global id is occupied; a tag or phase clash cannot verify a new request.
@@ -875,8 +875,9 @@ class FleetAgentRequestOnTheBoard(unittest.TestCase):
         row = self.post_row()
         self.board["rows"].extend((list(row), list(row)))
         code, out = self.run_post_row(row)
-        self.assertEqual((self.fa.EXIT_REFUSED, []), (code, self.appends))
-        self.assertIn("duplicate", out)
+        # Something was sent, twice, earlier: unconfirmed as ONE post, never "refused" (nothing sent).
+        self.assertEqual((self.fa.EXIT_UNCONFIRMED, []), (code, self.appends))
+        self.assertIn("2 times already", out)
         self.assertNotIn("VERIFIED", out)
 
     def test_plain_post_global_id_clashes_are_refused_before_append(self):
@@ -914,8 +915,13 @@ class FleetAgentRequestOnTheBoard(unittest.TestCase):
         self.board["rows"][-1][1] = "10/11/2026 00:00"
         code, out = self.run_post_row(row)
         self.assertEqual((self.fa.EXIT_VERIFIED, 1), (code, len(self.appends)))
+        # A row the sheet returns one cell short (a trimmed blank tenth cell) is this row, padded;
+        # a row short of a NON-blank cell is not.
         self.board["rows"] = [list(self.HEAD), row[:-1]]
         self.appends.clear()
+        code, out = self.run_post_row(row)
+        self.assertEqual((self.fa.EXIT_VERIFIED, []), (code, self.appends))
+        self.board["rows"] = [list(self.HEAD), row[:-2]]
         code, out = self.run_post_row(row)
         self.assertEqual((self.fa.EXIT_REFUSED, []), (code, self.appends))
         self.assertNotIn("VERIFIED", out)
@@ -932,6 +938,67 @@ class FleetAgentRequestOnTheBoard(unittest.TestCase):
         code, out = self.run_post_row(row)
         self.assertEqual((self.fa.EXIT_UNCONFIRMED, 1), (code, len(self.appends)))
         self.assertNotIn("VERIFIED", out)
+
+    def test_the_live_twelve_wide_board_with_blank_padding_verifies_like_a_ten_wide_one(self):
+        """THE BOARD IS A:L TODAY, K AND L BLANK (docs/COMMS-PROTOCOL.md rule 5): getDataRange() returns
+        every row, the header included, at the sheet's full width. A pin on exactly ten cells made
+        every post NOT SENT on that board (d53079b); the fourth adversarial check on #367 found it."""
+        self.board = {"rows": [list(self.HEAD) + ["", ""]]}
+        self.fa.read_board = lambda **kw: self.board
+
+        def fetch_wide(url, payload, tries=1):
+            self.appends.append(payload["sheetRow"])
+            self.board["rows"].append(list(payload["sheetRow"]) + ["", ""])    # the sheet pads K:L
+            return "ok:true"
+        self.fa._bus_fetch = fetch_wide
+        code, out = self.run_request(self.args())
+        self.assertEqual((self.fa.EXIT_VERIFIED, 1), (code, len(self.appends)))
+        self.assertIn("VERIFIED on the board: Row_ID=REQ-T-0001", out)
+        code, out = self.run_request(self.args())                 # the retry finds the padded row
+        self.assertEqual((self.fa.EXIT_VERIFIED, 1), (code, len(self.appends)))
+        self.assertIn("already on the board", out)
+        # The post path too (every waker reply): a twelve-wide board is not NOT SENT.
+        import contextlib, io
+        row = ["GEMINI-WAKE-2", "2026-10-11T00:00:00.000000Z", "gemini", "grok;ALL", "DONE",
+               "BCB|v=1|id=GEMINI-WAKE-2|phase=DONE|text=an answer", "", "FLEET", "g", ""]
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = self.fa.append_and_verify("GEMINI-WAKE-2", row, exact=False)
+        self.assertEqual(self.fa.EXIT_VERIFIED, code)
+
+    def test_a_non_blank_cell_past_the_tenth_is_not_this_row_and_an_eleventh_named_column_is_NOT_SENT(self):
+        rid, row = self.fa.request_row("gemini", "set", "proj:k", val="one", rid="REQ-T-0007")
+        self.board["rows"].append(list(row) + ["", "stray"])            # same id, something in L
+        code, out = self.run_request(self.args(rid="REQ-T-0007"))
+        self.assertEqual((self.fa.EXIT_REFUSED, []), (code, self.appends), "a row with a non-blank L is not this row")
+        self.board = {"rows": [list(self.HEAD) + ["Notes"]]}           # an eleventh NAMED column
+        self.fa.read_board = lambda **kw: self.board
+        code, out = self.run_request(self.args(rid="REQ-T-0008"))
+        self.assertEqual((self.fa.EXIT_NOT_SENT, []), (code, self.appends))
+        self.assertIn("header is not the ten-named-cell schema", out)
+        self.assertIn("11 cells", out)
+        self.fa.read_board = lambda **kw: None
+        code, out = self.run_request(self.args(rid="REQ-T-0008"))
+        self.assertEqual(self.fa.EXIT_NOT_SENT, code)
+        self.assertIn("could not be read", out)
+
+    def test_a_post_that_names_no_id_gets_one_that_differs_per_post_and_repeats_per_retry(self):
+        import datetime
+        when = datetime.datetime(2026, 10, 11, 6, 30, 5, tzinfo=datetime.timezone.utc)
+        a = self.fa.default_post_id("CCC", "claude-code-cli", "DONE", "first", when)
+        b = self.fa.default_post_id("CCC", "claude-code-cli", "DONE", "second", when)
+        self.assertNotEqual(a, b, "two posts in one second differ")
+        self.assertEqual(a, self.fa.default_post_id("CCC", "claude-code-cli", "DONE", "first", when), "a retry repeats")
+        self.assertRegex(a, r"^CCC-20261011T063005Z-[0-9a-f]{6}$")
+
+    def test_free_text_cells_are_compared_with_spaces_collapsed_and_the_rest_byte_exact(self):
+        row = self.post_row()
+        self.board["rows"].append(list(row))
+        self.board["rows"][-1][8] = "first  answer"               # the sheet collapsed a run of spaces
+        code, out = self.run_post_row(row)
+        self.assertEqual(self.fa.EXIT_VERIFIED, code)
+        self.board["rows"][-1][6] = "OPEN "                      # Category is not free text
+        code, out = self.run_post_row(row)
+        self.assertEqual(self.fa.EXIT_REFUSED, code)
 
     def test_the_caller_names_the_id_the_tool_does_not_make_one_up(self):
         with self.assertRaises(ValueError) as caught:
