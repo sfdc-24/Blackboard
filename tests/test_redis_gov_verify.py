@@ -1002,6 +1002,158 @@ class GenerationAudit(unittest.TestCase):
         self.assertNotIn("readback-", blob)
         self.assertNotIn("keys", out)
 
+    def test_a_change_after_batch_one_is_not_ok(self):
+        """A document watched in batch 1 and changed before the final EXEC is not a pass.
+
+        129 documents cross MAX_AUDIT_BATCH. The old per-batch EXEC dropped those watches,
+        so a change to the first key after the first 128 reads still returned ok with
+        matched=129. One WATCH set has to last until the confirmation of every batch.
+        """
+        self.assertEqual(128, gov.MAX_AUDIT_BATCH)
+        self.assertEqual(8, gov.PAGE_SIZE)
+        self.assertEqual(65536, gov.MAX_AUDIT_MANIFEST_BYTES)
+        self.assertEqual(474, gov.MAX_GENERATION_DOCS)
+        self.assertEqual(2048, gov.MAX_AUDIT_DOCUMENT_BYTES)
+        self.assertFalse(gov.verifier_enabled({}))
+        conn = AuditRedis()
+        gen = generation("a")
+        prefix = prefix_for(gen)
+        count = gov.MAX_AUDIT_BATCH + 1
+        planted = {prefix + "k%03d" % n: {"n": "%03d" % n} for n in range(count)}
+        self._plant(conn, gen, planted)
+        expected = {key: spec(mapping) for key, mapping in planted.items()}
+        first = prefix + "k000"
+        marker = "mutated-after-batch-1"
+        seen = []
+        real = conn.hgetall
+
+        def hgetall(name):
+            seen.append(name)
+            if len(seen) == count:
+                FakeRedis.hset(conn, first, "n", marker)
+            return real(name)
+
+        conn.hgetall = hgetall
+        called = {"keys": 0, "scan": 0, "eval": 0}
+
+        def forbid(name):
+            def wrapped(*args, **kwargs):
+                called[name] += 1
+                raise AssertionError(name)
+            return wrapped
+
+        for name in ("keys", "scan", "eval"):
+            setattr(conn, name, forbid(name))
+        out = audit(conn, gen, expected, cid="cid-batch-watch")
+        self.assertFalse(out["ok"], out)
+        self.assertTrue(out["moved"], out)
+        self.assertTrue(out["partial"], out)
+        self.assertFalse(out["page_ok"], out)
+        self.assertFalse(out["coverage"]["covered"], out)
+        self.assertEqual(count, out["coverage"]["matched"])
+        self.assertFalse(gov.backend_receipt_accepts(out))
+        self.assertEqual(count, len(seen))
+        self.assertEqual(first, seen[0])
+        self.assertEqual(count, conn.fetches)
+        self.assertEqual(0, conn.scans)
+        self.assertEqual({"keys": 0, "scan": 0, "eval": 0}, called)
+        self.assertLessEqual(count, gov.MAX_GENERATION_DOCS)
+        self.assertEqual(marker, conn.data[first]["n"])
+        self.assertNotEqual(spec({"n": marker})["sha256"], expected[first]["sha256"])
+        blob = json.dumps(out) + gov.summarise(out) + json.dumps(conn.audit())
+        self.assertNotIn(marker, blob)
+        self.assertNotIn(first, blob)
+        self.assertIn("ok=0", gov.summarise(out))
+        self.assertIn("moved=1", gov.summarise(out))
+
+        clean = AuditRedis()
+        self._plant(clean, gen, planted)
+        for name in ("keys", "scan", "eval"):
+            setattr(clean, name, forbid(name))
+        good = audit(clean, gen, expected, cid="cid-batch-clean")
+        self.assertTrue(good["ok"], good)
+        self.assertTrue(good["page_ok"], good)
+        self.assertFalse(good["moved"], good)
+        self.assertEqual(count, good["coverage"]["matched"])
+        self.assertEqual(count, good["listed"])
+        self.assertTrue(gov.backend_receipt_accepts(good))
+        self.assertEqual(count, clean.fetches)
+        self.assertEqual(0, clean.scans)
+
+    def test_page_count_bad_fails_closed(self):
+        """page_count='bad' and the other numeric receipt fields return false. They do not raise."""
+        conn = AuditRedis()
+        gen = generation("c")
+        prefix = prefix_for(gen)
+        planted = {prefix + "k%02d" % n: {"n": str(n)} for n in range(9)}
+        self._plant(conn, gen, planted)
+        expected = {key: spec(mapping) for key, mapping in planted.items()}
+        good = audit(conn, gen, expected, cid="cid-count-base")
+        self.assertTrue(gov.backend_receipt_accepts(good), good)
+
+        def copy():
+            return json.loads(json.dumps(good))
+
+        for changes in (
+            {"page_count": "bad"},
+            {"page_count": "2"},
+            {"page_count": True},
+            {"listed": "bad"},
+            {"listed": True},
+            {"length": "bad"},
+            {"length": True},
+        ):
+            receipt = copy()
+            receipt.update(changes)
+            self.assertFalse(gov.backend_receipt_accepts(receipt), changes)
+        for name in ("expected", "seen", "missing", "extra", "changed", "matched"):
+            receipt = copy()
+            receipt["coverage"][name] = "bad"
+            self.assertFalse(gov.backend_receipt_accepts(receipt), name)
+        malformed = copy()
+        malformed["page_count"] = "bad"
+        line = gov.summarise(malformed)
+        self.assertIn("page_count=0", line)
+        self.assertNotIn("page_count=bad", line)
+
+        published = gov._publish_audit(
+            [{"key": prefix + "k00", "sha256": "a" * 64, "len": "bad"}],
+            gen, "cid-publish-count",
+            {"expected": 9, "seen": 9, "missing": 0, "extra": 0, "changed": 0, "matched": 9,
+             "pages": 2, "page_count": "bad", "page_read": True, "complete": True},
+            False, False, False, gen, root_digest_hex="ab" * 32, head_root="ab" * 32,
+            manifest_digest_hex="cd" * 32)
+        self.assertFalse(published["ok"], published)
+        self.assertFalse(published["page_ok"], published)
+        self.assertTrue(published["partial"], published)
+        self.assertFalse(gov.backend_receipt_accepts(published))
+        self.assertIn("page_count=0", gov.summarise(published))
+        self.assertNotIn("page_count=bad", gov.summarise(published))
+
+        live = AuditRedis()
+        self._plant(live, gen, planted)
+        FakeRedis.hset(live, "proj:pr-board:v1:head", "page_count", "bad")
+        out = audit(live, gen, expected, cid="cid-head-count")
+        self.assertFalse(out["ok"], out)
+        self.assertFalse(out["coverage"]["covered"], out)
+        self.assertFalse(gov.backend_receipt_accepts(out))
+        self.assertNotIn("ValueError", json.dumps(out) + gov.summarise(out))
+        self.assertNotIn("page_count=bad", gov.summarise(out))
+
+        raw = {"keys": {prefix + "k00": {"sha256": expected[prefix + "k00"]["sha256"], "len": "9"}}}
+        blob = base64.b64encode(json.dumps(raw, sort_keys=True, separators=(",", ":")).encode()).decode()
+        fresh = AuditRedis()
+        self._plant(fresh, gen, planted)
+        refused = gov.execute(fresh, ACL, "cursor", "via", gov.VERIFY_OP, prefix,
+                              raw_value=blob, enc="b64", generation=gen,
+                              correlation="cid-len-string", head="proj:pr-board:v1:head")
+        self.assertFalse(refused["ok"], refused)
+        self.assertFalse(gov.backend_receipt_accepts(refused))
+        self.assertIn("len", refused.get("refused", ""))
+        self.assertEqual(0, fresh.fetches)
+        self.assertEqual(0, fresh.scans)
+        self.assertNotIn("ValueError", json.dumps(refused))
+
 
 class ScopeAndManifest(unittest.TestCase):
     def setUp(self):
