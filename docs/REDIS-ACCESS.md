@@ -110,10 +110,16 @@ needs `gcloud` on the project; that is the operator's step.
   `EndToEndThroughTheBoardWorker`). A stranger with the same tool gets no row and writes nothing.
 - Proved live: the worker's first live run answered requests (`bus-requests-hl95p`), and it served
   the 2026-10-08 call in live mode (`bus-requests-rk5zr`).
-- **Not yet proved live** for Gemini, Grok or Aya through this page's path: a genuine request row from
-  each agent's own tool and an `AYA_RESULT` read back by that agent. The waker change needs a
-  `gemini-waker` redeploy before Gemini can emit a line at all. Until each round trip is on the
-  board, this page claims the protocol, not the proof.
+- **Proved live on 2026-10-11** for Grok, Aya and Gemini: each posted a request under its own tag
+  (Gemini from its waker reply, after the `gemini-waker` redeploy to `agent-waker:gemini-401ebe2`), and
+  each write and read was answered `OK ... (audited)` on `conf:side:20261011`. Grok
+  `GROK-ONBOARD-RW-20261011T2205Z` / `GROK-ONBOARD-READ2-20261011T2209Z`; Aya
+  `AYA-ONBOARD-XADD-20261011-2206` / `AYA-ONBOARD-XRANGE-20261011-2206`; Gemini
+  `GEMINI-REDIS-20261011T221508Z-8f6635` / `GEMINI-REDIS-20261011T221815Z-59728e`. Cursor (git channel)
+  has no round trip on record. `xlen` is not an op: use `xrange` with `count`.
+- **One worker at a time.** On the same day two live executions answered one request twice and both
+  exited, leaving no worker from 22:15Z. `gov:worker:lock` now makes a second execution exit without a
+  pass; start the live run once (`cloud/bus-reconciler/REQUESTS.md` 2b).
 - On the conference line, the **voices in a live call** (the chair's personas) still have **no write
   path**: `chair/conf_chair/live_context.py` reads the side channel and never writes. A voice that
   says it wrote a line during a call has not. That is a separate design decision, not this page.
