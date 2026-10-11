@@ -397,6 +397,29 @@ def _same_payload(a, b) -> bool:
     return " ".join(str(a or "").split()) == " ".join(str(b or "").split())
 
 
+_REQUEST_HEADER = ("Row_ID", "Timestamp", "Source_Tag", "Target_Surface", "Action_Type",
+                   "Payload", "Category", "Project Tag", "Gist", "Sub-Gist")
+
+
+def _request_rows(data):
+    """Only the real complete ten-column board schema may prove a request."""
+    rows = data.get("rows") if isinstance(data, dict) else None
+    if not isinstance(rows, list) or not rows or not isinstance(rows[0], (list, tuple)):
+        return None
+    return rows[1:] if tuple(rows[0]) == _REQUEST_HEADER else None
+
+
+def _same_request(hit, row, include_timestamp=True):
+    """Compare all ten cells; only preflight may tolerate a fresh timestamp."""
+    return (isinstance(hit, (list, tuple)) and len(hit) == len(row) == len(_REQUEST_HEADER)
+            and all(str(hit[i]) == str(row[i]) for i in range(len(_REQUEST_HEADER))
+                    if include_timestamp or i != 1))
+
+
+def _request_hits(rows, rid):
+    return [r for r in rows if isinstance(r, (list, tuple)) and r and str(r[0]) == rid]
+
+
 def _same_row(rec, row) -> bool:
     """A board record that is this row: id, who posted it, and the row type (Grok on #367, item 2)."""
     return (str(rec.get("Row_ID", "")) == str(row[ROW_ID_COL])
@@ -414,7 +437,7 @@ def _board_rows_like(rid, row):
     return hit, [r for r in hit if _same_payload(r.get("Payload"), row[PAYLOAD_COL])]
 
 
-def append_and_verify(rid, row, fitted=None, spill=None, exact=True):
+def append_and_verify(rid, row, fitted=None, spill=None, exact=True, request=False):
     """Read the board, append the row if it is not there, commit its spill, and prove it landed by
     reading it back. EXIT_VERIFIED only on EXACTLY ONE row read back with this id, this Source_Tag,
     this Action_Type and this payload (Grok on #367, item 2). The one append path for post and
@@ -429,7 +452,20 @@ def append_and_verify(rid, row, fitted=None, spill=None, exact=True):
     paying for. After the append, the read-back is the proof; "not found" is UNCONFIRMED, never
     "absent" (a 404 on the redirect hop has been raised client-side after the row landed)."""
     fitted = fitted or {}
-    hit, identical = _board_rows_like(rid, row)
+    if request:
+        prior = _request_rows(read_board(quiet=True))
+        if prior is None:
+            print("  NOT SENT: invalid or unreadable ten-column board schema; refusing blind append")
+            return EXIT_NOT_SENT
+        hits = _request_hits(prior, rid)
+        if hits:
+            if len(hits) == 1 and _same_request(hits[0], row, include_timestamp=False):
+                print("  VERIFIED on the board: Row_ID=%s Source_Tag=%s Target_Surface=%s (existing request)"
+                      % (rid, row[2], row[3]))
+                return EXIT_VERIFIED
+            print("  refused before posting: request id %s exists with duplicate or different content" % rid)
+            return EXIT_REFUSED
+    hit, identical = ([], []) if request else _board_rows_like(rid, row)
     if hit is None:
         print("  NOT SENT: the board could not be read before posting, so the id could not be checked")
         return EXIT_NOT_SENT
@@ -478,6 +514,15 @@ def append_and_verify(rid, row, fitted=None, spill=None, exact=True):
                   "a later commit of the same text reuses it and cannot overwrite a different one.")
 
     # D-4: the response is not the proof. Read the row back: exactly one identical row.
+    if request:
+        recs = _request_rows(read_board(quiet=True))
+        hits = _request_hits(recs, rid) if recs is not None else []
+        if not (len(hits) == 1 and _same_request(hits[0], row)):
+            print("  UNCONFIRMED: missing, duplicate, changed or incomplete request row")
+            return EXIT_UNCONFIRMED
+        print("  VERIFIED on the board: Row_ID=%s Source_Tag=%s Target_Surface=%s"
+              % (rid, row[2], row[3]))
+        return EXIT_VERIFIED
     hit, identical = _board_rows_like(rid, row)
     if hit is None:
         print("  UNCONFIRMED: no valid board read after the append. It may have landed. Do NOT retry blindly.")
@@ -593,7 +638,7 @@ def cmd_request(args):
         print("  refused before posting: %s" % why)
         return EXIT_REFUSED
     print("  request %s: %s %s" % (rid, args.op, args.key))
-    return append_and_verify(rid, row, exact=True)
+    return append_and_verify(rid, row, exact=True, request=True)
 
 
 def cmd_archive(args):

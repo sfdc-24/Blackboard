@@ -112,32 +112,17 @@ HOW TO ANSWER:
 - Plain ASCII. No markdown headers, no bullet characters, no pipes - the reply
   is written into a pipe-delimited board row."""
 
-# Every fleet agent has governed read/write on Redis (scripts/redis_acl.json; the owner, 2026-10-08).
+# The Redis ACL and shared board have different security boundaries.
 # The instance is on a private address, so an agent asks with a BOARD ROW and the bus-requests job
 # answers it. A waker's model cannot write that row itself - post_reply writes a phase row, and the
 # worker reads only Action_Type AYA_REQ - so the adapter posts it FROM the reply, the way okf_land
 # writes an OKF file from one: a structured line the model writes on purpose, never a sentence it
 # might say. docs/REDIS-ACCESS.md is the agents' page.
 _REDIS_RULES = """
-REDIS, which you may read and write through your adapter, governed and audited:
-- To ask for ONE Redis operation, put ONE line in your reply, on its own, in exactly this
-  form (op first, then the key, then the value when the op takes one):
-      REDIS-OP|op=xadd|key=conf:side:YYYYMMDD|val=your line of text
-  ops: get, hgetall, xrange (reads); set, hset (needs field=), hput, xadd, del (writes).
-  A key must be shared (conf:, proj:), your own inbox (fleet:inbox:<you>), or
-  gov:worker:heartbeat for a read; any other key is refused before posting. The side
-  channel every voice on the conference line reads is conf:side:<today, UTC yyyymmdd>.
-- Your adapter posts that line as a request row under your own tag and removes it from the
-  text of your answer. The governed worker judges it under the access list and answers you
-  with ONE later row (AYA_RESULT) saying OK or REFUSED and why. Until that row exists nothing
-  has been written: never say a value is in Redis, only that you asked.
-- One operation per reply. A value may not contain a pipe. This REDIS-OP line is the ONE
-  exception to the no-pipes rule above: it is lifted out of your answer before posting.
-- The line is read strictly: a repeated field, a field other than op, key, val, field and
-  count, or a pipe inside a value makes it malformed, and a malformed line is not sent (your
-  reply says so). Your reply row then carries redis=<request id> and redis_state=posted,
-  unconfirmed, refused, cut or malformed; cut means your answer hit its output cap, so the
-  line was not sent, and only posted means a row exists."""
+Generic REDIS-OP through the shared board is disabled. The board is not a private channel.
+Only a separately reviewed synthetic canary may be enabled with an exact runtime-configured
+key. Its sole write value is PUBLIC_CANARY_V1; results contain status or match, never a value.
+Do not claim a private read or write from this adapter."""
 
 # THE BUDGET, AND WHY IT IS NOT THE 700 THIS FILE SHIPPED WITH
 #
@@ -193,7 +178,7 @@ how long work actually takes against what was estimated.""" + _SHARED_RULES,
         "cloud_context": True,
         "okf_land": True,
         # Mr. Salam, 2026-10-08: "also Gemini needs access in Redis"; 2026-10-11: Grok, Aya and Gemini.
-        "redis_requests": True,
+        "redis_requests": False,
         "doctrine": """You are Gemini, a participant on the SFDC24 Blackboard.
 
 WHAT YOU ACTUALLY ARE, and you must not overstate it:
@@ -228,7 +213,7 @@ owner, from joining to the close.""" + _SHARED_RULES + _REDIS_RULES,
     "grok": {
         "module": "grok_agent",
         "project": "FLEET",
-        "redis_requests": True,
+        "redis_requests": False,
         "doctrine": """You are Grok, a participant on the SFDC24 Blackboard.
 
 WHAT YOU ACTUALLY ARE, and you must not overstate it:
@@ -730,6 +715,11 @@ def claim_answer(answers_id: str) -> bool:
     return True
 
 
+def reserve_redis_side_effect(answers_id: str) -> bool:
+    """Only a cloud runner with a durable posting claim may append a request."""
+    return False
+
+
 # Rows that ask for a result. A waker's answer to one is posted as phase=RESULT (its evidence stays
 # STATED: a model's reasoning, not a measurement), so a dispatcher's tracker sees it. The owner via
 # Grok, 2026-09-29 06:24Z: Gemini never posted a RESULT, because every waker reply was phase=DONE.
@@ -817,6 +807,13 @@ REDIS_OPS = ("get", "hgetall", "xrange", "set", "del", "hset", "hput", "xadd")
 
 REQUEST_FIELDS = ("op", "key", "val", "field", "count")
 REQUEST_STATES = ("posted", "unconfirmed", "refused", "cut", "malformed")
+REDIS_CANARY_MARKER = "PUBLIC_CANARY_V1"
+_MODEL_REQUEST_SHAPES = {
+    "get": {"op", "key"}, "hgetall": {"op", "key"},
+    "xrange": {"op", "key", "count"}, "set": {"op", "key", "val"},
+    "del": {"op", "key"}, "hset": {"op", "key", "field", "val"},
+    "hput": {"op", "key", "val"}, "xadd": {"op", "key", "val"},
+}
 
 
 def _request_fields(line: str):
@@ -867,9 +864,13 @@ def redis_request(text: str, report: dict = None):
             why.append(problem)
             continue
         op, key = fields.get("op", "").lower(), fields.get("key", "")
-        if op not in REDIS_OPS or not key or re.search(r"\s", key):
+        shape = set(fields)
+        if (op not in REDIS_OPS or not key or re.search(r"\s", key)
+                or (shape != _MODEL_REQUEST_SHAPES.get(op)
+                    and not (op == "xrange" and shape == {"op", "key"}))
+                or (op == "hset" and not fields.get("field"))):
             dropped += 1
-            why.append("op or key missing, or an op the governor does not know")
+            why.append("the operation has missing or inappropriate fields")
             continue
         request = {"op": op, "key": key, "val": fields.get("val"), "field": fields.get("field") or None,
                    "count": fields.get("count") or None}
@@ -905,6 +906,17 @@ def request_id(me: str, answers: str) -> str:
     return "%s-REDIS-%s" % (re.sub(r"[^A-Za-z0-9]", "", me.upper())[:12], digest)
 
 
+def canary_request_allowed(request: dict) -> bool:
+    """Only an exact configured synthetic key, operation and marker may leave the adapter."""
+    key = os.environ.get("REDIS_BOARD_CANARY_KEY", "")
+    if (os.environ.get("REDIS_BOARD_CANARY_ENABLED") != "1"
+            or not re.fullmatch(r"conf:canary:redis-op:[A-Za-z0-9._:-]{1,64}", key)
+            or request.get("key") != key or request.get("field") or request.get("count")):
+        return False
+    return ((request.get("op") == "set" and request.get("val") == REDIS_CANARY_MARKER)
+            or (request.get("op") == "get" and request.get("val") is None))
+
+
 def post_request(me: str, cfg: dict, request: dict, verbose: bool, answers: str = ""):
     """Post the request through fleet_agent request, never a hand-built row. (state, detail), where
     state is "posted" (detail: the row id READ BACK), "refused" (nothing was sent; detail: why) or
@@ -925,6 +937,8 @@ def post_request(me: str, cfg: dict, request: dict, verbose: bool, answers: str 
     # agent's own inbox, the heartbeat for a read. scripts/redis_keys.py owns it (fleet_agent applies
     # the same); it is checked here first so a refused key never reaches a subprocess, a log line or
     # the board.
+    if not canary_request_allowed(request):
+        return "refused", "no configured synthetic canary policy for this operation"
     denied = redis_keys.key_allowed_for(me, request.get("op", ""), str(request.get("key") or ""))
     if denied:
         return "refused", denied + "; nothing was sent"
@@ -947,15 +961,19 @@ def post_request(me: str, cfg: dict, request: dict, verbose: bool, answers: str 
     except subprocess.TimeoutExpired:
         return "unconfirmed", "no read-back after %d s (it may have landed; not posted again)" % POST_TIMEOUT_SECONDS
     out = (res.stdout or "") + (res.stderr or "")
+    safe_out = okf_land.scrub_secrets(out).replace(str(request["key"]), "[key]")
     if verbose:
-        print("    " + out.strip()[-400:].replace("\n", "\n    "))
-    found = re.search(r"VERIFIED on the board: Row_ID=(\S+)", out)
-    if found and res.returncode == 0:
-        return "posted", found.group(1)
-    reason = " ".join(out.split())[-200:] or "no output from fleet_agent request"
-    if res.returncode in (1, 2) or "refused before posting" in out or "NOT SENT" in out:
-        return "refused", reason          # fleet_agent's EXIT_NOT_SENT / EXIT_REFUSED: nothing appended
-    return "unconfirmed", reason          # EXIT_UNCONFIRMED, a timeout, or words it did not say
+        print("    " + safe_out.strip()[-400:].replace("\n", "\n    "))
+    rid = request_id(me, answers)
+    verified = re.findall(r"^  VERIFIED on the board: Row_ID=(\S+) Source_Tag=(\S+) "
+                          r"Target_Surface=(\S+)(?: \(existing request\))?$", out, re.MULTILINE)
+    contradictory = "NOT SENT" in out or "refused before posting" in out or "UNCONFIRMED" in out
+    if res.returncode == 0 and verified == [(rid, me, "bus-reconciler")] and not contradictory:
+        return "posted", rid
+    if (res.returncode == 2 and "refused before posting" in out and not verified
+            and "NOT SENT" not in out and "UNCONFIRMED" not in out):
+        return "refused", "the request was refused before posting"
+    return "unconfirmed", "request outcome ambiguous; it may have landed and must not be retried"
 
 
 def request_note(request, state: str, detail: str) -> str:
@@ -992,8 +1010,6 @@ def redis_hook(me: str, cfg: dict, text: str, src_id: str, model_cut: bool, verb
     key going through when this check ran after the post), then post_request's gates, then the
     subprocess. The log line never carries the key unless the request was posted, because a refused
     key must not reach a log line either."""
-    if not cfg.get("redis_requests"):
-        return text, "", "", "", ""
     report = {}
     request, text = redis_request(text, report)
     if request is None:
@@ -1002,9 +1018,18 @@ def redis_hook(me: str, cfg: dict, text: str, src_id: str, model_cut: bool, verb
             return text, "", "malformed", request_note(None, "malformed", why), "    redis request malformed: %s" % why
         return text, "", "", "", ""
     rid = request_id(me, src_id)
+    if not cfg.get("redis_requests"):
+        return (text, rid, "refused", request_note(request, "refused", "model REDIS-OP is disabled"),
+                "    redis request refused: model REDIS-OP disabled")
     if model_cut:
         return (text, rid, "cut", request_note(request, "cut", ""),
                 "    redis request not sent: the reply was cut at the output cap")
+    if not canary_request_allowed(request):
+        return (text, rid, "refused", request_note(request, "refused", "no synthetic canary policy"),
+                "    redis request refused: no synthetic canary policy")
+    if not reserve_redis_side_effect(src_id):
+        return (text, rid, "refused", request_note(request, "refused", "no durable posting claim"),
+                "    redis request refused: no durable posting claim")
     state, detail = post_request(me, cfg, request, verbose, answers=src_id)
     if state == "posted":
         rid = detail      # the id READ BACK, which is the id asked for; the measurement, not the plan

@@ -256,7 +256,8 @@ def _audit_alone(conn, fields) -> None:
 # ------------------------------------------------------------------------------------------ the ops
 
 def execute(conn, acl: dict, raw_tag: str, via: str, op: str, key: str, field: str = "",
-            raw_value: str = "", enc: str = "", count: int = 10, now=None) -> dict:
+            raw_value: str = "", enc: str = "", count: int = 10, now=None,
+            compare_value: str = None) -> dict:
     """Do one governed operation. Always returns a result dict; never raises into the caller.
 
     Every outcome - refused, read, written, or failed - leaves exactly one gov:audit entry, and a
@@ -275,7 +276,7 @@ def execute(conn, acl: dict, raw_tag: str, via: str, op: str, key: str, field: s
                 raise Refused("hput replaces the whole hash; it takes no field=")
             value = decode_mapping(raw_value, enc, acl, key)
         if op in OPS_READ:
-            return _read(conn, acl, who, raw_tag, via, op, key, count, now)
+            return _read(conn, acl, who, raw_tag, via, op, key, count, now, compare_value)
         return _write(conn, acl, who, raw_tag, via, op, key, field, value, now)
     except Refused as why:
         try:
@@ -295,10 +296,16 @@ def execute(conn, acl: dict, raw_tag: str, via: str, op: str, key: str, field: s
         return {"ok": False, "error": type(error).__name__}
 
 
-def _read(conn, acl, who, raw_tag, via, op, key, count, now) -> dict:
+def _read(conn, acl, who, raw_tag, via, op, key, count, now, compare_value=None) -> dict:
     if op == "get":
         value = conn.get(key)
         out = {"ok": True, "op": op, "key": key, "found": value is not None, "value": preview(value)}
+        if compare_value is not None:
+            # Compare the raw typed value before preview(). A literal string
+            # resembling repr(bytes) must not match actual marker bytes.
+            out["exact_match"] = (value == compare_value or
+                                  (isinstance(value, bytes) and
+                                   value == compare_value.encode("utf-8")))
     elif op == "hgetall":
         found = conn.hgetall(key) or {}
         items = sorted(found.items())[:MAX_HASH_FIELDS]

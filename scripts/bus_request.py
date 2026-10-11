@@ -1,4 +1,8 @@
-"""The request-handling mode: a bounded diagnostic Aya can ask for over the board, answered on the board.
+"""The request-handling mode: a bounded diagnostic Aya can ask for over the board.
+
+Board REDIS-OP is disabled without explicit runtime canary configuration. Even when enabled,
+only a fixed public marker at the exact configured synthetic key may be set or checked. The
+shared result contains status or match, never a Redis value. Source_Tag is a claim, not identity.
 
 THE CHAIN THIS IMPLEMENTS, END TO END
     Aya posts a request row            (the board; Aya's only tool)
@@ -38,20 +42,16 @@ it: "don't widen the stopgap". On 2026-10-08 he decided the trade differently, d
 claude-code-cli: "Everyone gets read write access, you control the Redis access rights and make
 actions auditable so there is governance."
 
-So `redis-op` exists, bounded by GOVERNANCE rather than by identity (scripts/redis_gov.py): every fleet
-agent may read everything and write the governed namespaces; one controller owns the access list
-(scripts/redis_acl.json); every operation, allowed or refused, is audited in gov:audit with the raw
-tag, the board row, and the old and new values; and the namespaces other things depend on - the board
-mirror the comparison gate checks, the roster, the chair's projection, the audit itself - are refused
-for writes in code, whatever the access list says. The identity is still a claim, and the audit says
-so by recording the raw tag beside the principal. Per-agent identity is the redis-tool-bridge (OIDC)
-for the agents that have a Google identity at all; until then, this is the path every agent can reach.
+The original ACL in scripts/redis_acl.json has broad rights, but that ACL does not make
+shared-board replies private. This worker gates board operations before any Redis access.
 """
 from __future__ import annotations
 
 import datetime
+import base64
 import hashlib
 import json
+import os
 import re
 import secrets
 import time
@@ -65,6 +65,7 @@ REQUEST_ACTION = "AYA_REQ"
 RECEIPT_ACTION = "AYA_RECEIPT"
 RESULT_ACTION = "AYA_RESULT"
 WORKER_TAG = "bus-reconciler"
+CANARY_MARKER = "PUBLIC_CANARY_V1"  # known non-sensitive test value, never model text
 
 # Who MAY ask. Not who DID ask: see the module docstring. This bounds the claim, never the identity.
 SENDERS = ("aya", "chatgpt-codex-desktop", "claude-code-cli", "owner", "whatsapp")
@@ -127,6 +128,9 @@ def parse_request(row):
         "claimed_sender": str(row[SOURCE] or "").strip().lower(),
         "action": (field(payload, "do") or "").strip().lower(),
         "row_id": str(row[ROW_ID] or "").strip(),
+        "payload": payload,
+        "cells": len(row),
+        "target": str(row[TARGET] or "").strip(),
         "at": read_ts(row[TS]),
         # redis-op only. Taken verbatim and judged by scripts/redis_gov.py, never used here.
         "op": field(payload, "op"),
@@ -140,6 +144,41 @@ def parse_request(row):
         # comment (its type says so; no cell can), "board" for everything else.
         "channel": getattr(row, "channel", "board"),
     }
+
+
+def board_canary_key() -> str:
+    """An explicit runtime choice; no configuration means no Redis board capability."""
+    if os.environ.get("REDIS_BOARD_CANARY_ENABLED") != "1":
+        return ""
+    key = os.environ.get("REDIS_BOARD_CANARY_KEY", "")
+    return key if re.fullmatch(r"conf:canary:redis-op:[A-Za-z0-9._:-]{1,64}", key) else ""
+
+
+def canary_refusal(req) -> str:
+    """Deny generic unauthenticated board operations before Redis access."""
+    key = board_canary_key()
+    if not key:
+        return "Redis board canary policy is disabled"
+    op = (req.get("op") or "").strip().lower()
+    if (req.get("cells") != 10 or req.get("target") != "bus-reconciler"
+            or req.get("key") != key or op not in ("set", "get")
+            or req.get("field") or req.get("count")
+            or req.get("row_id") != req.get("req_id")):
+        return "Redis board requests are limited to the configured synthetic canary"
+    if op == "set":
+        expected = base64.b64encode(CANARY_MARKER.encode("ascii")).decode("ascii")
+        if req.get("enc") != "b64" or req.get("val") != expected:
+            return "Redis board canary value must be the fixed public marker"
+    elif req.get("enc") or req.get("val"):
+        return "Redis board canary reads carry no value"
+    expected = ("BCB|v=1|id=%s|req=%s|do=redis-op|op=%s|key=%s" %
+                (req["req_id"], req["req_id"], op, key))
+    if op == "set":
+        expected += "|val=%s|enc=b64" % base64.b64encode(CANARY_MARKER.encode("ascii")).decode("ascii")
+    expected += "|from=%s|to=bus-reconciler" % req["claimed_sender"]
+    if req.get("payload") != expected:
+        return "Redis board canary request shape is not canonical"
+    return ""
 
 
 def repeated_keys(payload) -> list:
@@ -245,6 +284,13 @@ def refusals(req, now, already, acl=None) -> list:
     if req["action"] not in ACTIONS:
         out.append("the action %r is not allowlisted; the only one is %s"
                    % (req["action"], ", ".join(ACTIONS)))
+    if req["action"] == "redis-op" and req.get("channel", "board") == "board":
+        # Source_Tag is a claim and AYA_RESULT is a shared row. Permit only an
+        # explicitly configured synthetic key and a public marker; the ACL's
+        # broad private read rights do not authorize publishing arbitrary values.
+        denial = canary_refusal(req)
+        if denial:
+            out.append(denial)
     if req["at"] is None:
         out.append("the row has no readable timestamp, so staleness cannot be judged")
     elif (now - req["at"]).total_seconds() > STALE_MINUTES * 60:
@@ -437,11 +483,28 @@ def handle(rows, conn, now=None, append=None, max_per_run=MAX_PER_RUN) -> dict:
                                        "%s/%s" % (req["req_id"], req["row_id"]),
                                        req.get("op"), req.get("key"), field=req.get("field") or "",
                                        raw_value=req.get("val") or "", enc=req.get("enc") or "",
-                                       count=count, now=now)
+                                       count=count, now=now,
+                                       compare_value=(CANARY_MARKER if req.get("channel", "board") == "board"
+                                                      and req.get("op") == "get" else None))
             if append:
-                append(row_for(RESULT_ACTION, req, redis_gov.summarise(result),
-                               ("%s %s %s" % ("OK" if result.get("ok") else "NOT DONE",
-                                              req.get("op") or "?", req.get("key") or "?"))[:100]))
+                if req.get("channel", "board") == "git":
+                    # The separately authenticated Git comment route retains
+                    # its existing governance/result contract in this patch.
+                    append(row_for(RESULT_ACTION, req, redis_gov.summarise(result),
+                                   ("%s %s %s" % ("OK" if result.get("ok") else "NOT DONE",
+                                                  req.get("op") or "?", req.get("key") or "?"))[:100]))
+                else:
+                    # A board Source_Tag is a claim. Never serialize a Redis
+                    # value from this channel into its shared RESULT row.
+                    if result.get("ok") and result.get("op") == "get":
+                        matched = result.get("exact_match") is True
+                        summary = "OK canary get match=%s audit=ok" % ("yes" if matched else "no")
+                    elif result.get("ok"):
+                        summary = "OK canary set audit=ok digest=%s" % (result.get("new_sha") or "-")
+                    else:
+                        summary = "CANARY %s" % ("REFUSED" if "refused" in result else "ERROR")
+                    append(row_for(RESULT_ACTION, req, summary, "Canary %s" % (
+                        "OK" if result.get("ok") else "NOT DONE")))
             already.add(req["req_id"])
             status = ("OK" if result.get("ok")
                       else "REFUSED" if "refused" in result else "ERROR")

@@ -1044,5 +1044,61 @@ class APostThatOutlivesItsTimeout(unittest.TestCase):
         self.assertIn("NOT CONFIRMED after 400 s", buf.getvalue())
 
 
+class _ReservedRequestWaker:
+    """One source row, with a Redis request before its final reply."""
+
+    def __init__(self, on_request=None, crash=False):
+        self.on_request, self.crash = on_request, crash
+        self.requests, self.replies = 0, 0
+        self.reply_on_board = lambda _rid: False
+
+    def post_reply(self, me, cfg, text, to, answers, verbose, phase="DONE"):
+        self.replies += 1
+        return True
+
+    def main(self, argv):
+        if self.claim_answer("A") and self.reserve_redis_side_effect("A"):
+            self.requests += 1
+            if self.on_request:
+                self.on_request()
+            if self.crash:
+                raise RuntimeError("killed after request reservation")
+            self.post_reply("gemini", {}, "reply", "owner;ALL", "A", False)
+        return 0
+
+
+class RedisRequestOwnership(unittest.TestCase):
+    def test_side_effect_is_fenced_before_append_and_final_reply_renews_lease(self):
+        store = MemStore({"watermark": "2026-10-11T00:00:00Z", "answered_ids": []})
+        state_at_request, other_calls = [], []
+        other = _ClaimingWaker(other_calls)
+        other.reply_on_board = lambda _rid: False
+
+        def during_request():
+            state_at_request.append(store.state["claim_phase"])
+            main.run(store=store, waker=other, now="2026-10-11T01:00:00Z")
+
+        first = _ReservedRequestWaker(on_request=during_request)
+        main.run(store=store, waker=first, now="2026-10-11T01:00:00Z")
+        self.assertEqual(["posting"], state_at_request)
+        self.assertEqual([], other_calls)
+        self.assertEqual((1, 1), (first.requests, first.replies))
+        self.assertIn("A", store.state["answered_ids"])
+        self.assertNotIn("A", store.state.get("unknown_ids") or [])
+        self.assertGreaterEqual([s.get("claim_phase") for s in store.saves].count("posting"), 2)
+
+    def test_crash_after_reservation_never_repeats_request(self):
+        store = MemStore({"watermark": "2026-10-11T00:00:00Z", "answered_ids": []})
+        first = _ReservedRequestWaker(crash=True)
+        with self.assertRaisesRegex(RuntimeError, "killed"):
+            main.run(store=store, waker=first, now="2026-10-11T01:00:00Z")
+        self.assertEqual("posting", store.state["claim_phase"])
+        later = _ReservedRequestWaker()
+        main.run(store=store, waker=later, now="2026-10-11T02:00:00Z")
+        self.assertEqual(1, first.requests)
+        self.assertEqual(0, later.requests)
+        self.assertIn("A", store.state.get("unknown_ids") or [])
+
+
 if __name__ == "__main__":
     unittest.main()
