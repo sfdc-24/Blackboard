@@ -82,7 +82,8 @@ ACCEPT_KEY = "fleet:worker:accept:%s"     # cloud/claude-api-worker/lane.py read
 DONE_KEY = "fleet:worker:done:%s"
 TERMINAL = ("SUCCEEDED", "FAILED")
 NOTE_MAX = 300
-BEAT_EVERY = 240                           # inside the reader's 300 s window, with a worker pass to spare
+BEAT_EVERY = 240                           # the most a loop may wait: the reader's window is 300 s and a
+                                           # worker pass (10 to 60 s) has to land the next beat inside it
 BEAT_HOURS = 8
 
 
@@ -286,18 +287,32 @@ def done_value(state: str, note: str, evidence: str) -> str:
         raise SystemExit("--state must be one of %s" % ", ".join(TERMINAL))
     note = " ".join((note or "").split())
     if len(note) > NOTE_MAX:
-        note = note[:NOTE_MAX].rstrip() + " [note cut at %d of %d characters]" % (NOTE_MAX, len(note))
+        # The label is INSIDE the bound (Cursor on 517a918: 300 kept plus a label stored 336). Same
+        # shape as message() above: what is kept, then how much there was.
+        label = " [note cut here: %d characters in all]" % len(note)
+        note = note[:NOTE_MAX - len(label)].rstrip() + label
     evidence = (evidence or "").strip()
     if evidence and (not evidence.startswith("https://") or any(c.isspace() for c in evidence)):
         raise SystemExit("--evidence must be one https:// link, or absent")
     return json.dumps({"by": ME, "state": state, "note": note, "evidence": evidence}, sort_keys=True)
 
 
+def beat_interval(every) -> int:
+    """0 is one beat. A loop waits 60..BEAT_EVERY seconds: under 60 is a row a minute, and over
+    BEAT_EVERY the reader's 300 s window lapses before the worker's next pass lands the beat."""
+    every = int(every or 0)
+    if every == 0:
+        return 0
+    if not 60 <= every <= BEAT_EVERY:
+        raise SystemExit("--every must be 0 (one beat) or 60..%d seconds; the reader's window is 300 s "
+                         "and the worker's pass has to land the next beat inside it" % BEAT_EVERY)
+    return every
+
+
 def cmd_beat(args) -> int:
-    """One beat, or a loop of them under a cap. Not waited for: the next beat supersedes this one."""
-    every = int(args.every or 0)
-    if every and every < 60:
-        raise SystemExit("--every under 60 s is a row a minute; the reader's window is 300 s")
+    """One beat, or a loop of them under a cap. Not waited for: the next beat supersedes this one.
+    The loop stops BEFORE an interval that would cross --hours, so it never runs past the cap."""
+    every = beat_interval(args.every)
     stop = time.time() + float(args.hours) * 3600 if every else None
     while True:
         value = "%d" % int(time.time())
@@ -306,7 +321,8 @@ def cmd_beat(args) -> int:
         if not every:
             return 0
         if time.time() + every > stop:
-            print("beat loop: the cap of %g h is reached; stopping. Start it again if the session goes on." % float(args.hours))
+            print("beat loop: the next interval would cross the %g h cap; stopping before it. "
+                  "Start it again if the session goes on." % float(args.hours))
             return 0
         time.sleep(every)
 
@@ -389,7 +405,24 @@ def cmd_selftest(_args) -> int:
     assert done == {"by": "claude-code-cli", "evidence": "https://github.com/sfdc-24/Blackboard/pull/371",
                     "note": "Answered in PR 371.", "state": "SUCCEEDED"}, done
     cut = json.loads(done_value("FAILED", "x" * 400, ""))["note"]
-    assert cut.endswith("[note cut at 300 of 400 characters]"), cut[-60:]
+    assert len(cut) <= NOTE_MAX, len(cut)                              # the label is inside the bound
+    assert cut.endswith("[note cut here: 400 characters in all]"), cut[-60:]
+    for every in (0, 60, 240):
+        assert beat_interval(every) == every
+    for bad in (59, 241, 600):
+        try:
+            beat_interval(bad)
+        except SystemExit:
+            continue
+        raise AssertionError("accepted --every %r" % bad)
+    # THE PARSER, not only the literals: each verb parses with its options and its defaults.
+    parser = build_parser()
+    assert parser.parse_args(["beat", "--every", "240", "--hours", "2"]).every == 240
+    assert parser.parse_args(["beat"]).every == 0 and parser.parse_args(["beat"]).hours == BEAT_HOURS
+    assert parser.parse_args(["accept", "--task", "task-0123456789abcdef"]).lease == 900
+    done_args = parser.parse_args(["done", "--task", "task-0123456789abcdef", "--state", "FAILED",
+                                   "--note", "n", "--evidence", "https://x"])
+    assert (done_args.state, done_args.evidence, done_args.wait) == ("FAILED", "https://x", WAIT_SECONDS)
     for bad in (("DONE", "", ""), ("SUCCEEDED", "", "http://plain"), ("SUCCEEDED", "", "https://a b")):
         try:
             done_value(*bad)
@@ -404,11 +437,12 @@ def cmd_selftest(_args) -> int:
         raise AssertionError("accepted %r" % bad)
     assert task_id_ok(" task-0123456789abcdef ") == "task-0123456789abcdef"
     assert "beat [--every 240 --hours 8]" in __doc__ and "public board" in __doc__.lower(), __doc__
-    print("selftest OK: the grammar is what redis_gov parses, and only fleet:inbox: is addressed")
+    print("selftest OK: the grammar is what redis_gov parses; the keys addressed are fleet:inbox:<agent>, "
+          "fleet:alive:claude-code-cli and fleet:worker:accept|done:<task>")
     return 0
 
 
-def main(argv=()) -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="what", required=True)
     for name in ("send", "read", "selftest", "beat", "accept", "done"):
@@ -424,7 +458,7 @@ def main(argv=()) -> int:
             p.add_argument("--count", type=int, default=20)
         if name == "beat":
             p.add_argument("--every", type=int, default=0,
-                           help="loop: seconds between beats (0 = one beat; %d fits the 300 s window)" % BEAT_EVERY)
+                           help="loop: seconds between beats, 60..%d (0 = one beat); the reader's window is 300 s" % BEAT_EVERY)
             p.add_argument("--hours", type=float, default=BEAT_HOURS,
                            help="the loop's cap in hours (default %d); it never runs past it" % BEAT_HOURS)
         if name in ("accept", "done"):
@@ -435,7 +469,11 @@ def main(argv=()) -> int:
             p.add_argument("--state", required=True, help="SUCCEEDED or FAILED")
             p.add_argument("--note", default="", help="at most %d characters; it is PUBLIC" % NOTE_MAX)
             p.add_argument("--evidence", default="", help="one https:// link to the PR or the evidence")
-    args = parser.parse_args(list(argv))
+    return parser
+
+
+def main(argv=()) -> int:
+    args = build_parser().parse_args(list(argv))
     return {"send": cmd_send, "read": cmd_read, "selftest": cmd_selftest, "beat": cmd_beat,
             "accept": cmd_accept, "done": cmd_done}[args.what](args)
 
