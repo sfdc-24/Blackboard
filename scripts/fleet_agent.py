@@ -42,6 +42,8 @@ import json
 import os
 import re
 import sys
+import time
+import urllib.error
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -433,6 +435,19 @@ def _ten_cells(cells):
     return head + [""] * (BOARD_WIDTH - len(head))
 
 
+# THE FAST FAILURES OF A READ ARE RETRIED, THE SLOW ONES ARE NOT (the fifth adversarial check on #367).
+# The gateway is documented to answer a read now and then with a health ping ({ok, service, time}, no
+# rows: "unknown, never an empty board", docs/board-protocol.md) and with a 404 on the redirect hop.
+# Both come back in a second or two. One of them on a one-try read before the append turned a blip
+# into NOT SENT - on the Redis path a final "refused, nothing was sent" for an ask that only needed a
+# second look. A timeout or a dropped connection is the slow failure the one-try rule was written
+# for (a 120 s hop inside the waker's 400 s budget): it still ends the read at once.
+READ_TRIES_BEFORE_APPEND = 3
+READ_TRIES_AFTER_APPEND = 3
+FAST_RETRY_WINDOW_SECONDS = 45
+_pause = time.sleep          # a seam, so a test does not sleep
+
+
 def _matching_rows(rid, tries=1):
     """The board's rows that mention `rid`, by a FILTERED read, or None when the board could not be read.
 
@@ -443,13 +458,36 @@ def _matching_rows(rid, tries=1):
     over the whole row (a later row quoting the id matches too), so the caller still compares
     Row_ID exactly. No `limit` is safe here: later rows quoting an id could hide its exact row
     behind the cap. Require the known filtered-read metadata and data-row shape; a gateway that
-    ignores `match` is UNKNOWN, not an empty board. One try before the append preserves the budget."""
+    ignores `match` is UNKNOWN, not an empty board, and is not asked again.
+
+    `tries` counts attempts against the FAST failures only (a health ping, a non-JSON body, an HTTP
+    error such as the redirect hop's 404), within FAST_RETRY_WINDOW_SECONDS of the first; a timeout
+    or a dropped connection returns None at once, which keeps the budget for the append."""
     env = _bus_load_env()
-    try:
-        body = _bus_fetch(env["BUS_URL"], {"action": "read", "secret": env["BUS_SECRET"], "title": BOARD,
-                                           "match": str(rid)}, tries=tries)
-        answer = json.loads(body)
-    except Exception:  # noqa: BLE001 - a transport failure is not an empty board
+    payload = {"action": "read", "secret": env["BUS_SECRET"], "title": BOARD, "match": str(rid)}
+    began = time.monotonic()
+    answer = None
+    for attempt in range(max(1, tries)):
+        if attempt:
+            if time.monotonic() - began > FAST_RETRY_WINDOW_SECONDS:
+                return None
+            _pause(2 * attempt)
+        try:
+            body = _bus_fetch(env["BUS_URL"], payload, tries=1)
+        except urllib.error.HTTPError:
+            continue                  # fast: the redirect hop's intermittent 404
+        except Exception:  # noqa: BLE001 - a timeout or a dropped connection is not an empty board
+            return None               # slow: never retried inside the budget
+        try:
+            answer = json.loads(body)
+        except (TypeError, ValueError):
+            answer = None
+            continue                  # fast: a non-JSON body
+        if isinstance(answer, dict) and answer.get("ok") is True and "rows" not in answer:
+            answer = None
+            continue                  # fast: the documented health ping
+        break
+    if answer is None:
         return None
     if not isinstance(answer, dict) or answer.get("ok") is not True or answer.get("title") != BOARD:
         return None
@@ -487,7 +525,7 @@ def _board_rows_like(rid, row, tries=1):
     "" - or (None, None, why) when the board could not be read."""
     recs = _matching_rows(rid, tries=tries)
     if recs is None:
-        return None, None, "the board could not be read (filtered read, %d tr%s)" % (tries, "y" if tries == 1 else "ies")
+        return None, None, "the board could not be read (filtered read, up to %d tr%s)" % (tries, "y" if tries == 1 else "ies")
     hit = [r for r in recs if isinstance(r, (list, tuple)) and r and str(r[0] if r[0] is not None else "") == rid]
     return hit, [r for r in hit if _same_complete_row(r, row)], ""
 
@@ -506,7 +544,7 @@ def append_and_verify(rid, row, fitted=None, spill=None, exact=True):
     paying for. After the append, the read-back is the proof; "not found" is UNCONFIRMED, never
     "absent" (a 404 on the redirect hop has been raised client-side after the row landed)."""
     fitted = fitted or {}
-    hit, identical, why = _board_rows_like(rid, row, tries=1)
+    hit, identical, why = _board_rows_like(rid, row, tries=READ_TRIES_BEFORE_APPEND)
     if hit is None:
         # The id cannot be checked, and a blind append is the double write this fleet keeps paying
         # for. Nothing was appended: the caller may try again on its next pass.
@@ -560,7 +598,7 @@ def append_and_verify(rid, row, fitted=None, spill=None, exact=True):
                   "a later commit using the same row id and text reuses it without overwriting another.")
 
     # D-4: the response is not the proof. Read the row back: exactly one identical row.
-    hit, identical, why = _board_rows_like(rid, row, tries=2)
+    hit, identical, why = _board_rows_like(rid, row, tries=READ_TRIES_AFTER_APPEND)
     if hit is None:
         print("  UNCONFIRMED: no usable board read after the append (%s). It may have landed. Do NOT retry blindly." % why)
         return EXIT_UNCONFIRMED

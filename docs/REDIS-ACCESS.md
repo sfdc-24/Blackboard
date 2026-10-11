@@ -81,7 +81,7 @@ python scripts/fleet_agent.py request xrange conf:side:20261011 --count 8 --tag 
 
 It base64-encodes the value, refuses a request that would not fit a row (a request is never spilled —
 a pointer row carries no `op=` for the worker to read), **reads the rows under your id first** (a
-filtered read without a row cap, one try: the identical row already there is not posted again; the same id under a
+filtered read without a row cap; a health ping or a 404 is asked again within 45 seconds, a timeout is not: the identical row already there is not posted again; the same id under a
 different request is refused before anything is appended; a board it cannot read means `NOT SENT`, and
 nothing was appended), prints `appending Row_ID=…` and appends exactly once, then **reads the rows
 under your id back and requires exactly one** that is yours, matching every cell but the timestamp

@@ -841,8 +841,10 @@ class FilteredReadCompleteness(unittest.TestCase):
     def setUp(self):
         import fleet_agent
         self.fa = fleet_agent
-        self.real = fleet_agent._bus_fetch, fleet_agent._bus_load_env
+        self.real = fleet_agent._bus_fetch, fleet_agent._bus_load_env, fleet_agent._pause
         fleet_agent._bus_load_env = lambda: {"BUS_URL": "https://bus.test/x", "BUS_SECRET": "s"}
+        self.pauses = []
+        fleet_agent._pause = self.pauses.append
         self.rid = "REQ-HIDDEN-1"
         self.row = fleet_agent.request_row("gemini", "xadd", "conf:side:20261011", val="one",
                                             rid=self.rid)[1]
@@ -850,7 +852,90 @@ class FilteredReadCompleteness(unittest.TestCase):
                         "a later row quotes " + self.rid, "", "", "", ""] for n in range(200)]
 
     def tearDown(self):
-        self.fa._bus_fetch, self.fa._bus_load_env = self.real
+        self.fa._bus_fetch, self.fa._bus_load_env, self.fa._pause = self.real
+
+    HEALTH = json.dumps({"ok": True, "service": "blackboard-bus", "time": "2026-10-11T15:00:00Z"})
+
+    def scripted_fetch(self, reads, rows, appends):
+        """Reads answer from `reads` in order (a string body, or an exception to raise), then from
+        the board; appends land on the board."""
+        script = list(reads)
+
+        def fetch(url, payload, tries=1):
+            if payload["action"] == "append":
+                appends.append(payload["sheetRow"])
+                rows.append(payload["sheetRow"])
+                return "ok:true"
+            self.assertEqual(1, tries, "one transport attempt per read; the loop is _matching_rows'")
+            if script:
+                step = script.pop(0)
+                if isinstance(step, BaseException):
+                    raise step
+                return step
+            return json.dumps({"ok": True, "title": self.fa.BOARD, "rows": rows,
+                               "filtered": len(rows), "total": len(rows) + 1})
+        return fetch
+
+    def test_a_health_ping_or_a_404_before_the_append_is_asked_again_not_NOT_SENT(self):
+        """The fifth adversarial check on #367: one documented health ping on the one-try read before
+        the append made a Redis request "refused, nothing was sent" for good."""
+        import urllib.error
+        for blip in (self.HEALTH, "<html>Google sign-in</html>",
+                     urllib.error.HTTPError("https://x", 404, "Not Found", {}, None)):
+            with self.subTest(blip=type(blip).__name__):
+                rows, appends = [], []
+                self.pauses.clear()
+                self.fa._bus_fetch = self.scripted_fetch([blip], rows, appends)
+                code = self.fa.append_and_verify(self.rid, self.row)
+                self.assertEqual((self.fa.EXIT_VERIFIED, [self.row]), (code, appends))
+                self.assertEqual([2], self.pauses, "one short pause, then the read again")
+
+    def test_a_health_ping_after_the_append_is_asked_again_not_UNCONFIRMED(self):
+        rows, appends = [], []
+        fetch = self.scripted_fetch([], rows, appends)
+
+        def after_append_ping_once(url, payload, tries=1):
+            if payload["action"] == "read" and appends and not getattr(self, "pinged", False):
+                self.pinged = True
+                return self.HEALTH
+            return fetch(url, payload, tries)
+        self.fa._bus_fetch = after_append_ping_once
+        code = self.fa.append_and_verify(self.rid, self.row)
+        self.assertEqual((self.fa.EXIT_VERIFIED, [self.row]), (code, appends))
+
+    def test_a_timeout_before_the_append_is_NOT_SENT_at_once_without_a_second_read(self):
+        reads = []
+        rows, appends = [], []
+        inner = self.scripted_fetch([TimeoutError("timed out"), self.HEALTH], rows, appends)
+
+        def fetch(url, payload, tries=1):
+            if payload["action"] == "read":
+                reads.append(1)
+            return inner(url, payload, tries)
+        self.fa._bus_fetch = fetch
+        code = self.fa.append_and_verify(self.rid, self.row)
+        self.assertEqual((self.fa.EXIT_NOT_SENT, [], 1, []), (code, appends, len(reads), self.pauses),
+                         "the slow failure keeps the budget: no second read, no pause")
+
+    def test_health_pings_on_every_try_are_NOT_SENT_and_nothing_is_appended(self):
+        rows, appends = [], []
+        self.fa._bus_fetch = self.scripted_fetch([self.HEALTH] * self.fa.READ_TRIES_BEFORE_APPEND,
+                                                 rows, appends)
+        code = self.fa.append_and_verify(self.rid, self.row)
+        self.assertEqual((self.fa.EXIT_NOT_SENT, []), (code, appends))
+        self.assertEqual([2, 4], self.pauses)
+
+    def test_the_fast_retries_stop_when_the_window_is_spent(self):
+        rows, appends = [], []
+        self.fa._bus_fetch = self.scripted_fetch([self.HEALTH, self.HEALTH], rows, appends)
+        clock = iter([0.0, self.fa.FAST_RETRY_WINDOW_SECONDS + 1.0])
+        real_monotonic = self.fa.time.monotonic
+        self.fa.time.monotonic = lambda: next(clock)
+        try:
+            code = self.fa.append_and_verify(self.rid, self.row)
+        finally:
+            self.fa.time.monotonic = real_monotonic
+        self.assertEqual((self.fa.EXIT_NOT_SENT, [], []), (code, appends, self.pauses))
 
     def filtered_fetch(self, rows, appends):
         def fetch(url, payload, tries=1):
@@ -1167,13 +1252,14 @@ class FleetAgentRequestOnTheBoard(unittest.TestCase):
         tell nothing-sent from may-have-landed."""
         code, out = self.run_request(self.args())
         self.assertEqual(self.fa.EXIT_VERIFIED, code)
-        self.assertEqual([("REQ-T-0001", 1), ("REQ-T-0001", 2)], self.reads)
+        self.assertEqual([("REQ-T-0001", self.fa.READ_TRIES_BEFORE_APPEND),
+                          ("REQ-T-0001", self.fa.READ_TRIES_AFTER_APPEND)], self.reads)
         self.assertLess(out.index("appending Row_ID=REQ-T-0001"), out.index("VERIFIED on the board"))
         self.board = None
         self.appends.clear()
         code, out = self.run_request(self.args(rid="REQ-T-0009"))
         self.assertEqual((self.fa.EXIT_NOT_SENT, []), (code, self.appends))
-        self.assertIn("could not be read (filtered read, 1 try)", out)
+        self.assertIn("could not be read (filtered read, up to 3 tries)", out)
         self.assertNotIn("appending", out, "no marker: nothing was appended")
 
     def test_a_post_that_names_no_id_gets_one_that_differs_per_post_and_repeats_per_retry(self):
