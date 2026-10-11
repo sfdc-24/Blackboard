@@ -497,6 +497,40 @@ class EndToEndThroughTheBoardWorker(unittest.TestCase):
         for tag in ("chatgpt-codex-desktop", "grok", "cursor", "gemini", "codex", "aya"):
             self.assertEqual("hi", conn.data["fleet:hello:%s" % tag])
 
+    def test_the_row_fleet_agent_builds_is_the_row_the_worker_answers(self):
+        """The tool and the worker agree, proved on the real row - not a hand-written one.
+
+        Until 2026-10-11 no cloud waker could ask at all: fleet_agent post writes a phase row, and
+        parse_request reads only AYA_REQ. fleet_agent request is the tool; this holds the two
+        together, with a value that carries a pipe and a newline, which the payload grammar could
+        never carry raw."""
+        import datetime
+        import fleet_agent
+        when = self.now - datetime.timedelta(minutes=1)    # a request from the future is refused
+        rows, value = [], "Gemini: the lease shape holds | second clause\nsecond line"
+        for n, tag in enumerate(("gemini", "grok", "aya"), start=1):
+            rid, row = fleet_agent.request_row(tag, "xadd", "conf:side:20261011", val=value, now=when,
+                                               rid="REQ-FA-%04d" % n)
+            rows.append(row)
+        out, written, conn = self.run_rows(rows)
+        self.assertEqual(["OK"] * 3, [a["status"] for a in out["answered"]])
+        self.assertEqual(["gemini", "grok", "aya"], [r["target_surface"] for r in written],
+                         "each answered under the tag it asked with")
+        entries = [fields for _id, fields in conn.data["conf:side:20261011"]]
+        self.assertEqual(3, len(entries))
+        self.assertEqual([value] * 3, [e["text"] for e in entries], "the value survived whole")
+        self.assertEqual(["gemini", "grok", "chatgpt-codex-desktop"], [e["by"] for e in entries],
+                         "written under the canonical principal (aya is Codex's desktop)")
+
+    def test_a_stranger_with_the_same_tool_gets_no_row_and_writes_nothing(self):
+        import datetime
+        import fleet_agent
+        when = self.now - datetime.timedelta(minutes=1)    # a request from the future is refused
+        _, row = fleet_agent.request_row("stranger", "set", "fleet:x", val="v", now=when, rid="REQ-FA-0009")
+        out, written, conn = self.run_rows([row])
+        self.assertEqual([], written)
+        self.assertNotIn("fleet:x", conn.data)
+
     def test_a_read_comes_back_in_the_result(self):
         conn = FakeRedis()
         conn.set("fleet:status", "amber")
