@@ -128,8 +128,8 @@ REDIS, which you may read and write through your adapter, governed and audited:
   Every agent inbox and other key is refused until an authenticated identity route exists.
   Use today's UTC date for the side stream.
 - Your adapter posts that line as a request row under your own tag and removes it from the
-  text of your answer - only when it runs under the cloud runner, whose durable claim fences
-  the append; a laptop pass refuses the line and your reply says so. The governed worker
+  text of your answer, under a durable claim that fences the append (the cloud runner's, or a
+  laptop pass's claim file); without one the line is refused and your reply says so. The governed worker
   judges the row under the access list and answers you with ONE later row (AYA_RESULT)
   saying OK or REFUSED and why. Until that row exists nothing has been written: never say a
   value is in Redis, only that you asked.
@@ -318,9 +318,10 @@ def hands_note(me: str, cfg: dict, env=None) -> str:
     writes = ("; it writes only an OKF file to a review branch of the private conference "
               "repository when a row says land=okf" if cfg.get("okf_land") else "")
     if cfg.get("redis_requests"):
-        writes += ("; under the cloud runner it posts one governed Redis request (redis-op, under this "
-                   "agent's own tag) when the reply carries a REDIS-OP line, and the worker's AYA_RESULT "
-                   "row says what happened; a laptop pass refuses the line and says so")
+        writes += ("; under a durable claim (the cloud runner's, or a laptop pass's claim file) it posts one "
+                   "governed Redis request (redis-op, under this agent's own tag) when the reply carries a "
+                   "REDIS-OP line, and the worker's AYA_RESULT row says what happened; without a claim it "
+                   "refuses the line and says so")
     if not reads and not writes:
         return "%s is a model endpoint: no shell, no repo, no cloud CLI, no PR. " % me.capitalize()
     return ("%s is a model endpoint; its adapter attaches %s%s. It has no shell and no cloud CLI, "
@@ -952,14 +953,129 @@ def request_id(me: str, answers: str) -> str:
     return "%s-REDIS-%s" % (re.sub(r"[^A-Za-z0-9]", "", me.upper())[:12], digest)
 
 
+# ------------------------------------------------- the laptop pass's durable posting claim
+#
+# THE CLOUD RUNNER IS NOT THE ONLY PLACE A REQUEST CAN BE FENCED. Grok's API route is a laptop pass
+# (scripts/agent_waker_once.ps1 on a 15-minute schedule): until this, its REDIS-OP line was refused
+# because nothing on the laptop could fence a retry. The fence it needs is the cloud runner's, made
+# of local parts:
+#   - ONE PASS AT A TIME, held by the operating system (flock / msvcrt.locking on an open handle), so
+#     it is released when the process ends however it ends: no stale-lock rule, no pid probe (on
+#     Windows os.kill(pid, 0) terminates the process);
+#   - A CLAIM FILE, rewritten whole, flushed, synced and renamed into place BEFORE the Redis request
+#     append, naming the ask; and
+#   - RECONCILIATION at the start of the next pass: a claim still in the file was left by a pass that
+#     did not finish its reply. The board decides: a reply there marks the ask answered; none
+#     quarantines it (unknown_ids). It is never asked again, so the request is never appended twice
+#     and the model is never asked a second time for a request that may already have run.
+# Only agents with redis_requests take the lock, and only when no runner installed its own claim.
+
+class _PassLock:
+    """One laptop pass per agent at a time; the OS releases it with the process."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self.fh = None
+
+    def acquire(self) -> bool:
+        fh = open(self.path, "a+b")
+        try:
+            if os.name == "nt":
+                import msvcrt
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            fh.close()
+            return False
+        self.fh = fh
+        return True
+
+    def release(self) -> None:
+        if self.fh is None:
+            return
+        try:
+            if os.name == "nt":
+                import msvcrt
+                self.fh.seek(0)
+                msvcrt.locking(self.fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self.fh.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        finally:
+            self.fh.close()
+            self.fh = None
+
+
+class _LocalClaims:
+    """The laptop pass's posting claims: {answers_id: {phase, request, at}}, one file, rewritten whole.
+
+    A missing file is no claims. An unreadable one raises: a damaged claim file is not "nothing in
+    flight", and the pass stops rather than ask again for something that may have run."""
+
+    def __init__(self, me: str, path: str):
+        self.me = me
+        self.path = path
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except FileNotFoundError:
+            data = {}
+        if not isinstance(data, dict) or not all(isinstance(v, dict) for v in data.values()):
+            raise ValueError("the claim file is not a map of claims")
+        self.claims = data
+
+    def _write(self) -> None:
+        tmp = self.path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(self.claims, fh, indent=2, sort_keys=True)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, self.path)
+
+    def reserve(self, answers_id: str) -> bool:
+        self.claims[answers_id] = {"phase": "posting", "request": request_id(self.me, answers_id),
+                                   "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+        try:
+            self._write()
+        except OSError:
+            # A claim that did not reach the disk fences nothing: refuse the request.
+            self.claims.pop(answers_id, None)
+            return False
+        return True
+
+    def release(self, *answers_ids: str) -> None:
+        for answers_id in answers_ids:
+            self.claims.pop(answers_id, None)
+        self._write()
+
+
+_LOCAL_CLAIMS = None      # set by main() for a laptop pass that holds its lock
+
+
+def claims_path(me: str) -> str:
+    base = state_path(me)
+    return (base[:-5] if base.endswith(".json") else base) + ".claims.json"
+
+
 def reserve_redis_side_effect(answers_id: str) -> bool:
     """Whether a Redis request may be appended for this ask: only under a DURABLE posting claim.
 
     The cloud runner (cloud/agent-waker/main.py) replaces this with one that writes phase=posting to
-    the shared cursor and renews the lease before the request append, so a second run defers and an
-    uncertain append is reconciled, never repeated. Outside the runner there is no such claim, so
-    the answer is no: a laptop pass refuses the request and says so on the reply. Fail closed."""
-    return False
+    the shared cursor and renews the lease before the request append. A laptop pass that holds its
+    pass lock writes the claim to its local claim file first (above). Anywhere else there is no
+    claim, and the answer is no: fail closed."""
+    store = _LOCAL_CLAIMS
+    if store is None:
+        return False
+    return store.reserve(answers_id)
+
+
+_DEFAULT_RESERVE = reserve_redis_side_effect
 
 
 def request_gate(me: str, request: dict) -> str:
@@ -1107,10 +1223,11 @@ def redis_hook(me: str, cfg: dict, text: str, src_id: str, model_cut: bool, verb
     if denied:
         return text, rid, "refused", request_note(request, "refused", denied), "    redis request refused: %s" % denied
     # THE DURABLE CLAIM COMES BEFORE THE APPEND (Copilot on #365; Aya's supplement to #367): without
-    # one, a retried ask could append this request again. The cloud runner provides it; a pass
-    # outside the runner has none and refuses here, before any subprocess.
+    # one, a retried ask could append this request again. The cloud runner provides it, and so does a
+    # laptop pass holding its lock; anything else has none and refuses here, before any subprocess.
     if not reserve_redis_side_effect(src_id):
-        why = "no durable posting claim for this ask (a request is appended only under the cloud runner's claim)"
+        why = ("no durable posting claim for this ask (a request is appended only under the cloud runner's "
+               "claim or a laptop pass's claim file)")
         return text, rid, "refused", request_note(request, "refused", why), "    redis request refused: %s" % why
     state, detail = post_request(me, cfg, request, verbose, answers=src_id)
     if state == "posted":
@@ -1190,6 +1307,49 @@ def main(argv=None) -> int:
     cfg = AGENTS[me]
     __import__(cfg["module"])  # fail loudly now, not mid-loop
 
+    # A LAPTOP PASS FOR AN AGENT THAT SENDS REDIS REQUESTS takes the pass lock and opens its claim
+    # file (the block above reserve_redis_side_effect). A runner that installed its own claim keeps
+    # it, and a dry run sends nothing, so neither takes the lock.
+    global _LOCAL_CLAIMS
+    lock = None
+    if (cfg.get("redis_requests") and not args.dry_run
+            and globals().get("reserve_redis_side_effect") is _DEFAULT_RESERVE):
+        lock = _PassLock(state_path(me) + ".lock")
+        if not lock.acquire():
+            note = "=== [%s] another pass holds the lock; this pass does nothing" % me
+            print(note)
+            log(me, note)
+            return 0
+        try:
+            _LOCAL_CLAIMS = _LocalClaims(me, claims_path(me))
+        except (OSError, ValueError) as exc:
+            lock.release()
+            note = ("=== [%s] the claim file %s cannot be read (%s): nothing is answered until a person "
+                    "checks the board for the asks it names and moves it aside" % (me, claims_path(me), exc))
+            print(note)
+            log(me, note)
+            return 1
+    try:
+        return _pass(args, me, cfg, _LOCAL_CLAIMS)
+    finally:
+        _LOCAL_CLAIMS = None
+        if lock is not None:
+            lock.release()
+
+
+def _release_claim(me: str, local, answers_id: str) -> None:
+    """Clear a laptop claim whose outcome is known. A claim that cannot be cleared stays, and the next
+    pass settles it from the board; the pass goes on."""
+    try:
+        local.release(answers_id)
+    except OSError as exc:
+        note = "    claim for %s not cleared (%s); the next pass settles it from the board" % (answers_id, exc)
+        print(note)
+        log(me, note)
+
+
+def _pass(args, me: str, cfg: dict, local) -> int:
+    """One pass of main(): `local` is the laptop pass's claim file, or None."""
     env = load_env()
     state = load_state(me)
     since = state["watermark"] or (
@@ -1197,6 +1357,34 @@ def main(argv=None) -> int:
     ).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     data = read_since(env, since)
+    if local is not None and local.claims:
+        # EVERY CLAIM IN THE FILE NOW IS AN EARLIER PASS'S (the lock admits one pass at a time), and
+        # each names an ask whose Redis request may be on the board while its reply was not confirmed.
+        # The board settles it. A reply is newer than the claim, and the claim newer than any ask the
+        # watermark was moved to, so the reply, if it landed, is inside this window. Missing it would
+        # only quarantine an answered ask: both outcomes leave the ask unasked.
+        on_board = answered_on_board(data["rows"], me)
+        settled = []
+        for aid, claim in sorted(local.claims.items()):
+            if aid in on_board:
+                if aid not in state["answered_ids"]:
+                    state["answered_ids"].append(aid)
+                note = "  %s reconciled: an earlier pass's claim, and its reply is on the board" % aid
+            else:
+                unknown_ids = list(state.get("unknown_ids") or [])
+                if aid not in unknown_ids:
+                    unknown_ids.append(aid)
+                state["unknown_ids"] = unknown_ids[-400:]
+                note = ("  %s quarantined: an earlier pass claimed it for Redis request %s and no reply is "
+                        "on the board; the request may have run, so the ask is not asked again (unknown_ids)"
+                        % (aid, claim.get("request") or "?"))
+            print(note)
+            log(me, note)
+            settled.append(aid)
+        # The outcome is saved before the claim goes: a crash between leaves the claim, and the next
+        # pass settles it the same way.
+        save_state(me, state)
+        local.release(*settled)
     pending = select(data["rows"], set(state["answered_ids"]), me)
     # Quarantine is not a receipt and not work. unknown_ids stay in the
     # cursor so a person can still see them, and they are not copied into
@@ -1388,8 +1576,11 @@ def main(argv=None) -> int:
         )
         posted = post_reply(me, cfg, reply, to=sender + ";ALL", answers=src_id,
                             verbose=args.verbose, phase=reply_phase(row))
+        reserved = local is not None and src_id in local.claims
         if posted:
             state["answered_ids"].append(src_id)
+            if reserved:
+                _release_claim(me, local, src_id)
             mod = sys.modules[cfg["module"]]
             usage = getattr(mod.ask, "last_usage", None) or {}
             ok = "    posted, %s tokens" % usage.get("total", "?")
@@ -1398,6 +1589,11 @@ def main(argv=None) -> int:
         elif posted is NOT_SENT:
             # Nothing was appended: hold the watermark under this row and go on; the next pass
             # asks again. Not a break: the gateway was slow for this one read, not proven down.
+            # A laptop claim stays when the Redis request may be on the board (the next pass
+            # quarantines the ask); when the request was refused before it was sent too, nothing of
+            # this ask is on the board and the claim goes, so the next pass asks again.
+            if reserved and redis_state == "refused":
+                _release_claim(me, local, src_id)
             miss = ("    POST NOT SENT for %s: nothing was appended; the watermark is held and the ask "
                     "stays open for the next pass" % src_id)
             print(miss)
