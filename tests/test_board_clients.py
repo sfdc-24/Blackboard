@@ -452,9 +452,6 @@ class ReviewSourceReadTests(unittest.TestCase):
         for hit in posts[-3:]:
             matches.append(json.loads(hit[3].decode("utf-8"))["match"])
         self.assertEqual([item[0] for item in REVIEWS], matches)
-        entry = (ROOT / "cloud" / "bus-reconciler" / "serve_requests.py").read_text(encoding="utf-8")
-        self.assertIn("bus_reconcile.source_rows", entry)
-        self.assertLess(entry.index("source_rows"), entry.index("bus_request.handle("))
 
     def test_a_hex_prefix_is_unique_and_a_glued_id_is_not_that_row(self):
         self.assertTrue(bus.row_matches("53778e84", "53778e84-0000-4000-8000-000000000004"))

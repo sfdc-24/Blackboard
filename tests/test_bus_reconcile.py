@@ -161,6 +161,9 @@ class TheReaderShape(unittest.TestCase):
         self.assertEqual([["53778e84", "bc9e1a16", "aef36ae2"]], calls)
         self.assertEqual(3, len(got))
         self.assertEqual("CM-20261010-004", got[0][5])
+        entry = (Path(__file__).resolve().parents[1] / "cloud" / "bus-reconciler" / "serve_requests.py").read_text(encoding="utf-8")
+        self.assertIn("bus_reconcile.source_rows", entry)
+        self.assertLess(entry.index("source_rows"), entry.index("bus_request.handle("))
         window = rec.source_rows(None, since="2026-10-10T00:00:00Z",
                                  reader=lambda since, limit: {"rows": [list(A)]})
         self.assertEqual("R-1", window[0][0])
