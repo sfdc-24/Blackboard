@@ -14,14 +14,25 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 INTAKE = REPO / "cloud" / "drive-intake"
 WORKER = REPO / "cloud" / "claude-api-worker"
-ENV_READ = re.compile(r'environ\.get\("([A-Z_]+)"')
+# environ.get("NAME") and the two helpers that take the name as a string. A helper call is still a
+# read: _int_env(environ, "CAP") is how the cap, the reservation, the heartbeat and the attempt
+# limit are read, and a regex that only sees environ.get misses every one of them.
+ENV_READ = re.compile(
+    r'(?:environ\.get\(\s*"([A-Z0-9_]+)"|(?:_int_env|_float_env)\(\s*environ\s*,\s*"([A-Z0-9_]+)")'
+)
 
-# Read by the code, deliberately not set by the deploy: optional prices, the wake ring until #359
-# lands, the max-tokens knob, and Cloud Run's own PORT.
+# Read by the code, deliberately not set by the deploy: optional prices (the code treats unset as
+# "no price"), the wake ring until #359 lands, and Cloud Run's own PORT. Max tokens is set.
 OPTIONAL = {
     "drive-intake": {"INBOX_WAKE_URL", "INBOX_WAKE_SECRET", "PORT"},
     "claude-api-worker": {"CLAUDE_API_WORKER_USD_PER_MTOK_IN", "CLAUDE_API_WORKER_USD_PER_MTOK_OUT",
                           "FLEET_CAD_PER_USD"},
+}
+# #370's deps_from_env reads these. This branch's main.py does not, yet; an env name the script
+# drops is ignored until that image boots, and then the service runs on the default.
+WIRED_BY_370 = {
+    "DRIVE_INTAKE_FOLDER_ID", "DRIVE_INTAKE_CHANNEL_TOKEN", "DRIVE_INTAKE_POLL_TOKEN",
+    "DRIVE_INTAKE_API_WORKER", "DRIVE_INTAKE_HEARTBEAT_SECONDS", "DRIVE_INTAKE_POLL_SECONDS",
 }
 # Named by the script but read through a mount or a secret rather than environ.get in main.py.
 VIA_SECRET_OR_MOUNT = {"ANTHROPIC_API_KEY", "BUS_URL", "BUS_SECRET"}
@@ -30,8 +41,16 @@ VIA_SECRET_OR_MOUNT = {"ANTHROPIC_API_KEY", "BUS_URL", "BUS_SECRET"}
 def env_names_read(*paths):
     names = set()
     for path in paths:
-        names |= set(ENV_READ.findall(path.read_text(encoding="utf-8")))
+        for groups in ENV_READ.findall(path.read_text(encoding="utf-8")):
+            names.update(group for group in groups if group)
     return names
+
+
+def function_body(script, name):
+    match = re.search(r"(?m)^%s\(\) \{\n(.*?)\n\}" % re.escape(name), script, re.S)
+    if not match:
+        raise AssertionError("no function %s" % name)
+    return match.group(1)
 
 
 def env_names_set(script_text):
@@ -53,7 +72,10 @@ class IntakeDeployTest(unittest.TestCase):
         read -= {"DRIVE_INTAKE_ENABLED"}                          # set by the script too, checked below
         missing = read - env_names_set(self.script) - OPTIONAL["drive-intake"]
         self.assertEqual(set(), missing)
+        self.assertEqual(set(), WIRED_BY_370 - env_names_set(self.script))
         self.assertIn("DRIVE_INTAKE_ENABLED=off", self.script)
+        self.assertIn("REDIS_CONNECT=true", self.script)
+        self.assertIn("REDIS_HOST=${REDIS_HOST}", self.script)
 
     def test_private_service_private_egress_flag_off_no_values(self):
         self.assertIn("--no-allow-unauthenticated", self.script)
@@ -68,6 +90,15 @@ class IntakeDeployTest(unittest.TestCase):
         for secret in ("REDIS_AUTH_STRING", "REDIS_CA_CERT", "DRIVE_INTAKE_POLL_TOKEN", "DRIVE_INTAKE_CHANNEL_TOKEN"):
             self.assertIn(secret, self.script)
         self.assertNotIn("ANTHROPIC_API_KEY", self.script)         # intake never holds the model key
+        # The poller never attempts without this, and a second schedule must update the header.
+        self.assertIn("roles/iam.serviceAccountTokenCreator", self.script)
+        self.assertIn("service-${PROJECT_NUMBER}@gcp-sa-cloudscheduler.iam.gserviceaccount.com", self.script)
+        self.assertNotIn("v1/namespaces", self.script)
+        self.assertIn('header_flag="--headers"', self.script)
+        self.assertIn('header_flag="--update-headers"', self.script)
+        tokens = function_body(self.script, "tokens")
+        self.assertIn("grant_secret", tokens)
+        self.assertNotIn("continue", tokens)                      # an existing secret still gets granted
 
 
 class WorkerDeployTest(unittest.TestCase):
@@ -80,6 +111,8 @@ class WorkerDeployTest(unittest.TestCase):
         self.assertEqual(set(), missing)
         self.assertIn("CLAUDE_API_WORKER_ENABLED=off", self.script)
         self.assertIn("CLAUDE_API_LANE_ENABLED=off", self.script)
+        self.assertIn("REDIS_CONNECT=true", self.script)
+        self.assertIn("REDIS_HOST=${REDIS_HOST}", self.script)
 
     def test_his_decisions_are_env_and_the_model_id_is_never_committed(self):
         self.assertIn("FLEET_SPEND_CAP_CENTS_CAD:-2500", self.script)
@@ -97,6 +130,17 @@ class WorkerDeployTest(unittest.TestCase):
         for secret in ("REDIS_AUTH_STRING", "REDIS_CA_CERT"):
             self.assertIn("=" + secret + ":latest", self.script)                   # mounted as files
         self.assertNotIn("REDIS_AUTH_STRING=REDIS_AUTH_STRING", self.script)       # never as an env var
+        # v2 :run, and TokenCreator on the ticker. The v1 namespaces form needs run.developer; the
+        # other role leaves the ticker at code -1 with no lastAttemptTime. Comments may name the
+        # wrong form; the URI that is assigned may not.
+        uris = re.findall(r'^RUN_URI="([^"]+)"', self.script, re.M)
+        self.assertEqual(
+            ["https://run.googleapis.com/v2/projects/${PROJECT}/locations/${REGION}/jobs/${JOB}:run"],
+            uris)
+        self.assertNotRegex(self.script, r"--format '[^']*spec\.template")
+        self.assertIn("roles/iam.serviceAccountTokenCreator", self.script)
+        self.assertNotIn("roles/iam.serviceAccountUser", self.script)
+        self.assertIn("template.template.serviceAccount", self.script)
 
 
 class ShellTest(unittest.TestCase):
