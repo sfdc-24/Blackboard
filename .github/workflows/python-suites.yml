@@ -150,6 +150,8 @@ on:
       - "tools/board_governor/board_facts.py"
       - "tools/board_governor/governor.py"
       - "tests/test_board_governor.py"
+      - "cloud/drive-intake/main.py"
+      - "tests/test_drive_intake.py"
       - ".github/workflows/python-suites.yml"
   push:
     branches: [main]
@@ -281,6 +283,8 @@ on:
       - "tools/board_governor/board_facts.py"
       - "tools/board_governor/governor.py"
       - "tests/test_board_governor.py"
+      - "cloud/drive-intake/main.py"
+      - "tests/test_drive_intake.py"
       - ".github/workflows/python-suites.yml"
 
 permissions:
@@ -366,7 +370,8 @@ jobs:
                    tests/test_sf360.py \
                    tests/test_org_publish.py \
                    tests/test_agent_waker.py \
-                   tests/test_board_governor.py; do
+                   tests/test_board_governor.py \
+                   tests/test_drive_intake.py; do
             if [ -f "$t" ]; then echo "present : $t"; else echo "absent  : $t"; fi
           done
 
@@ -447,6 +452,21 @@ jobs:
           if [ -f tests/test_board_governor.py ]; then
             python_bin="$(command -v python3)"
             sudo unshare -n -- "$python_bin" tests/test_board_governor.py
+          else
+            echo "not on this branch; skipping"
+          fi
+
+      # Drive intake (cloud/drive-intake/main.py): a doc in the owner's folder becomes one
+      # correlated task. The guards: a receipt never retriggers its own task, push and poll
+      # produce one task, a failed hand-off releases its claim, no worker is never silent,
+      # the receipt names only the state reached, and an unrecorded watch expiry is "unknown".
+      # Offline by construction: every outside call is an injected adapter.
+      - name: drive intake correlation, dedupe, failover and receipts (no network)
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_drive_intake.py ]; then
+            python_bin="$(command -v python3)"
+            sudo unshare -n -- "$python_bin" -m unittest tests.test_drive_intake -v
           else
             echo "not on this branch; skipping"
           fi
