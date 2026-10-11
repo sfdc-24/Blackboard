@@ -240,6 +240,11 @@ def correlate(file_id: str, text: str, drive_revision: str, recipient: str) -> d
     derived from exactly those three. The recipient rides along for the hops
     but is not identity - a request routed to a different worker on a later
     pass is the same request, not a second one.
+
+    That task is this service's task. It is not a studio session. The doc
+    text is the owner's request; a session id written into it would be the
+    author's claim, and this function does not read one. Nothing here calls
+    the studio controller.
     """
     revision = request_revision(text)
     found = REQUEST_LINE.search(strip_receipts(text) or "")

@@ -254,13 +254,31 @@ address must be there as well.
 
 The telephone trail (step 4 of the broken-telephone fix; off unless
 `STUDIO_TELEPHONE_URL` is set): `GET /v1/session/{id}/telephone?doc=<Drive
-file id>` reads the private drive-intake service's `/trail` for a live
-session and returns its receipts and answer lines, never the request. It needs
+file id>` reads the private drive-intake service's `/trail` and returns its
+receipts and answer lines, never the request. The query names a doc. The read
+happens only for a live session whose server-side record already stores that
+same id (`telephone_doc`). A stopped, expired, deleted, or unknown session is
+refused before any read. A doc the session is not bound to is refused with
+nothing about that doc's contents, size, or existence. The five-second cache
+is per session and doc, so one session is not handed another's trail. It needs
 `STUDIO_TELEPHONE_URL` (the service URL), `STUDIO_TELEPHONE_TOKEN` (the same
 value as `DRIVE_INTAKE_POLL_TOKEN`, from Secret Manager), and `roles/run.invoker`
 on drive-intake for this service's account, since the call carries this
-service's own OIDC identity. One upstream read per doc every five seconds at
-most, whatever the page asks.
+service's own OIDC identity. The binding is written only by
+`bind_telephone_doc`, not by the query, and that writer is off with the flag.
+It is not an HTTP route. Nothing in session creation calls it. `POST /v1/session`
+has no server-assigned Drive file id (its body is the client's, and the
+session's task id is minted here). drive-intake's `correlate` keeps
+`source_doc_id` on its own tuple and derives its own task id from the file,
+the request revision, and the request id. That task is not this session, the
+tuple has no session id, and the doc grammar does not name one. Studio state
+is not the fleet inbox, and the controller's inbound authenticators (browser
+token, voice-sweep secret) are not drive-intake. A binding from drive-intake
+would require a correlation of that trusted file id to a live session. None
+exists, so none was invented: not a session id in the doc, not an
+operator-to-doc map, not a client doc field, not a session minted at
+dispatch. A normal session therefore stays unbound, and with the flag on its
+telephone read stays 403.
 
 Keep `STUDIO_MAX_SESSION_SECONDS=600`, `STUDIO_DAILY_SESSION_CAP=20`, and
 the operator allowlist for the approved initial envelope. Voice is one call per
