@@ -1673,7 +1673,14 @@ class TrailPageTest(unittest.TestCase):
         self.assertEqual("[answer cut here at 200 lines]", entries[0]["result"][-1])
         self.assertEqual([], trail_mod.parse("> an answer with no line above it\n"))
         long_line = "SUCCEEDED - task task-0123456789abcdef - request R - rev abc - recipient claude-api - by claude-api - 2026-10-11T04:05:09Z - " + "d" * 900 + " - id cccccccccccccccc"
-        self.assertEqual(400, len(trail_mod.parse(long_line)[0]["detail"]))
+        detail = trail_mod.parse(long_line)[0]["detail"]
+        self.assertTrue(detail.startswith("d" * 400) and detail.endswith("[cut here at 400 of 900 characters]"), detail[-50:])
+        # the worker keeps an answer to 3000 characters, often as ONE line: kept whole, and a longer
+        # one is cut out loud (Cursor on e080da3: 400 silently was the one cut that did not say so)
+        one_line = "SUCCEEDED - task task-0123456789abcdef - request R - rev abc - recipient claude-api - by claude-api - 2026-10-11T04:05:09Z - id cccccccccccccccc\n> " + "a" * 3000 + "\n> " + "b" * 3500 + "\n"
+        result = trail_mod.parse(one_line)[0]["result"]
+        self.assertEqual("a" * 3000, result[0])
+        self.assertTrue(result[1].startswith("b" * 3000) and result[1].endswith("[cut here at 3000 of 3500 characters]"), result[1][-50:])
 
     def test_the_route_wants_the_token_first_then_the_flag_then_a_file_id(self):
         d, t = self.trail_doc()
@@ -1718,6 +1725,17 @@ class TrailPageTest(unittest.TestCase):
                 raise ConnectionError()
         d.claims = Broken()
         self.assertEqual("unknown", di.trail_for_doc(d, FILE)["live"]["worker_claim"])
+        class NoHeartbeat(di.MemoryClaims):
+            def heartbeat(self, agent):
+                raise ConnectionError()
+        d.claims = NoHeartbeat()
+        out = di.trail_for_doc(d, FILE)
+        self.assertEqual(("unknown", "unknown"), (out["live"]["laptop"], out["live"]["api_worker"]))   # unreadable is not offline
+        self.assertEqual("unknown", di.liveness(NoHeartbeat(), "claude-api", 1000.0, 900))
+        self.assertEqual("offline", di.liveness(di.MemoryClaims(), "claude-api", 1000.0, 900))
+        self.assertEqual("online", di.liveness(di.MemoryClaims({"claude-api": 500.0}), "claude-api", 1000.0, 900))
+        self.assertEqual("offline", di.liveness(di.MemoryClaims({"claude-api": 50.0}), "claude-api", 1000.0, 900))
+        self.assertEqual("unknown", di.liveness(di.MemoryClaims({"claude-api": "soon"}), "claude-api", 1000.0, 900))
         d.claims = None
         self.assertEqual("unknown", di.trail_for_doc(d, FILE)["live"]["laptop"])
 

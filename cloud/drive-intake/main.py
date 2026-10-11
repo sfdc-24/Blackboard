@@ -896,6 +896,21 @@ def handle(method: str, path: str, headers: dict, body: bytes, deps) -> tuple:
 API_HEARTBEAT = 900   # the worker beats once per tick (5 min); three ticks silent reads offline
 
 
+def liveness(store, agent: str, now: float, window: int) -> str:
+    """'online' inside the window, 'offline' when absent or stale, 'unknown' when the key cannot be read."""
+    try:
+        at = store.heartbeat(agent)
+    except Exception:  # noqa: BLE001
+        return "unknown"
+    if at is None:
+        return "offline"
+    try:
+        age = float(now) - float(at)
+    except (TypeError, ValueError):
+        return "unknown"
+    return "online" if 0 <= age <= window else "offline"
+
+
 def trail_for_doc(deps, file_id: str) -> dict:
     """The doc's receipt trail and the live state behind it. Never the request's own words.
 
@@ -933,8 +948,10 @@ def trail_for_doc(deps, file_id: str) -> dict:
     live = {"laptop": "unknown", "api_worker": "unknown", "intake": "unknown", "pending": "unknown",
             "worker_claim": "unknown", "doorbell": "unknown"}
     if deps.claims is not None:
-        live["laptop"] = "online" if heartbeat_age(deps.claims, now, window=deps.heartbeat_window) is not None else "offline"
-        live["api_worker"] = "online" if heartbeat_age(deps.claims, now, "claude-api", API_HEARTBEAT) is not None else "offline"
+        # A heartbeat the store cannot READ is unknown, not offline (Cursor on e080da3): the router's
+        # heartbeat_age treats unreadable as absent on purpose, so this reads the key itself first.
+        live["laptop"] = liveness(deps.claims, "claude-code-cli", now, deps.heartbeat_window)
+        live["api_worker"] = liveness(deps.claims, "claude-api", now, API_HEARTBEAT)
         if tuple_:
             for name, read in (("intake", lambda: deps.claims.state(idempotency_key(tuple_))),
                                ("pending", lambda: file_id in (deps.claims.pending() or ())),

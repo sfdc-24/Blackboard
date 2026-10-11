@@ -25,7 +25,16 @@ LINE = re.compile(
 ID_TAIL = re.compile(r"\s+-\s+id\s+(?P<id>[0-9a-f]{16})\s*$")
 RESULT_PREFIX = "> "
 RESULT_LINES_MAX = 200
-LINE_CHARS_MAX = 400
+DETAIL_CHARS_MAX = 400
+ANSWER_CHARS_MAX = 3000      # the worker keeps an answer to 3000 characters, often as ONE "> " line
+
+
+def bounded(value: str, limit: int) -> str:
+    """At most `limit` characters, and a cut SAYS so (PR 354: never trim silently; Cursor on e080da3)."""
+    value = value or ""
+    if len(value) <= limit:
+        return value
+    return value[:limit] + " [cut here at %d of %d characters]" % (limit, len(value))
 
 
 def parse(text: str) -> list:
@@ -52,7 +61,7 @@ def parse(text: str) -> list:
                 "state": match.group("state"), "task": match.group("task"),
                 "request": match.group("request"), "rev": match.group("rev"),
                 "recipient": match.group("recipient"), "by": match.group("by"),
-                "at": match.group("at"), "detail": detail[:LINE_CHARS_MAX], "id": receipt_id,
+                "at": match.group("at"), "detail": bounded(detail, DETAIL_CHARS_MAX), "id": receipt_id,
                 "result": [],
             })
             continue
@@ -60,7 +69,7 @@ def parse(text: str) -> list:
         if stripped.startswith(RESULT_PREFIX) and entries:
             lines = entries[-1]["result"]
             if len(lines) < RESULT_LINES_MAX:
-                lines.append(stripped[len(RESULT_PREFIX):][:LINE_CHARS_MAX])
+                lines.append(bounded(stripped[len(RESULT_PREFIX):], ANSWER_CHARS_MAX))
             elif len(lines) == RESULT_LINES_MAX:
                 lines.append("[answer cut here at %d lines]" % RESULT_LINES_MAX)
     return entries
