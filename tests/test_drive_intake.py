@@ -1322,11 +1322,13 @@ class WiringTest(unittest.TestCase):
         self.assertEqual("dispatched", out[0]["status"])
         self.assertEqual(5000.0, d.claims.last_poll())
         self.assertEqual(5000.0, d.claims.watermark())                    # a plain list: the watermark is now
+        self.assertFalse(d.claims.resume())                               # it finished, so the margin applies next
         self.assertEqual(set(), d.claims.pending())                       # finished: not kept
         d = deps(changes=lambda folder: {"hints": [{"file_id": FILE, "folder_id": folder}], "watermark": 4321.0,
                                          "complete": False}, now=5000.0)
         di.poll(d)
         self.assertEqual((5000.0, 4321.0), (d.claims.last_poll(), d.claims.watermark()))   # the feed's own watermark
+        self.assertTrue(d.claims.resume())                                # capped: the next poll starts at 4321
 
         def broken(folder):
             raise ConnectionError()
@@ -1576,6 +1578,40 @@ class FeedTest(unittest.TestCase):
         self.assertEqual(1760000000.0, drive_feed.epoch_of("2025-10-09T08:53:20.000Z"))
         self.assertIsNone(drive_feed.epoch_of("soon"))
         self.assertIsNone(drive_feed.epoch_of(""))
+
+    def test_a_capped_listing_is_resumed_at_the_last_doc_and_the_margin_does_not_refill_the_cap(self):
+        """150 docs, one per second, one page of 100. The margin is 600 s, so resuming ten minutes
+        behind the last doc returns the same first page forever and the other 50 are never listed."""
+        base = 1760000000.0
+        docs = [{"id": "doc-%03d" % i, "parents": [FOLDER],
+                 "modifiedTime": drive_feed.iso(base + i)} for i in range(150)]
+        calls = []
+
+        def fetch(method, url, body, headers):
+            calls.append(url)
+            since = url.split("modifiedTime+%3E+%27")[1].split("%27")[0].replace("%3A", ":")
+            listed = [f for f in docs if f["modifiedTime"] > since]
+            page, rest = listed[:drive_feed.PAGE], listed[drive_feed.PAGE:]
+            answer = {"files": page}
+            if rest:
+                answer["nextPageToken"] = "more"
+            return 200, json.dumps(answer).encode()
+
+        store = di.MemoryClaims()
+        feed = drive_feed.DriveFolder(lambda: "tok", fetch, store, now=base + 10000, max_pages=1)
+        first = feed.changes(FOLDER)
+        self.assertFalse(first["complete"])
+        self.assertEqual("doc-099", first["hints"][-1]["file_id"])
+        self.assertEqual(drive_feed.epoch_of(docs[99]["modifiedTime"]), first["watermark"])
+        store.note_poll(base + 10000, first["watermark"], resume=True)
+        feed.now = base + 10120
+        second = feed.changes(FOLDER)
+        resumed = "modifiedTime+%3E+%27" + drive_feed.iso(base + 99).replace(":", "%3A")
+        rewound = "modifiedTime+%3E+%27" + drive_feed.iso(base + 99 - 600).replace(":", "%3A")
+        self.assertIn(resumed, calls[-1])
+        self.assertNotIn(rewound, calls[-1])
+        self.assertEqual(["doc-%03d" % i for i in range(100, 150)], [h["file_id"] for h in second["hints"]])
+        self.assertTrue(second["complete"])
 
 
 if __name__ == "__main__":
