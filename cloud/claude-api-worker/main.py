@@ -424,6 +424,11 @@ def consider(entry_id, fields: dict, deps) -> dict:
         return out
     current_tuple = di.correlate(tuple_["source_doc_id"], text, drive_revision, WORKER)
     if current_tuple["task_id"] != task_id:
+        if getattr(deps, "pilot_docs", None) is not None:
+            tuple_["drive_revision"] = drive_revision
+            recovered = _recover_pilot_result(deps, tuple_, text, out)
+            if recovered is not None:
+                return recovered
         # Edited since it was queued. The edit is its own task through intake; this one is over.
         _mark_done(deps, task_id)
         out.update(status="superseded", now=current_tuple["task_id"])
@@ -750,6 +755,39 @@ def actual_cents(tokens_in, tokens_out, price_in, price_out, cad_per_usd):
         return int((usd * Decimal(str(cad_per_usd)) * 100).to_integral_value(rounding=ROUND_CEILING))
     except (InvalidOperation, TypeError, ValueError):
         return None
+
+
+def _recover_pilot_result(deps, tuple_, text, out):
+    """An edited request cannot erase a result from an earlier model call."""
+    task_id = tuple_["task_id"]
+    try:
+        current = deps.claims.state(task_id)
+    except Exception as exc:  # an unreadable claim cannot prove a pre-call state
+        out.update(status="claim_error", error=type(exc).__name__)
+        return out
+    phase, _middle, attempt, rejected = _split(current)
+    if phase == STATE_RESULTED:
+        return _finish_from_store(deps, tuple_, text, current, attempt, out)
+    if phase not in (STATE_ACCEPTED, STATE_UNCERTAIN):
+        return None
+    try:
+        kept = deps.claims.result(task_id)
+    except Exception as exc:  # do not discard a result whose read failed
+        out.update(status="result_unreadable", error=type(exc).__name__)
+        return out
+    if kept:
+        resulted = _state(STATE_RESULTED, int(_now(deps)), attempt, rejected)
+        if not deps.claims.advance(task_id, current, resulted):
+            out["status"] = "in_progress"
+            return out
+        return _finish_from_store(deps, tuple_, text, resulted, attempt, out)
+    if phase == STATE_UNCERTAIN:
+        out["receipt"] = write_receipt(
+            deps, tuple_, text, UNKNOWN, deps.at,
+            "a call occurred but its outcome was not kept; charge or reservation remains in the ledger; manual reconciliation needed")
+        out["status"] = "result_persistence_unknown"
+        return out
+    return None
 
 
 def _finish_from_store(deps, tuple_, text, current, attempt, out, stored=None):

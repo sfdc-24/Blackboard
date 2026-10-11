@@ -159,6 +159,12 @@ class PilotDocs:
         view = dict(doc)
         request_id, revision = self.expected.get(file_id, ("", ""))
         view["text"] = focused_text(doc.get("text") or "", request_id, revision)
+        if self.require_expected and not view["text"]:
+            # A stored result can still owe its terminal receipt after the
+            # owner edits the block. Expose only the heading so that writer
+            # does not add another one; no replacement request reaches a model.
+            heading = di.RECEIPTS_HEADING.search(doc.get("text") or "")
+            view["text"] = heading.group(0) if heading else ""
         return view
 
     def append(self, file_id, expected_revision, receipt_id, block):
