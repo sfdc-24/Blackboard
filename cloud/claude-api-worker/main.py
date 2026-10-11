@@ -42,13 +42,22 @@ THE THINGS THAT GO WRONG, AND WHERE EACH IS STOPPED
   2. The model answered and the receipt did not land: the answer is KEPT in
      Redis (fleet:worker:result:<task>) BEFORE the receipt is written, so a
      later pass writes the line from the stored answer and never calls again.
+     And the store is read BEFORE the lease or the attempt count is judged:
+     the answer is kept before the claim moves to resulted, so a death
+     between the two leaves a claim that still says accepted beside an
+     answer that exists (Cursor on 9d46250). An answer that exists is
+     finished from; UNKNOWN is written only when there is none.
   3. The request was edited after it was queued: the tuple is recomputed from
      the doc; a task id that no longer matches is superseded (the new revision
      comes through intake as its own task) and this entry is never run.
   4. An outcome nobody can prove: a timeout is UNKNOWN, not FAILED and not a
      reason to run again. One attempt by default (MAX_ATTEMPTS); an attempt
      whose lease died is counted, and when the attempts are spent the doc says
-     UNKNOWN rather than nothing.
+     UNKNOWN rather than nothing. A refusal (any HTTP status but 200) is the
+     other way round: not an answer and not billed, so the reservation goes
+     back, the attempt is not consumed and the task stays open - a fixed key
+     or a quieter API finds it waiting - bounded by MAX_REJECTIONS, after
+     which the doc says FAILED with the status (Cursor on 9d46250).
   5. The result block retriggering or forging a receipt: every result line is
      prefixed "> " so no line of the model's text can match a receipt shape,
      and the block lives under the RECEIPTS heading, which the request hash
@@ -105,6 +114,7 @@ DEFAULT_REASSIGN = 1800      # his rule: a task to the laptop unanswered 30 min 
 WORK_LEASE = 600             # longer than the model timeout, so a dead lease means a dead attempt
 MODEL_TIMEOUT = 300
 DEFAULT_MAX_ATTEMPTS = 1     # one attempt, no automatic retry (the budget rule of 2026-10-08)
+MAX_REJECTIONS = 3           # HTTP refusals (401, 429, 529...) are not answers and not billed: retried, bounded
 MAX_TASKS_PER_PASS = 1       # one model call per pass; the schedule is the throttle
 INBOX_LOOKBACK = 500
 REQUEST_MAX = 12000          # chars of the request given to the model; cut is SAID, never silent
@@ -115,9 +125,9 @@ DONE_TTL = 5184000           # 60 days: a done marker that outlives the inbox en
 RESULT_TTL = 604800          # 7 days for a stored answer whose receipt is still owed
 SPEND_TTL = 259200           # the day ledger lives three days, long enough to be read
 
-STATE_ACCEPTED = "accepted"  # accepted:<since>:<attempt> - a model call is in flight or died
-STATE_CAPPED = "capped"      # capped:<day>:<attempt> - the day's cap refused it; tomorrow retries
-STATE_RESULTED = "resulted"  # resulted:<since>:<attempt> - answer stored, terminal line owed
+STATE_ACCEPTED = "accepted"  # accepted:<since>:<attempt>:<rejections> - a call is in flight or died
+STATE_CAPPED = "capped"      # capped:<day>:<attempt>:<rejections> - the day's cap refused it; tomorrow retries
+STATE_RESULTED = "resulted"  # resulted:<since>:<attempt>:<rejections> - answer stored, terminal line owed
 STATE_DONE = "done"
 
 # Any receipt in the shared shape, by anyone: "<STATE> - task <id> - request .. - rev .. - recipient .. - by <who> - "
@@ -144,7 +154,11 @@ class Unconfigured(Exception):
 
 
 class ModelError(Exception):
-    """The model answered with an error, a refusal or no text. Not billed as a result."""
+    """A 200 that holds no usable answer (no text, unparseable). Billed, and final."""
+
+
+class ModelRejected(Exception):
+    """The API refused the request (any status but 200). Not an answer, not billed: refund and retry, bounded."""
 
 
 class ModelUnknown(Exception):
@@ -285,19 +299,21 @@ def _now(deps) -> float:
 
 
 def _split(state):
-    """'accepted:1000:1' -> ('accepted', '1000', 1). The middle part is a clock or a day."""
+    """'accepted:1000:1:0' -> ('accepted', '1000', 1, 0): phase, a clock or a day, attempts, rejections."""
     if not state:
-        return None, "", 0
+        return None, "", 0, 0
     parts = str(state).split(":")
-    try:
-        attempt = int(parts[2]) if len(parts) > 2 else 0
-    except ValueError:
-        attempt = 0
-    return parts[0], parts[1] if len(parts) > 1 else "", attempt
+
+    def number(index):
+        try:
+            return int(parts[index]) if len(parts) > index else 0
+        except ValueError:
+            return 0
+    return parts[0], parts[1] if len(parts) > 1 else "", number(2), number(3)
 
 
-def _state(phase, middle, attempt) -> str:
-    return "%s:%s:%d" % (phase, middle, int(attempt))
+def _state(phase, middle, attempt, rejected=0) -> str:
+    return "%s:%s:%d:%d" % (phase, middle, int(attempt), int(rejected))
 
 
 def entry_time(entry_id, fields) -> float | None:
@@ -420,7 +436,7 @@ def consider(entry_id, fields: dict, deps) -> dict:
     if current is None:
         out.update(status="claim_error", error="unreadable")
         return out
-    phase, middle, attempt = _split(current)
+    phase, middle, attempt, rejected = _split(current)
     if phase == STATE_DONE:
         _mark_done(deps, task_id)
         out["status"] = "done"
@@ -434,12 +450,27 @@ def consider(entry_id, fields: dict, deps) -> dict:
         if middle == deps.day(now):
             out.update(status="capped", day=middle)
             return out
-        moved = _state(STATE_ACCEPTED, int(now), attempt + 1)
+        moved = _state(STATE_ACCEPTED, int(now), attempt + 1, rejected)
         if not deps.claims.advance(task_id, current, moved):
             out["status"] = "in_progress"
             return out
         current, attempt = moved, attempt + 1
     elif phase == STATE_ACCEPTED and not fresh:
+        # The store FIRST (Cursor on 9d46250): the answer is kept before the claim moves to
+        # resulted, so a death or a lost compare-and-set between the two leaves a claim that
+        # still says accepted with the answer sitting in Redis. An answer that exists is
+        # finished from, whatever the lease or the attempt count says; UNKNOWN is for no answer.
+        try:
+            kept = deps.claims.result(task_id)
+        except Exception as exc:  # noqa: BLE001
+            out.update(status="result_unreadable", error=type(exc).__name__)
+            return out
+        if kept:
+            resulted = _state(STATE_RESULTED, int(now), attempt, rejected)
+            if not deps.claims.advance(task_id, current, resulted):
+                out["status"] = "in_progress"
+                return out
+            return _finish_from_store(deps, tuple_, text, resulted, attempt, out)
         try:
             since = float(middle)
         except ValueError:
@@ -461,7 +492,7 @@ def consider(entry_id, fields: dict, deps) -> dict:
             else:
                 out["status"] = "unknown_receipt_owed"
             return out
-        moved = _state(STATE_ACCEPTED, int(now), attempt + 1)
+        moved = _state(STATE_ACCEPTED, int(now), attempt + 1, rejected)
         if not deps.claims.advance(task_id, current, moved):
             out["status"] = "in_progress"
             return out
@@ -474,7 +505,7 @@ def consider(entry_id, fields: dict, deps) -> dict:
         "attempt %d - lease until %s - model %s" % (attempt, deadline, deps.model_name or "unset"))
     text = di.with_heading(text)
     if out["accepted"] not in ("written", "no_receipt_writer"):
-        deps.claims.advance(task_id, current, _state(STATE_ACCEPTED, 0, attempt - 1))  # lease given up
+        deps.claims.advance(task_id, current, _state(STATE_ACCEPTED, 0, attempt - 1, rejected))  # lease given up
         out["status"] = "accepted_receipt_owed"
         return out
 
@@ -491,7 +522,7 @@ def consider(entry_id, fields: dict, deps) -> dict:
                   % (spent, deps.cap_cents, day)) if deps.cap_cents > 0 and deps.reserve_cents > 0 \
             else "no spend cap or reservation configured; nothing is called until there is one"
         out["receipt"] = write_receipt(deps, tuple_, text, QUEUED, deps.at, detail)
-        deps.claims.advance(task_id, current, _state(STATE_CAPPED, day, attempt - 1))
+        deps.claims.advance(task_id, current, _state(STATE_CAPPED, day, attempt - 1, rejected))
         out["status"] = "capped"
         return out
 
@@ -505,9 +536,22 @@ def consider(entry_id, fields: dict, deps) -> dict:
             MODEL_TIMEOUT, type(exc).__name__), "", None
     except Unconfigured as exc:
         _refund(deps, day)
-        deps.claims.advance(task_id, current, _state(STATE_ACCEPTED, 0, attempt - 1))
+        deps.claims.advance(task_id, current, _state(STATE_ACCEPTED, 0, attempt - 1, rejected))
         out.update(status="unconfigured", error=str(exc), ran=False)
         return out
+    except ModelRejected as exc:
+        # Not an answer and not billed (Cursor on 9d46250): the reservation goes back, the attempt
+        # is not consumed, and the task stays open for a later pass - a fixed key or a quieter API
+        # reopens nothing because nothing was closed. Bounded: after MAX_REJECTIONS the doc says
+        # FAILED with the status, so a request the API will never take does not knock every tick.
+        _refund(deps, day)
+        rejected += 1
+        if rejected < MAX_REJECTIONS:
+            deps.claims.advance(task_id, current, _state(STATE_ACCEPTED, 0, attempt - 1, rejected))
+            out.update(status="rejected", error=str(exc)[:80], rejections=rejected)
+            return out
+        state, detail, extra, usage = FAILED, "the API refused %d times, last %s; nothing was billed" % (
+            rejected, str(exc)[:80]), "", None
     except ModelError as exc:
         state, detail, extra, usage = FAILED, "the model answered with an error: %s" % str(exc)[:160], "", None
     except Exception as exc:  # noqa: BLE001 - a transport failure of unknown depth is UNKNOWN
@@ -517,7 +561,7 @@ def consider(entry_id, fields: dict, deps) -> dict:
         deps.claims.keep_result(task_id, json.dumps(stored, sort_keys=True))
     except Exception as exc:  # noqa: BLE001 - the line is still attempted now; a retry would re-call
         out["kept"] = "unknown:" + type(exc).__name__
-    resulted = _state(STATE_RESULTED, int(now), attempt)
+    resulted = _state(STATE_RESULTED, int(now), attempt, rejected)
     if not deps.claims.advance(task_id, current, resulted):
         out["status"] = "in_progress"
         return out
@@ -656,7 +700,7 @@ class AnthropicModel:
         else:
             status, raw = _post(self.URL, body, headers, self.timeout)
         if status != 200:
-            raise ModelError("HTTP %s" % status)
+            raise ModelRejected("HTTP %s" % status)
         try:
             parsed = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
         except ValueError as exc:

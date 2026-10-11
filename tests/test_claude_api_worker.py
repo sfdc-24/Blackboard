@@ -312,7 +312,7 @@ class AcceptanceTest(unittest.TestCase):
         out = wk.run_once(d)
         self.assertEqual("accepted_receipt_owed", out["considered"][0]["status"], out)
         self.assertEqual([], d.model.calls)
-        self.assertEqual("accepted:0:0", d.claims.states[task_tuple()["task_id"]])
+        self.assertEqual("accepted:0:0:0", d.claims.states[task_tuple()["task_id"]])
         self.assertEqual(0, d.ledger.spent("2026-10-11"))          # nothing reserved either
         # the doc comes back: the next pass accepts and runs
         d.receipts.drop = False
@@ -423,12 +423,48 @@ class SpendTest(unittest.TestCase):
         self.assertEqual("idle", wk.run_once(d)["status"])
         self.assertEqual(1, len(d.model.calls))
 
-    def test_a_model_error_is_failed_and_final(self):
-        d = deps(model=Model(fail=wk.ModelError("HTTP 529")))
+    def test_a_model_error_is_failed_and_final_and_keeps_the_reservation(self):
+        d = deps(model=Model(fail=wk.ModelError("unparseable answer")), reserve_cents=5)
         out = wk.run_once(d)
         self.assertEqual("failed", out["considered"][0]["status"], out)
-        self.assertIn("HTTP 529", d.receipts.lines[1][2])
+        self.assertIn("unparseable answer", d.receipts.lines[1][2])
+        self.assertEqual(5, d.ledger.spent("2026-10-11"))             # a 200 was billed
         self.assertEqual("idle", wk.run_once(d)["status"])
+
+    def test_an_http_refusal_refunds_keeps_the_task_open_and_a_fixed_key_runs_it(self):
+        """Cursor on 9d46250: a 401 or 529 is not an answer and not billed; FAILED closed the task
+        with the reservation kept, and fixing the key reopened nothing."""
+        d = deps(model=Model(fail=wk.ModelRejected("HTTP 401")), reserve_cents=5)
+        out = wk.run_once(d)
+        self.assertEqual("rejected", out["considered"][0]["status"], out)
+        self.assertEqual(1, out["considered"][0]["rejections"])
+        self.assertEqual(0, d.ledger.spent("2026-10-11"))             # refunded
+        self.assertEqual(["ACCEPTED"], d.receipts.states())            # nothing final in the doc
+        self.assertEqual("accepted:0:0:1", d.claims.states[task_tuple()["task_id"]])
+        d.model = Model()                                              # the key is fixed
+        out = wk.run_once(d)
+        self.assertEqual("succeeded", out["considered"][0]["status"], out)
+        self.assertIn("attempt 1", d.receipts.lines[0][2])             # a refusal was not an attempt
+        self.assertEqual(5, d.ledger.spent("2026-10-11"))
+
+    def test_refusals_are_bounded_then_failed_with_nothing_billed(self):
+        d = deps(model=Model(fail=wk.ModelRejected("HTTP 529")), reserve_cents=5)
+        for n in (1, 2):
+            out = wk.run_once(d)
+            self.assertEqual("rejected", out["considered"][0]["status"], out)
+            self.assertEqual(n, out["considered"][0]["rejections"])
+        out = wk.run_once(d)
+        self.assertEqual("failed", out["considered"][0]["status"], out)
+        self.assertIn("refused 3 times, last HTTP 529; nothing was billed", d.receipts.lines[1][2])
+        self.assertEqual(0, d.ledger.spent("2026-10-11"))
+        self.assertEqual(3, len(d.model.calls))
+        self.assertEqual("idle", wk.run_once(d)["status"])
+        self.assertEqual(3, len(d.model.calls))
+
+    def test_the_adapter_classes_a_non_200_as_a_refusal(self):
+        m = wk.AnthropicModel(key="k", model="m", post=lambda *a: (401, b""))
+        with self.assertRaises(wk.ModelRejected):
+            m("s", "p")
 
     def test_an_unconfigured_model_refunds_and_leaves_the_task_for_a_configured_pass(self):
         d = deps(model=None, reserve_cents=5)
@@ -478,6 +514,28 @@ class ResultTest(unittest.TestCase):
         self.assertEqual("succeeded", out["considered"][0]["status"], out)
         self.assertEqual(1, len(d.model.calls))
         self.assertIn("\n> The answer.", d.receipts.lines[-1][2])
+
+    def test_a_dead_lease_beside_a_stored_answer_finishes_from_the_store(self):
+        """Cursor on 9d46250: the answer is kept before the claim moves to resulted; a death between
+        the two left accepted:<dead>:1 beside a SUCCEEDED answer, and the pass wrote UNKNOWN."""
+        d = deps()
+        task = task_tuple()["task_id"]
+        d.claims.states[task] = "accepted:%d:1" % int(NOW - 601)
+        d.claims.results[task] = json.dumps({"state": "SUCCEEDED", "detail": "model x - tokens in 1 out 1",
+                                             "extra": "> The kept answer."})
+        out = wk.run_once(d)
+        self.assertEqual("succeeded", out["considered"][0]["status"], out)
+        self.assertEqual(["SUCCEEDED"], d.receipts.states())
+        self.assertIn("> The kept answer.", d.receipts.lines[0][2])
+        self.assertEqual([], d.model.calls)
+        self.assertEqual("done", d.claims.states[task])
+        # and inside a live lease too: an answer that exists needs no waiting
+        d = deps()
+        d.claims.states[task] = "accepted:%d:1" % int(NOW - 5)
+        d.claims.results[task] = json.dumps({"state": "FAILED", "detail": "x", "extra": ""})
+        out = wk.run_once(d)
+        self.assertEqual("failed", out["considered"][0]["status"], out)
+        self.assertEqual([], d.model.calls)
 
     def test_a_stored_answer_that_expired_is_unknown_not_a_new_call(self):
         d = deps()
@@ -715,7 +773,7 @@ class ModelAdapterTest(unittest.TestCase):
 
     def test_errors_by_class(self):
         m = wk.AnthropicModel(key="k", model="m", post=lambda *a: (529, b""))
-        with self.assertRaises(wk.ModelError):
+        with self.assertRaises(wk.ModelRejected):
             m("s", "p")
         m = wk.AnthropicModel(key="k", model="m", post=lambda *a: (200, b'{"content": [], "stop_reason": "max_tokens"}'))
         with self.assertRaisesRegex(wk.ModelError, "max_tokens"):
