@@ -119,6 +119,8 @@ CLAIM_TTL = 2592000       # 30 days, the ttl cloud/inbox-wake already uses for f
 DEFAULT_HEARTBEAT = 300   # the owner's suggested 5 minutes
 DEFAULT_RENEW_WARN = 172800
 INBOX_LOOKBACK = 500      # newest entries read back per worker stream
+DEFAULT_POLL_TICK = 120   # the scheduler's cadence for /poll; health reads degraded past three of them
+POLL_TOKEN_HEADER = "x-drive-intake-poll-token"   # the scheduler's header when Authorization carries its OIDC token
 DELIVER_LEASE = 60        # seconds a delivering pass owns the put before another may resume it
 
 ID_OK = re.compile(r"[A-Za-z0-9_.:-]{1,128}\Z")
@@ -754,8 +756,44 @@ def poll(deps) -> list:
         changed = deps.changes(deps.folder_id) or []
     except Exception as exc:  # noqa: BLE001
         return [{"status": "read_error", "task": None, "error": type(exc).__name__}]
-    return [decide({"file_id": c.get("file_id") or "", "folder_id": c.get("folder_id") or ""}, deps)
-            for c in changed]
+    out, undecided = [], False
+    for c in changed:
+        try:
+            out.append(decide({"file_id": (c or {}).get("file_id") or "",
+                               "folder_id": (c or {}).get("folder_id") or ""}, deps))
+        except Exception as exc:  # noqa: BLE001 - one hint's failure must not lose the others
+            undecided = True
+            out.append({"status": "decide_error", "task": None, "error": type(exc).__name__})
+    if not undecided:
+        # On record only when the feed listed AND every hint was decided: a poll recorded over an
+        # undecided hint would move the next poll's window past the doc it failed on.
+        try:
+            deps.claims.note_poll(_now(deps))
+        except Exception:  # noqa: BLE001 - health will read unknown; the intake itself is done
+            pass
+    return out
+
+
+def poll_health(last_poll, now, tick=DEFAULT_POLL_TICK) -> dict:
+    """The poll is the channel when no watch is registered. No poll on record is unknown, not ok."""
+    if last_poll is None:
+        return {"poll": "unknown", "last_poll": None}
+    try:
+        age = float(now) - float(last_poll)
+    except (TypeError, ValueError):
+        return {"poll": "unknown", "last_poll": None}
+    state = "ok" if 0 <= age <= 3 * tick else "degraded"
+    return {"poll": state, "last_poll": int(float(last_poll)), "poll_age": int(age)}
+
+
+def poll_token_ok(secret: str, headers: dict) -> bool:
+    """The scheduler's token: as a bearer, or in its own header when Authorization carries the OIDC
+    token Cloud Run itself checks. An empty secret is a refusal, not a skip."""
+    if not secret:
+        return False
+    if bearer_ok(secret, headers.get("authorization", "")):
+        return True
+    return hmac.compare_digest(secret, headers.get(POLL_TOKEN_HEADER, "") or "")
 
 
 def handle(method: str, path: str, headers: dict, body: bytes, deps) -> tuple:
@@ -764,8 +802,16 @@ def handle(method: str, path: str, headers: dict, body: bytes, deps) -> tuple:
     if method == "GET" and path == "/healthz":
         now = _now(deps)
         health = channel_health(deps.channel_expires_at, now, deps.renew_warn)
-        out = {"ok": health["channel"] == "ok", "enabled": bool(deps.enabled)}
+        try:
+            last_poll = deps.claims.last_poll() if deps.claims is not None else None
+        except Exception:  # noqa: BLE001 - unreadable is unknown
+            last_poll = None
+        polled = poll_health(last_poll, now, deps.poll_tick)
+        # ok when EITHER channel is live: a registered watch inside its life, or a poll inside
+        # three ticks. Neither on record reads unknown, and ok stays false.
+        out = {"ok": health["channel"] == "ok" or polled["poll"] == "ok", "enabled": bool(deps.enabled)}
         out.update(health)
+        out.update(polled)
         alive = heartbeat_age(deps.claims, now, window=deps.heartbeat_window)
         out["worker"] = {"claude-code-cli": "online" if alive is not None else "offline",
                          "api": canonical(deps.api_worker) or "none"}
@@ -780,7 +826,7 @@ def handle(method: str, path: str, headers: dict, body: bytes, deps) -> tuple:
     if method == "POST" and path == "/poll":
         if not deps.enabled:
             return 200, {"enabled": False, "intake": []}
-        if not bearer_ok(deps.poll_token, headers.get("authorization", "")):
+        if not poll_token_ok(deps.poll_token, headers):
             return 401, {"error": "bad poll token"}
         return 200, {"enabled": True, "intake": poll(deps)}
     return 404, {"error": "not found"}
@@ -861,6 +907,12 @@ class MemoryClaims:
     def heartbeat(self, agent):
         return self.beats.get(agent)
 
+    def last_poll(self):
+        return self.beats.get("poll")
+
+    def note_poll(self, now):
+        self.beats["poll"] = float(now)
+
 
 # Compare-and-set in one round trip, so two passes cannot both win a transition.
 CAS_LUA = ("if redis.call('get', KEYS[1]) == ARGV[1] then "
@@ -932,6 +984,19 @@ class RedisClaims:
         except (TypeError, ValueError):
             return None
 
+    def last_poll(self):
+        """fleet:intake:poll:last - when the last poll listed the folder and decided every hint."""
+        raw = self.client.get("fleet:intake:poll:last")
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", "replace")
+        try:
+            return float(raw) if raw is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def note_poll(self, now):
+        self.client.set("fleet:intake:poll:last", "%d" % int(now), ex=CLAIM_TTL)
+
 
 class InboxQueue:
     """One task onto fleet:inbox:<recipient>, carrying the whole tuple unchanged, read back by task id."""
@@ -999,8 +1064,11 @@ class Deps:
     def __init__(self, enabled=False, docs=None, claims=None, queue=None, receipts=None,
                  changes=None, ring=None, folder_id="", channel_token="", poll_token="",
                  api_worker="", now=None, at="", channel_expires_at=None,
-                 heartbeat_window=DEFAULT_HEARTBEAT, renew_warn=DEFAULT_RENEW_WARN):
+                 heartbeat_window=DEFAULT_HEARTBEAT, renew_warn=DEFAULT_RENEW_WARN,
+                 at_provider=None, poll_tick=DEFAULT_POLL_TICK):
         self.enabled = enabled
+        self.at_provider = at_provider
+        self.poll_tick = poll_tick
         self.docs = docs
         self.claims = claims
         self.queue = queue
@@ -1012,10 +1080,20 @@ class Deps:
         self.poll_token = poll_token
         self.api_worker = api_worker
         self.now = now
-        self.at = at
+        self._at = at
         self.channel_expires_at = channel_expires_at
         self.heartbeat_window = heartbeat_window
         self.renew_warn = renew_warn
+
+    @property
+    def at(self):
+        """The receipt clock: a fixed string in tests, the clock NOW in a server (a line stamped with
+        the boot time, days later, would be a receipt that lies about when)."""
+        return self.at_provider() if self.at_provider is not None else self._at
+
+    @at.setter
+    def at(self, value):
+        self._at = value
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1046,8 +1124,62 @@ class Handler(BaseHTTPRequestHandler):
         print("drive-intake %s" % (fmt % args))
 
 
+def utc_now_iso() -> str:
+    import datetime  # noqa: PLC0415
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _int_env(environ, name, default):
+    try:
+        return int(environ.get(name) or default)
+    except ValueError:
+        return default
+
+
+def deps_from_env(environ=None, client=None, docs=None, feed=None, post=None) -> "Deps":
+    """The service's dependencies from its environment and the adapters handed in. Pure: no socket
+    is opened here, so a test can read exactly what a deploy would wire."""
+    environ = os.environ if environ is None else environ
+    ring_url, ring_secret = environ.get("INBOX_WAKE_URL") or "", environ.get("INBOX_WAKE_SECRET") or ""
+    return Deps(
+        enabled=enabled_from_env(environ),
+        docs=docs,
+        receipts=docs,
+        claims=RedisClaims(client) if client is not None else None,
+        queue=InboxQueue(client) if client is not None else None,
+        changes=feed,
+        ring=WakeRing(ring_url, ring_secret, post=post) if ring_url and ring_secret else no_ring,
+        folder_id=environ.get("DRIVE_INTAKE_FOLDER_ID") or "",
+        channel_token=environ.get("DRIVE_INTAKE_CHANNEL_TOKEN") or "",
+        poll_token=environ.get("DRIVE_INTAKE_POLL_TOKEN") or "",
+        api_worker=environ.get("DRIVE_INTAKE_API_WORKER") or "",
+        at_provider=utc_now_iso,
+        heartbeat_window=_int_env(environ, "DRIVE_INTAKE_HEARTBEAT_SECONDS", DEFAULT_HEARTBEAT),
+        poll_tick=_int_env(environ, "DRIVE_INTAKE_POLL_SECONDS", DEFAULT_POLL_TICK),
+    )
+
+
 def main():  # pragma: no cover - the server loop
-    Handler.deps = Deps(enabled=enabled_from_env())
+    import sys  # noqa: PLC0415
+    here = os.path.dirname(os.path.abspath(__file__))
+    sys.path.insert(0, here)
+    client = docs = feed = post = None
+    if enabled_from_env():
+        try:
+            import redis_dual  # noqa: PLC0415 - beside this file in the image
+            client = redis_dual.client(redis_dual.Settings(), precheck=False)
+        except Exception as exc:  # noqa: BLE001
+            print("drive-intake no redis: %s" % type(exc).__name__)
+        try:
+            import gdocs  # noqa: PLC0415
+            import drive_feed  # noqa: PLC0415
+            docs = gdocs.GoogleDocs()
+            post = drive_feed.http_post
+            if client is not None:
+                feed = drive_feed.DriveFolder(gdocs.metadata_token, gdocs._fetch, RedisClaims(client)).changes
+        except Exception as exc:  # noqa: BLE001
+            print("drive-intake no docs: %s" % type(exc).__name__)
+    Handler.deps = deps_from_env(client=client, docs=docs, feed=feed, post=post)
     port = int(os.environ.get("PORT") or 8080)
     ThreadingHTTPServer(("", port), Handler).serve_forever()
 

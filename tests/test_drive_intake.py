@@ -1293,5 +1293,158 @@ class OfflineTest(unittest.TestCase):
         self.assertNotIn("redis", sys.modules)
 
 
+feed_spec = importlib.util.spec_from_file_location("drive_feed", REPO / "cloud" / "drive-intake" / "drive_feed.py")
+drive_feed = importlib.util.module_from_spec(feed_spec)
+feed_spec.loader.exec_module(drive_feed)
+
+
+class WiringTest(unittest.TestCase):
+    """What a deploy wires, read without a socket: the clock per request, the poll on record, health
+    by poll, the scheduler's token header, and the dependencies built from env."""
+
+    def test_the_receipt_clock_is_per_request_in_a_server_and_fixed_in_a_test(self):
+        ticks = iter(["2026-10-11T05:00:00Z", "2026-10-11T05:00:01Z"])
+        d = deps(at_provider=lambda: next(ticks))
+        self.assertEqual("2026-10-11T05:00:00Z", d.at)
+        self.assertEqual("2026-10-11T05:00:01Z", d.at)
+        fixed = deps()
+        self.assertEqual("2026-10-10T21:00:00Z", fixed.at)
+        fixed.at = "later"
+        self.assertEqual("later", fixed.at)
+        d = deps(at_provider=lambda: "2026-10-11T06:00:00Z")
+        di.decide(hint(), d)
+        self.assertIn(" - 2026-10-11T06:00:00Z", d.receipts.lines[0][2])
+
+    def test_a_poll_that_listed_and_decided_is_on_record_and_a_failed_one_is_not(self):
+        d = deps(changes=lambda folder: [{"file_id": FILE, "folder_id": folder}], now=5000.0)
+        self.assertIsNone(d.claims.last_poll())
+        out = di.poll(d)
+        self.assertEqual("dispatched", out[0]["status"])
+        self.assertEqual(5000.0, d.claims.last_poll())
+
+        def broken(folder):
+            raise ConnectionError()
+        d = deps(changes=broken, now=5000.0)
+        self.assertEqual("read_error", di.poll(d)[0]["status"])
+        self.assertIsNone(d.claims.last_poll())
+        d = deps(changes=None, now=5000.0)
+        self.assertEqual("no_store", di.poll(d)[0]["status"])
+        self.assertIsNone(d.claims.last_poll())
+        # a hint that cannot even be decided keeps the poll off the record, and loses no other hint
+        class Odd(dict):
+            def get(self, key, default=None):
+                raise ValueError("odd hint")
+        d = deps(changes=lambda folder: [Odd({"file_id": FILE}), {"file_id": FILE, "folder_id": folder}], now=5000.0)
+        out = di.poll(d)
+        self.assertEqual(["decide_error", "dispatched"], [o["status"] for o in out])
+        self.assertIsNone(d.claims.last_poll())
+
+    def test_health_reads_ok_on_a_fresh_poll_degraded_past_three_ticks_and_unknown_with_none(self):
+        self.assertEqual({"poll": "unknown", "last_poll": None}, di.poll_health(None, 1000.0))
+        self.assertEqual({"poll": "unknown", "last_poll": None}, di.poll_health("soon", 1000.0))
+        self.assertEqual("ok", di.poll_health(1000.0 - 360, 1000.0)["poll"])
+        self.assertEqual("degraded", di.poll_health(1000.0 - 361, 1000.0)["poll"])
+        self.assertEqual("degraded", di.poll_health(1000.0 + 5, 1000.0)["poll"])     # a poll from the future
+        self.assertEqual("ok", di.poll_health(1000.0 - 100, 1000.0, tick=60)["poll"])
+        d = deps(now=1000.0)
+        status, out = di.handle("GET", "/healthz", {}, b"", d)
+        self.assertFalse(out["ok"])
+        self.assertEqual(("unknown", "unknown"), (out["channel"], out["poll"]))
+        d.claims.note_poll(900.0)
+        status, out = di.handle("GET", "/healthz", {}, b"", d)
+        self.assertTrue(out["ok"])                                       # the poll is the channel
+        self.assertEqual(("unknown", "ok", 900, 100), (out["channel"], out["poll"], out["last_poll"], out["poll_age"]))
+        d.claims.note_poll(1000.0 - 400)
+        self.assertFalse(di.handle("GET", "/healthz", {}, b"", d)[1]["ok"])
+        d.channel_expires_at = 1000.0 + 10 ** 6                           # a live watch is enough on its own
+        self.assertTrue(di.handle("GET", "/healthz", {}, b"", d)[1]["ok"])
+
+    def test_the_scheduler_may_send_the_poll_token_in_its_own_header(self):
+        self.assertTrue(di.poll_token_ok("poll", {"authorization": "Bearer poll"}))
+        self.assertTrue(di.poll_token_ok("poll", {"authorization": "Bearer eyJ-an-oidc-token",
+                                                  di.POLL_TOKEN_HEADER: "poll"}))
+        self.assertFalse(di.poll_token_ok("poll", {di.POLL_TOKEN_HEADER: "wrong"}))
+        self.assertFalse(di.poll_token_ok("poll", {}))
+        self.assertFalse(di.poll_token_ok("", {di.POLL_TOKEN_HEADER: ""}))
+        d = deps(changes=lambda folder: [])
+        self.assertEqual(200, di.handle("POST", "/poll", {"Authorization": "Bearer eyJ", "X-Drive-Intake-Poll-Token": "poll"}, b"", d)[0])
+        self.assertEqual(401, di.handle("POST", "/poll", {"Authorization": "Bearer eyJ"}, b"", d)[0])
+
+    def test_deps_from_env_wires_what_a_deploy_gives_and_nothing_it_does_not(self):
+        env = {"DRIVE_INTAKE_ENABLED": "on", "DRIVE_INTAKE_FOLDER_ID": FOLDER,
+               "DRIVE_INTAKE_CHANNEL_TOKEN": "ct", "DRIVE_INTAKE_POLL_TOKEN": "pt",
+               "DRIVE_INTAKE_API_WORKER": "claude-api", "DRIVE_INTAKE_HEARTBEAT_SECONDS": "300",
+               "DRIVE_INTAKE_POLL_SECONDS": "120"}
+        d = di.deps_from_env(env, client=None, docs=None, feed=None, post=None)
+        self.assertTrue(d.enabled)
+        self.assertEqual((FOLDER, "ct", "pt", "claude-api", 300, 120),
+                         (d.folder_id, d.channel_token, d.poll_token, d.api_worker, d.heartbeat_window, d.poll_tick))
+        self.assertIsNone(d.claims)
+        self.assertIsNone(d.queue)
+        self.assertIs(d.ring, di.no_ring)                                 # no wake url: no ring, named
+        self.assertRegex(d.at, r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+        self.assertEqual("no_store", di.decide(hint(), d)["status"])      # nothing wired, nothing decided
+        wired = di.deps_from_env(dict(env, INBOX_WAKE_URL="https://wake", INBOX_WAKE_SECRET="s"),
+                                 client=object(), docs=Docs(), feed=lambda f: [], post=lambda *a: b"{}")
+        self.assertIsInstance(wired.ring, di.WakeRing)
+        half = di.deps_from_env(dict(env, INBOX_WAKE_URL="https://wake"), client=None, docs=None)
+        self.assertIs(half.ring, di.no_ring)                              # a url without its secret is no ring
+        self.assertIsInstance(wired.claims, di.RedisClaims)
+        self.assertIsInstance(wired.queue, di.InboxQueue)
+        self.assertIs(wired.receipts, wired.docs)
+        off = di.deps_from_env({}, client=None, docs=None)
+        self.assertFalse(off.enabled)
+        self.assertEqual(di.DEFAULT_POLL_TICK, off.poll_tick)
+
+
+class FeedTest(unittest.TestCase):
+    """The poll's question to Drive, and its bookkeeping."""
+
+    def test_the_query_is_this_folder_docs_only_not_trashed_since(self):
+        q = drive_feed.query_for(FOLDER, 1760000000)
+        self.assertEqual("'%s' in parents and mimeType = 'application/vnd.google-apps.document' and "
+                         "trashed = false and modifiedTime > '2025-10-09T08:53:20Z'" % FOLDER, q)
+        with self.assertRaises(drive_feed.Unconfigured):
+            drive_feed.query_for("", 1.0)
+
+    def test_since_is_the_last_poll_less_a_margin_else_a_bounded_look_back(self):
+        self.assertEqual(1760000000.0 - 86400, drive_feed.since_for(None, 1760000000.0))
+        self.assertEqual(900.0 - 600, drive_feed.since_for(900.0, 1000.0))
+        self.assertEqual(1000.0, drive_feed.since_for(5000.0, 1000.0))          # never ahead of now
+        self.assertEqual(1760000000.0 - 86400, drive_feed.since_for("soon", 1760000000.0))
+        self.assertEqual(0.0, drive_feed.since_for(None, 1000.0))                # never before the epoch
+        self.assertEqual(0.0, drive_feed.since_for(100.0, 1000.0))
+
+    def test_hints_carry_the_file_and_its_parent(self):
+        self.assertEqual([{"file_id": "A", "folder_id": "P"}, {"file_id": "B", "folder_id": FOLDER}],
+                         drive_feed.hints_from([{"id": "A", "parents": ["P"]}, {"id": "B"}, {"id": ""}, None], FOLDER))
+
+    def test_a_poll_lists_pages_records_itself_only_on_success_and_refuses_without_a_token(self):
+        calls = []
+        pages = [{"files": [{"id": "A", "parents": [FOLDER]}], "nextPageToken": "p2"},
+                 {"files": [{"id": "B", "parents": [FOLDER]}]}]
+
+        def fetch(method, url, body, headers):
+            calls.append((method, url, headers))
+            self.assertEqual("Bearer tok", headers["Authorization"])
+            return 200, json.dumps(pages[len(calls) - 1]).encode()
+        store = di.MemoryClaims()
+        store.note_poll(1760000000.0)                                             # 2025-10-09T08:53:20Z
+        feed = drive_feed.DriveFolder(lambda: "tok", fetch, store, now=1760000100.0)
+        hints = feed.changes(FOLDER)
+        self.assertEqual([{"file_id": "A", "folder_id": FOLDER}, {"file_id": "B", "folder_id": FOLDER}], hints)
+        self.assertEqual(2, len(calls))
+        self.assertIn("pageToken=p2", calls[1][1])
+        self.assertIn("modifiedTime+%3E+%272025-10-09T08%3A43%3A20Z%27", calls[0][1])   # the last poll less 600 s
+        self.assertIn("orderBy=modifiedTime+desc", calls[0][1])
+        self.assertEqual(1760000100.0, store.last_poll())                         # recorded after the listing
+        failing = drive_feed.DriveFolder(lambda: "tok", lambda *a: (500, b'{"files": []}'), di.MemoryClaims(), now=1000.0)
+        with self.assertRaises(RuntimeError):
+            failing.changes(FOLDER)
+        self.assertIsNone(failing.store.last_poll())                              # a failed poll is not on record
+        with self.assertRaises(drive_feed.Unconfigured):
+            drive_feed.DriveFolder(lambda: "", lambda *a: (200, b"{}"), di.MemoryClaims(), now=1.0).changes(FOLDER)
+
+
 if __name__ == "__main__":
     unittest.main()
