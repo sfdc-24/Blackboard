@@ -375,7 +375,13 @@ def cmd_post(args):
               % (fitted["chars"], fitted["error"] or "no spill store"))
     gist = args.gist or board_row.split_fields(text)[1][:180]
     row = [rid, now, tag, to, args.phase, payload, args.category, args.project, gist[:180], ""]
+    return append_and_verify(rid, row, fitted, spill)
 
+
+def append_and_verify(rid, row, fitted=None, spill=None):
+    """Append one row, commit its spill if it has one, and prove it landed by reading it back.
+    0 only on a verified row. The one append path for post and request, so they cannot drift."""
+    fitted = fitted or {}
     # tries=1 is not a tuning choice. The v1 bus does not dedup, and a
     # googleusercontent 404 on the redirect hop can be raised client-side AFTER
     # the row has landed - that replayed a row onto the live board once already.
@@ -418,6 +424,86 @@ def cmd_post(args):
         return 0
     print("  NOT FOUND after append — the ok:true was a silent no-op.")
     return 1
+
+
+# ---------------------------------------------------------------- redis-op requests
+#
+# Every fleet agent has governed read/write on Redis (Mr. Salam, 2026-10-08: "Everyone gets read
+# write access, you control the Redis access rights and make actions auditable"). The instance has a
+# private address, so the path is a BOARD ROW: the agent appends a request, the bus-requests job
+# (cloud/bus-reconciler/serve_requests.py) judges it under scripts/redis_acl.json via
+# scripts/redis_gov.py, does it, and answers with ONE result row addressed back to the agent's tag.
+# Every operation, allowed or refused, is in gov:audit. docs/REDIS-ACCESS.md is the agents' page.
+#
+# WHY THIS IS ITS OWN SUBCOMMAND. `post` writes Action_Type = a phase (WIP/OPEN/DONE/ASK/BLOCKED/
+# RESULT), and bus_request.parse_request() answers ONLY a row whose Action_Type is AYA_REQ. So an
+# agent whose only tool is `post` - every cloud waker, Gemini's included - could never ask, however
+# the access list read. Measured 2026-10-11: the ACL had named gemini and grok since 2026-10-08 and
+# neither had a tool that could produce the row. This is that tool.
+REQUEST_ACTION = "AYA_REQ"
+REQUEST_WORKER = "bus-reconciler"
+REQUEST_OPS = ("get", "hgetall", "xrange", "set", "del", "hset", "hput", "xadd")
+# scripts/bus_request._REQ_ID, restated: the id is the one thing the worker takes from the row.
+_REQUEST_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{3,63}$")
+
+
+def request_row(tag, op, key, val=None, field=None, count=None, project="FLEET", rid=None, now=None):
+    """(rid, row) for one governed Redis request, in the exact shape bus_request.parse_request reads.
+
+    The value always travels base64 (enc=b64): the payload has no escaping, so a pipe or a newline in
+    a value would otherwise end the field - and a value an agent wrote is not ours to trust with the
+    grammar. The worker decodes it and judges it; this builds the row, nothing more. A request is
+    never spilled: a pointer row would carry no op= for the worker to read, so one that does not fit
+    is refused here with the reason, not stored elsewhere."""
+    import base64
+    tag = (tag or "").strip().lower()
+    op = (op or "").strip().lower()
+    if op not in REQUEST_OPS:
+        raise ValueError("op must be one of " + ", ".join(REQUEST_OPS))
+    key = (key or "").strip()
+    if not key or any(ch in key for ch in "|\r\n\t "):
+        raise ValueError("key is required and may not contain a pipe or whitespace")
+    if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", tag):
+        raise ValueError("tag must be the agent's board tag (letters, digits, . _ -)")
+    stamp = now or dt.datetime.now(dt.timezone.utc)
+    rid = rid or "%s-REDIS-%s-%s" % (re.sub(r"[^A-Za-z0-9]", "", tag.upper())[:12],
+                                     stamp.strftime("%Y%m%dT%H%M%SZ"), os.urandom(3).hex())
+    if not _REQUEST_ID.match(rid):
+        raise ValueError("request id %r is outside the worker's id grammar" % rid)
+    parts = ["BCB", "v=1", "id=%s" % rid, "req=%s" % rid, "do=redis-op", "op=%s" % op, "key=%s" % key]
+    if field:
+        if any(ch in field for ch in "|\r\n\t "):
+            raise ValueError("field may not contain a pipe or whitespace")
+        parts.append("field=%s" % field.strip())
+    if val is not None:
+        parts.append("val=%s" % base64.b64encode(str(val).encode("utf-8")).decode("ascii"))
+        parts.append("enc=b64")
+    if count is not None:
+        parts.append("count=%d" % int(count))
+    parts += ["from=%s" % tag, "to=%s" % REQUEST_WORKER]
+    payload = "|".join(parts)
+    if len(payload) > board_row.ROW_LIMIT:
+        raise ValueError("the request is %d chars; a row holds %d, and a request cannot be spilled "
+                         "(the value is %d bytes before base64)"
+                         % (len(payload), board_row.ROW_LIMIT, len(str(val or "").encode("utf-8"))))
+    payload = board_row.guard(payload)
+    gist = "redis-op %s %s" % (op, key)
+    row = [rid, stamp.strftime("%Y-%m-%dT%H:%M:%S.%fZ"), tag, REQUEST_WORKER, REQUEST_ACTION,
+           payload, "OPEN", project, gist[:180], ""]
+    return rid, row
+
+
+def cmd_request(args):
+    """Post one governed Redis request and read the row back. The answer arrives later, as an
+    AYA_RESULT row addressed to --tag; this exit code says only whether the ASK landed."""
+    try:
+        rid, row = request_row(args.tag, args.op, args.key, val=args.val, field=args.field,
+                               count=args.count, project=args.project, rid=args.id)
+    except ValueError as why:
+        print("  refused before posting: %s" % why)
+        return 2
+    print("  request %s: %s %s" % (rid, args.op, args.key))
+    return append_and_verify(rid, row)
 
 
 def cmd_archive(args):
@@ -465,6 +551,17 @@ def build_parser():
     po.add_argument("--id", default=None)
     po.add_argument("--prefix", default="CCC-NOTE")
     po.set_defaults(fn=cmd_post)
+
+    rq = sub.add_parser("request", help="ask the governed Redis worker for one op; the answer is a later row")
+    rq.add_argument("op", choices=list(REQUEST_OPS))
+    rq.add_argument("key")
+    rq.add_argument("--val", default=None, help="the value (set, hset, xadd) or a JSON object (hput)")
+    rq.add_argument("--field", default=None, help="the hash field, for hset")
+    rq.add_argument("--count", type=int, default=None, help="entries to return, for xrange")
+    rq.add_argument("--tag", default="claude-code-cli")
+    rq.add_argument("--project", default="FLEET")
+    rq.add_argument("--id", default=None)
+    rq.set_defaults(fn=cmd_request)
     return p
 
 

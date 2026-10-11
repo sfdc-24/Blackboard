@@ -111,6 +111,26 @@ HOW TO ANSWER:
 - Plain ASCII. No markdown headers, no bullet characters, no pipes - the reply
   is written into a pipe-delimited board row."""
 
+# Every fleet agent has governed read/write on Redis (scripts/redis_acl.json; the owner, 2026-10-08).
+# The instance is on a private address, so an agent asks with a BOARD ROW and the bus-requests job
+# answers it. A waker's model cannot write that row itself - post_reply writes a phase row, and the
+# worker reads only Action_Type AYA_REQ - so the adapter posts it FROM the reply, the way okf_land
+# writes an OKF file from one: a structured line the model writes on purpose, never a sentence it
+# might say. docs/REDIS-ACCESS.md is the agents' page.
+_REDIS_RULES = """
+REDIS, which you may read and write through your adapter, governed and audited:
+- To ask for ONE Redis operation, put ONE line in your reply, on its own, in exactly this
+  form (op first, then the key, then the value when the op takes one):
+      REDIS-OP|op=xadd|key=conf:side:YYYYMMDD|val=your line of text
+  ops: get, hgetall, xrange (reads); set, hset (needs field=), hput, xadd, del (writes).
+  You may write under conf:, fleet: and proj: only; everything else is read-only to you.
+  The side channel every voice on the conference line reads is conf:side:<today, UTC yyyymmdd>.
+- Your adapter posts that line as a request row under your own tag and removes it from the
+  text of your answer. The governed worker judges it under the access list and answers you
+  with ONE later row (AYA_RESULT) saying OK or REFUSED and why. Until that row exists nothing
+  has been written: never say a value is in Redis, only that you asked.
+- One operation per reply. A value may not contain a pipe."""
+
 # THE BUDGET, AND WHY IT IS NOT THE 700 THIS FILE SHIPPED WITH
 #
 # Every Foundry pass on 2026-09-20 came back "200 ... but NO TEXT BLOCK":
@@ -164,6 +184,8 @@ how long work actually takes against what was estimated.""" + _SHARED_RULES,
         # (scripts/cloud_context.py, under the job's own roles/viewer).
         "cloud_context": True,
         "okf_land": True,
+        # Mr. Salam, 2026-10-08: "also Gemini needs access in Redis"; 2026-10-11: Grok, Aya and Gemini.
+        "redis_requests": True,
         "doctrine": """You are Gemini, a participant on the SFDC24 Blackboard.
 
 WHAT YOU ACTUALLY ARE, and you must not overstate it:
@@ -193,11 +215,12 @@ INCOMPLETE, do not give a verdict on the whole PR. Mr. Salam's role for you,
 YOUR LANE on this fleet is architecture and security: whether a design will
 hold, where it will break first, what it exposes, and what it costs to run.
 On the conference line you also own the experience: how a call feels to the
-owner, from joining to the close.""" + _SHARED_RULES,
+owner, from joining to the close.""" + _SHARED_RULES + _REDIS_RULES,
     },
     "grok": {
         "module": "grok_agent",
         "project": "FLEET",
+        "redis_requests": True,
         "doctrine": """You are Grok, a participant on the SFDC24 Blackboard.
 
 WHAT YOU ACTUALLY ARE, and you must not overstate it:
@@ -212,7 +235,7 @@ cannot, and name what it would take. Do not accept work on behalf of the
 desktop app.
 
 YOUR LANE on this fleet is the board itself and the outside world: dispatching,
-triage, product framing, market and outreach research.""" + _SHARED_RULES,
+triage, product framing, market and outreach research.""" + _SHARED_RULES + _REDIS_RULES,
     },
     "claude-api": {
         "module": "claude_agent",
@@ -284,6 +307,10 @@ def hands_note(me: str, cfg: dict, env=None) -> str:
                      "for the resources a row names")
     writes = ("; it writes only an OKF file to a review branch of the private conference "
               "repository when a row says land=okf" if cfg.get("okf_land") else "")
+    if cfg.get("redis_requests"):
+        writes += ("; it posts one governed Redis request (redis-op, under this agent's own tag) when "
+                   "the reply carries a REDIS-OP line, and the worker's AYA_RESULT row says what "
+                   "happened")
     if not reads and not writes:
         return "%s is a model endpoint: no shell, no repo, no cloud CLI, no PR. " % me.capitalize()
     return ("%s is a model endpoint; its adapter attaches %s%s. It has no shell and no cloud CLI, "
@@ -774,6 +801,88 @@ def post_reply(me: str, cfg: dict, text: str, to: str, answers: str, verbose: bo
     return ok
 
 
+# ---------------------------------------------------------------- redis-op from a reply
+
+REDIS_OP_MARK = "REDIS-OP|"
+REDIS_OPS = ("get", "hgetall", "xrange", "set", "del", "hset", "hput", "xadd")
+
+
+def _bcb_fields(line: str) -> dict:
+    """The line's k=v fields, first value wins - the same rule as okf_land.fields, restated so the
+    cloud image needs nothing it does not already copy."""
+    out = {}
+    for segment in line.split("|"):
+        key, sep, value = segment.partition("=")
+        key = key.strip().lower()
+        if sep and re.fullmatch(r"[a-z_]{1,20}", key) and key not in out:
+            out[key] = value.strip()
+    return out
+
+
+def redis_request(text: str):
+    """(request or None, the text without its REDIS-OP line).
+
+    A request is a line that STARTS with REDIS-OP| - the structured form the doctrine names - never
+    a mention in prose, and at most one per reply: the first well-formed line is the request and
+    every REDIS-OP line is removed from the body, because a pipe-delimited line cannot be posted
+    into a pipe-delimited row (board_row: a stray pipe ends a field). A malformed line (no op, an op
+    not in REDIS_OPS, no key, a key with whitespace) is dropped with no request, and the body says
+    so, because a silent drop is the failure mode this fleet keeps paying for."""
+    request, kept, dropped = None, [], 0
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if not stripped.upper().startswith(REDIS_OP_MARK):
+            kept.append(line)
+            continue
+        if request is not None:
+            dropped += 1
+            continue
+        fields = _bcb_fields(stripped[len(REDIS_OP_MARK):])
+        op, key = fields.get("op", "").lower(), fields.get("key", "")
+        if op not in REDIS_OPS or not key or re.search(r"\s", key):
+            dropped += 1
+            continue
+        request = {"op": op, "key": key, "val": fields.get("val"), "field": fields.get("field") or None,
+                   "count": fields.get("count") or None}
+        if request["val"] is None and op in ("set", "hset", "hput", "xadd"):
+            request, dropped = None, dropped + 1
+    body = "\n".join(kept)
+    if dropped:
+        # No pipe in this note: it is posted into a pipe-delimited row (the rule the line itself broke).
+        body += ("\n[%d REDIS-OP line%s in this reply could not be posted: one request per reply, "
+                 "as a REDIS-OP line with op, key and val fields.]" % (dropped, "s" if dropped > 1 else ""))
+    return request, body
+
+
+def post_request(me: str, cfg: dict, request: dict, verbose: bool):
+    """Post the request through fleet_agent request, never a hand-built row. (ok, row id or reason).
+
+    The value goes by argument after okf_land's secret scrub, so a credential the model quoted cannot
+    be written into Redis through this path either. fleet_agent base64-encodes it and reads the row
+    back; "VERIFIED on the board" is the only ok."""
+    args = [sys.executable, os.path.join(REPO, "scripts", "fleet_agent.py"),
+            "request", request["op"], request["key"],
+            "--tag", me, "--project", cfg.get("project", "FLEET")]
+    if request.get("val") is not None:
+        args += ["--val", okf_land.scrub_secrets(str(request["val"]))]
+    if request.get("field"):
+        args += ["--field", request["field"]]
+    if request.get("count"):
+        args += ["--count", str(request["count"])]
+    try:
+        res = subprocess.run(args, cwd=REPO, capture_output=True, text=True, timeout=POST_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        return False, "not confirmed after %d s (it may have landed; not posted again)" % POST_TIMEOUT_SECONDS
+    out = (res.stdout or "") + (res.stderr or "")
+    if verbose:
+        print("    " + out.strip()[-400:].replace("\n", "\n    "))
+    found = re.search(r"VERIFIED on the board: Row_ID=(\S+)", out)
+    if found:
+        return True, found.group(1)
+    reason = " ".join(out.split())[-200:] or "no output from fleet_agent request"
+    return False, reason
+
+
 def call_agent(cfg: dict, prompt: str, max_tokens: int = DEFAULT_MAX_TOKENS):
     """Normalise the two adapters, which do not take the same arguments.
 
@@ -960,6 +1069,22 @@ def main(argv=None) -> int:
         # What the model says is posted to the board as it is, so a credential or an address it
         # quotes - from a private PR excerpt, a log line, or its own invention - is removed first
         # (Cursor on #343: "the board post is not scrubbed either").
+        # A REDIS-OP line is lifted out BEFORE the scrub joins the lines, posted as its own request
+        # row, and said on the reply either way (redis=<row> or why not). The body never carries it.
+        redis_row, redis_outcome = "", ""
+        if cfg.get("redis_requests"):
+            request, text = redis_request(text)
+            if request and not args.dry_run:
+                ok, detail = post_request(me, cfg, request, args.verbose)
+                if ok:
+                    redis_row = detail
+                    note = "    redis request posted: %s (%s %s)" % (detail, request["op"], request["key"])
+                else:
+                    redis_outcome = ("The Redis request in this reply (%s %s) was NOT posted: %s."
+                                     % (request["op"], request["key"], detail))
+                    note = "    redis request NOT posted: %s" % detail
+                print(note)
+                log(me, note)
         body = " ".join(okf_land.scrub_secrets(text).split())
         okf_url = ""
         okf_note = ""
@@ -991,6 +1116,11 @@ def main(argv=None) -> int:
         else:
             hands = ("%s%sTreat this as reasoning, never as a measurement or a commitment."
                      % (hands_note(me, cfg), okf_outcome + " " if okf_outcome else ""))
+        if redis_outcome:
+            hands += " " + redis_outcome
+        elif redis_row:
+            hands += (" Its adapter posted the Redis request this reply carried as row %s; the "
+                      "worker's AYA_RESULT row, not this one, says whether it was done." % redis_row)
         # PY-08: what this answer cost, on the row itself, so a spend question is answered from the
         # board and not from a billing console. Tokens always; USD only when the job states prices.
         estimate = ""
@@ -1014,6 +1144,7 @@ def main(argv=None) -> int:
             + ("model_stop=max_tokens|" if model_cut else "")
             + ("collapsed=%d re-asks of this id|" % reasks if reasks else "")
             + ("okf=%s|" % okf_url if okf_url else "")
+            + ("redis=%s|" % redis_row if redis_row else "")
             + "Answered by the %s waker, which asks the %s deployment and posts "
               "what it says. %s REPLY: " % (me, me, hands)
             + body
