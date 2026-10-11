@@ -288,10 +288,24 @@ class WorkerDeployTest(unittest.TestCase):
         self.assertEqual(
             ["https://run.googleapis.com/v2/projects/${PROJECT}/locations/${REGION}/jobs/${JOB}:run"],
             uris)
-        self.assertNotRegex(self.script, r"--format '[^']*spec\.template")
         self.assertIn("roles/iam.serviceAccountTokenCreator", self.script)
         self.assertNotIn("roles/iam.serviceAccountUser", self.script)
-        self.assertIn("template.template.serviceAccount", self.script)
+        # The readback names the job's fields in BOTH shapes. This test used to forbid the v1 one;
+        # on gcloud 584 the v1 shape is what `run jobs describe` answers, and the v2-only projection
+        # printed nothing for the real job (measured 2026-10-11).
+        readback = function_body(self.script, "readback")
+        for field in ("spec.template.spec.template.spec.serviceAccountName", "template.template.serviceAccount",
+                      "spec.template.spec.template.spec.containers[0].env", "template.template.containers[0].env",
+                      "spec.template.metadata.annotations", "template.template.vpcAccess"):
+            self.assertIn(field, readback)
+
+    def test_the_reconcilers_readback_names_both_shapes_too(self):
+        # The projection the worker's readback was copied from. It printed one line for the real
+        # bus-reconciler job on gcloud 584; the v1 projection printed 27 (measured 2026-10-11).
+        reconciler = function_body((REPO / "cloud" / "bus-reconciler" / "deploy.sh").read_text(encoding="utf-8"), "readback")
+        for field in ("spec.template.spec.template.spec.containers[0].env", "template.template.containers[0].env",
+                      "spec.template.spec.template.spec.serviceAccountName", "template.template.serviceAccount"):
+            self.assertIn(field, reconciler)
 
     def test_cost_bounds_are_wired_but_fail_closed_by_default(self):
         for name, var, default in (("CLAUDE_API_WORKER_MAX_INPUT_TOKENS", "MAX_INPUT_TOKENS", "0"),
@@ -442,7 +456,10 @@ case "$*" in
   *"auth print-identity-token"*) printf '%s' "idt-456" ;;
 esac
 '''
-# How a describe goes wrong, in gcloud's own words: absent, denied, down, or an answer that is not JSON.
+# How a describe goes wrong, in gcloud's own words: absent, denied, down, or an answer that is not
+# JSON. And three answers that ARE JSON and still cannot be read as lines: a resource with its
+# containers in no place the reader knows (shapeless), one with two containers (twins), and one
+# whose variable is there twice (twice).
 FAKE_DESCRIBE = r'''describe() {
   case "$1" in
     notfound) echo "ERROR: (gcloud.run.describe) Cannot find $3 [x]" >&2; exit 1 ;;
@@ -450,6 +467,9 @@ FAKE_DESCRIBE = r'''describe() {
     down) echo "ERROR: (gcloud.run.describe) UNAVAILABLE: The service is currently unavailable." >&2; exit 1 ;;
     garbage) printf '%s' "Updates are available for some Google Cloud CLI components." ;;
     list) printf '%s' "[]" ;;
+    shapeless) printf '%s' '{"apiVersion":"run.googleapis.com/v9","kind":"Job","spec":{"somewhere":{"else":{"containers":[{"env":[]}]}}}}' ;;
+    twins) printf '%s' "$2" | sed 's/"containers": \[/"containers": [{"env": []}, /' ;;
+    twice) printf '%s' "$2" | sed 's/"env": \[/"env": [{"name": "PHONE_DOC_INTAKE_ENABLED", "value": "off"}, {"name": "DRIVE_INTAKE_ENABLED", "value": "off"}, /' ;;
     *) printf '%s' "$2" ;;
   esac
 }
@@ -470,8 +490,45 @@ FAKE_CRLF_PYTHON = r'''#!/usr/bin/env bash
 "$REAL_PYTHON" "$@" | sed 's/$/\r/'
 exit "${PIPESTATUS[0]}"
 '''
-JOB_JSON = '{"template":{"template":{"containers":[{"env":[%s]}]}}}'                 # the v2 job shape
-SERVICE_JSON = '{"spec":{"template":{"spec":{"containers":[{"env":[%s]}]}}}}'        # the Knative service shape
+# A secret the job holds, as the job really lists it: no value, a source. It is never a line.
+SECRET_ITEM = {"name": "ANTHROPIC_API_KEY", "valueFrom": {"secretKeyRef": {"key": "latest", "name": "ANTHROPIC_API_KEY"}}}
+
+
+def env_list(values, extra=()):
+    """The env list of a describe answer: literals from {name: value}, then any raw items."""
+    return [{"name": name, "value": value} for name, value in (values or {}).items()] + list(extra)
+
+
+def job_json(values=None, extra=(), shape="v1"):
+    """A job as `gcloud run jobs describe --format json` answers.
+
+    v1 IS THE REAL ONE. Its key structure was read from the real job on 2026-10-11 (gcloud 584;
+    every value here is made up): the env four levels down, egress in an annotation, a secret as
+    valueFrom. Until that day this stand-in answered in the v2 shape, the only one the reader knew,
+    so every test passed while the reader read nothing from the real job. v2 (template.template)
+    is what the v2 API answers and stays as the second shape."""
+    container = {"image": "us-central1-docker.pkg.dev/p/r/claude-api-worker:v1", "env": env_list(values, extra) + [SECRET_ITEM]}
+    if shape == "v2":
+        return json.dumps({"name": "projects/p/locations/r/jobs/claude-api-worker",
+                           "template": {"taskCount": 1, "template": {"containers": [container], "maxRetries": 0}}})
+    return json.dumps({
+        "apiVersion": "run.googleapis.com/v1", "kind": "Job", "metadata": {"name": "claude-api-worker"},
+        "spec": {"template": {
+            "metadata": {"annotations": {"run.googleapis.com/vpc-access-egress": "private-ranges-only"}},
+            "spec": {"parallelism": 1, "taskCount": 1, "template": {"spec": {
+                "containers": [container], "maxRetries": 0, "serviceAccountName": "sa", "timeoutSeconds": "600"}}}}},
+        "status": {}})
+
+
+def service_json(values=None, extra=()):
+    """A service as `gcloud run services describe --format json` answers (serving.knative.dev/v1; the
+    place of its containers was read from a real service on 2026-10-11)."""
+    return json.dumps({"apiVersion": "serving.knative.dev/v1", "kind": "Service", "metadata": {"name": "drive-intake"},
+                       "spec": {"template": {"spec": {"containers": [{"env": env_list(values, extra)}],
+                                                      "serviceAccountName": "sa"}}},
+                       "status": {"url": "https://drive-intake.invalid"}})
+
+
 DOC = "1gZlJFDD2Wm419YOuolIXC3HXwzXOWYfP"
 SET = dict(CLAUDE_API_WORKER_MODEL="m", CLAUDE_API_WORKER_USD_PER_MTOK_IN="0.1", CLAUDE_API_WORKER_USD_PER_MTOK_OUT="0.5",
            FLEET_CAD_PER_USD="1.45", CLAUDE_API_WORKER_MAX_INPUT_TOKENS="100000",
@@ -496,11 +553,6 @@ UNUSABLE = (
     ("CLAUDE_API_WORKER_RESERVE_CENTS_CAD", "0"), ("CLAUDE_API_WORKER_MAX_TOKENS", "0"),
     ("CLAUDE_API_WORKER_MODEL", "  "),
 )
-
-
-def env_items(**values):
-    """The env list of a describe answer. json.dumps, not a format string: a value may hold quotes."""
-    return ",".join(json.dumps({"name": name, "value": value}, separators=(",", ":")) for name, value in values.items())
 
 
 # One reviewed request, as the review hands it over: any key order, any spacing.
@@ -543,18 +595,18 @@ class FakeGcloudTest(unittest.TestCase):
     def tearDownClass(cls):
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
-    def verb(self, script, *args, job=None, service=None, after=None,
+    def verb(self, script, *args, job=None, service=None, after=None, shape="v1", job_extra=(), service_extra=(),
              studio_sa="studio-sa@sfdc24.iam.gserviceaccount.com", **fakes):
         type(self).calls += 1
         log = self.tmp / ("calls-%d.log" % self.calls)
         if after is not None:
-            fakes["FAKE_JOB_AFTER"] = JOB_JSON % env_items(**after)
+            fakes["FAKE_JOB_AFTER"] = job_json(after, shape=shape)
         # gcloud AND curl by name. Neither is left to PATH: the bash Git for Windows ships puts its
         # own directories first, and a stand-in found through PATH is then not the one that runs.
         env = shell_env(GCLOUD=(self.tmp / "gcloud").as_posix(), CURL=(self.tmp / "curl").as_posix(),
                         FAKE_LOG=log.as_posix(), FAKE_STUDIO_SA=studio_sa,
-                        FAKE_JOB_JSON=JOB_JSON % env_items(**(job or {})),
-                        FAKE_SERVICE_JSON=SERVICE_JSON % env_items(**(service or {})), **fakes)
+                        FAKE_JOB_JSON=job_json(job, job_extra, shape),
+                        FAKE_SERVICE_JSON=service_json(service, service_extra), **fakes)
         if "PHONE_DOC_PILOT_TARGET" not in fakes:
             env.pop("PHONE_DOC_PILOT_TARGET", None)              # only a test that names a target has one
         run = subprocess.run([self.bash, str(script), *args], capture_output=True, text=True, cwd=str(REPO), env=env)
@@ -656,8 +708,17 @@ class FakeGcloudTest(unittest.TestCase):
         # worker refuses on every tick. The job is read back, and a pilot that cannot be confirmed
         # is turned off again, the worker with it.
         lost_quotes = TARGET_LINE.replace('"', "")
+        doc_id = TARGET["source_doc_id"]
         for held, flag, how in ((lost_quotes, "on", ""), (TARGET_LINE + " ", "on", ""), ("", "on", ""),
-                                (TARGET_LINE, "off", ""), (TARGET_LINE, "on", "denied"), (TARGET_LINE, "on", "garbage")):
+                                (TARGET_LINE, "off", ""), (TARGET_LINE, "on", "denied"), (TARGET_LINE, "on", "garbage"),
+                                (TARGET_LINE, "on", "shapeless"), (TARGET_LINE, "on", "twins"),
+                                # Cursor on b975708. Each of these read back as "held": the value was
+                                # judged a line at a time, and carriage returns were deleted first.
+                                # The worker refuses every one (pilot_target_invalid, pilot_flags_invalid).
+                                (TARGET_LINE + "\nGARBAGE", "on", ""), ("\n" + TARGET_LINE, "on", ""),
+                                (TARGET_LINE + "\r", "on", ""),
+                                (TARGET_LINE.replace(doc_id, doc_id[:5] + "\r" + doc_id[5:]), "on", ""),
+                                (TARGET_LINE, "on\r", ""), (TARGET_LINE, "on\nEXTRA", ""), (TARGET_LINE, "on ", "")):
             run, calls = self.pilot_on(held=held, flag=flag, FAKE_JOB_AFTER_FAILS=how)
             self.assertEqual(1, run.returncode, (held, flag, how, run.stderr))
             self.assertIn("the pilot goes off again", run.stderr)
@@ -693,12 +754,18 @@ class FakeGcloudTest(unittest.TestCase):
         # on every tick. Each on verb reads the job back and refuses; an unreadable job is a refusal.
         for job in (dict(PHONE_DOC_INTAKE_ENABLED="on", PHONE_DOC_PILOT_TARGET=TARGET_LINE),
                     dict(PHONE_DOC_INTAKE_ENABLED="on"),
-                    dict(PHONE_DOC_INTAKE_ENABLED="off", PHONE_DOC_PILOT_TARGET=TARGET_LINE)):
+                    dict(PHONE_DOC_INTAKE_ENABLED="off", PHONE_DOC_PILOT_TARGET=TARGET_LINE),
+                    # Cursor on b975708: a target whose FIRST LINE is empty read as no target, and
+                    # the lane went on beside a value main() still treats as set.
+                    dict(PHONE_DOC_INTAKE_ENABLED="off", PHONE_DOC_PILOT_TARGET="\n"),
+                    dict(PHONE_DOC_INTAKE_ENABLED="off", PHONE_DOC_PILOT_TARGET="\r"),
+                    dict(PHONE_DOC_INTAKE_ENABLED="off", PHONE_DOC_PILOT_TARGET="\n" + TARGET_LINE),
+                    dict(PHONE_DOC_INTAKE_ENABLED="off", PHONE_DOC_PILOT_TARGET=" ")):
             run, calls = self.verb(WORKER / "deploy.sh", "lane", "on", job=job)
             self.assertEqual(2, run.returncode, (job, run.stderr))
             self.assertIn("pilot off first", run.stderr)
             self.assertEqual([], [c for c in calls if "run jobs update" in c], job)
-        for how in ("denied", "down", "garbage", "list"):
+        for how in ("denied", "down", "garbage", "list", "shapeless", "twins"):
             run, calls = self.verb(WORKER / "deploy.sh", "lane", "on", FAKE_JOB_FAILS=how)
             self.assertEqual(2, run.returncode, how + run.stderr)
             self.assertIn("could not be read back", run.stderr, how)
@@ -707,8 +774,11 @@ class FakeGcloudTest(unittest.TestCase):
             self.assertEqual(2, run.returncode, how + run.stderr)
             self.assertIn("could not be read back", run.stderr, how)
             self.assertEqual([], [c for c in calls if "run jobs update" in c], how)
-        for job in (dict(PHONE_DOC_INTAKE_ENABLED="off"), dict(PHONE_DOC_INTAKE_ENABLED="off", PHONE_DOC_PILOT_TARGET="")):
-            run, calls = self.verb(WORKER / "deploy.sh", "lane", "on", job=job)
+        # A cleared target is no target, however the answer writes an empty string: "" or no value at all.
+        for job, extra in ((dict(PHONE_DOC_INTAKE_ENABLED="off"), ()),
+                           (dict(PHONE_DOC_INTAKE_ENABLED="off", PHONE_DOC_PILOT_TARGET=""), ()),
+                           (dict(PHONE_DOC_INTAKE_ENABLED="off"), ({"name": "PHONE_DOC_PILOT_TARGET"},))):
+            run, calls = self.verb(WORKER / "deploy.sh", "lane", "on", job=job, job_extra=extra)
             self.assertEqual(0, run.returncode, run.stderr)
             self.assertEqual(1, len([c for c in calls if c.endswith("--update-env-vars CLAUDE_API_LANE_ENABLED=on")]), calls)
         run, calls = self.verb(WORKER / "deploy.sh", "lane", "off", FAKE_JOB_FAILS="denied")     # off never waits on a read
@@ -718,6 +788,59 @@ class FakeGcloudTest(unittest.TestCase):
         self.assertEqual(2, run.returncode, run.stderr)
         self.assertIn("lane off first", run.stderr)
         self.assertEqual([], [c for c in calls if "run jobs update" in c])
+
+    def test_the_verbs_read_the_job_in_the_shape_this_gcloud_answers_and_in_the_v2_one(self):
+        # THE TEST THAT WAS MISSING. `gcloud run jobs describe --format json` on gcloud 584 answers
+        # in the v1 shape; the reader knew only v2 and read nothing from the real job, so worker on
+        # refused a good job and drive-intake on would have gone on beside a pilot. The stand-in
+        # answered v2, so nothing here showed it. verb() now answers v1 unless told otherwise.
+        for shape in ("v1", "v2"):
+            run, calls = self.verb(WORKER / "deploy.sh", "worker", "on", job=SET, shape=shape)
+            self.assertEqual(0, run.returncode, (shape, run.stderr))                       # a good job is READ as good
+            self.assertEqual(1, len([c for c in calls if c.endswith("--update-env-vars CLAUDE_API_WORKER_ENABLED=on")]), calls)
+            run, calls = self.verb(WORKER / "deploy.sh", "cost", job=SET, shape=shape)
+            self.assertIn("CLAUDE_API_WORKER_USD_PER_MTOK_IN=0.1", run.stdout, shape)
+            self.assertNotIn("ANTHROPIC_API_KEY", run.stdout, shape)                       # a secret is never a line
+            run, calls = self.verb(INTAKE / "deploy.sh", "on", job=dict(PHONE_DOC_INTAKE_ENABLED="on"), shape=shape)
+            self.assertEqual(2, run.returncode, (shape, run.stderr))                       # the pilot is SEEN
+            self.assertIn("one intake at a time", run.stderr, shape)
+            self.assertEqual([], [c for c in calls if "run services update" in c], shape)
+            run, calls = self.verb(WORKER / "deploy.sh", "lane", "on", job=dict(PHONE_DOC_INTAKE_ENABLED="on"), shape=shape)
+            self.assertEqual(2, run.returncode, (shape, run.stderr))
+            run, calls = self.pilot_on(shape=shape)
+            self.assertEqual(0, run.returncode, (shape, run.stderr))
+
+    def test_a_job_the_lines_cannot_speak_for_is_unreadable_and_every_on_verb_refuses(self):
+        # A name there twice (the first says off, the second on), and a flag that comes from a
+        # secret, which no line can show: neither is "off".
+        from_a_secret = {"name": "PHONE_DOC_INTAKE_ENABLED", "valueFrom": {"secretKeyRef": {"key": "latest", "name": "x"}}}
+        for fakes in (dict(job=dict(PHONE_DOC_INTAKE_ENABLED="on"), FAKE_JOB_FAILS="twice"), dict(job_extra=(from_a_secret,))):
+            run, calls = self.verb(INTAKE / "deploy.sh", "on", **fakes)
+            self.assertEqual(2, run.returncode, (fakes, run.stderr))
+            self.assertIn("could not be read back", run.stderr, fakes)
+            self.assertEqual([], [c for c in calls if "run services update" in c], fakes)
+            run, calls = self.verb(WORKER / "deploy.sh", "lane", "on", **fakes)
+            self.assertEqual(2, run.returncode, (fakes, run.stderr))
+            self.assertEqual([], [c for c in calls if "run jobs update" in c], fakes)
+        run, calls = self.pilot_on(service=dict(DRIVE_INTAKE_ENABLED="on"), FAKE_SERVICE_FAILS="twice")
+        self.assertEqual(2, run.returncode, run.stderr)
+        self.assertIn("could not be read back", run.stderr)
+        self.assertEqual([], [c for c in calls if "run jobs update" in c])
+
+    def test_a_value_with_a_line_break_in_it_cannot_pass_for_another_variable(self):
+        # One variable, one line. A second line of some other value used to be read as a variable
+        # of its own, and the last one won: a zero price read as a good one, and worker on flipped.
+        smuggled = dict(SET, CLAUDE_API_WORKER_USD_PER_MTOK_IN="0", ZZ_NOTE="x\nCLAUDE_API_WORKER_USD_PER_MTOK_IN=0.1")
+        run, calls = self.verb(WORKER / "deploy.sh", "worker", "on", job=smuggled)
+        self.assertEqual(2, run.returncode, run.stderr)
+        self.assertIn("CLAUDE_API_WORKER_USD_PER_MTOK_IN", run.stderr)
+        self.assertEqual([], [c for c in calls if "run jobs update" in c])
+        # And a flag is on only when it is exactly on, as each service reads its own.
+        for value in ("on\r", "on\nEXTRA", " on", "ON"):
+            run, calls = self.verb(INTAKE / "deploy.sh", "on", job=dict(PHONE_DOC_INTAKE_ENABLED=value))
+            self.assertEqual(0, run.returncode, (value, run.stderr))
+        run, calls = self.verb(INTAKE / "deploy.sh", "on", job=dict(ZZ_NOTE="x\nPHONE_DOC_INTAKE_ENABLED=on"))
+        self.assertEqual(0, run.returncode, run.stderr)                                    # a note is not the flag
 
     def test_studio_grants_the_discovered_account_and_prints_the_url_never_the_token(self):
         run, calls = self.verb(INTAKE / "deploy.sh", "studio")
@@ -774,7 +897,7 @@ class FakeGcloudTest(unittest.TestCase):
     def test_an_interlock_that_cannot_read_the_other_side_refuses(self):
         # A denied describe, an outage and an answer that is not the resource all used to print
         # nothing, and nothing read as "the other intake is off" (Cursor and Copilot on 9eced7e).
-        for how in ("denied", "down", "garbage", "list"):
+        for how in ("denied", "down", "garbage", "list", "shapeless", "twins"):
             run, calls = self.verb(INTAKE / "deploy.sh", "on", job=dict(PHONE_DOC_INTAKE_ENABLED="on"), FAKE_JOB_FAILS=how)
             self.assertEqual(2, run.returncode, how + run.stderr)
             self.assertIn("could not be read back", run.stderr, how)
@@ -1022,6 +1145,83 @@ class PilotTargetGateTest(unittest.TestCase):
         # And what `pilot on` leaves before `worker on`, and what `pilot off` leaves: a job that does nothing.
         self.assertEqual((0, "disabled"), stops(pilot="on", target=TARGET_LINE))
         self.assertEqual((0, "disabled"), stops())
+        # Cursor on b975708: what `lane on` let through when it judged the first line only.
+        for left_behind in ("\n", " ", "\n" + TARGET_LINE):
+            self.assertEqual((1, "pilot_flags_invalid"), stops(lane="on", target=left_behind), repr(left_behind))
+        # And what the read-back in `pilot on` took for the target it had sent.
+        self.assertEqual((1, "pilot_target_invalid"), stops(worker="on", pilot="on", target=TARGET_LINE + "\nGARBAGE"))
+
+
+class ReaderTest(unittest.TestCase):
+    """ENV_LINES_PY by itself, no bash: the reader every read-back verb in both scripts stands on.
+    It must find the variables wherever the answer keeps them, write one line for one variable and
+    never the same line for two values, and say "unreadable" for what a line cannot speak for."""
+
+    reader = quoted((WORKER / "deploy.sh").read_text(encoding="utf-8"), "ENV_LINES_PY")
+
+    def read(self, answer):
+        text = answer if isinstance(answer, str) else json.dumps(answer)
+        done = subprocess.run([sys.executable, "-c", self.reader], input=text.encode("utf-8"), capture_output=True)
+        return done.returncode, done.stdout.decode("ascii").replace("\r\n", "\n")   # ascii: the lines are nothing else
+
+    @staticmethod
+    def unescape(line):
+        return re.sub(r"\\u([0-9a-f]{4})|\\U([0-9a-f]{8})", lambda m: chr(int(m.group(1) or m.group(2), 16)), line)
+
+    def test_the_variables_are_found_in_every_shape_and_a_shape_it_does_not_know_is_unreadable(self):
+        values = dict(CLAUDE_API_WORKER_ENABLED="off", PHONE_DOC_INTAKE_ENABLED="on", PHONE_DOC_PILOT_TARGET=TARGET_LINE)
+        wanted = "CLAUDE_API_WORKER_ENABLED=off\nPHONE_DOC_INTAKE_ENABLED=on\nPHONE_DOC_PILOT_TARGET=%s\n" % TARGET_LINE
+        container = {"env": env_list(values)}
+        for name, answer in (("the v1 job, as gcloud 584 answers", job_json(values)),
+                             ("the v2 job", job_json(values, shape="v2")),
+                             ("the v1 service", service_json(values)),
+                             ("the v2 service", {"template": {"containers": [container]}})):
+            self.assertEqual((0, wanted), self.read(answer), name)
+        # The secret in the job is not a line, and the target prints as it was sent, to the character.
+        self.assertNotIn("ANTHROPIC_API_KEY", self.read(job_json(values))[1])
+        for name, answer in (("containers somewhere else", {"spec": {"somewhere": {"containers": [container]}}}),
+                             ("no containers", {"spec": {"template": {"spec": {"template": {"spec": {}}}}}}),
+                             ("an empty list of them", {"template": {"template": {"containers": []}}}),
+                             ("two containers", {"template": {"template": {"containers": [container, container]}}}),
+                             ("a list", [container]), ("a string", '"x"'), ("not JSON", "Updates are available")):
+            code, said = self.read(answer)
+            self.assertEqual((3, ""), (code, said), name)             # unreadable, and nothing printed that could read as off
+
+    def test_one_variable_is_one_line_and_no_two_values_are_the_same_line(self):
+        values = ["", "on", "off", "on\r", "on\n", "on\nEXTRA", "\n", "\r", "\r\n", " ", "\t", "on ", " on", "\\", "\\n",
+                  "\\u000a", "\\u005cu000a", "a=b", "x\nPHONE_DOC_INTAKE_ENABLED=on", TARGET_LINE, TARGET_LINE + "\nGARBAGE",
+                  "\n" + TARGET_LINE, "café", " ", "\x00", "\x7f", "\x85", "\U0001f600", "ὠ" + "0"]
+        self.assertEqual(len(values), len(set(values)))
+        answer = job_json({"V%02d" % i: value for i, value in enumerate(values)})
+        code, said = self.read(answer)
+        self.assertEqual(0, code)
+        lines = said.split("\n")[:-1]
+        self.assertEqual(len(values), len(lines), lines)                              # one each, never two
+        self.assertEqual(len(values), len({line.split("=", 1)[1] for line in lines}))  # never the same line twice
+        for i, (value, line) in enumerate(zip(values, lines)):
+            name, written = line.split("=", 1)
+            self.assertEqual("V%02d" % i, name)
+            self.assertRegex(written, r"\A[ -~]*\Z", repr(value))                     # printable ASCII and nothing else
+            self.assertEqual(value, self.unescape(written), repr(value))             # and the value comes back whole
+        # What is plain stays plain: a caller matches the value itself.
+        for plain in ("on", "off", "a=b", " on", "on ", TARGET_LINE):
+            self.assertIn("=%s\n" % plain, said)
+
+    def test_a_flag_from_a_secret_or_a_name_twice_is_unreadable_and_an_empty_literal_is_not(self):
+        source = {"secretKeyRef": {"key": "latest", "name": "x"}}
+        for name, extra in (("a flag from a secret, v1", [{"name": "PHONE_DOC_INTAKE_ENABLED", "valueFrom": source}]),
+                            ("a flag from a secret, v2", [{"name": "DRIVE_INTAKE_ENABLED", "valueSource": source}]),
+                            ("the target from a secret", [{"name": "PHONE_DOC_PILOT_TARGET", "valueFrom": source}]),
+                            ("a name twice", [{"name": "A", "value": "off"}, {"name": "A", "value": "on"}]),
+                            ("a name twice, once from a secret", [{"name": "ANTHROPIC_API_KEY", "value": "x"}])):
+            self.assertEqual((3, ""), self.read(job_json({}, extra)), name)
+        # Any other secret is simply not a line, and an empty string is a value, written or left out.
+        self.assertEqual((0, "A=\nB=\nC=x\n"), self.read(job_json({}, [{"name": "A"}, {"name": "B", "value": ""},
+                                                                         {"name": "C", "value": "x"},
+                                                                         {"name": "BUS_SECRET", "valueFrom": source}])))
+
+    def test_both_scripts_carry_this_reader(self):
+        self.assertEqual(self.reader, quoted((INTAKE / "deploy.sh").read_text(encoding="utf-8"), "ENV_LINES_PY"))
 
 
 if __name__ == "__main__":

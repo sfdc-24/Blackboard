@@ -108,8 +108,28 @@ HEARTBEAT_SECONDS="${DRIVE_INTAKE_HEARTBEAT_SECONDS:-300}"
 INTAKE_SERVICE="${INTAKE_SERVICE:-drive-intake}"
 
 # The env of a deployed resource, one NAME=VALUE per line, read back from the job or the service
-# that RUNS, never from this shell. Python parses the JSON (jobs are the v2 shape, services the
-# Knative one): no awk over yaml, no value split on a comma.
+# that RUNS, never from this shell. Python parses the JSON: no awk over yaml, no value split on a
+# comma.
+#
+# WHERE THE CONTAINERS ARE DEPENDS ON WHO ANSWERS. `gcloud run jobs describe --format json` on
+# gcloud 584 answers in the v1 shape, spec.template.spec.template.spec (measured on the real job,
+# 2026-10-11); the v2 API answers template.template; a service is spec.template.spec. Until that
+# day this reader knew only the v2 place: it read NOTHING from the real job, nothing read as
+# "off", and every test passed because the stand-in gcloud answered in the shape the reader
+# expected. So every known place is tried, and an answer with a container in none of them is
+# unreadable (below), never empty.
+#
+# ONE VARIABLE, ONE LINE, AND NO TWO VALUES THE SAME LINE. Every caller judges a line: grep -x, or
+# a split on the first "=". A value with a newline in it printed as two lines, so its second line
+# could pass for another variable or its first for the whole value; and a carriage return inside a
+# value was deleted with the line ends, so "on<CR>" read as "on" (Cursor on b975708). A backslash
+# and every character that is not printable ASCII is therefore written as \uXXXX. What a caller
+# matches is the value itself, to the character, which is how each service reads its own flag.
+# A resource these lines cannot speak for is not read at all (it is "unreadable", below): more than
+# one container or a name twice, where whose value runs is not a thing a line can say; and a flag
+# or the pilot target that comes from a secret instead of a literal, which no line here can show.
+# A variable with neither a value nor a source is an EMPTY literal and prints as NAME= (an API
+# that leaves out empty strings must not turn a cleared target into an unreadable job).
 #
 # ABSENT IS NOT THE SAME AS UNREADABLE. Only gcloud saying the resource is not there prints nothing
 # and returns 0, which a caller may read as "off". A denied describe, a transient failure, an answer
@@ -123,11 +143,33 @@ try:
         raise ValueError("not an object")
 except ValueError:
     sys.exit(3)
-template = doc.get("template", {}).get("template") or doc.get("spec", {}).get("template", {}).get("spec", {})
-for container in template.get("containers") or []:
-    for item in container.get("env") or []:
-        if "value" in item:
-            print("%s=%s" % (item.get("name", ""), item.get("value", "")))
+
+def one_line(text):
+    return "".join(ch if " " <= ch <= "~" and ch != "\\" else ("\\u%04x" if ord(ch) < 65536 else "\\U%08x") % ord(ch)
+                   for ch in str(text))
+
+def containers_of(doc):
+    for path in (("spec", "template", "spec", "template", "spec"), ("template", "template"),
+                 ("spec", "template", "spec"), ("template",)):
+        node = doc
+        for key in path:
+            node = node.get(key) if isinstance(node, dict) else None
+        found = node.get("containers") if isinstance(node, dict) else None
+        if isinstance(found, list) and found:
+            return found
+    sys.exit(3)
+
+containers = containers_of(doc)
+env = [item for container in containers for item in container.get("env") or []]
+names = [str(item.get("name", "")) for item in env]
+from_a_source = [bool(set(item) & {"valueSource", "valueFrom"}) for item in env]
+hidden = [name for sourced, name in zip(from_a_source, names)
+          if sourced and (name.endswith("_ENABLED") or name == "PHONE_DOC_PILOT_TARGET")]
+if len(containers) > 1 or len(set(names)) != len(names) or hidden:
+    sys.exit(3)
+for item, name, sourced in zip(env, names, from_a_source):
+    if not sourced:
+        print("%s=%s" % (one_line(name), one_line(item.get("value") or "")))
 '
 # env_lines jobs|services NAME
 env_lines() {
@@ -146,7 +188,8 @@ env_lines() {
   fi
   rm -f "$err"
   # tr: a Windows python writes CRLF into the pipe, and grep -x NAME=on does not match a line that
-  # still ends in a carriage return, so the interlock read "on" as "off".
+  # still ends in a carriage return, so the interlock read "on" as "off". Only line ends are left
+  # to remove: a carriage return INSIDE a value was already written as \u000d above.
   printf "%s" "$json" | "$PYTHON" -c "$ENV_LINES_PY" | tr -d "\r"
 }
 
@@ -217,10 +260,13 @@ readback() {
   # Check: the service account is claude-api-worker, not default; all five secrets present (three env,
   # two mounts); no env value rewritten into a C:/... path; egress private-ranges-only; both flags off
   # until you turn them on; the model id is the one you meant.
-  # The v2 job resource, the same projection cloud/bus-reconciler/deploy.sh reads back.
-  # spec.template.spec.template.spec is the Knative shape and prints empty here.
+  # BOTH shapes, because which one answers depends on the gcloud. On gcloud 584 the job comes back
+  # in the v1 shape (spec.template.spec.template.spec; egress is an annotation), and the v2-only
+  # projection that stood here printed one empty line for the real job (measured 2026-10-11): a
+  # read-back that shows nothing looks exactly like a job with nothing set. A key that is not in
+  # the answer prints nothing, so naming both costs nothing.
   "$GCLOUD" run jobs describe "$JOB" --project "$PROJECT" --region "$REGION" \
-    --format 'yaml(template.template.serviceAccount,template.template.containers[0].env,template.template.containers[0].image,template.template.vpcAccess,template.template.maxRetries)'
+    --format 'yaml(spec.template.spec.template.spec.serviceAccountName,spec.template.spec.template.spec.containers[0].env,spec.template.spec.template.spec.containers[0].image,spec.template.spec.template.spec.maxRetries,spec.template.metadata.annotations,template.template.serviceAccount,template.template.containers[0].env,template.template.containers[0].image,template.template.vpcAccess,template.template.maxRetries)'
   "$GCLOUD" scheduler jobs describe "$SCHED_JOB" --project "$PROJECT" --location "$REGION" \
     --format 'yaml(schedule,state,lastAttemptTime,status,httpTarget.uri)' || true
   "$GCLOUD" run jobs executions list --job "$JOB" --project "$PROJECT" --region "$REGION" --limit 5 || true

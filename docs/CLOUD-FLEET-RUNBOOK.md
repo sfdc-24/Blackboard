@@ -221,6 +221,20 @@ service's flag is on. Turn one off before the other goes on. Either verb also
 refuses when it cannot read the other side back: a denied or failed `describe`
 is not "off". Only a resource gcloud says does not exist counts as off.
 
+**What the read-back reads.** Every verb above that reads a job or a service
+back reads `gcloud run ... describe --format json`. Where the variables sit in
+that answer depends on the gcloud: on gcloud 584, `run jobs describe` answers
+in the v1 shape (`spec.template.spec.template.spec`), elsewhere in the v2 one
+(`template.template`). Both are read. Until 2026-10-11 only v2 was, so on this
+laptop every read-back of the real job read nothing: `cost` listed every input
+as missing on a job that had them all, and `drive-intake on` could not have
+seen a pilot. An answer the reader cannot place is now refused ("could not be
+read back"), as are a job with two containers, a variable listed twice, and a
+flag or pilot target that comes from a secret. One variable is one line: a
+line break, or any character that is not plain ASCII, is written as `\uXXXX`,
+so a value is matched whole, the way each service reads its own flag (exactly
+`on`). `readback` names the job's fields in both shapes for the same reason.
+
 **The pilot answers one reviewed request (#386).** With the pilot flag on, the
 worker reads `PHONE_DOC_PILOT_TARGET`: a JSON object of exactly five strings
 (`source_doc_id`, `source_revision`, `request_id`, `task_id`, `recipient_id`),
