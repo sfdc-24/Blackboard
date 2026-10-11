@@ -60,7 +60,9 @@ import binascii
 import datetime
 import hashlib
 import json
+import os
 import re
+import unicodedata
 from pathlib import Path
 
 ACL_FILE = Path(__file__).resolve().parent / "redis_acl.json"
@@ -78,6 +80,18 @@ OPS_READ = ("get", "hgetall", "xrange")
 OPS_WRITE = ("set", "del", "hset", "hput", "xadd")
 MAX_PUT_FIELDS = 50
 OPS = OPS_READ + OPS_WRITE
+
+# Generation audit. Off unless REDIS_GOV_VERIFY is explicitly on, so a deploy of this module does
+# not answer haudit and does not change get, hgetall, xrange, or any write. The op compares
+# SHA-256 and byte length of a canonical UTF-8 hash payload. It does not return the payload.
+VERIFY_OP = "haudit"
+VERIFY_FLAG = "REDIS_GOV_VERIFY"
+# bus_request.HEARTBEAT_KEY. Repeated here so this module does not import the worker.
+HEARTBEAT_READ_KEY = "gov:worker:heartbeat"
+MAX_AUDIT_KEYS = 128
+MAX_AUDIT_LISTED = 128
+MAX_AUDIT_MANIFEST_BYTES = 65536
+_VERIFY_ON = {"1", "true", "on", "yes"}
 
 # A key reaches the server verbatim, so its grammar is closed: no space, no glob character (* ? [ ]),
 # no control character, bounded length. A colon is allowed - it is how a namespace is spelled.
@@ -148,6 +162,20 @@ def _matches(key: str, prefixes) -> bool:
     return any(p == "*" or key.startswith(p) for p in (prefixes or ()))
 
 
+def verifier_enabled(env=None) -> bool:
+    """True only when REDIS_GOV_VERIFY is explicitly on. Unset, empty, and anything else are off."""
+    source = os.environ if env is None else env
+    return str(source.get(VERIFY_FLAG) or "").strip().lower() in _VERIFY_ON
+
+
+def active_ops(env=None):
+    """The ops check() will accept. haudit is absent until the flag is on, so the refusal for an
+    unknown op stays the list this module shipped with."""
+    if verifier_enabled(env):
+        return OPS + (VERIFY_OP,)
+    return OPS
+
+
 def check(acl: dict, who: str, op: str, key: str, field: str = "") -> None:
     """Raise Refused unless `who` may perform `op` on `key`. Returns nothing when allowed.
 
@@ -158,8 +186,8 @@ def check(acl: dict, who: str, op: str, key: str, field: str = "") -> None:
         raise Refused("the access list is unreadable, so nothing is permitted")
     if not who:
         raise Refused("the sender is not a principal in the access list")
-    if op not in OPS:
-        raise Refused("unknown op; the ops are " + ", ".join(OPS))
+    if op not in active_ops():
+        raise Refused("unknown op; the ops are " + ", ".join(active_ops()))
     if not _KEY.match(key or ""):
         raise Refused("the key is missing or not a key (letters, digits, . _ : - only, at most 200)")
     if field and not _FIELD.match(field):
@@ -256,16 +284,23 @@ def _audit_alone(conn, fields) -> None:
 # ------------------------------------------------------------------------------------------ the ops
 
 def execute(conn, acl: dict, raw_tag: str, via: str, op: str, key: str, field: str = "",
-            raw_value: str = "", enc: str = "", count: int = 10, now=None) -> dict:
+            raw_value: str = "", enc: str = "", count: int = 10, now=None, generation: str = "",
+            correlation: str = "", head: str = "") -> dict:
     """Do one governed operation. Always returns a result dict; never raises into the caller.
 
     Every outcome - refused, read, written, or failed - leaves exactly one gov:audit entry, and a
-    write's entry is committed in the SAME transaction as the write."""
+    write's entry is committed in the SAME transaction as the write.
+
+    generation, correlation and head are read only by haudit. Other ops ignore them."""
     who = principal(acl, raw_tag)
     op = (op or "").strip().lower()
     key = (key or "").strip()
     field = (field or "").strip()
+    echoed_generation = _id_echo(generation, "generation") if op == VERIFY_OP else ""
+    echoed_correlation = _id_echo(correlation, "correlation") if op == VERIFY_OP else ""
     try:
+        if op == VERIFY_OP and not verifier_enabled():
+            raise Refused("the verifier is off")
         check(acl, who, op, key, field)
         value = decode_value(raw_value, enc, acl, key) if op in ("set", "hset", "xadd") else None
         if op == "hset" and not field:
@@ -274,6 +309,9 @@ def execute(conn, acl: dict, raw_tag: str, via: str, op: str, key: str, field: s
             if field:
                 raise Refused("hput replaces the whole hash; it takes no field=")
             value = decode_mapping(raw_value, enc, acl, key)
+        if op == VERIFY_OP:
+            return _audit_generation(conn, acl, who, raw_tag, via, key, field, raw_value, enc,
+                                     echoed_generation, echoed_correlation, (head or "").strip(), now)
         if op in OPS_READ:
             return _read(conn, acl, who, raw_tag, via, op, key, count, now)
         return _write(conn, acl, who, raw_tag, via, op, key, field, value, now)
@@ -282,8 +320,10 @@ def execute(conn, acl: dict, raw_tag: str, via: str, op: str, key: str, field: s
             _audit_alone(conn, audit_fields(acl, who, raw_tag, via, op, key, field, False, str(why),
                                             now=now))
         except Exception as error:
-            return {"ok": False, "refused": str(why), "audit": "FAILED:" + type(error).__name__}
-        return {"ok": False, "refused": str(why), "audit": "ok"}
+            result = {"ok": False, "refused": str(why), "audit": "FAILED:" + type(error).__name__}
+        else:
+            result = {"ok": False, "refused": str(why), "audit": "ok"}
+        return _attach_verify_ids(result, op, echoed_generation, echoed_correlation)
     except Exception as error:
         # The TYPE, never the message: a client's message can quote what it was sent.
         reason = "failed:" + type(error).__name__
@@ -292,7 +332,11 @@ def execute(conn, acl: dict, raw_tag: str, via: str, op: str, key: str, field: s
                                             now=now))
         except Exception:
             pass
-        return {"ok": False, "error": type(error).__name__}
+        result = {"ok": False, "error": type(error).__name__}
+        if op == VERIFY_OP:
+            result["partial"] = True
+            result["timeout"] = _is_timeout(error)
+        return _attach_verify_ids(result, op, echoed_generation, echoed_correlation)
 
 
 def _read(conn, acl, who, raw_tag, via, op, key, count, now) -> dict:
@@ -328,6 +372,385 @@ def canonical(mapping) -> str:
 
 def _text(value) -> str:
     return value.decode("utf-8", "replace") if isinstance(value, bytes) else str(value)
+
+
+def _nfc(value) -> str:
+    return unicodedata.normalize("NFC", _text(value))
+
+
+def canonical_utf8(mapping) -> bytes:
+    """The hash as canonical UTF-8 bytes.
+
+    Field names and values are decoded as UTF-8 and NFC-normalised before they are sorted, so a
+    composed character and its decomposed form are one payload, and insertion order is not part of
+    the payload. The JSON is compact and not ASCII-escaped. Two fields whose names collapse to the
+    same NFC string are a collision: this raises Refused rather than dropping one of them."""
+    clean = {}
+    for key, value in (mapping or {}).items():
+        name = _nfc(key)
+        if name in clean:
+            raise Refused("two fields normalise to one name; nothing was treated as a match")
+        clean[name] = _nfc(value)
+    return json.dumps(clean, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def payload_digest(mapping) -> tuple:
+    """(sha256 hex, byte length) of canonical_utf8(mapping)."""
+    raw = canonical_utf8(mapping)
+    return hashlib.sha256(raw).hexdigest(), len(raw)
+
+
+def _id_echo(value, kind) -> str:
+    """An id safe to put back on a board row, or "" when the raw text is not one.
+
+    The raw text is never returned. A generation id is 64 hex characters. A correlation id is a
+    short token from the same alphabet as a Redis key."""
+    text = str(value or "").strip()
+    if kind == "generation":
+        return text if re.fullmatch(r"[0-9a-f]{64}", text) else ""
+    return text if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,80}", text) else ""
+
+
+def _is_timeout(error) -> bool:
+    return isinstance(error, TimeoutError) or type(error).__name__ == "TimeoutError"
+
+
+def _attach_verify_ids(result, op, generation, correlation):
+    if op != VERIFY_OP:
+        return result
+    result["op"] = VERIFY_OP
+    result["generation"] = generation
+    result["correlation"] = correlation
+    return result
+
+
+def verifier_scope(who: str, key: str) -> bool:
+    """The keys haudit may touch, which is narrower than a fleet agent's read '*'.
+
+    Own inbox, the governed write prefixes, and the worker heartbeat. get and hgetall are unchanged
+    and still follow the access list. A digest of a key the caller could not otherwise name is
+    still a digest of that key, so this op does not become a second way to read the board mirror,
+    another agent's inbox, or the audit stream."""
+    own = "fleet:inbox:" + (who or "")
+    if key == own or key.startswith(own + ":"):
+        return True
+    if key.startswith("conf:") or key.startswith("proj:"):
+        return True
+    return key == HEARTBEAT_READ_KEY
+
+
+def _guard_verify_key(acl, who, key) -> None:
+    if not verifier_scope(who, key):
+        raise Refused("that key is outside this agent's verifier scope")
+    check(acl, who, "hgetall", key)
+
+
+def _parse_manifest(raw: str, enc: str) -> dict:
+    """b64 JSON of {keys: {key: {sha256, len}}}. Any other field is refused, unread.
+
+    The manifest is digests and lengths only. A stored string does not belong in it, and a field
+    that is not sha256 or len is refused without being copied into the refusal."""
+    if enc != "b64":
+        raise Refused("haudit needs enc=b64")
+    try:
+        blob = base64.b64decode(str(raw or "").encode("ascii"), validate=True)
+    except (binascii.Error, ValueError):
+        raise Refused("haudit val is not valid base64")
+    if len(blob) > MAX_AUDIT_MANIFEST_BYTES:
+        raise Refused("haudit manifest is over the byte cap")
+    try:
+        data = json.loads(blob.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise Refused("haudit manifest is not UTF-8 JSON")
+    if not isinstance(data, dict) or set(data) != {"keys"}:
+        raise Refused("haudit manifest must be an object whose only member is keys")
+    keys = data["keys"]
+    if not isinstance(keys, dict) or not keys:
+        raise Refused("haudit manifest needs a non-empty keys object")
+    if len(keys) > MAX_AUDIT_KEYS:
+        raise Refused("haudit manifest has too many keys")
+    expected = {}
+    for name, spec in keys.items():
+        if not isinstance(name, str) or not _KEY.match(name):
+            raise Refused("haudit key is not a key")
+        if not isinstance(spec, dict) or set(spec) != {"sha256", "len"}:
+            raise Refused("haudit key entry must be sha256 and len only")
+        digest, length = spec["sha256"], spec["len"]
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise Refused("haudit sha256 must be 64 hex characters")
+        if isinstance(length, bool) or not isinstance(length, int) or length < 0 or length > 1_000_000:
+            raise Refused("haudit len must be a byte length")
+        expected[name] = {"sha256": digest, "len": length}
+    return expected
+
+
+def _hash_generation(conn, key):
+    """The head hash's generation field, and the raw field for the movement compare.
+
+    Only that one field is read. A string or stream is not read at all. The raw field is
+    discarded unless it is itself a 64-hex generation id, so a secret parked in the field
+    cannot ride out on the result."""
+    kind = _text(conn.type(key))
+    if kind != "hash":
+        return "", ""
+    raw = _text(conn.hget(key, "generation") or "")
+    return (raw if re.fullmatch(r"[0-9a-f]{64}", raw) else ""), raw
+
+
+def _keys_under(conn, prefix, limit):
+    """Keys that start with prefix. The second value is True when the listing stopped early."""
+    scan = getattr(conn, "scan_iter", None)
+    if not callable(scan):
+        raise Refused("this connection cannot list a generation, so the audit cannot cover it")
+    found, seen = [], set()
+    try:
+        for key in scan(match=prefix + "*", count=100):
+            text = _text(key)
+            if text in seen or not text.startswith(prefix):
+                continue
+            if len(found) >= limit:
+                return found, True
+            seen.add(text)
+            found.append(text)
+    except Exception as error:
+        if _is_timeout(error):
+            raise TimeoutError("generation listing timed out")
+        raise
+    return found, False
+
+
+def _audit_report(entries) -> tuple:
+    lines = ["%s\t%s\t%d\t%s" % (entry["key"], entry["sha256"], entry["len"], entry["status"])
+             for entry in sorted(entries, key=lambda item: item["key"])]
+    raw = "\n".join(lines).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest(), len(raw)
+
+
+def _publish_audit(entries, generation, correlation, coverage, partial, moved, timeout,
+                   head_generation, audit="ok", refused="", error=""):
+    """The only shape haudit returns. There is no field for a stored string."""
+    out = {
+        "ok": False,
+        "op": VERIFY_OP,
+        "generation": generation,
+        "correlation": correlation,
+        "partial": bool(partial),
+        "moved": bool(moved),
+        "timeout": bool(timeout),
+        "head_generation": head_generation if re.fullmatch(r"[0-9a-f]{64}", head_generation or "") else "",
+        "coverage": {
+            "expected": int(coverage.get("expected") or 0),
+            "seen": int(coverage.get("seen") or 0),
+            "missing": int(coverage.get("missing") or 0),
+            "extra": int(coverage.get("extra") or 0),
+            "changed": int(coverage.get("changed") or 0),
+            "matched": int(coverage.get("matched") or 0),
+            "covered": bool(coverage.get("covered")),
+        },
+        "keys": [{
+            "key": entry["key"],
+            "sha256": entry["sha256"] if re.fullmatch(r"[0-9a-f]{64}", entry.get("sha256") or "") else "",
+            "len": int(entry.get("len") or 0),
+            "status": entry["status"] if entry.get("status") in ("match", "missing", "extra", "changed")
+            else "changed",
+        } for entry in entries],
+        "audit": audit or "",
+    }
+    digest, length = _audit_report(out["keys"])
+    out["digest"] = digest
+    out["length"] = length
+    clean = (out["coverage"]["missing"] == 0 and out["coverage"]["extra"] == 0
+             and out["coverage"]["changed"] == 0 and out["coverage"]["matched"] == out["coverage"]["expected"]
+             and out["coverage"]["expected"] > 0 and not out["partial"] and not out["moved"]
+             and not out["timeout"] and not refused and not error and bool(coverage.get("head_match")))
+    out["coverage"]["covered"] = clean
+    out["ok"] = clean and audit == "ok"
+    if refused:
+        out["ok"] = False
+        out["refused"] = str(refused)[:200]
+    if error:
+        out["ok"] = False
+        out["error"] = str(error)[:80]
+    return out
+
+
+def _audit_generation(conn, acl, who, raw_tag, via, prefix, field, raw_value, enc,
+                      generation, correlation, head, now) -> dict:
+    """Compare one generation to the caller's digest manifest.
+
+    Reads are watched. A head generation or a key set that changes before the watch is confirmed
+    is reported as moved and is not a pass. A listing that stops early, or a read that does not
+    finish, is partial and is not a pass. TimeoutError is returned as timeout, with the correlation
+    id, and its message is not."""
+    if field:
+        raise Refused("haudit takes no field=")
+    if not generation:
+        raise Refused("haudit needs a 64-hex generation id")
+    if not correlation:
+        raise Refused("haudit needs a correlation id")
+    if not head:
+        raise Refused("haudit needs a head key")
+    if not prefix.endswith(":") or (":" + generation[:16] + ":") not in prefix:
+        raise Refused("the prefix is not this generation")
+    if head.startswith(prefix):
+        raise Refused("the head key must sit outside the generation prefix")
+    _guard_verify_key(acl, who, prefix)
+    _guard_verify_key(acl, who, head)
+    expected = _parse_manifest(raw_value, enc)
+    for name in expected:
+        if not name.startswith(prefix):
+            raise Refused("a manifest key is outside the generation prefix")
+        _guard_verify_key(acl, who, name)
+
+    try:
+        found, truncated = _keys_under(conn, prefix, MAX_AUDIT_LISTED)
+    except TimeoutError:
+        return _finish_audit(conn, acl, who, raw_tag, via, prefix, [], generation, correlation,
+                             {"expected": len(expected), "seen": 0, "head_match": False},
+                             partial=True, moved=False, timeout=True, head_generation="", now=now,
+                             error="TimeoutError")
+    for name in found:
+        _guard_verify_key(acl, who, name)
+
+    watched = sorted(set(found) | set(expected) | {head})
+    pipe = conn.pipeline(transaction=True)
+    records = {}
+    partial = truncated
+    moved = False
+    timed_out = False
+    hard_error = ""
+    head_generation = ""
+    head_match = False
+    found_after = list(found)
+    try:
+        for name in watched:
+            pipe.watch(name)
+        try:
+            head_generation, head_raw_before = _hash_generation(pipe, head)
+        except Exception as error:
+            if _is_timeout(error):
+                timed_out = True
+            else:
+                hard_error = type(error).__name__
+            partial = True
+            head_raw_before = None
+        if not timed_out and not hard_error:
+            for name in sorted(set(found) | set(expected)):
+                try:
+                    kind = _text(pipe.type(name))
+                    if kind == "none":
+                        records[name] = ("missing", "", 0)
+                        continue
+                    if kind != "hash":
+                        records[name] = ("changed", "", 0)
+                        continue
+                    raw_hash = pipe.hgetall(name) or {}
+                    mapping = {_text(k): _text(v) for k, v in raw_hash.items()}
+                    try:
+                        digest, length = payload_digest(mapping)
+                    except Refused:
+                        records[name] = ("changed", "", 0)
+                        partial = True
+                        continue
+                    records[name] = ("hash", digest, length)
+                except Exception as error:
+                    partial = True
+                    if _is_timeout(error):
+                        timed_out = True
+                    else:
+                        hard_error = type(error).__name__
+                    break
+        head_raw_after = head_raw_before
+        if not timed_out and not hard_error:
+            try:
+                _published_after, head_raw_after = _hash_generation(pipe, head)
+                found_after, truncated_after = _keys_under(conn, prefix, MAX_AUDIT_LISTED)
+                if truncated_after:
+                    partial = True
+            except Exception as error:
+                partial = True
+                if _is_timeout(error):
+                    timed_out = True
+                else:
+                    hard_error = type(error).__name__
+        if head_raw_before is not None and head_raw_after != head_raw_before:
+            moved = True
+        if not timed_out and not hard_error and set(found_after) != set(found):
+            moved = True
+        head_match = bool(head_raw_before) and head_raw_before == generation and not moved
+        if not timed_out and not hard_error:
+            try:
+                pipe.multi()
+                pipe.type(head)
+                pipe.execute(raise_on_error=False)
+            except Exception as error:
+                if type(error).__name__ == "WatchError":
+                    moved = True
+                    head_match = False
+                elif _is_timeout(error):
+                    timed_out = True
+                    partial = True
+                else:
+                    hard_error = type(error).__name__
+                    partial = True
+    finally:
+        pipe.reset()
+
+    entries = []
+    missing = extra = changed = matched = 0
+    for name in sorted(expected):
+        if name not in records:
+            partial = True
+            continue
+        kind, digest, length = records[name]
+        want = expected[name]
+        if kind == "missing":
+            if truncated:
+                partial = True
+                continue
+            status = "missing"
+            missing += 1
+            digest, length = "", 0
+        elif kind != "hash" or digest != want["sha256"] or length != want["len"]:
+            status = "changed"
+            changed += 1
+        else:
+            status = "match"
+            matched += 1
+        entries.append({"key": name, "sha256": digest, "len": length, "status": status})
+    for name in sorted(found):
+        if name in expected:
+            continue
+        kind, digest, length = records.get(name, ("changed", "", 0))
+        extra += 1
+        entries.append({"key": name, "sha256": digest if kind == "hash" else "",
+                        "len": length if kind == "hash" else 0, "status": "extra"})
+    coverage = {
+        "expected": len(expected), "seen": len(found), "missing": missing, "extra": extra,
+        "changed": changed, "matched": matched, "head_match": head_match,
+    }
+    return _finish_audit(conn, acl, who, raw_tag, via, prefix, entries, generation, correlation,
+                         coverage, partial=partial or bool(hard_error), moved=moved,
+                         timeout=timed_out, head_generation=head_generation, now=now,
+                         error=("TimeoutError" if timed_out else hard_error))
+
+
+def _finish_audit(conn, acl, who, raw_tag, via, key, entries, generation, correlation, coverage,
+                  partial, moved, timeout, head_generation, now, error=""):
+    result = _publish_audit(entries, generation, correlation, coverage, partial, moved, timeout,
+                            head_generation, audit="ok", error=error)
+    reason = "missing=%d extra=%d changed=%d partial=%d moved=%d timeout=%d" % (
+        result["coverage"]["missing"], result["coverage"]["extra"], result["coverage"]["changed"],
+        int(result["partial"]), int(result["moved"]), int(result["timeout"]))
+    try:
+        _audit_alone(conn, audit_fields(acl, who, raw_tag, via, VERIFY_OP, key, "", result["ok"],
+                                        reason, now=now))
+    except Exception as failure:
+        result["audit"] = "FAILED:" + type(failure).__name__
+        result["ok"] = False
+        result["coverage"]["covered"] = False
+        result["partial"] = True
+    return result
 
 
 def _write(conn, acl, who, raw_tag, via, op, key, field, value, now) -> dict:
@@ -402,8 +825,48 @@ def _write(conn, acl, who, raw_tag, via, op, key, field, value, now) -> dict:
             "old_sha": entry["old_sha"], "new_sha": entry["new_sha"], "audit": "ok"}
 
 
+def _summarise_verify(result: dict) -> str:
+    """One line of ids, counts and digests. Stored strings are not in the result, and this does not
+    go looking for them."""
+    if result.get("refused"):
+        return "REFUSED haudit gen=%s cid=%s: %s (audited: %s)" % (
+            result.get("generation") or "-", result.get("correlation") or "-",
+            result["refused"], result.get("audit", "?"))
+    cov = result.get("coverage") or {}
+    base = ("HAUDIT ok=%d gen=%s cid=%s expected=%d seen=%d missing=%d extra=%d changed=%d "
+            "matched=%d covered=%d partial=%d moved=%d timeout=%d digest=%s length=%d" % (
+                int(bool(result.get("ok"))), result.get("generation") or "-",
+                result.get("correlation") or "-", int(cov.get("expected") or 0),
+                int(cov.get("seen") or 0), int(cov.get("missing") or 0), int(cov.get("extra") or 0),
+                int(cov.get("changed") or 0), int(cov.get("matched") or 0),
+                int(bool(cov.get("covered"))), int(bool(result.get("partial"))),
+                int(bool(result.get("moved"))), int(bool(result.get("timeout"))),
+                result.get("digest") or "-", int(result.get("length") or 0)))
+    if result.get("error"):
+        base += " error=%s" % result["error"]
+    detail = ",".join(
+        "%s=%s:%d:%s" % (entry.get("key") or "", entry.get("sha256") or "",
+                         int(entry.get("len") or 0), entry.get("status") or "")
+        for entry in (result.get("keys") or []))
+    if detail and len(base) + 1 + len(detail) <= 800:
+        return base + " " + detail
+    mismatches = [entry for entry in (result.get("keys") or []) if entry.get("status") != "match"]
+    brief = ",".join(
+        "%s=%s:%d:%s" % (entry.get("key") or "", entry.get("sha256") or "",
+                         int(entry.get("len") or 0), entry.get("status") or "")
+        for entry in mismatches)
+    if brief and len(base) + 1 + len(brief) <= 800:
+        return base + " " + brief
+    if mismatches:
+        return base + " detail=bounded"
+    return base
+
+
 def summarise(result: dict) -> str:
     """One line for a board RESULT row: pipe-free, newline-free, bounded."""
+    if result.get("op") == VERIFY_OP:
+        line = _summarise_verify(result).replace("|", "/").replace("\n", " ")
+        return line
     if not result.get("ok"):
         if "refused" in result:
             return "REFUSED: %s (audited: %s)" % (result["refused"], result.get("audit", "?"))
