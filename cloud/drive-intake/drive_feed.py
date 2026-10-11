@@ -12,11 +12,12 @@ WHY POLLING FIRST
 
 WHAT ONE POLL ASKS, AND WHAT IT NEVER WRITES
   files.list in the approved folder: Google Docs only, not trashed, modified
-  after the WATERMARK less a margin, OLDEST FIRST. The watermark is where the
-  last poll got to, not when it ran: a listing that still has pages after the
-  cap is returned as incomplete, with the watermark at the last doc it did
-  return, so the next poll continues from there instead of re-reading the
-  same newest thousand (Cursor on 0bee083). No watermark on record means a
+  after the WATERMARK less a margin, OLDEST FIRST, when the previous listing
+  finished. The watermark is where the last poll got to, not when it ran. A
+  listing that still has pages after the cap is incomplete, and its watermark
+  is the last doc it returned: the next poll resumes THERE, with no margin.
+  Subtracting the margin would re-read the same thousand docs and the cursor
+  would never move (Cursor on 0bee083). No watermark on record means a
   bounded look back, not "everything ever".
 
   This module writes NOTHING to the store. Cursor on 0bee083: the feed used to
@@ -135,7 +136,17 @@ class DriveFolder:
     def changes(self, folder_id: str) -> dict:
         import time  # noqa: PLC0415
         now = float(self.now) if self.now is not None else time.time()
-        since = since_for(self.store.watermark(), now, self.lookback, self.margin)
+        # A capped listing is resumed at its last doc. The margin is only for a listing that
+        # finished: an edit that landed while that poll ran is still inside the next window.
+        resume = getattr(self.store, "resume", None)
+        mark = self.store.watermark()
+        if callable(resume) and resume() and mark is not None:
+            try:
+                since = max(0.0, min(float(mark), now))
+            except (TypeError, ValueError):
+                since = since_for(mark, now, self.lookback, self.margin)
+        else:
+            since = since_for(mark, now, self.lookback, self.margin)
         query = query_for(folder_id, since)
         self.last_query = query
         files, page_token, complete = [], "", True
