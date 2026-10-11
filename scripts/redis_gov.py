@@ -88,18 +88,26 @@ VERIFY_OP = "haudit"
 VERIFY_FLAG = "REDIS_GOV_VERIFY"
 # bus_request.HEARTBEAT_KEY. Repeated here so this module does not import the worker.
 HEARTBEAT_READ_KEY = "gov:worker:heartbeat"
-MAX_AUDIT_KEYS = 128          # manifest cap. The verifier does not list or scan the keyspace.
 MAX_AUDIT_MANIFEST_BYTES = 65536
-# Truly paged. Page size 8, indexes 0..N-1, at most 128 documents (16 pages). Shared with #296.
+# Truly paged. Page size 8. A read is at most one batch of 128. The absolute generation ceiling
+# is 512 listed documents (64 pages), shared with #296 head 9a0d8f85. The 326-document board
+# (41 pages) is under that ceiling and is delivered, not refused. 2048 and 65536 do not rise.
 PAGE_SIZE = 8
-MAX_AUDIT_PAGES = MAX_AUDIT_KEYS // PAGE_SIZE
+MAX_AUDIT_BATCH = 128
+MAX_GENERATION_DOCS = 512
+MAX_AUDIT_KEYS = MAX_AUDIT_BATCH
+MAX_AUDIT_PAGES = MAX_GENERATION_DOCS // PAGE_SIZE
 # Per-document canonical cap. Checked with HLEN/HSTRLEN before HGETALL. Shared with the writer.
+# The manifest-root preimage is not a stored hash value. A 41-page preimage is 2787 bytes and
+# the head stores only its SHA-256, so this cap is not applied to that preimage.
 MAX_AUDIT_DOCUMENT_BYTES = 2048
 MAX_AUDIT_FIELDS = 64
 _VERIFY_ON = {"1", "true", "on", "yes"}
 
-# A key reaches the server verbatim, so its grammar is closed: no space, no glob character (* ? [ ]),
-# no control character, bounded length. A colon is allowed - it is how a namespace is spelled.
+# Key encoding, shared with sfdc24-site #296 head 9a0d8f85 (C14). repo_key is owner:name,
+# for example "sfdc-24:conference". A colon is legal and a GitHub owner or name has none,
+# so the first colon splits. Plus is outside the grammar. No percent-encoding.
+KEY_ENCODING = "owner:name"
 _KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _FIELD = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
 
@@ -494,7 +502,7 @@ def _pages_from_keys(specs) -> list:
 
 
 def _parse_manifest(raw: str, enc: str) -> list:
-    """b64 JSON of a paged manifest. Page size is 8. At most 128 documents.
+    """b64 JSON of a paged manifest. Page size is 8. At most MAX_GENERATION_DOCS documents.
 
     ``{"keys": {...}}`` is split into pages of 8 in key order. ``{"pages": [{"index", "keys"}]}``
     is the explicit form. A gap, a repeated key, or a short page that is not the last of a
@@ -532,7 +540,7 @@ def _parse_manifest(raw: str, enc: str) -> list:
     if reason:
         raise Refused(reason)
     total = sum(len(page["keys"]) for page in pages)
-    if total > MAX_AUDIT_KEYS:
+    if total > MAX_GENERATION_DOCS:
         raise Refused("haudit manifest has too many keys")
     return pages
 
@@ -577,7 +585,7 @@ def _count_field(raw):
     if not re.fullmatch(r"[0-9]{1,3}", text):
         return None
     value = int(text)
-    if value > MAX_AUDIT_KEYS:
+    if value > MAX_GENERATION_DOCS:
         return None
     return value
 
@@ -618,8 +626,8 @@ def check_page_union(pages) -> str:
     """"" when the pages can be read. The reason does not contain a key name.
 
     One page of at most PAGE_SIZE keys is allowed and is only ever page_ok. Two or more pages
-    must be indexes 0..N-1, each full page exactly PAGE_SIZE, no repeated key. More than 128
-    documents or 16 pages is refused."""
+    must be indexes 0..N-1, each full page exactly PAGE_SIZE, no repeated key. More than
+    MAX_GENERATION_DOCS documents is refused before any read."""
     if not pages:
         return "haudit needs a page"
     if len(pages) > MAX_AUDIT_PAGES:
@@ -642,7 +650,7 @@ def check_page_union(pages) -> str:
             if name in seen:
                 return "haudit key is listed on two pages"
             seen.add(name)
-    if total > MAX_AUDIT_KEYS:
+    if total > MAX_GENERATION_DOCS:
         return "haudit manifest has too many keys"
     if len(set(indexes)) != len(indexes):
         return "haudit page index is repeated"
@@ -891,16 +899,102 @@ def _read_listed(pipe, names, records):
     return partial, timed_out, hard_error, bound
 
 
+def _read_in_batches(conn, head, names, before):
+    """Read listed keys in batches of MAX_AUDIT_BATCH. Revalidate the head around every page.
+
+    The head snapshot was taken before any document. Each batch watches the head and its keys,
+    then reads at most 128 documents, one manifest page at a time. The head is read again after
+    every page, including page 0, and TYPE is confirmed inside EXEC at the end of a clean batch.
+    A head change at any of those points stops the read: later pages and later batches are not
+    fetched, and the result is not ok. There is no KEYS and no SCAN."""
+    records = {}
+    partial = timed_out = bound = moved = False
+    hard_error = ""
+    snapshot = _head_raw(before)
+    size = MAX_AUDIT_BATCH
+    for start in range(0, len(names), size):
+        batch = names[start:start + size]
+        pipe = conn.pipeline(transaction=True)
+        stop = False
+        try:
+            pipe.watch(head)
+            try:
+                now = _hash_head(pipe, head)
+            except Exception as error:
+                partial = True
+                if _is_timeout(error):
+                    timed_out = True
+                else:
+                    hard_error = type(error).__name__
+                break
+            if _head_raw(now) != snapshot:
+                moved = True
+                partial = True
+                break
+            for name in batch:
+                pipe.watch(name)
+            for page_start in range(0, len(batch), PAGE_SIZE):
+                page = batch[page_start:page_start + PAGE_SIZE]
+                read_partial, timed_out, hard_error, bound = _read_listed(pipe, page, records)
+                partial = partial or read_partial
+                if timed_out or hard_error or bound:
+                    stop = True
+                    break
+                try:
+                    after = _hash_head(pipe, head)
+                except Exception as error:
+                    partial = True
+                    if _is_timeout(error):
+                        timed_out = True
+                    else:
+                        hard_error = type(error).__name__
+                    stop = True
+                    break
+                if _head_raw(after) != snapshot:
+                    moved = True
+                    partial = True
+                    stop = True
+                    break
+            if stop:
+                break
+            pipe.multi()
+            pipe.type(head)
+            for name in batch:
+                pipe.type(name)
+            confirmed = pipe.execute(raise_on_error=False)
+            failed = _exec_error(confirmed)
+            if failed or len(confirmed) != 1 + len(batch):
+                hard_error = failed or "ExecError"
+                partial = True
+                break
+        except Exception as error:
+            partial = True
+            if type(error).__name__ == "WatchError":
+                moved = True
+            elif _is_timeout(error):
+                timed_out = True
+            else:
+                hard_error = type(error).__name__
+            break
+        finally:
+            pipe.reset()
+    return records, partial, timed_out, hard_error, bound, moved
+
+
 def _audit_generation(conn, acl, who, raw_tag, via, prefix, field, raw_value, enc,
                       generation, correlation, head, now) -> dict:
-    """Receipt for a paged manifest. Shared contract v2, root pinned by #296 head 45916666.
+    """Receipt for a paged manifest. Root serialization is #296 head 45916666. Ceiling is 9a0d8f85.
 
     The head is bound from the generation namespace. generation, manifest_root, page_count and
-    listed are read before any document. Only manifest-listed keys are read, each under WATCH.
-    Pages are 8 keys, at most 128 documents. There is no KEYS, no SCAN, and no Lua walk.
-    A document over 2048 bytes is refused before HGETALL. One page is page_ok and never ok.
-    ok requires every page 0..N-1, no gaps or overlap, the recomputed root equal to manifest_root,
-    and the head unchanged. The receipt has no key names."""
+    listed are read before any document and again after every manifest page and every batch.
+    Only manifest-listed keys are read, each under WATCH. Pages are 8 keys. A generation may
+    hold MAX_GENERATION_DOCS documents and is read in batches of MAX_AUDIT_BATCH. There is no
+    KEYS, no SCAN, and no Lua walk. A document over 2048 bytes is refused before HGETALL. One
+    page is page_ok and never ok. ok requires every page 0..N-1, no gaps or overlap, the
+    recomputed root equal to manifest_root, and the head unchanged from the first read through
+    the last page. A public route is refused before any read. The receipt has no key names."""
+    if "public-sheet" in str(via or "").lower():
+        raise Refused("haudit is not accepted from a public route")
     if field:
         raise Refused("haudit takes no field=")
     if not generation:
@@ -956,62 +1050,14 @@ def _audit_generation(conn, acl, who, raw_tag, via, prefix, field, raw_value, en
         # Head -> generation id before any document read. A mismatch does not open the manifest keys.
         if not timed_out and not hard_error and before and before["raw_generation"] == generation:
             started = True
-            for name in names:
-                pipe.watch(name)
-            read_partial, timed_out, hard_error, bound = _read_listed(pipe, names, records)
+            (records, read_partial, timed_out, hard_error, bound, moved) = _read_in_batches(
+                conn, head, names, before)
             partial = partial or read_partial
-            after = before
-            if not timed_out and not hard_error and not bound:
-                try:
-                    after = _hash_head(pipe, head)
-                except Exception as error:
-                    partial = True
-                    if _is_timeout(error):
-                        timed_out = True
-                    else:
-                        hard_error = type(error).__name__
-            if _head_raw(before) != _head_raw(after):
-                moved = True
         head_match = bool(before) and before["raw_generation"] == generation and not moved
         root_match = (head_match and bool(head_root) and head_root == claimed_root
                       and before["page_count"] == len(pages) and before["listed"] == len(expected))
         complete = root_match and full_page_union(pages, before["page_count"] if before else None,
                                                    before["listed"] if before else None)
-        if started and not timed_out and not hard_error and not bound:
-            try:
-                # TYPE each watched key inside the transaction. An error in any result is not a
-                # pass. WATCH aborts EXEC when a listed key or the head changes. Nothing here
-                # lists the keyspace.
-                pipe.multi()
-                pipe.type(head)
-                for name in names:
-                    pipe.type(name)
-                confirmed = pipe.execute(raise_on_error=False)
-                failed = _exec_error(confirmed)
-                if failed or len(confirmed) != 1 + len(names):
-                    hard_error = failed or "ExecError"
-                    partial = True
-                    head_match = False
-                    root_match = False
-                    complete = False
-            except Exception as error:
-                if type(error).__name__ == "WatchError":
-                    moved = True
-                    head_match = False
-                    root_match = False
-                    complete = False
-                elif _is_timeout(error):
-                    timed_out = True
-                    partial = True
-                    head_match = False
-                    root_match = False
-                    complete = False
-                else:
-                    hard_error = type(error).__name__
-                    partial = True
-                    head_match = False
-                    root_match = False
-                    complete = False
     finally:
         pipe.reset()
 

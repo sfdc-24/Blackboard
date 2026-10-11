@@ -621,11 +621,16 @@ class GenerationAudit(unittest.TestCase):
     def test_a_manifest_over_the_cap_is_refused_and_never_ok(self):
         conn = AuditRedis()
         gen = generation("0")
-        prefix = prefix_for(gen)
+        # Short proj: keys so 513 documents stay under the 65536-byte manifest cap and the
+        # refusal is the 512-document ceiling, not the byte cap.
+        prefix = "proj:g:" + gen[:16] + ":"
         expected = {}
-        for n in range(gov.MAX_AUDIT_KEYS + 1):
-            name = prefix + "k%03d" % n
+        for n in range(gov.MAX_GENERATION_DOCS + 1):
+            name = prefix + str(n)
             expected[name] = {"sha256": "ab" * 32, "len": 1}
+        raw = json.dumps({"keys": expected}, separators=(",", ":")).encode("utf-8")
+        self.assertLess(len(raw), gov.MAX_AUDIT_MANIFEST_BYTES)
+        self.assertGreater(gov.MAX_GENERATION_DOCS, 326)
         called = {"keys": 0, "scan": 0, "eval": 0}
 
         def forbid(name):
@@ -636,7 +641,9 @@ class GenerationAudit(unittest.TestCase):
 
         for name in ("keys", "scan", "eval"):
             setattr(conn, name, forbid(name))
-        out = audit(conn, gen, expected, cid="cid-over-cap")
+        out = gov.execute(conn, ACL, "cursor", "via", gov.VERIFY_OP, prefix,
+                          raw_value=b64_manifest(expected), enc="b64", generation=gen,
+                          correlation="cid-over-cap", head="proj:head")
         self.assertFalse(out["ok"], out)
         self.assertIn("too many", out["refused"])
         self.assertEqual({"keys": 0, "scan": 0, "eval": 0}, called)
@@ -747,6 +754,155 @@ class GenerationAudit(unittest.TestCase):
         self.assertNotIn(marker, blob)
         self.assertNotIn(key, blob)
         self.assertNotIn(SECRET, blob)
+
+    def test_owner_name_repo_key_passes_and_plus_does_not(self):
+        self.assertEqual("owner:name", gov.KEY_ENCODING)
+        self.assertTrue(gov._KEY.fullmatch("sfdc-24:conference"))
+        self.assertIsNone(gov._KEY.fullmatch("sfdc-24+conference"))
+        self.assertIsNone(gov._KEY.fullmatch("sfdc-24 conference"))
+        self.assertIsNone(gov._KEY.fullmatch("sfdc-24*conference"))
+        gen = generation("a")
+        key = prefix_for(gen) + "repo:sfdc-24:conference"
+        self.assertTrue(gov._KEY.fullmatch(key))
+        gov.check(ACL, "cursor", "hgetall", key)
+        gov.check(ACL, "cursor", "hput", key)
+        with self.assertRaises(gov.Refused):
+            gov.check(ACL, "cursor", "hgetall", prefix_for(gen) + "repo:sfdc-24+conference")
+
+    def test_a_public_sheet_route_is_refused_before_any_document_read(self):
+        conn = AuditRedis()
+        gen = generation("a")
+        key = prefix_for(gen) + "meta"
+        mapping = {"body": SECRET}
+        self._plant(conn, gen, {key: mapping})
+        expected = {key: spec(mapping)}
+        before = set(conn.data)
+
+        def run(via, cid):
+            return gov.execute(conn, ACL, "cursor", via, gov.VERIFY_OP, prefix_for(gen),
+                               raw_value=b64_manifest(expected), enc="b64", generation=gen,
+                               correlation=cid, head="proj:pr-board:v1:head")
+
+        out = run("public-sheet", "cid-public-sheet")
+        self.assertFalse(out["ok"])
+        self.assertFalse(out.get("page_ok"))
+        self.assertIn("public", out["refused"])
+        self.assertEqual(0, conn.fetches)
+        self.assertEqual(0, conn.scans)
+        self.assertEqual(before, set(conn.data) - {gov.AUDIT_STREAM})
+        blob = json.dumps(out) + gov.summarise(out) + json.dumps(conn.audit())
+        self.assertNotIn(key, blob)
+        self.assertNotIn(SECRET, blob)
+        again = run("Other-Public-Sheet", "cid-public-sheet-2")
+        self.assertIn("public", again["refused"])
+        self.assertEqual(0, conn.fetches)
+
+    def test_a_head_change_during_the_first_page_stops_the_read(self):
+        conn = AuditRedis()
+        gen = generation("f")
+        prefix = prefix_for(gen)
+        count = gov.MAX_AUDIT_BATCH + gov.PAGE_SIZE
+        planted = {prefix + "k%03d" % n: {"n": "%03d" % n} for n in range(count)}
+        self._plant(conn, gen, planted)
+        expected = {key: spec(mapping) for key, mapping in planted.items()}
+        seen = []
+        real = conn.hgetall
+
+        def hgetall(name):
+            seen.append(name)
+            if len(seen) == 1:
+                FakeRedis.hset(conn, "proj:pr-board:v1:head", "generation", generation("1"))
+            return real(name)
+
+        conn.hgetall = hgetall
+        out = audit(conn, gen, expected, cid="cid-first-page")
+        self.assertFalse(out["ok"], out)
+        self.assertFalse(out.get("page_ok"), out)
+        self.assertTrue(out["moved"], out)
+        self.assertLessEqual(len(seen), gov.PAGE_SIZE)
+        self.assertLessEqual(conn.fetches, gov.PAGE_SIZE)
+        self.assertNotIn(prefix + "k%03d" % gov.PAGE_SIZE, seen)
+        self.assertNotIn(prefix + "k%03d" % gov.MAX_AUDIT_BATCH, seen)
+        blob = json.dumps(out) + gov.summarise(out) + json.dumps(conn.audit())
+        self.assertNotIn(prefix + "k000", blob)
+        self.assertNotIn(SECRET, blob)
+
+    def test_board_326_fixture_root_and_report(self):
+        """#296 head 9a0d8f85. 159 conference PRs, as_of 2026-10-09T17:00:00Z, no history."""
+        path = ROOT / "tests" / "fixtures" / "board_326.json"
+        documents = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(326, len(documents))
+        gen = "f1bc5a226e0449ac6ba5e2c9395730aac81eabe6bdc6fdd79d4c2b38b85476e3"
+        prefix = prefix_for(gen)
+        planted = {}
+        for key, mapping in documents:
+            self.assertTrue(key.startswith(prefix), key)
+            self.assertTrue(gov._KEY.fullmatch(key), key)
+            planted[key] = mapping
+        self.assertIn(prefix + "repo:sfdc-24:conference", planted)
+        specs = {key: spec(mapping) for key, mapping in planted.items()}
+        names = sorted(specs)
+        pages = []
+        for index, start in enumerate(range(0, len(names), gov.PAGE_SIZE)):
+            chunk = {name: specs[name] for name in names[start:start + gov.PAGE_SIZE]}
+            pages.append({"index": index, "keys": chunk})
+        self.assertEqual(41, len(pages))
+        self.assertEqual(6, len(pages[-1]["keys"]))
+        root_raw = gov.root_body(
+            [gov.page_digest(gov.page_entries(page["keys"])) for page in pages], 326)
+        self.assertEqual(2787, len(root_raw))
+        self.assertEqual(
+            "09f6f05011d44c73ba16173297b80506070d2f7470f86b14eaf42203acb4c833",
+            hashlib.sha256(root_raw).hexdigest())
+        self.assertEqual(
+            "09f6f05011d44c73ba16173297b80506070d2f7470f86b14eaf42203acb4c833",
+            gov.root_from_pages(pages))
+        report_hex, report_len = gov.report_digest(specs)
+        self.assertEqual(
+            "786e44e7e7a82c9fd301d54c2e2d081c872608e4740332182dc2774691b6106a", report_hex)
+        self.assertEqual(37178, report_len)
+        self.assertLess(len(gov.manifest_body(specs)), gov.MAX_AUDIT_MANIFEST_BYTES)
+        self.assertLessEqual(max(spec_row["len"] for spec_row in specs.values()), 2048)
+        conn = AuditRedis()
+        self._plant(conn, gen, planted)
+        head = conn.hgetall("proj:pr-board:v1:head")
+        self.assertEqual(root_raw.decode("utf-8")[:1], "{")
+        self.assertNotIn(root_raw.decode("utf-8"), json.dumps(head))
+        self.assertEqual("41", head["page_count"])
+        self.assertEqual("326", head["listed"])
+        self.assertLess(len(gov.canonical_utf8(head)), 2048)
+        fetches_before = conn.fetches
+        called = {"keys": 0, "scan": 0, "eval": 0}
+
+        def forbid(name):
+            def wrapped(*args, **kwargs):
+                called[name] += 1
+                raise AssertionError(name)
+            return wrapped
+
+        for name in ("keys", "scan", "eval"):
+            setattr(conn, name, forbid(name))
+        out = audit(conn, gen, specs, cid="cid-board-326")
+        self.assertTrue(out["page_ok"], out)
+        self.assertTrue(out["ok"], out)
+        self.assertTrue(out["coverage"]["covered"], out)
+        self.assertEqual(326, out["listed"])
+        self.assertEqual(326, out["coverage"]["matched"])
+        self.assertEqual(41, out["page_count"])
+        self.assertEqual(
+            "09f6f05011d44c73ba16173297b80506070d2f7470f86b14eaf42203acb4c833",
+            out["manifest_root"])
+        self.assertEqual(out["manifest_root"], out["head_manifest_root"])
+        self.assertEqual(report_hex, out["digest"])
+        self.assertEqual(37178, out["length"])
+        self.assertEqual(fetches_before + 326, conn.fetches)
+        self.assertEqual(0, conn.scans)
+        self.assertEqual({"keys": 0, "scan": 0, "eval": 0}, called)
+        blob = json.dumps(out) + gov.summarise(out) + json.dumps(conn.audit())
+        self.assertNotIn(prefix + "repo:sfdc-24:conference", blob)
+        self.assertNotIn(prefix + "i:0", blob)
+        self.assertNotIn("readback-", blob)
+        self.assertNotIn("keys", out)
 
 
 class ScopeAndManifest(unittest.TestCase):
