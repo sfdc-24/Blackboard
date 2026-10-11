@@ -1208,10 +1208,11 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
                 raise HTTPException(429, "the conversations for today are used up") from exc
         # telephone_doc stays unset. This handler's fields (title, creation_id,
         # start, topic) are the client's, and the task id on the session is
-        # minted here, not taken from a Drive file. drive-intake's dispatcher
-        # keeps source_doc_id on its own tuple and does not write this session.
-        # Copying ?doc= or a body field into the binding would make the client
-        # the authority, which the telephone read is written to refuse.
+        # minted here, not taken from a Drive file. drive-intake's correlate()
+        # keeps source_doc_id on its own tuple (a drive task, not this session)
+        # and does not write this session. Copying ?doc= or a body field into
+        # the binding would make the client the authority, which the telephone
+        # read is written to refuse.
         token = mint_token(state["session_id"], state["expires_at"], settings.session_secret)
         return {
             "session_id": state["session_id"],
@@ -1576,10 +1577,22 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         query is checked against this field and is not itself the binding.
         Off with the trail (no STUDIO_TELEPHONE_URL), this refuses and stores nothing.
 
-        Nothing in the normal session path calls this. POST /v1/session does
-        not know a Drive file id the server assigned, and drive-intake's
-        dispatcher never writes a studio session. Until one of those holds a
-        trusted id, a session created the normal way stays unbound.
+        Nothing in the normal session path calls this, and there is no HTTP
+        route that does. POST /v1/session does not know a Drive file id the
+        server assigned. drive-intake's correlate() trusts source_doc_id as
+        the file it re-read, then derives its own task id from that file, the
+        request revision, and the request id. That task is not this session's
+        task_id, and the tuple has no session id. The doc grammar (to:, request:)
+        does not name a session. Studio state is not the fleet inbox drive-intake
+        writes, and this service's inbound authenticators are the browser token
+        and the voice-sweep secret, neither of which is drive-intake.
+
+        A binding may be written only after drive-intake has correlated a doc
+        to a live session and called this with that source_doc_id. No such
+        correlation exists. A session id in the doc, an operator-to-doc map,
+        a client doc field, and a session minted at dispatch were not added:
+        each would be a new source, and the first three are the author's or
+        the client's claim. A session created the normal way stays unbound.
         """
         if not settings.telephone_url:
             raise HTTPException(404, "the telephone trail is off")

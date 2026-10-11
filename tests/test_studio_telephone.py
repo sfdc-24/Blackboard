@@ -355,6 +355,30 @@ class TelephoneTests(unittest.TestCase):
             self.assertEqual(own.json(), still.json())
             self.assertEqual([], self.upstream.calls)
 
+    def test_no_http_caller_can_bind_a_doc(self):
+        """bind_telephone_doc is in-process only. A signed-in client, an
+        unauthenticated caller, and a forged doc id have no route that stores one.
+        """
+        with TestClient(self.app()) as client:
+            sid, headers, _created = self.session(client)
+            attempts = (
+                client.post("/v1/session/%s/telephone" % sid, headers=headers, json={"doc": DOC}),
+                client.put("/v1/session/%s/telephone" % sid, headers=headers, json={"doc": DOC}),
+                client.post("/v1/session/%s/telephone/bind" % sid, headers=headers, json={"doc": DOC}),
+                client.post("/v1/telephone/bind", headers=headers, json={"session_id": sid, "doc": DOC}),
+                client.post("/v1/session/%s/telephone" % sid, headers=ORIGIN, json={"doc": DOC}),
+                client.post("/v1/telephone/bind", json={"session_id": sid, "doc": DOC}),
+            )
+            for response in attempts:
+                self.assertIn(response.status_code, (404, 405), response.text)
+                self.assertNotIn("telephone_doc", response.text)
+                self.assertNotIn("entries", response.text)
+            self.assertNotIn("telephone_doc", self.stored(sid))
+            self.assertEqual([], self.upstream.calls)
+            refused = client.get("/v1/session/%s/telephone" % sid, params={"doc": DOC}, headers=ORIGIN)
+            self.assertEqual(401, refused.status_code, refused.text)
+            self.assertNotIn("telephone_doc", self.stored(sid))
+
     def test_with_the_flag_unset_session_creation_does_not_bind_and_other_routes_stay(self):
         """STUDIO_TELEPHONE_URL unset: the route is 404, creation stores nothing, events stay put."""
         with TestClient(self.app(telephone_url="")) as client:

@@ -276,6 +276,34 @@ class DuplicateTest(unittest.TestCase):
         self.assertFalse(di.tuple_ok(dict(a, source_doc_id="short")))
         self.assertFalse(di.tuple_ok(dict(a, drive_revision="")))
 
+    def test_correlation_is_a_drive_task_and_not_a_studio_session(self):
+        """A session id in the doc is the author's text, not a binding.
+
+        correlate() keeps the same six fields. It does not grow a session id
+        from a line that looks like one, and decide() does not call a studio
+        controller or return a telephone binding.
+        """
+        session_id = "s-" + ("ab" * 16)
+        text = "session: %s\n%s" % (session_id, REQUEST)
+        bound = di.correlate(FILE, text, "r1", "claude-api")
+        plain = di.correlate(FILE, REQUEST, "r1", "claude-api")
+        self.assertEqual(
+            {"source_doc_id", "source_revision", "drive_revision", "request_id", "task_id", "recipient_id"},
+            set(bound))
+        self.assertEqual("OT-20261010", bound["request_id"])
+        self.assertEqual(FILE, bound["source_doc_id"])
+        self.assertNotIn(session_id, bound.values())
+        self.assertNotEqual(plain["task_id"], bound["task_id"])  # extra text changes the request, not a join
+        d = deps(docs=Docs(text=text))
+        out = di.decide(hint(), d)
+        self.assertEqual("dispatched", out["status"], out)
+        self.assertNotIn("session_id", out)
+        self.assertNotIn("telephone_doc", out)
+        self.assertEqual(set(bound), set(out["tuple"]))
+        self.assertNotIn(session_id, out["tuple"].values())
+        self.assertEqual(FILE, d.queue.puts[0][0]["source_doc_id"])
+        self.assertNotIn("session_id", d.queue.puts[0][0])
+
     def test_two_overlapping_passes_deliver_once(self):
         """Cursor on d150d84: push and poll both observed `intake` and each put to a worker."""
         class Racing(di.MemoryClaims):
