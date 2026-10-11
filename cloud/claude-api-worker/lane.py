@@ -98,7 +98,10 @@ def parse_done(raw):
         return None
     note = " ".join(str(data.get("note") or "").split())
     if len(note) > NOTE_MAX:
-        note = note[:NOTE_MAX].rstrip() + " [note cut at %d of %d characters]" % (NOTE_MAX, len(note))
+        # The label sits INSIDE the bound (Cursor on #357's 517a918: 300 kept plus a label stored 336),
+        # the same shape the laptop's tool writes, so a note cut there is not cut again here.
+        label = " [note cut here: %d characters in all]" % len(note)
+        note = note[:NOTE_MAX - len(label)].rstrip() + label
     evidence = str(data.get("evidence") or "").strip()
     if evidence and not EVIDENCE_OK.match(evidence):
         evidence = "(evidence link refused: not an https URL)"

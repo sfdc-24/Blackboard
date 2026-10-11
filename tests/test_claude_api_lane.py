@@ -280,7 +280,10 @@ class DoneTest(unittest.TestCase):
     def test_the_note_is_bounded_and_the_evidence_must_be_https(self):
         done = lane.parse_done(json.dumps({"by": LAPTOP, "state": "SUCCEEDED", "note": "x" * 400,
                                            "evidence": "ftp://nope"}))
-        self.assertTrue(done["note"].endswith("[note cut at 300 of 400 characters]"), done["note"][-60:])
+        self.assertTrue(done["note"].endswith("[note cut here: 400 characters in all]"), done["note"][-60:])
+        self.assertLessEqual(len(done["note"]), lane.NOTE_MAX)            # the label is inside the bound
+        exact = lane.parse_done(json.dumps({"by": LAPTOP, "state": "SUCCEEDED", "note": "y" * 300}))
+        self.assertEqual("y" * 300, exact["note"])                         # 300 is kept whole
         self.assertEqual("(evidence link refused: not an https URL)", done["evidence"])
         self.assertIn("evidence (evidence link refused", lane.done_detail(done))
         plain = lane.parse_done(json.dumps({"by": LAPTOP, "state": "FAILED"}))
