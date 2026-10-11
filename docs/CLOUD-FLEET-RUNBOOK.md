@@ -170,7 +170,8 @@ accounts - a share nobody but the owner can do.
    within one tick REQUESTED (recipient claude-api) and DISPATCHED in the doc,
    `/healthz` poll ok. Nothing else runs yet: the task waits on
    `fleet:inbox:claude-api`.
-2. `claude-api-worker/deploy.sh worker on`. The next tick: ACCEPTED, then
+2. `claude-api-worker/deploy.sh worker on` (it reads the job back and refuses
+   while any cost input below is unset). The next tick: ACCEPTED, then
    SUCCEEDED with the answer under it, one call in the Anthropic console,
    `fleet:spend:<day>` moved by one reservation; the tick after: `idle`.
 3. `claude-api-worker/deploy.sh lane on`, laptop ON with
@@ -184,6 +185,65 @@ accounts - a share nobody but the owner can do.
 **Rollback** is the flag, never a redeploy: `deploy.sh off`, `worker off`,
 `lane off`. A doc already claimed keeps its claim (30 days) and its receipts;
 turning a flag back on resumes from the doc's own trail.
+
+**The cost inputs (#374), without which the worker calls nothing.** Five values
+are read as fail-closed: unset or zero, the job deploys and runs, and every
+task gets one QUEUED line a day ("no valid cap, reservation, price, exchange
+rate, model limit or authorization deadline; nothing called"). They are the
+owner's, set in the shell that runs `deploy`, never committed:
+`CLAUDE_API_WORKER_USD_PER_MTOK_IN` and `_OUT` (the price of the chosen model
+id, from the Claude pricing page), `CLAUDE_API_WORKER_MAX_INPUT_TOKENS` (the
+input size that price holds for: the pricing tier's bound, not the context
+window; a request larger than it is refused, and the reservation is the worst
+case at that bound), `FLEET_CAD_PER_USD` (a ceiling rate; every cost is rounded
+UP into CAD cents, so a high rate only over-reserves), and
+`CLAUDE_API_WORKER_AUTHORIZED_UNTIL_UTC` (his authorization deadline, `...Z`;
+no call at or after it, checked on Redis's clock inside the reservation). The
+cap stays `FLEET_SPEND_CAP_CENTS_CAD` (2500 unless he sets it). `deploy.sh cost`
+prints the inputs as deployed; `worker on` refuses while any is unset.
+
+**One intake at a time.** #374 also ships `PHONE_DOC_INTAKE_ENABLED`, a second
+intake inside the worker job over the two originals only (owner request blocks
+between `BEGIN OWNER REQUEST` and `END OWNER REQUEST`). With both it and
+`DRIVE_INTAKE_ENABLED` on, one request becomes two tasks (the two intakes hash
+different revisions of the same words), two calls and two answers in the doc,
+and the pilot's inbox filter checkpoints the worker past the service's rows for
+good. So `drive-intake/deploy.sh on` reads the job back and refuses while the
+pilot is on, and `claude-api-worker/deploy.sh pilot on` refuses while the
+service's flag is on. Turn one off before the other goes on.
+
+**Step 4: the trail on the call page (#376, site #309).** drive-intake answers
+`GET /trail?doc=<id>` (poll token, then flag, then id) with the doc's receipt
+lines, the answer under the terminal line, and a live line (laptop, api worker,
+intake phase, another pass due); the studio controller proxies it at
+`GET /v1/session/{id}/telephone?doc=` for the session that holds the call, and
+`/studio/?live=1&doc=<id>` shows it beside the call, polled every ten seconds.
+Deploy delta, after `drive-intake` is deployed: `cloud/drive-intake/deploy.sh studio`
+grants the studio controller's runtime account `run.invoker` on drive-intake and
+`secretAccessor` on `DRIVE_INTAKE_POLL_TOKEN`, and prints the two settings the
+next studio release must carry (`STUDIO_TELEPHONE_URL=<drive-intake URL>`,
+`STUDIO_TELEPHONE_TOKEN` from that secret). The studio release is this runbook's
+procedure above, his to run; the panel is inert until that release carries the
+URL. Nothing on the page is fetched without a live session, and the request
+itself never leaves the doc.
+
+**The proof: the acceptance gate.** The architecture doc's milestone 4 is one
+authorized, real, laptop-offline round trip, confirmed by readback. Read the
+trail from the terminal with `bash cloud/drive-intake/deploy.sh trail <doc id>`
+(the service's own reading of the doc; needs the flag on) after each hop:
+
+| hop | the line that proves it | written by |
+|---|---|---|
+| intake | `REQUESTED - task task-<16 hex> - ... - recipient claude-api` and `DISPATCHED ... on fleet:inbox:claude-api, which the worker polls; no wake rung` | drive-intake |
+| pickup | `ACCEPTED ... attempt 1 - lease until <UTC> - model <id>` | claude-api |
+| result | `SUCCEEDED ... model <id> - tokens in N out M - C cents CAD` with the `> ` answer lines under it (or FAILED / UNKNOWN that says why) | claude-api |
+| ledger | `fleet:spend:<Toronto day>` moved by the settled cents; the Claude console shows one call | - |
+| no duplicate | a second `trail` read shows the same task id and no second ACCEPTED; the next tick's line is `idle` | - |
+
+With the laptop on and `lane on`, the same doc routes to claude-code-cli
+instead: `CAW-WAKE-<task>` on the board, then ACCEPTED and SUCCEEDED by
+claude-code-cli from `scripts/redis_inbox.py accept | done`. Both are the gate;
+a passing suite, a green deploy or a heartbeat alone proves neither.
 
 **What a health line means.** drive-intake `/healthz`: `ok` only when the
 watch channel is live or the last poll is inside three ticks; `poll: unknown`

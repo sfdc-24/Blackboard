@@ -13,6 +13,15 @@
 #   per-call reservation      CLAUDE_API_WORKER_RESERVE_CENTS_CAD (5 covers a Haiku-class call)
 #   the model                 CLAUDE_API_WORKER_MODEL (the id is yours; the cheapest capable one)
 #   heartbeat window          DRIVE_INTAKE_HEARTBEAT_SECONDS (300)
+#   THE FIVE #374 MADE FAIL-CLOSED. Unset, the job deploys, `worker on` would succeed, and every task
+#   gets QUEUED "no valid cap, reservation, price..." in the doc: it CALLS NOTHING. So `worker on`
+#   reads the job back first and refuses while any of them is unset or zero (`deploy.sh cost` shows).
+#     CLAUDE_API_WORKER_USD_PER_MTOK_IN / _OUT   the price of YOUR model id, from the Claude pricing page
+#     CLAUDE_API_WORKER_MAX_INPUT_TOKENS         the input size that price holds for (a tier bound, not the context window)
+#     FLEET_CAD_PER_USD                          a ceiling rate: every cost is rounded UP into CAD cents
+#     CLAUDE_API_WORKER_AUTHORIZED_UNTIL_UTC     his authorization deadline, ...Z; no call at or after it
+#   PHONE_DOC_INTAKE_ENABLED (#374) is a SECOND intake over the two originals, inside this job. Never
+#   on together with drive-intake's flag: `pilot on` and the intake's `on` refuse each other (below).
 #
 # WHAT IS THE OWNER'S
 #   1. The same Drive share as drive-intake: the two originals (Editor) and the folder (Viewer) with
@@ -25,7 +34,8 @@
 #   bash cloud/claude-api-worker/deploy.sh schedule  # the tick, every 5 minutes
 #   bash cloud/claude-api-worker/deploy.sh run       # execute once and wait (one pass)
 #   bash cloud/claude-api-worker/deploy.sh readback  # what is actually deployed, printed
-#   bash cloud/claude-api-worker/deploy.sh worker on|off   lane on|off      # the flags, nothing else
+#   bash cloud/claude-api-worker/deploy.sh cost      # the cost inputs as deployed; what `worker on` would refuse on
+#   bash cloud/claude-api-worker/deploy.sh worker on|off   lane on|off   pilot on|off   # the flags, nothing else
 
 set -euo pipefail
 
@@ -42,6 +52,15 @@ REPO="${REGION}-docker.pkg.dev/${PROJECT}/cloud-run-source-deploy"
 TAG="${TAG:-v1}"
 IMAGE="${REPO}/${NAME}:${TAG}"
 GCLOUD="${GCLOUD:-gcloud}"
+# The python that RUNS: python3 where it is one, python where only that name works (a Windows Store
+# stub answers to python3 and does nothing). Read-back verbs parse gcloud's JSON with it.
+PYTHON="${PYTHON:-}"
+if [ -z "$PYTHON" ]; then
+  for candidate in python3 python; do
+    if "$candidate" -c pass >/dev/null 2>&1; then PYTHON="$candidate"; break; fi
+  done
+fi
+PYTHON="${PYTHON:-python}"
 SCHED_JOB="${SCHED_JOB:-claude-api-worker-tick}"
 SCHEDULE="${SCHEDULE:-*/5 * * * *}"
 # v2, not v1 namespaces. roles/run.invoker grants run.jobs.run, which is what v2 :run needs.
@@ -75,6 +94,30 @@ REASSIGN_SECONDS="${CLAUDE_API_WORKER_REASSIGN_SECONDS:-1800}"
 MAX_ATTEMPTS="${CLAUDE_API_WORKER_MAX_ATTEMPTS:-1}"
 FOLDER_ID="${DRIVE_INTAKE_FOLDER_ID:-1gZlJFDD2Wm419YOuolIXC3HXwzXOWYfP}"
 HEARTBEAT_SECONDS="${DRIVE_INTAKE_HEARTBEAT_SECONDS:-300}"
+# The other intake. `pilot on` refuses while this service has DRIVE_INTAKE_ENABLED=on.
+INTAKE_SERVICE="${INTAKE_SERVICE:-drive-intake}"
+
+# The env of a deployed resource, one NAME=VALUE per line, read back from the job or the service
+# that RUNS, never from this shell. Python parses the JSON (jobs are the v2 shape, services the
+# Knative one): no awk over yaml, no value split on a comma. A resource that does not exist prints
+# nothing, which every caller treats as "off" and "unset".
+ENV_LINES_PY='
+import json, sys
+try:
+    doc = json.load(sys.stdin)
+except ValueError:
+    sys.exit(0)
+template = doc.get("template", {}).get("template") or doc.get("spec", {}).get("template", {}).get("spec", {})
+for container in template.get("containers") or []:
+    for item in container.get("env") or []:
+        if "value" in item:
+            print("%s=%s" % (item.get("name", ""), item.get("value", "")))
+'
+# env_lines jobs|services NAME
+env_lines() {
+  "$GCLOUD" run "$1" describe "$2" --project "$PROJECT" --region "$REGION" --format json 2>/dev/null |
+    "$PYTHON" -c "$ENV_LINES_PY" || true
+}
 
 setup() {
   # The APIs the job calls (Docs, Drive) and the ones this script uses; enabling is idempotent.
@@ -158,6 +201,60 @@ flag() {
   echo "$1=$2 on ${JOB}"
 }
 
+# The names whose absence makes the worker call nothing (main.py call_reservation: no price, rate,
+# input bound or deadline means no reservation, and no reservation means no call). The model id
+# is on the list because an empty one is Unconfigured on every pass.
+COST_MISSING_PY='
+import sys
+env = dict(line.rstrip("\n").split("=", 1) for line in sys.stdin if "=" in line)
+names = ("CLAUDE_API_WORKER_MODEL", "CLAUDE_API_WORKER_USD_PER_MTOK_IN", "CLAUDE_API_WORKER_USD_PER_MTOK_OUT",
+         "FLEET_CAD_PER_USD", "CLAUDE_API_WORKER_MAX_INPUT_TOKENS", "CLAUDE_API_WORKER_AUTHORIZED_UNTIL_UTC")
+def unset(value):
+    try:
+        return float(value) == 0
+    except ValueError:
+        return not value.strip()
+print(" ".join(name for name in names if unset(env.get(name, ""))))
+'
+cost_missing() {
+  env_lines jobs "$JOB" | "$PYTHON" -c "$COST_MISSING_PY"
+}
+
+cost_readback() {
+  env_lines jobs "$JOB" | grep -E "^(CLAUDE_API_WORKER_(MODEL|MAX_TOKENS|MAX_INPUT_TOKENS|AUTHORIZED_UNTIL_UTC|USD_PER_MTOK_IN|USD_PER_MTOK_OUT|RESERVE_CENTS_CAD)|FLEET_CAD_PER_USD|FLEET_SPEND_CAP_CENTS_CAD)=" || true
+  local missing
+  missing="$(cost_missing)"
+  if [ -z "$missing" ]; then
+    echo "every cost input is set on ${JOB}; worker on is allowed"
+  else
+    echo "unset or zero on ${JOB}: ${missing}; worker on refuses until deploy runs with them set"
+  fi
+}
+
+worker_on() {
+  # Read the JOB back, not this shell: the job is what runs. Refuse rather than deploy a worker
+  # that writes QUEUED into the doc once a day per task and never calls (#374's fail-closed inputs).
+  local missing
+  missing="$(cost_missing)"
+  if [ -n "$missing" ]; then
+    echo "refused: unset or zero on ${JOB}, so the worker would call nothing: ${missing}" >&2
+    echo "export them and run: bash cloud/claude-api-worker/deploy.sh deploy, then worker on" >&2
+    exit 2
+  fi
+  flag CLAUDE_API_WORKER_ENABLED on
+}
+
+pilot_on() {
+  # The pilot is a SECOND intake over the two originals. With drive-intake's flag on as well, one
+  # request becomes two tasks (two revisions of the same words), two calls and two answers in the
+  # doc, and the pilot's inbox filter checkpoints the worker past the service's rows for good.
+  if env_lines services "$INTAKE_SERVICE" | grep -qx "DRIVE_INTAKE_ENABLED=on"; then
+    echo "refused: ${INTAKE_SERVICE} has DRIVE_INTAKE_ENABLED=on; one intake at a time (cloud/drive-intake/deploy.sh off first)" >&2
+    exit 2
+  fi
+  flag PHONE_DOC_INTAKE_ENABLED on
+}
+
 case "${1:-}" in
   setup) setup ;;
   build) build ;;
@@ -165,7 +262,9 @@ case "${1:-}" in
   schedule) schedule ;;
   run) run_once ;;
   readback) readback ;;
-  worker) case "${2:-}" in on|off) flag CLAUDE_API_WORKER_ENABLED "$2" ;; *) echo "worker on|off" >&2; exit 2 ;; esac ;;
+  cost) cost_readback ;;
+  worker) case "${2:-}" in on) worker_on ;; off) flag CLAUDE_API_WORKER_ENABLED off ;; *) echo "worker on|off" >&2; exit 2 ;; esac ;;
   lane) case "${2:-}" in on|off) flag CLAUDE_API_LANE_ENABLED "$2" ;; *) echo "lane on|off" >&2; exit 2 ;; esac ;;
-  *) sed -n '2,28p' "$0"; exit 2 ;;
+  pilot) case "${2:-}" in on) pilot_on ;; off) flag PHONE_DOC_INTAKE_ENABLED off ;; *) echo "pilot on|off" >&2; exit 2 ;; esac ;;
+  *) sed -n '2,38p' "$0"; exit 2 ;;
 esac

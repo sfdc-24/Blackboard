@@ -25,7 +25,9 @@
 #   REDIS_HOST=<private address> bash cloud/drive-intake/deploy.sh deploy   # the service, flag OFF
 #   bash cloud/drive-intake/deploy.sh schedule  # the poll tick, every 2 minutes, OIDC
 #   bash cloud/drive-intake/deploy.sh readback  # what is actually deployed, printed; /healthz
-#   bash cloud/drive-intake/deploy.sh on | off  # the flag, and nothing else
+#   bash cloud/drive-intake/deploy.sh on | off  # the flag, and nothing else (on refuses while the worker's pilot intake is on)
+#   bash cloud/drive-intake/deploy.sh studio    # step 4, the grants half: the studio controller may call GET /trail
+#   bash cloud/drive-intake/deploy.sh trail <doc id>   # the doc's receipt trail as the service reads it: the proof
 
 set -euo pipefail
 
@@ -42,6 +44,15 @@ REPO="${REGION}-docker.pkg.dev/${PROJECT}/cloud-run-source-deploy"
 TAG="${TAG:-v1}"
 IMAGE="${REPO}/${NAME}:${TAG}"
 GCLOUD="${GCLOUD:-gcloud}"
+# The python that RUNS: python3 where it is one, python where only that name works (a Windows Store
+# stub answers to python3 and does nothing). Read-back verbs parse gcloud's JSON with it.
+PYTHON="${PYTHON:-}"
+if [ -z "$PYTHON" ]; then
+  for candidate in python3 python; do
+    if "$candidate" -c pass >/dev/null 2>&1; then PYTHON="$candidate"; break; fi
+  done
+fi
+PYTHON="${PYTHON:-python}"
 SCHED_JOB="${SCHED_JOB:-drive-intake-poll}"
 SCHEDULE="${SCHEDULE:-*/2 * * * *}"
 
@@ -68,6 +79,34 @@ POLL_SECONDS="${DRIVE_INTAKE_POLL_SECONDS:-120}"
 # put IS the hand-off and DISPATCHED is reachable without #359 (Cursor on 0bee083: a deploy with no
 # wake variables could never reach it). Set INBOX_WAKE_URL/INBOX_WAKE_SECRET instead once #359 lands.
 RING="${DRIVE_INTAKE_RING:-polled}"
+# Step 4 (PR 376): the studio controller reads GET /trail as its own identity plus the poll token.
+STUDIO_SERVICE="${STUDIO_SERVICE:-sfdc24-studio-controller}"
+# The other intake (#374's pilot, inside the worker job). `on` refuses while it is on.
+WORKER_JOB="${WORKER_JOB:-claude-api-worker}"
+# A Drive file id, the same shape main.py's FILE_ID_OK accepts; anything else never reaches curl.
+DOC_ID_OK='^[A-Za-z0-9_-]{10,128}$'
+
+# The env of a deployed resource, one NAME=VALUE per line, read back from the job or the service
+# that RUNS, never from this shell. Python parses the JSON (jobs are the v2 shape, services the
+# Knative one): no awk over yaml, no value split on a comma. A resource that does not exist prints
+# nothing, which every caller treats as "off" and "unset".
+ENV_LINES_PY='
+import json, sys
+try:
+    doc = json.load(sys.stdin)
+except ValueError:
+    sys.exit(0)
+template = doc.get("template", {}).get("template") or doc.get("spec", {}).get("template", {}).get("spec", {})
+for container in template.get("containers") or []:
+    for item in container.get("env") or []:
+        if "value" in item:
+            print("%s=%s" % (item.get("name", ""), item.get("value", "")))
+'
+# env_lines jobs|services NAME
+env_lines() {
+  "$GCLOUD" run "$1" describe "$2" --project "$PROJECT" --region "$REGION" --format json 2>/dev/null |
+    "$PYTHON" -c "$ENV_LINES_PY" || true
+}
 
 # One grant, safe in either order. setup runs before tokens in the printed order, so the two
 # tokens do not exist yet when setup walks the list; tokens creates them afterwards. A grant that
@@ -118,7 +157,7 @@ tokens() {
     if "$GCLOUD" secrets describe "$secret" --project "$PROJECT" >/dev/null 2>&1; then
       echo "${secret} exists; not replaced (add a version by hand if you mean to rotate it)"
     else
-      python -c "import secrets,sys; sys.stdout.write(secrets.token_hex(32))" |
+      "$PYTHON" -c "import secrets,sys; sys.stdout.write(secrets.token_hex(32))" |
         "$GCLOUD" secrets create "$secret" --project "$PROJECT" --replication-policy automatic --data-file=-
       echo "${secret} created with one version"
     fi
@@ -191,9 +230,55 @@ readback() {
 }
 
 flag() {
+  # One intake at a time: with the worker's pilot intake on as well, one request becomes two tasks,
+  # two calls and two answers, and the pilot's inbox filter checkpoints the worker past this
+  # service's rows for good. The job is read back, not assumed.
+  if [ "$1" = on ] && env_lines jobs "$WORKER_JOB" | grep -qx "PHONE_DOC_INTAKE_ENABLED=on"; then
+    echo "refused: ${WORKER_JOB} has PHONE_DOC_INTAKE_ENABLED=on; one intake at a time (cloud/claude-api-worker/deploy.sh pilot off first)" >&2
+    exit 2
+  fi
   "$GCLOUD" run services update "$SERVICE" --project "$PROJECT" --region "$REGION" \
     --update-env-vars "DRIVE_INTAKE_ENABLED=$1"
   echo "DRIVE_INTAKE_ENABLED=$1 on ${SERVICE}"
+}
+
+studio() {
+  # Step 4's deploy delta, the grants half. The studio controller calls GET /trail?doc= as ITS OWN
+  # identity (an OIDC token for this service's URL) and sends the poll token in its header, so its
+  # runtime account needs run.invoker here and secretAccessor on that one token. The studio release
+  # itself is the runbook's procedure (build from merged main, --no-traffic --tag, /health,
+  # update-traffic) and is NOT run here: the two settings it must carry are printed, the URL filled
+  # in, the token never (it rides from Secret Manager into the service as a secret).
+  local url sa
+  url="$(service_url)"
+  sa="$("$GCLOUD" run services describe "$STUDIO_SERVICE" --project "$PROJECT" --region "$REGION" \
+    --format 'value(spec.template.spec.serviceAccountName)')"
+  sa="${sa:-${PROJECT_NUMBER}-compute@developer.gserviceaccount.com}"
+  "$GCLOUD" run services add-iam-policy-binding "$SERVICE" --project "$PROJECT" --region "$REGION" \
+    --member "serviceAccount:${sa}" --role roles/run.invoker >/dev/null
+  "$GCLOUD" secrets add-iam-policy-binding DRIVE_INTAKE_POLL_TOKEN --project "$PROJECT" \
+    --member "serviceAccount:${sa}" --role roles/secretmanager.secretAccessor --condition None >/dev/null
+  echo "${sa} may invoke ${SERVICE} and read DRIVE_INTAKE_POLL_TOKEN"
+  echo "add these two to the studio release command, exactly (docs/CLOUD-FLEET-RUNBOOK.md, the studio release):"
+  echo "  --update-env-vars STUDIO_TELEPHONE_URL=${url} --update-secrets STUDIO_TELEPHONE_TOKEN=DRIVE_INTAKE_POLL_TOKEN:latest"
+}
+
+trail() {
+  # The doc's receipt trail as the deployed service reads it (GET /trail?doc=, PR 376): the proof of
+  # a round trip from the terminal, without opening the doc. With the flag off the service answers
+  # {"enabled": false, "trail": null}. The poll token is read from Secret Manager at this moment and
+  # rides in its own header, never printed; Authorization carries your own identity token, as
+  # readback sends it.
+  local doc="${2:-}" url token
+  if ! printf '%s' "$doc" | grep -Eq "$DOC_ID_OK"; then
+    echo "usage: deploy.sh trail <Drive file id>" >&2
+    exit 2
+  fi
+  url="$(service_url)"
+  token="$("$GCLOUD" secrets versions access latest --secret DRIVE_INTAKE_POLL_TOKEN --project "$PROJECT")"
+  curl -s -H "Authorization: Bearer $("$GCLOUD" auth print-identity-token)" \
+    -H "X-Drive-Intake-Poll-Token: ${token}" "${url}/trail?doc=${doc}"
+  echo
 }
 
 case "${1:-}" in
@@ -205,5 +290,7 @@ case "${1:-}" in
   readback) readback ;;
   on) flag on ;;
   off) flag off ;;
-  *) sed -n '2,28p' "$0"; exit 2 ;;
+  studio) studio ;;
+  trail) trail "$@" ;;
+  *) sed -n '2,30p' "$0"; exit 2 ;;
 esac
