@@ -101,6 +101,17 @@ def _load_contract():
 
 di = _load_contract()
 
+
+def _load_lane():
+    """cloud/claude-api-worker/lane.py, beside this file: the laptop lane (step 3), no model, no spend."""
+    spec = importlib.util.spec_from_file_location("claude_api_lane", os.path.join(HERE, "lane.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+lane = _load_lane()
+
 WORKER = "claude-api"
 ACCEPTED = "ACCEPTED"
 SUCCEEDED = "SUCCEEDED"
@@ -196,20 +207,21 @@ def addressed_to_worker(doc_text: str) -> bool:
     return bool(found) and di.canonical(found.group(1)) == WORKER
 
 
-def receipt_id_for(task_id: str, state: str) -> str:
+def receipt_id_for(task_id: str, state: str, by: str = WORKER) -> str:
     """One per (worker, task, state), and distinct from drive-intake's for the same state."""
-    return hashlib.sha256("\x1f".join((WORKER, task_id, state)).encode("utf-8")).hexdigest()[:16]
+    return hashlib.sha256("\x1f".join((by, task_id, state)).encode("utf-8")).hexdigest()[:16]
 
 
-def receipt_line(state: str, tuple_: dict, at: str, receipt_id: str, detail: str = "") -> str:
-    """The shared shape, by claude-api, ending with its id so a read-back can find it."""
+def receipt_line(state: str, tuple_: dict, at: str, receipt_id: str, detail: str = "",
+                 by: str = WORKER) -> str:
+    """The shared shape, by the worker named, ending with its id so a read-back can find it."""
     parts = [
         state,
         "task " + tuple_["task_id"],
         "request " + tuple_["request_id"],
         "rev " + tuple_["source_revision"][:12],
-        "recipient " + WORKER,
-        "by " + WORKER,
+        "recipient " + by,
+        "by " + by,
         at,
     ]
     if detail:
@@ -249,7 +261,7 @@ def _refresh_revision(deps, tuple_):
 
 
 def write_receipt(deps, tuple_: dict, doc_text: str, state: str, at: str, detail: str = "",
-                  extra: str = "") -> str:
+                  extra: str = "", by: str = WORKER) -> str:
     """Append one receipt (and, for a terminal line, the answer under it), then READ IT BACK.
 
     Mirrors drive-intake's writer: has() first so a retry is a no-op; a lost
@@ -260,13 +272,13 @@ def write_receipt(deps, tuple_: dict, doc_text: str, state: str, at: str, detail
     if deps.receipts is None:
         return "no_receipt_writer"
     doc_id = tuple_["source_doc_id"]
-    receipt_id = receipt_id_for(tuple_["task_id"], state)
+    receipt_id = receipt_id_for(tuple_["task_id"], state, by)
     try:
         if deps.receipts.has(doc_id, receipt_id):
             return "written"
     except Exception as exc:  # noqa: BLE001
         return "unknown:" + type(exc).__name__
-    line = receipt_line(state, tuple_, at, receipt_id, detail)
+    line = receipt_line(state, tuple_, at, receipt_id, detail, by)
     if extra:
         line = line + "\n" + extra
     block = di.receipt_block(doc_text, line)
@@ -647,12 +659,38 @@ def _finish_from_store(deps, tuple_, text, current, attempt, out, stored=None):
 
 
 def run_once(deps) -> dict:
-    """One pass over claude-api's inbox. Disabled reads nothing, writes nothing, calls nothing."""
-    if not deps.enabled:
-        return {"status": "disabled", "considered": []}
+    """One pass: claude-api's own inbox, then the laptop lane. Disabled reads, writes and calls nothing."""
+    now = _now(deps)
+    out = {"status": "disabled", "considered": []}
+    if deps.enabled:
+        out = _api_pass(deps, now)
+    if deps.lane_enabled:
+        out["lane"] = lane.run(_contract(), deps, now)
+        if not deps.enabled:
+            out["status"] = "lane_only"
+    return out
+
+
+class _Contract:
+    """What the lane borrows from this module: the shared grammar, never a copy of it."""
+
+    def __init__(self):
+        self.di = di
+        self.INBOX_LOOKBACK = INBOX_LOOKBACK
+        self.INTAKE_WRITER = INTAKE_WRITER
+        self.ACCEPTED = ACCEPTED
+        self.trail_for = trail_for
+        self.write_receipt = write_receipt
+
+
+def _contract():
+    return _Contract()
+
+
+def _api_pass(deps, now) -> dict:
+    """claude-api's own inbox: at most one model call."""
     if deps.inbox is None or deps.docs is None or deps.claims is None or deps.ledger is None:
         return {"status": "no_store", "considered": []}
-    now = _now(deps)
     try:
         deps.claims.beat(WORKER, now)
     except Exception:  # noqa: BLE001 - a missed beat is not a reason to skip the work
@@ -734,6 +772,7 @@ class MemoryClaims(di.MemoryClaims):
     def __init__(self, beats=None):
         super().__init__(beats)
         self.done_marks, self.results = set(), {}
+        self.lane, self.woke_marks, self.settled_marks = {}, {}, set()     # the laptop lane's keys
 
     def claim(self, task_id, initial):
         if task_id in self.states:
@@ -755,6 +794,34 @@ class MemoryClaims(di.MemoryClaims):
 
     def beat(self, agent, now):
         self.beats[agent] = float(now)
+
+    # The laptop lane: the keys claude-code-cli writes through the governed path, and the markers.
+    def lane_value(self, key):
+        return self.lane.get(key)
+
+    def settled(self, task_id):
+        return task_id in self.settled_marks
+
+    def mark_settled(self, task_id):
+        self.settled_marks.add(task_id)
+
+    def woke(self, task_id):
+        return self.woke_marks.get(task_id)
+
+    def claim_woke(self, task_id, value):
+        if task_id in self.woke_marks:
+            return False
+        self.woke_marks[task_id] = value
+        return True
+
+    def advance_woke(self, task_id, current, new):
+        if self.woke_marks.get(task_id) != current:
+            return False
+        self.woke_marks[task_id] = new
+        return True
+
+    def set_woke(self, task_id, value):
+        self.woke_marks[task_id] = value
 
 
 class MemoryLedger:
@@ -829,6 +896,29 @@ class RedisClaims:
 
     def beat(self, agent, now):
         self.client.set("fleet:alive:" + agent, "%d" % int(now), ex=3600)
+
+    # The laptop lane. fleet:worker:accept:<task> and fleet:worker:done:<task> are the laptop's,
+    # written through the governed path; woke and settled are this job's markers.
+    def lane_value(self, key):
+        return self._get(key)
+
+    def settled(self, task_id):
+        return self._get("fleet:worker:settled:" + task_id) is not None
+
+    def mark_settled(self, task_id):
+        self.client.set("fleet:worker:settled:" + task_id, "1", ex=DONE_TTL)
+
+    def woke(self, task_id):
+        return self._get("fleet:worker:woke:" + task_id)
+
+    def claim_woke(self, task_id, value):
+        return bool(self.client.set("fleet:worker:woke:" + task_id, value, nx=True, ex=DONE_TTL))
+
+    def advance_woke(self, task_id, current, new):
+        return bool(self.client.eval(CAS_LUA, 1, "fleet:worker:woke:" + task_id, current, new, DONE_TTL))
+
+    def set_woke(self, task_id, value):
+        self.client.set("fleet:worker:woke:" + task_id, value, ex=DONE_TTL)
 
 
 class RedisLedger:
@@ -908,8 +998,10 @@ class Deps:
                  model=None, model_name="", folder_id="", now=None, at="", day=None,
                  heartbeat_window=di.DEFAULT_HEARTBEAT, reassign_after=DEFAULT_REASSIGN,
                  max_attempts=DEFAULT_MAX_ATTEMPTS, cap_cents=0, reserve_cents=0,
-                 price_in=None, price_out=None, cad_per_usd=None):
+                 price_in=None, price_out=None, cad_per_usd=None, lane_enabled=False, board=None):
         self.enabled = enabled
+        self.lane_enabled = lane_enabled
+        self.board = board
         self.inbox = inbox
         self.docs = docs
         self.receipts = receipts
@@ -935,13 +1027,52 @@ def _no_model(_system, _prompt):
     raise Unconfigured("no model configured (ANTHROPIC_API_KEY, CLAUDE_API_WORKER_MODEL)")
 
 
-def deps_from_env(environ=None, client=None, docs=None):  # pragma: no cover - wiring, not logic
+def lane_enabled_from_env(environ=None) -> bool:
+    environ = os.environ if environ is None else environ
+    return environ.get("CLAUDE_API_LANE_ENABLED") == "on"
+
+
+class AppendBoard:  # pragma: no cover - the one board socket, through the fleet's one append path
+    """ONE row through scripts/append.py (copied into the image), which reads it back by Row_ID.
+
+    The same pattern as cloud/bus-reconciler/serve_requests.py: a spec file, append.py's own main(),
+    and its exit code is the verdict. BUS_URL and BUS_SECRET arrive as env; nothing here holds them.
+    """
+
+    def __call__(self, spec: dict) -> None:
+        import tempfile  # noqa: PLC0415
+        sys.path.insert(0, HERE)
+        import append  # noqa: PLC0415
+        handle, path = tempfile.mkstemp(suffix=".json", prefix="row-")
+        os.close(handle)
+        try:
+            with open(path, "w", encoding="utf-8", newline="") as fh:
+                json.dump(spec, fh)
+            argv = sys.argv
+            sys.argv = ["append.py", path]
+            try:
+                append.main()
+            except SystemExit as stop:
+                if stop.code not in (None, 0):
+                    raise RuntimeError("append exit %s" % stop.code) from stop
+            finally:
+                sys.argv = argv
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
+def deps_from_env(environ=None, client=None, docs=None, board=None):  # pragma: no cover - wiring, not logic
     environ = os.environ if environ is None else environ
     model_name = environ.get("CLAUDE_API_WORKER_MODEL") or ""
     model = AnthropicModel(key=environ.get("ANTHROPIC_API_KEY") or "", model=model_name,
                            max_tokens=_int_env(environ, "CLAUDE_API_WORKER_MAX_TOKENS", DEFAULT_MAX_TOKENS))
     return Deps(
         enabled=enabled_from_env(environ),
+        lane_enabled=lane_enabled_from_env(environ),
+        board=board,
         inbox=RedisInbox(client) if client is not None else None,
         docs=docs, receipts=docs,
         claims=RedisClaims(client) if client is not None else None,
@@ -961,7 +1092,7 @@ def deps_from_env(environ=None, client=None, docs=None):  # pragma: no cover - w
 
 
 def main():  # pragma: no cover - the job entry point
-    if not enabled_from_env():
+    if not enabled_from_env() and not lane_enabled_from_env():
         print(json.dumps({"status": "disabled"}))
         return 0
     sys.path.insert(0, HERE)
@@ -977,7 +1108,8 @@ def main():  # pragma: no cover - the job entry point
         docs = gdocs.GoogleDocs()
     except Exception as exc:  # noqa: BLE001
         print(json.dumps({"status": "no_docs", "error": type(exc).__name__}))
-    deps = deps_from_env(client=client, docs=docs)
+    board = AppendBoard() if os.environ.get("BUS_URL") and os.environ.get("BUS_SECRET") else None
+    deps = deps_from_env(client=client, docs=docs, board=board)
     out = run_once(deps)
     print(json.dumps(out, sort_keys=True))     # statuses and task ids; never the doc's text
     return 0
