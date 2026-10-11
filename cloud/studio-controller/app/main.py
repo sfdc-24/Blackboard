@@ -90,7 +90,8 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
                clock=time.time, id_factory=None, voice_client=None,
                email_sender=None, email_client=None, talk_client=None,
                analyst=None, moderation_client=None, muse=None, summary_sender=None,
-               advisor=None, charter=None, pilot_feedback_sink=None) -> FastAPI:
+               advisor=None, charter=None, pilot_feedback_sink=None,
+               telephone_client=None, identity_token=None) -> FastAPI:
     settings = settings or Settings.from_env()
     settings.validate()
     from workers.topics import TOPICS as _TOPICS, quote_lines as _quote_lines
@@ -352,8 +353,21 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         else:
             app.state.email_client = None
             app.state.close_email_client = False
+        # The telephone trail's client (step 4): one sync client, only while the trail is on.
+        if telephone_client is not None:
+            app.state.telephone_client = telephone_client
+            app.state.close_telephone_client = False
+        elif settings.telephone_url:
+            app.state.telephone_client = httpx.Client(timeout=10)
+            app.state.close_telephone_client = True
+        else:
+            app.state.telephone_client = None
+            app.state.close_telephone_client = False
+        app.state.telephone_cache = {}
         app.state.voice_sweeper = asyncio.create_task(voice_sweeper())
         yield
+        if app.state.close_telephone_client and app.state.telephone_client is not None:
+            app.state.telephone_client.close()
         app.state.voice_sweeper.cancel()
         try:
             await app.state.voice_sweeper
@@ -1497,6 +1511,76 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         if pilot.is_pilot(state):
             await emit_pilot_feedback(session_id)    # the host closed a pilot's call
         return {"recap": text, "speaker": agent}
+
+    # THE TELEPHONE TRAIL (step 4 of the broken-telephone fix, Converspan Channel Architecture
+    # v0.1): "the Converspan page shows the live task/receipt trail during a call". The record is
+    # the originating Drive doc; drive-intake reads it and parses the receipt shape back
+    # (GET /trail?doc=); this service reads that as its own identity (an OIDC token for the
+    # private service) plus the shared poll token, for a LIVE SESSION only, and hands the page
+    # receipts and the answer lines - never the owner's request. One upstream read per doc per
+    # few seconds, whatever the page asks, because every read is a Docs read.
+    TELEPHONE_DOC = re.compile(r"[A-Za-z0-9_-]{10,128}\Z")
+    TELEPHONE_CACHE_SECONDS = 5.0
+    TELEPHONE_MAX_BYTES = 262144
+    TELEPHONE_KEYS = ("status", "enabled", "doc", "revision", "task", "request", "tasks", "entries",
+                      "live", "at", "error")
+
+    class TelephoneUnavailable(Exception):
+        pass
+
+    def metadata_identity(audience: str) -> str:
+        """An OIDC identity token for this service's account, from the metadata server, or ''."""
+        client = app.state.telephone_client
+        try:
+            response = client.get(
+                "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity",
+                params={"audience": audience}, headers={"Metadata-Flavor": "Google"})
+        except Exception:  # noqa: BLE001 - off Cloud Run there is no metadata server
+            return ""
+        return response.text.strip() if response.status_code == 200 else ""
+
+    def telephone_trail(doc: str) -> dict:
+        client = app.state.telephone_client
+        if client is None or not settings.telephone_url:
+            raise TelephoneUnavailable("the telephone trail is off")
+        token = (identity_token or metadata_identity)(settings.telephone_url)
+        headers = {"X-Drive-Intake-Poll-Token": settings.telephone_token}
+        if token:
+            headers["Authorization"] = "Bearer " + token
+        response = client.get(settings.telephone_url + "/trail", params={"doc": doc}, headers=headers)
+        if response.status_code != 200:
+            raise TelephoneUnavailable("drive-intake answered %d" % response.status_code)
+        if len(response.content) > TELEPHONE_MAX_BYTES:
+            raise TelephoneUnavailable("the trail is larger than a page may read")
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise TelephoneUnavailable("drive-intake gave no JSON") from exc
+        if not isinstance(body, dict):
+            raise TelephoneUnavailable("drive-intake gave no object")
+        return {key: body.get(key) for key in TELEPHONE_KEYS if key in body}
+
+    @app.get("/v1/session/{session_id}/telephone")
+    async def telephone(request: Request, session_id: str, doc: str = Query("")):
+        """The doc's receipt trail for THIS session's page. Off unless STUDIO_TELEPHONE_URL is set."""
+        require_origin(request)
+        require_session(request, session_id)
+        if not settings.telephone_url:
+            raise HTTPException(404, "the telephone trail is off")
+        if not TELEPHONE_DOC.fullmatch(doc or ""):
+            raise HTTPException(400, "doc must be a Drive file id")
+        now = clock()
+        cached = app.state.telephone_cache.get(doc)
+        if cached and 0 <= now - cached[0] < TELEPHONE_CACHE_SECONDS:
+            return cached[1]
+        try:
+            trail = await asyncio.to_thread(telephone_trail, doc)
+        except TelephoneUnavailable as exc:
+            raise HTTPException(502, str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001 - a transport failure, named by type only
+            raise HTTPException(502, "the trail could not be read: " + type(exc).__name__) from exc
+        app.state.telephone_cache[doc] = (now, trail)
+        return trail
 
     @app.get("/v1/leads")
     async def leads(request: Request):

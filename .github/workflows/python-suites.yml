@@ -87,6 +87,8 @@ on:
       - "tests/test_gemini_cloud_waker.py"
       - "tests/test_soak_report.py"
       - "tests/test_studio_controller.py"
+      - "tests/test_studio_telephone.py"
+      - "cloud/drive-intake/trail.py"
       - "tests/test_studio_auth.py"
       - "tests/test_studio_email_sender.cjs"
       - "apps-script/studio-email-sender/**"
@@ -236,6 +238,8 @@ on:
       - "tests/test_gemini_cloud_waker.py"
       - "tests/test_soak_report.py"
       - "tests/test_studio_controller.py"
+      - "tests/test_studio_telephone.py"
+      - "cloud/drive-intake/trail.py"
       - "tests/test_studio_auth.py"
       - "tests/test_studio_email_sender.cjs"
       - "apps-script/studio-email-sender/**"
@@ -374,6 +378,7 @@ jobs:
                    tests/test_gemini_cloud_waker.py \
                    tests/test_soak_report.py \
                    tests/test_studio_controller.py \
+                   tests/test_studio_telephone.py \
                    tests/test_studio_auth.py \
                    tests/test_studio_email_sender.cjs \
                    tests/test_studio_claude_worker.py \
@@ -932,7 +937,8 @@ jobs:
               tests.test_studio_routing \
               tests.test_studio_advisor \
               tests.test_studio_advisor_route \
-              tests.test_studio_charter
+              tests.test_studio_charter \
+              tests.test_studio_telephone
           else
             echo "not on this branch; skipping"
           fi

@@ -252,6 +252,16 @@ The Apps Script sender mails a sign-in code only to an address in its own
 `STUDIO_SUMMARY_ANY_RECIPIENT=true`), so the invited addresses and the notify
 address must be there as well.
 
+The telephone trail (step 4 of the broken-telephone fix; off unless
+`STUDIO_TELEPHONE_URL` is set): `GET /v1/session/{id}/telephone?doc=<Drive
+file id>` reads the private drive-intake service's `/trail` for a live
+session and returns its receipts and answer lines, never the request. It needs
+`STUDIO_TELEPHONE_URL` (the service URL), `STUDIO_TELEPHONE_TOKEN` (the same
+value as `DRIVE_INTAKE_POLL_TOKEN`, from Secret Manager), and `roles/run.invoker`
+on drive-intake for this service's account, since the call carries this
+service's own OIDC identity. One upstream read per doc every five seconds at
+most, whatever the page asks.
+
 Keep `STUDIO_MAX_SESSION_SECONDS=600`, `STUDIO_DAILY_SESSION_CAP=20`, and
 the operator allowlist for the approved initial envelope. Voice is one call per
 Studio session. The controller reserves one `STUDIO_VOICE_MINT_CAP` slot
