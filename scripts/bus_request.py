@@ -89,6 +89,9 @@ PROBE_TTL_SECONDS = 10
 # staleness bound, so a request is unrunnable by staleness long before its marker can expire.
 DONE_PREFIX = "gov:req:"
 DONE_TTL_SECONDS = 6 * 3600
+# What the marker says once this request's RESULT row is on the board (read back by append). Until then
+# it holds the requesting row id: claimed, outcome unknown.
+ANSWERED_MARK = "ANSWERED|"
 
 
 def field(payload: str, name: str) -> str:
@@ -428,6 +431,21 @@ def handle(rows, conn, now=None, append=None, max_per_run=MAX_PER_RUN) -> dict:
             if not claimed:
                 noticed = req["req_id"] in already
                 already.add(req["req_id"])
+                # ANSWERED IS SILENT. A live loop reads the board every few seconds, and a snapshot taken
+                # before the first pass's RESULT row landed made the second pass append "NOT RUN AGAIN ...
+                # UNKNOWN" under a request that had run and been answered (GEMINI-REDIS-20261011T221508Z,
+                # two RESULT rows; aya on it). The marker says whether the answer is out; only a claim
+                # without one is news.
+                try:
+                    held = conn.get(marker)
+                except Exception:   # noqa: BLE001 - an unreadable marker is the unknown case, said as such
+                    held = None
+                if isinstance(held, bytes):
+                    held = held.decode("utf-8", "replace")
+                if str(held or "").startswith(ANSWERED_MARK):
+                    out["refused"].append({"req_id": req["req_id"],
+                                           "why": ["already answered: its RESULT row is on the board"]})
+                    continue
                 out["refused"].append({"req_id": req["req_id"],
                                        "why": ["already claimed: Redis holds this request's run marker"]})
                 if append and not noticed:
@@ -450,6 +468,12 @@ def handle(rows, conn, now=None, append=None, max_per_run=MAX_PER_RUN) -> dict:
                 append(row_for(RESULT_ACTION, req, redis_gov.summarise(result),
                                ("%s %s %s" % ("OK" if result.get("ok") else "NOT DONE",
                                               req.get("op") or "?", req.get("key") or "?"))[:100]))
+                # append reads its own row back, so reaching here means the answer is on the board. A
+                # marker that cannot be updated only costs a redundant notice later, never a second op.
+                try:
+                    conn.set(marker, ANSWERED_MARK + (safe(req["row_id"])[:100] or "-"), ex=DONE_TTL_SECONDS)
+                except Exception:   # noqa: BLE001
+                    pass
             already.add(req["req_id"])
             # A finished haudit that did not match is FAILED, not ERROR: ERROR is a crash, and the
             # entrypoint counts those. The row itself says missing, extra, changed, moved or partial.

@@ -172,6 +172,21 @@ class ItRunsThroughTheSameGovernance(unittest.TestCase):
         writes = [e for e in conn.audit() if "conf:2026-10-08:git:cursor" in json.dumps(e)]
         self.assertEqual(1, len(writes), "one set in the audit, not two")
 
+    def test_an_answered_request_seen_again_in_a_stale_snapshot_gets_no_second_row(self):
+        # GEMINI-REDIS-20261011T221508Z-8f6635 on 2026-10-11: the live loop's next pass read a board taken
+        # before its own RESULT landed, found the marker, and appended "NOT RUN AGAIN ... UNKNOWN" under a
+        # request that had run and been answered. One request, one answer.
+        conn = FakeRedis()
+        rows = gr.rows_from_comments("Blackboard", [comment(SET)], BOTS)
+        posted = []
+        first = br.handle(rows, conn, now=NOW, append=posted.append)
+        second = br.handle(rows, conn, now=NOW, append=posted.append)    # no RESULT row in this snapshot
+        self.assertEqual(["OK"], [a["status"] for a in first["answered"]])
+        self.assertEqual([], second["answered"])
+        self.assertEqual(1, len(posted), "one RESULT row, not an OK and then an UNKNOWN")
+        self.assertNotIn("UNKNOWN", posted[0]["payload"])
+        self.assertIn("already answered", json.dumps(second["refused"]))
+
     def test_a_repeated_field_is_refused_not_read_first_value_wins(self):
         conn = FakeRedis()
         body = "BCB|v=1|do=redis-op|op=get|key=conf:a|op=set|val=x"
