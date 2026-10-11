@@ -133,6 +133,11 @@ on:
       - ".github/workflows/inbox-wake-sweep.yml"
       - ".github/workflows/inbox-wake-claude.yml"
       - ".github/workflows/inbox-wake-codex.yml"
+      - "gas-bus/Code.js"
+      - "gas-bus/appsscript.json"
+      - "tests/test_board_mirror.py"
+      - "cloud/board-mirror/**"
+      - "cloud/bus-reconciler/serve_requests.py"
       - "scripts/sf360.py"
       - "tests/test_org_publish.py"
       - "scripts/org_publish.py"
@@ -212,6 +217,11 @@ on:
       - ".github/workflows/inbox-wake-sweep.yml"
       - ".github/workflows/inbox-wake-claude.yml"
       - ".github/workflows/inbox-wake-codex.yml"
+      - "gas-bus/Code.js"
+      - "gas-bus/appsscript.json"
+      - "tests/test_board_mirror.py"
+      - "cloud/board-mirror/**"
+      - "cloud/bus-reconciler/serve_requests.py"
       - "scripts/roster_seed.py"
       - "tests/test_roster_seed.py"
       - "tests/test_image_layout.py"
@@ -941,12 +951,17 @@ jobs:
 
       # Each board-read guard is deleted on purpose and the suite must break the
       # way predicted in advance; a surviving mutant is an untested claim.
+      # The /exec follower tests in test_board_clients.py serve 127.0.0.1.
+      # A new namespace starts with lo down, so the connect is "Network is
+      # unreachable" (the suites failure on cb92aff). Bring lo up and leave
+      # every other interface absent: nothing can route out.
       - name: "board read guards are load-bearing (mutation, no network)"
         run: |
           set -euo pipefail
           if [ -f tests/mutate_bus_filters.py ]; then
             python_bin="$(command -v python3)"
-            sudo unshare -n -- "$python_bin" -B tests/mutate_bus_filters.py
+            sudo unshare -n -- sh -c 'ip link set lo up && exec "$@"' sh \
+              "$python_bin" -B tests/mutate_bus_filters.py
           else
             echo "not on this branch; skipping"
           fi
@@ -971,6 +986,16 @@ jobs:
           if [ -f tests/test_inbox_wake.py ]; then
             python_bin="$(command -v python3)"
             sudo unshare -n -- "$python_bin" -B tests/test_inbox_wake.py
+          else
+            echo "not on this branch; skipping"
+          fi
+
+      - name: "board mirror is default off, signed, and a separate writer (no network)"
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_board_mirror.py ]; then
+            python_bin="$(command -v python3)"
+            sudo unshare -n -- "$python_bin" -B tests/test_board_mirror.py
           else
             echo "not on this branch; skipping"
           fi

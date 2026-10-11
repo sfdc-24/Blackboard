@@ -30,6 +30,19 @@ has to come back through that agent's own path, inside five minutes, with the
 laptop closed. The test plan for that is in the pull request, and it is not
 run from here.
 
+THIS PROCESS READS fleet:inbox:<agent> AND WAKES THAT AGENT. It does not
+write fleet:board:stream and it does not write fleet:inbox:*. Copying a board
+row into Redis is cloud/board-mirror, its own service and its own service
+account (board-mirror@). This account is inbox-wake@sfdc24.iam.gserviceaccount.com.
+It is not redis-tool-bridge@sfdc24.iam.gserviceaccount.com. It has no
+roles/iam.serviceAccountUser, and no roles/redis.admin, roles/redis.editor,
+or roles/redis.viewer. Secret access is roles/secretmanager.secretAccessor
+on REDIS_AUTH_STRING, REDIS_CA_CERT, GITHUB_WEBHOOK_SECRET,
+INBOX_WAKE_SWEEP_TOKEN, and GITHUB_WAKE_TOKEN only. roles/run.invoker is on
+the Cloud Run job gemini-waker only. The parent doorbell still SET NXes
+fleet:wake:seen:* and fleet:wake:receipt:entry:*. This file does not add a
+board write. Nothing here grants a role.
+
 Deploy is not this file's job. The command is in the pull request. Nothing
 here is applied.
 """
@@ -594,7 +607,11 @@ def attach_store(deps, client, receipts=None):
 
 
 def deps_from_env() -> Deps:
-    """Build the runtime deps. Redis is opened only when the flag is on."""
+    """Build the runtime deps. Redis stays closed until the wake flag is exactly on.
+
+    This service reads fleet:inbox:<agent>. It does not open Redis to write a
+    board row. That writer is cloud/board-mirror.
+    """
     on = enabled_from_env()
     deps = Deps(
         enabled=on,
@@ -609,8 +626,9 @@ def deps_from_env() -> Deps:
     if not on:
         return deps
     client = _redis_client()
-    if client is not None:
-        attach_store(deps, client)
+    if client is None:
+        return deps
+    attach_store(deps, client)
     return deps
 
 

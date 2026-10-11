@@ -165,6 +165,9 @@ function handleAppend_(body, cfg) {
                           existing_row: dup.row }, 409);
       }
       sheet.appendRow(row);
+      // appendRow does not fire onEdit. The installable triggers cover edits
+      // a person makes. A row this request wrote is copied by the one-pass
+      // reconcile on board-mirror, not by a fetch or a trigger created here.
       if (Array.isArray(body.sheetRow)) {
         const trigger = maybeTriggerWorker_(body.sheetRow);
         if (trigger !== 'off' && trigger !== 'not-a-request') {
@@ -453,4 +456,157 @@ function jsonOut_(obj, code) {
   obj._httpStatus = code || 200;
   return ContentService.createTextOutput(JSON.stringify(obj))
     .setMimeType(ContentService.MimeType.JSON);
+}
+
+// ---- BOARD HOOK — one signed POST per changed-row batch ----
+//
+// An installable onEdit / onChange, installed once by the owner from the
+// script editor, POSTs the changed rows to board-mirror. This file does not
+// create or delete triggers. The URL is the Script Property BOARD_HOOK_URL.
+// The HMAC secret is BOARD_HOOK_SECRET. The OIDC audience is
+// BOARD_MIRROR_AUDIENCE (the Cloud Run URL). None of those values are in
+// this file.
+//
+// Cloud Run IAM is the door: the call carries an identity token from
+// ScriptApp.getIdentityToken. The HMAC, the timestamp, and the nonce are
+// the second check. One UrlFetchApp.fetch per batch. No retry loop.
+//
+// appendRow from this web app does not fire onEdit. Those rows wait for
+// board-mirror's one-pass reconcile. Unset URL or secret: no fetch.
+
+function onBoardEdit(e) {
+  try {
+    if (!e || !e.range) return;
+    var range = e.range;
+    var sheet = range.getSheet();
+    var start = range.getRow();
+    var n = range.getNumRows();
+    if (start < 2) {
+      var skip = 2 - start;
+      if (skip >= n) return;
+      start = 2;
+      n = n - skip;
+    }
+    var values = sheet.getRange(start, 1, n, 10).getValues();
+    var events = [];
+    for (var i = 0; i < values.length; i++) {
+      var event = boardEvent_(values[i], start + i);
+      if (event.row_id) events.push(event);
+    }
+    if (!events.length) return;
+    postBoardHook_(events);
+  } catch (err) {
+    console.error('board hook edit failed: ' + err);
+  }
+}
+
+function onBoardChange(e) {
+  try {
+    var change = String(e && e.changeType || '');
+    // EDIT is onBoardEdit's batch. FORMAT and removals are not new rows.
+    if (change !== 'INSERT_ROW' && change !== 'INSERT_GRID' && change !== 'OTHER') return;
+    var ss = e && e.source;
+    if (!ss) return;
+    var sheet = ss.getSheets()[0];
+    var sheetRow = sheet.getLastRow();
+    if (sheetRow < 2) return;
+    var row = sheet.getRange(sheetRow, 1, 1, 10).getValues()[0];
+    var event = boardEvent_(row, sheetRow);
+    if (!event.row_id) return;
+    postBoardHook_([event]);
+  } catch (err) {
+    console.error('board hook change failed: ' + err);
+  }
+}
+
+function boardEvent_(row, sheetRow) {
+  var cells = row || [];
+  var payload = String(cells[5] == null ? '' : cells[5]);
+  return {
+    row_id: String(cells[0] == null ? '' : cells[0]).trim(),
+    sheet_row: sheetRow || 0,
+    appended_at: String(cells[1] == null ? '' : cells[1]),
+    from: String(cells[2] == null ? '' : cells[2]),
+    to: String(cells[3] == null ? '' : cells[3]),
+    phase: String(cells[4] == null ? '' : cells[4]),
+    id: bcbId_(payload),
+    sha256: sha256Hex_(payload)
+  };
+}
+
+function boardIdentityToken_(audience) {
+  // ScriptApp.getIdentityToken is the OIDC token Cloud Run IAM checks.
+  // It is not a UrlFetch. A service-account token is what this returns when
+  // the script runs as that account. No second fetch on this path.
+  try {
+    if (typeof ScriptApp.getIdentityToken === 'function') {
+      try {
+        return ScriptApp.getIdentityToken(audience);
+      } catch (inner) {
+        return ScriptApp.getIdentityToken();
+      }
+    }
+  } catch (err) {
+    console.error('getIdentityToken failed: ' + err);
+  }
+  return '';
+}
+
+function postBoardHook_(events) {
+  if (!events || !events.length) return;
+  var props = PropertiesService.getScriptProperties();
+  var url = props.getProperty('BOARD_HOOK_URL');
+  var secret = props.getProperty('BOARD_HOOK_SECRET');
+  var audience = props.getProperty('BOARD_MIRROR_AUDIENCE') || url;
+  if (!url || !secret) return;
+  var token = boardIdentityToken_(audience);
+  if (!token) {
+    console.error('board hook has no identity token; left for reconcile');
+    return;
+  }
+  var body = JSON.stringify({
+    ts: Math.floor(Date.now() / 1000),
+    nonce: Utilities.getUuid(),
+    events: events
+  });
+  var sig = 'sha256=' + hmacHex_(secret, body);
+  var ids = events.map(function (event) { return event.row_id; }).join(',');
+  try {
+    var resp = UrlFetchApp.fetch(url, {
+      method: 'post',
+      contentType: 'application/json',
+      payload: body,
+      muteHttpExceptions: true,
+      followRedirects: false,
+      headers: {
+        'X-Board-Signature-256': sig,
+        'Authorization': 'Bearer ' + token
+      }
+    });
+    var code = resp.getResponseCode();
+    if (code < 200 || code >= 300) {
+      console.error('board hook failed row_id=' + ids + ' http=' + code);
+    }
+  } catch (err) {
+    console.error('board hook failed row_id=' + ids + ' error=' + err);
+  }
+}
+
+function hmacHex_(secret, body) {
+  var bytes = Utilities.computeHmacSha256Signature(body, secret);
+  return bytes.map(function (b) {
+    var v = b < 0 ? b + 256 : b;
+    var s = v.toString(16);
+    return s.length === 1 ? '0' + s : s;
+  }).join('');
+}
+
+function sha256Hex_(text) {
+  var bytes = Utilities.computeDigest(
+    Utilities.DigestAlgorithm.SHA_256, String(text), Utilities.Charset.UTF_8);
+  return bytes.map(function (b) {
+    var v = b < 0 ? b + 256 : b;
+    var s = v.toString(16);
+    return s.length === 1 ? '0' + s : s;
+  }).join('');
 }

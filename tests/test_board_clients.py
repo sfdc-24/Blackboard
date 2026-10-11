@@ -6,8 +6,12 @@ import io
 import json
 import pathlib
 import sys
+import threading
 import unittest
 import urllib.error
+import urllib.parse
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
 
 
@@ -257,6 +261,216 @@ class MatchIsNotIdentityTests(unittest.TestCase):
         served = {"rows": [row("WRK-narrow", spec["payload"])], "total": 2953, "filtered": 1}
         _, _, _, _, read = AppendClientTests().run_client(spec, [served])
         self.assertEqual(read.call_args.kwargs.get("match"), "WRK-narrow")
+
+
+class ExecRedirectTests(unittest.TestCase):
+    """The /exec 302 is followed as a bare GET. The automatic handler 404s."""
+
+    def serve(self, location):
+        hits = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                n = int(self.headers.get("Content-Length") or 0)
+                self.rfile.read(n)
+                hits.append((self.command, self.path, self.headers.get("Content-Type")))
+                self.send_response(302)
+                self.send_header("Location", location)
+                self.end_headers()
+
+            def do_GET(self):
+                content_type = self.headers.get("Content-Type")
+                hits.append((self.command, self.path, content_type))
+                if content_type:
+                    body = b"content-type-404"
+                    code = 404
+                elif self.path.startswith("/echo"):
+                    body = b""
+                    code = 302
+                    self.send_response(code)
+                    self.send_header("Location", "/final")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                elif self.path.startswith("/final"):
+                    body = b'{"ok":true,"rows":[["R1"]]}'
+                    code = 200
+                else:
+                    body = b"missing"
+                    code = 404
+                self.send_response(code)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                if body:
+                    self.wfile.write(body)
+
+            def log_message(self, fmt, *args):
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        return server, hits
+
+    def test_exec_redirect_is_a_bare_get_on_every_hop(self):
+        server, hits = self.serve("/echo?k=1")
+        url = "http://127.0.0.1:%d/exec" % server.server_address[1]
+        try:
+            with mock.patch.object(
+                urllib.request, "urlopen", side_effect=AssertionError("automatic redirect")
+            ):
+                body = bus._fetch_once(url, {"action": "read", "match": "R1"})
+        finally:
+            server.shutdown()
+            server.server_close()
+        self.assertEqual('{"ok":true,"rows":[["R1"]]}', body)
+        self.assertEqual("POST", hits[0][0])
+        self.assertEqual("/exec", hits[0][1])
+        self.assertEqual("application/json", hits[0][2])
+        self.assertEqual(("GET", "/echo?k=1", None), hits[1])
+        self.assertEqual(("GET", "/final", None), hits[2])
+
+    def test_a_redirect_off_the_script_host_is_not_followed(self):
+        server, hits = self.serve("https://evil.example/steal")
+        url = "http://127.0.0.1:%d/exec" % server.server_address[1]
+        try:
+            with self.assertRaises(urllib.error.HTTPError):
+                bus._fetch_once(url, {"action": "read"})
+        finally:
+            server.shutdown()
+            server.server_close()
+        self.assertEqual([("POST", "/exec", "application/json")], hits)
+
+
+# The three reviews bus-requests-6ct9q could not read. The row id is the UUID.
+# The review id lives in the payload. Prefixes are what a caller already has.
+REVIEWS = (
+    ("53778e84", "53778e84-0000-4000-8000-000000000004", "CM-20261010-004"),
+    ("bc9e1a16", "bc9e1a16-0000-4000-8000-000000000001", "GR-20261010-001"),
+    ("aef36ae2", "aef36ae2-0000-4000-8000-000000000040", "GEMINI-20261010-0040"),
+)
+
+
+class ReviewSourceReadTests(unittest.TestCase):
+    """bus-requests-6ct9q: two HTTP 404s on the board source read, then stop.
+
+    POST /exec answers 302. A follower that keeps Content-Type on the echo GET
+    gets 404. The source read follows that hop as a bare GET and returns the
+    three reviews by stable row id.
+    """
+
+    def serve(self):
+        hits = []
+        rows = []
+        for _prefix, full, review in REVIEWS:
+            rows.append([full, "2026-10-10T00:00:00Z", "review", "all", "REVIEW", review,
+                         "OPEN", "Blackboard", "", ""])
+        body = json.dumps({
+            "ok": True, "rows": rows, "total": 3, "filtered": 3,
+        }).encode("utf-8")
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                n = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(n)
+                hits.append((self.command, self.path, self.headers.get("Content-Type"), raw))
+                self.send_response(302)
+                self.send_header("Location", "/echo")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def do_GET(self):
+                content_type = self.headers.get("Content-Type")
+                hits.append((self.command, self.path, content_type, b""))
+                if content_type or not self.path.startswith("/echo"):
+                    code, payload = 404, b"content-type-404"
+                else:
+                    code, payload = 200, body
+                self.send_response(code)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, fmt, *args):
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        return server, hits
+
+    def _content_type_follow(self, url):
+        """The follower that 404s: the echo GET still carries Content-Type."""
+        opener = urllib.request.build_opener(bus.NoRedirect)
+        request = urllib.request.Request(
+            url, data=b"{}", headers={"Content-Type": "application/json"})
+        try:
+            opener.open(request, timeout=5)
+        except urllib.error.HTTPError as error:
+            if error.code != 302:
+                raise
+            loc = urllib.parse.urljoin(url, error.headers.get("Location"))
+            error.close()
+            echoed = urllib.request.Request(
+                loc, method="GET", headers={"Content-Type": "application/json"})
+            opener.open(echoed, timeout=5)
+        raise AssertionError("the content-type hop should 404")
+
+    def test_302_then_404_and_source_rows_fetches_the_three_reviews(self):
+        import bus_reconcile
+        server, hits = self.serve()
+        url = "http://127.0.0.1:%d/exec" % server.server_address[1]
+        try:
+            codes = []
+            for _ in range(2):
+                with self.assertRaises(urllib.error.HTTPError) as caught:
+                    self._content_type_follow(url)
+                codes.append(caught.exception.code)
+            self.assertEqual([404, 404], codes)
+            env = {"BUS_URL": url, "BUS_SECRET": "test-secret"}
+            with mock.patch.object(
+                urllib.request, "urlopen", side_effect=AssertionError("automatic redirect")
+            ):
+                got = bus_reconcile.source_rows(
+                    env, row_ids=[item[0] for item in REVIEWS])
+        finally:
+            server.shutdown()
+            server.server_close()
+        self.assertEqual([item[2] for item in REVIEWS], [row[5] for row in got])
+        self.assertEqual([item[1] for item in REVIEWS], [row[0] for row in got])
+        posts = [hit for hit in hits if hit[0] == "POST"]
+        gets = [hit for hit in hits if hit[0] == "GET"]
+        # Two broken follows, then one bare GET per review.
+        self.assertEqual(5, len(posts))
+        self.assertEqual(5, len(gets))
+        bare = [hit for hit in gets if hit[2] is None]
+        typed = [hit for hit in gets if hit[2]]
+        self.assertEqual(2, len(typed))
+        self.assertEqual(3, len(bare))
+        self.assertTrue(all(hit[1] == "/echo" for hit in bare))
+        matches = []
+        for hit in posts[-3:]:
+            matches.append(json.loads(hit[3].decode("utf-8"))["match"])
+        self.assertEqual([item[0] for item in REVIEWS], matches)
+
+    def test_a_hex_prefix_is_unique_and_a_glued_id_is_not_that_row(self):
+        self.assertTrue(bus.row_matches("53778e84", "53778e84-0000-4000-8000-000000000004"))
+        self.assertFalse(bus.row_matches("53778e84", "53778e84999"))
+        rows = {
+            "rows": [
+                ["53778e84-aaaa-4000-8000-000000000004", "", "", "", "", "CM-20261010-004"],
+                ["53778e84-bbbb-4000-8000-000000000099", "", "", "", "", "other"],
+            ],
+            "filtered": 2,
+        }
+        with mock.patch.object(bus, "read_rows", return_value=rows):
+            with self.assertRaises(LookupError):
+                bus.read_row({"BUS_URL": "http://127.0.0.1/exec", "BUS_SECRET": "x"}, "53778e84")
+        one = {"rows": [rows["rows"][0]], "filtered": 1}
+        with mock.patch.object(bus, "read_rows", return_value=one) as read:
+            found = bus.read_row({"BUS_URL": "u", "BUS_SECRET": "s"}, "53778e84")
+        self.assertEqual("CM-20261010-004", found[5])
+        self.assertEqual("53778e84", read.call_args.kwargs.get("match"))
 
 
 class ReaderAndDiagnosticTests(unittest.TestCase):

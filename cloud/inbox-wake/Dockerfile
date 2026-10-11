@@ -4,6 +4,7 @@
 # INBOX_WAKE_ENABLED=off is the image default. A deploy that forgets the env
 # var still wakes nobody. INBOX_WAKE_RECEIPTS=off is the receipt default:
 # pickup writes nothing back until that variable is exactly "on".
+# This image does not copy the board and does not write fleet:inbox:*.
 # Scale-to-zero is a deploy flag (--min-instances=0), not something this
 # image can turn on by itself.
 FROM python:3.12-slim

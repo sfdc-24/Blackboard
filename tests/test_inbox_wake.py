@@ -6,6 +6,7 @@ No network. The wakers are fakes. Run: python3 tests/test_inbox_wake.py
 import hashlib
 import hmac
 import importlib.util
+import inspect
 import json
 import os
 import pathlib
@@ -691,6 +692,19 @@ class NeverAccepted(unittest.TestCase):
         source = (REPO / "cloud" / "inbox-wake" / "main.py").read_text(encoding="utf-8")
         self.assertNotIn('"ACCEPTED"', source)
         self.assertNotIn("'ACCEPTED'", source)
+
+
+
+class WakeDoesNotWriteTheBoard(unittest.TestCase):
+    def test_inbox_wake_has_no_board_route_and_no_board_write(self):
+        source = (REPO / "cloud" / "inbox-wake" / "main.py").read_text(encoding="utf-8")
+        docker = (REPO / "cloud" / "inbox-wake" / "Dockerfile").read_text(encoding="utf-8")
+        self.assertNotIn("/hooks/board", source)
+        self.assertNotIn(".xadd(", source)
+        self.assertNotIn("INBOX_WAKE_BOARD_MIRROR", source)
+        self.assertNotIn("INBOX_WAKE_BOARD_MIRROR", docker)
+        self.assertNotIn("COPY scripts/bus.py", docker)
+        self.assertIn("inbox-wake@sfdc24.iam.gserviceaccount.com", source)
 
 
 if __name__ == "__main__":
