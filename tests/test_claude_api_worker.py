@@ -86,10 +86,19 @@ class Inbox:
     def __init__(self, entries=()):
         self.entries = list(entries)         # oldest first, like a stream
         self.reads = 0
+        self.after = 0
+        self.through = 0
 
     def read(self, agent, count):
         self.reads += 1
-        return list(reversed(self.entries))[:count]
+        if self.after >= self.through:
+            self.after = 0
+            self.through = len(self.entries)
+        self.last_read = self.entries[self.after:min(self.after + count, self.through)]
+        return self.last_read
+
+    def checkpoint(self, agent, entry_id):
+        self.after += next(i + 1 for i, row in enumerate(self.last_read) if row[0] == entry_id)
 
 
 class Model:
@@ -125,7 +134,10 @@ def deps(text=REQUEST, receipts=None, **over):
     base = dict(enabled=True, inbox=Inbox([entry(text)]), docs=docs, receipts=receipts,
                 claims=wk.MemoryClaims(), ledger=wk.MemoryLedger(), model=Model(),
                 model_name="claude-haiku-5-5", folder_id=FOLDER, now=NOW, at=AT,
-                day=lambda now: "2026-10-11", cap_cents=2500, reserve_cents=5)
+                day=lambda now: "2026-10-11", day_window=lambda now: (NOW - 86400, NOW + 86400),
+                cap_cents=2500, reserve_cents=5,
+                price_in=1.0, price_out=5.0, cad_per_usd=1.4,
+                max_input_tokens=12_000, authorized_until=NOW + 3600)
     base.update(over)
     return wk.Deps(**base)
 
@@ -208,8 +220,8 @@ class RunTest(unittest.TestCase):
         d2 = deps()
         d2.inbox = Inbox([entry(REQUEST, when=NOW - 120), entry(other, when=NOW - 60)])
         out2 = wk.run_once(d2)
-        self.assertEqual(["succeeded", "left_for_next_pass"], [c["status"] for c in out2["considered"]])
-        self.assertEqual(t2["task_id"], out2["considered"][1]["task"])
+        self.assertEqual(["succeeded"], [c["status"] for c in out2["considered"]])
+        self.assertEqual(t2["task_id"], d2.inbox.entries[1][1]["task_id"])
 
     def test_entries_that_are_not_drive_requests_for_this_worker_are_not_touched(self):
         d = deps()
@@ -219,6 +231,15 @@ class RunTest(unittest.TestCase):
         self.assertEqual(["not_mine", "not_mine"], [c["status"] for c in out["considered"]])
         self.assertEqual(0, d.docs.reads)
         self.assertEqual([], d.model.calls)
+
+    def test_an_entry_after_five_hundred_older_entries_is_reached_on_the_next_pass(self):
+        d = deps()
+        note = dict(entry()[1], kind="note")
+        d.inbox = Inbox([("%d-0" % i, note) for i in range(1, 501)] + [entry()])
+        self.assertEqual("idle", wk.run_once(d)["status"])
+        self.assertEqual(500, d.inbox.after)
+        self.assertEqual("succeeded", wk.run_once(d)["considered"][0]["status"])
+        self.assertEqual(1, len(d.model.calls))
 
 
 class GateTest(unittest.TestCase):
@@ -354,14 +375,14 @@ class AcceptanceTest(unittest.TestCase):
         self.assertEqual([], d.model.calls)
         self.assertEqual("idle", wk.run_once(d)["status"])
 
-    def test_a_dead_lease_with_an_attempt_left_runs_once_more(self):
+    def test_a_dead_lease_never_replays_even_if_more_attempts_were_configured(self):
         d = deps(max_attempts=2)
         t = task_tuple()
         d.docs.text += wk.receipt_line("ACCEPTED", t, "2026-10-11T04:10:00Z", "feedfeedfeedfeed", "attempt 1") + chr(10)
         d.claims.states[t["task_id"]] = "accepted:%d:1" % int(NOW - 601)
         out = wk.run_once(d)
-        self.assertEqual("succeeded", out["considered"][0]["status"], out)
-        self.assertEqual(1, len(d.model.calls))
+        self.assertEqual("unknown", out["considered"][0]["status"], out)
+        self.assertEqual(0, len(d.model.calls))
         self.assertEqual("done", d.claims.states[task_tuple()["task_id"]])
 
 
@@ -374,7 +395,7 @@ class SpendTest(unittest.TestCase):
         self.assertEqual("capped", out["considered"][0]["status"], out)
         self.assertEqual([], d.model.calls)
         self.assertEqual(["ACCEPTED", "QUEUED"], d.receipts.states())
-        self.assertIn("no spend cap or reservation configured", d.receipts.lines[1][2])
+        self.assertIn("no valid cap", d.receipts.lines[1][2])
 
     def test_the_day_cap_reached_queues_and_the_next_day_runs(self):
         d = deps(cap_cents=10, reserve_cents=5)
@@ -406,12 +427,59 @@ class SpendTest(unittest.TestCase):
         self.assertIn("1 cents CAD", d.receipts.lines[1][2])
         self.assertEqual("1", d.ledger.calls[0][1]["settled"])
 
-    def test_without_a_price_the_reservation_stands(self):
-        d = deps(reserve_cents=7)
+    def test_without_a_price_no_call_is_admitted(self):
+        d = deps(reserve_cents=7, price_in=None)
         wk.run_once(d)
-        self.assertEqual(7, d.ledger.spent("2026-10-11"))
-        self.assertIn("7 cents CAD reserved", d.receipts.lines[1][2])
-        self.assertEqual("0", d.ledger.calls[0][1]["settled"])
+        self.assertEqual(0, d.ledger.spent("2026-10-11"))
+        self.assertEqual([], d.model.calls)
+        self.assertIn("no valid cap", d.receipts.lines[1][2])
+
+    def test_missing_or_expired_input_and_authorization_bounds_block_the_call(self):
+        for override in ({"max_input_tokens": 0}, {"max_input_tokens": 100},
+                         {"authorized_until": None}, {"authorized_until": NOW}):
+            with self.subTest(override=override):
+                d = deps(**override)
+                self.assertEqual("capped", wk.run_once(d)["considered"][0]["status"])
+                self.assertEqual([], d.model.calls)
+                self.assertEqual(0, d.ledger.spent("2026-10-11"))
+
+    def test_authorization_deadline_must_be_explicit_utc(self):
+        name = "CLAUDE_API_WORKER_AUTHORIZED_UNTIL_UTC"
+        self.assertIsNone(wk._utc_deadline_env({}, name))
+        self.assertIsNone(wk._utc_deadline_env({name: "2026-10-15T04:00:00"}, name))
+        self.assertEqual(1792036800.0,
+                         wk._utc_deadline_env({name: "2026-10-15T04:00:00Z"}, name))
+
+    def test_pre_call_worst_case_blocks_a_reservation_that_would_settle_over_cap(self):
+        d = deps(cap_cents=10, reserve_cents=4, price_out=30.0)
+        d.ledger.days["2026-10-11"] = 6
+        bound = wk.call_reservation(d, wk.DOCTRINE % wk.RESULT_MAX, wk.request_for_model(REQUEST))
+        self.assertGreater(bound, 4)
+        self.assertGreater(6 + bound, d.cap_cents)
+        out = wk.run_once(d)
+        self.assertEqual("capped", out["considered"][0]["status"], out)
+        self.assertEqual([], d.model.calls)
+        self.assertEqual(6, d.ledger.spent("2026-10-11"))
+
+    def test_the_worst_case_amount_is_reserved_before_the_model_call(self):
+        seen = []
+        class Watching(Model):
+            def __call__(self, system, prompt):
+                seen.append(d.ledger.spent("2026-10-11"))
+                return super().__call__(system, prompt)
+        d = deps(model=Watching(), reserve_cents=1, price_out=30.0)
+        wk.run_once(d)
+        self.assertEqual(1, len(seen))
+        self.assertGreater(seen[0], 1)
+        self.assertLessEqual(d.ledger.spent("2026-10-11"), seen[0])
+
+    def test_an_out_of_bound_provider_charge_is_recorded_without_hiding_the_breach(self):
+        d = deps(model=Model(tokens=(1200, 100000)), cap_cents=10,
+                 reserve_cents=1, price_out=30.0)
+        self.assertEqual("succeeded", wk.run_once(d)["considered"][0]["status"])
+        self.assertGreater(d.ledger.spent("2026-10-11"), d.cap_cents)
+        self.assertEqual("1", d.ledger.calls[0][1]["overrun"])
+        self.assertIn("budget review needed", d.receipts.lines[-1][2])
 
     def test_a_timeout_is_unknown_keeps_the_reservation_and_is_never_run_again(self):
         d = deps(model=Model(fail=wk.ModelUnknown("timeout")), reserve_cents=5)
@@ -445,7 +513,89 @@ class SpendTest(unittest.TestCase):
         out = wk.run_once(d)
         self.assertEqual("succeeded", out["considered"][0]["status"], out)
         self.assertIn("attempt 1", d.receipts.lines[0][2])             # a refusal was not an attempt
-        self.assertEqual(5, d.ledger.spent("2026-10-11"))
+        self.assertEqual(1, d.ledger.spent("2026-10-11"))
+
+    def test_zero_attempt_retry_must_win_cas_before_receipt_or_call(self):
+        class LostRace(wk.MemoryClaims):
+            def advance(self, task_id, current, new):
+                if current == "accepted:0:0:1" and new.startswith("accepted:"):
+                    return False
+                return super().advance(task_id, current, new)
+
+        claims = LostRace()
+        claims.states[task_tuple()["task_id"]] = "accepted:0:0:1"
+        d = deps(claims=claims)
+        out = wk.run_once(d)["considered"][0]
+        self.assertEqual("in_progress", out["status"])
+        self.assertEqual([], d.model.calls)
+        self.assertEqual([], d.receipts.states())
+        self.assertEqual(0, d.ledger.spent("2026-10-11"))
+
+    def test_killed_retry_consumes_attempt_and_cannot_replay(self):
+        class Killed(Model):
+            def __call__(self, system, prompt):
+                self.calls.append((system, prompt))
+                raise KeyboardInterrupt()
+
+        claims = wk.MemoryClaims()
+        task = task_tuple()["task_id"]
+        claims.states[task] = "accepted:0:0:1"
+        model = Killed()
+        d = deps(claims=claims, model=model)
+        with self.assertRaises(KeyboardInterrupt):
+            wk.run_once(d)
+        self.assertTrue(claims.states[task].startswith("accepted:"))
+        self.assertEqual(1, wk._split(claims.states[task])[2])
+        d.now += wk.WORK_LEASE + 1
+        out = wk.run_once(d)["considered"][0]
+        self.assertEqual("unknown", out["status"])
+        self.assertEqual(1, len(model.calls))
+
+    def test_receipt_delay_refreshes_authorization_time_before_reservation(self):
+        class SlowReceipt(Receipts):
+            def append(self, file_id, expected_revision, receipt_id, block):
+                value = super().append(file_id, expected_revision, receipt_id, block)
+                d.now = NOW + 2
+                return value
+
+        d = deps(receipts=SlowReceipt(), authorized_until=NOW + 1)
+        out = wk.run_once(d)["considered"][0]
+        self.assertEqual("capped", out["status"])
+        self.assertEqual([], d.model.calls)
+        self.assertEqual(0, d.ledger.spent("2026-10-11"))
+
+    def test_receipt_delay_selects_new_budget_day(self):
+        boundary = NOW + 1
+        class SlowReceipt(Receipts):
+            def append(self, file_id, expected_revision, receipt_id, block):
+                value = super().append(file_id, expected_revision, receipt_id, block)
+                d.now = boundary
+                return value
+
+        d = deps(receipts=SlowReceipt(), authorized_until=NOW + 3600,
+                 day=lambda now: "before" if now < boundary else "after",
+                 day_window=lambda now: (NOW - 3600, boundary) if now < boundary else
+                     (boundary, NOW + 3600))
+        self.assertEqual("succeeded", wk.run_once(d)["considered"][0]["status"])
+        self.assertEqual(0, d.ledger.spent("before"))
+        self.assertEqual(1, d.ledger.spent("after"))
+
+    def test_http_200_without_valid_usage_retains_reservation(self):
+        for usage in ({}, {"input_tokens": 0, "output_tokens": 4},
+                      {"input_tokens": "12", "output_tokens": 4},
+                      {"input_tokens": True, "output_tokens": 4},
+                      {"input_tokens": 12, "output_tokens": -1}):
+            with self.subTest(usage=usage):
+                raw = json.dumps({"content": [{"type": "text", "text": "Answer"}],
+                                  "usage": usage, "model": "claude-haiku-5-5",
+                                  "stop_reason": "end_turn"}).encode()
+                model = wk.AnthropicModel(key="k", model="claude-haiku-5-5",
+                                          post=lambda *a: (200, raw))
+                d = deps(model=model, reserve_cents=5)
+                self.assertEqual("succeeded", wk.run_once(d)["considered"][0]["status"])
+                self.assertEqual(5, d.ledger.spent("2026-10-11"))
+                self.assertEqual("0", d.ledger.calls[0][1]["settled"])
+                self.assertIn("usage unknown", d.receipts.lines[-1][2])
 
     def test_refusals_are_bounded_then_failed_with_nothing_billed(self):
         d = deps(model=Model(fail=wk.ModelRejected("HTTP 529")), reserve_cents=5)
@@ -461,10 +611,17 @@ class SpendTest(unittest.TestCase):
         self.assertEqual("idle", wk.run_once(d)["status"])
         self.assertEqual(3, len(d.model.calls))
 
-    def test_the_adapter_classes_a_non_200_as_a_refusal(self):
+    def test_the_adapter_classes_a_definite_non_200_as_a_refusal(self):
         m = wk.AnthropicModel(key="k", model="m", post=lambda *a: (401, b""))
         with self.assertRaises(wk.ModelRejected):
             m("s", "p")
+
+    def test_an_ambiguous_server_error_keeps_reservation_and_does_not_replay(self):
+        model = wk.AnthropicModel(key="k", model="m", post=lambda *a: (500, b""))
+        d = deps(model=model)
+        self.assertEqual("unknown", wk.run_once(d)["considered"][0]["status"])
+        self.assertEqual(5, d.ledger.spent("2026-10-11"))
+        self.assertEqual("idle", wk.run_once(d)["status"])
 
     def test_an_unconfigured_model_refunds_and_leaves_the_task_for_a_configured_pass(self):
         d = deps(model=None, reserve_cents=5)
@@ -481,6 +638,8 @@ class SpendTest(unittest.TestCase):
         self.assertEqual(0, wk.actual_cents(0, 0, 1.0, 5.0, 1.4))
         self.assertIsNone(wk.actual_cents(1200, 300, None, 5.0, 1.4))
         self.assertIsNone(wk.actual_cents(1200, 300, 1.0, 5.0, None))
+        self.assertIsNone(wk.actual_cents(1200, 300, float("nan"), 5.0, 1.4))
+        self.assertIsNone(wk.actual_cents(-1, 300, 1.0, 5.0, 1.4))
         self.assertEqual(141, wk.actual_cents(1_000_000, 0, 1.0, 5.0, 1.4000001))
 
 
@@ -545,6 +704,62 @@ class ResultTest(unittest.TestCase):
         self.assertEqual("unknown", out["considered"][0]["status"], out)
         self.assertIn("stored answer expired", d.receipts.lines[0][2])
         self.assertEqual([], d.model.calls)
+
+    def test_failed_result_store_cannot_advance_or_attempt_a_success_receipt(self):
+        class Broken(wk.MemoryClaims):
+            def keep_result(self, task_id, raw):
+                raise OSError("store unavailable")
+        d = deps(claims=Broken(), max_attempts=3)
+        task = task_tuple()["task_id"]
+        out = wk.run_once(d)
+        self.assertEqual("result_persistence_unknown", out["considered"][0]["status"])
+        self.assertTrue(d.claims.states[task].startswith("uncertain:"))
+        self.assertEqual(["ACCEPTED"], d.receipts.states())
+        self.assertEqual(1, d.ledger.spent("2026-10-11"))  # known usage is settled despite failed result storage
+        wk.run_once(d)
+        self.assertEqual(["ACCEPTED", "UNKNOWN"], d.receipts.states())
+        self.assertEqual(1, len(d.model.calls))
+
+    def test_lost_store_ack_with_readable_payload_finishes_without_replay(self):
+        class LostAck(wk.MemoryClaims):
+            def keep_result(self, task_id, raw):
+                super().keep_result(task_id, raw)
+                raise OSError("ack lost")
+        d = deps(claims=LostAck())
+        self.assertEqual("succeeded", wk.run_once(d)["considered"][0]["status"])
+        self.assertEqual(["ACCEPTED", "SUCCEEDED"], d.receipts.states())
+        self.assertEqual(1, len(d.model.calls))
+
+    def test_unreadable_store_confirmation_recovers_the_kept_answer_later(self):
+        class UnreadableOnce(wk.MemoryClaims):
+            def __init__(self):
+                super().__init__()
+                self.fail_reads = 2
+            def result(self, task_id):
+                if self.fail_reads and task_id in self.results:
+                    self.fail_reads -= 1
+                    raise OSError("read unavailable")
+                return super().result(task_id)
+        d = deps(claims=UnreadableOnce())
+        self.assertEqual("result_persistence_unknown", wk.run_once(d)["considered"][0]["status"])
+        self.assertEqual(["ACCEPTED"], d.receipts.states())
+        self.assertEqual("succeeded", wk.run_once(d)["considered"][0]["status"])
+        self.assertEqual(["ACCEPTED", "SUCCEEDED"], d.receipts.states())
+        self.assertEqual(1, len(d.model.calls))
+
+    def test_nonempty_truncated_answer_is_failed_and_keeps_the_charge_reservation(self):
+        class Truncated(Model):
+            def __call__(self, system, prompt):
+                answer = super().__call__(system, prompt)
+                answer["stop_reason"] = "max_tokens"
+                return answer
+        d = deps(model=Truncated())
+        out = wk.run_once(d)
+        self.assertEqual("failed", out["considered"][0]["status"], out)
+        self.assertEqual(["ACCEPTED", "FAILED"], d.receipts.states())
+        self.assertIn("max_tokens", d.receipts.lines[-1][2])
+        self.assertEqual(5, d.ledger.spent("2026-10-11"))
+        self.assertEqual(1, len(d.model.calls))
 
     def test_no_result_line_can_look_like_a_receipt_and_the_cut_is_said(self):
         t = task_tuple()
@@ -651,6 +866,7 @@ class RedisShapeTest(unittest.TestCase):
     class Client:
         def __init__(self):
             self.kv, self.ttl, self.streams, self.evals = {}, {}, {}, []
+            self.server_now = 1
 
         def get(self, key):
             return self.kv.get(key)
@@ -677,15 +893,26 @@ class RedisShapeTest(unittest.TestCase):
             rows = [("%d-0" % (i + 1), f) for i, f in enumerate(self.streams.get(key, []))]
             return list(reversed(rows))[:count]
 
+        def xrange(self, key, min="-", max="+", count=None):
+            rows = [("%d-0" % (i + 1), f) for i, f in enumerate(self.streams.get(key, []))]
+            def number(value):
+                return tuple(int(part) for part in value.lstrip("(").split("-"))
+            rows = [(id_, fields) for id_, fields in rows
+                    if (min == "-" or number(id_) > number(min))
+                    and (max == "+" or number(id_) <= number(max))]
+            return rows[:count]
+
         def eval(self, script, nkeys, *args):
             self.evals.append((script, args))
             keys, argv = args[:nkeys], args[nkeys:]
             if script == wk.CAS_LUA:
                 if self.kv.get(keys[0]) == argv[0]:
-                    self.set(keys[0], argv[1], ex=argv[2])
+                    self.set(keys[0], argv[1], ex=argv[2] or None)
                     return 1
                 return 0
             if script == wk.RESERVE_LUA:
+                if not int(argv[3]) <= self.server_now < min(int(argv[4]), int(argv[5])):
+                    return -1
                 value = self.incrby(keys[0], argv[0])
                 self.expire(keys[0], argv[2])
                 if value > int(argv[1]):
@@ -700,7 +927,10 @@ class RedisShapeTest(unittest.TestCase):
         self.assertTrue(claims.claim("task-1", "accepted:1:1"))
         self.assertFalse(claims.claim("task-1", "accepted:2:1"))
         self.assertEqual("accepted:1:1", claims.state("task-1"))
-        self.assertTrue(claims.advance("task-1", "accepted:1:1", "done"))
+        self.assertNotIn("fleet:worker:claim:task-1", c.ttl)
+        self.assertTrue(claims.advance("task-1", "accepted:1:1", "uncertain:1:1"))
+        self.assertNotIn("fleet:worker:claim:task-1", c.ttl)
+        self.assertTrue(claims.advance("task-1", "uncertain:1:1", "done"))
         self.assertFalse(claims.advance("task-1", "accepted:1:1", "done"))
         self.assertEqual(wk.CLAIM_TTL, c.ttl["fleet:worker:claim:task-1"])
         self.assertFalse(claims.done("task-1"))
@@ -732,11 +962,47 @@ class RedisShapeTest(unittest.TestCase):
         ledger.record("2026-10-11", {"by": "claude-api", "cents": "1"})
         self.assertEqual([{"by": "claude-api", "cents": "1"}], c.streams["fleet:spend:2026-10-11:calls"])
 
-    def test_the_inbox_reads_newest_first_and_decodes_bytes(self):
+    def test_redis_clock_rechecks_day_and_authorization_atomically(self):
+        self.assertIn("redis.replicate_commands()", wk.RESERVE_LUA)
+        c = self.Client()
+        ledger = wk.RedisLedger(c)
+        c.server_now = 101  # newer than the worker's selection at 99
+        for start, end, deadline in ((0, 100, 200), (0, 200, 100)):
+            with self.subTest(end=end, deadline=deadline):
+                with self.assertRaises(wk.AdmissionTimeMoved):
+                    ledger.reserve("selected-day", 5, 10, start, end, deadline, 99)
+                self.assertEqual(0, ledger.spent("selected-day"))
+        self.assertTrue(ledger.reserve("current-day", 5, 10, 100, 200, 200, 99))
+        self.assertEqual(5, ledger.spent("current-day"))
+
+    def test_the_inbox_reads_oldest_first_and_decodes_bytes(self):
         c = self.Client()
         c.streams["fleet:inbox:claude-api"] = [{b"task_id": b"task-a"}, {"task_id": "task-b"}]
-        rows = wk.RedisInbox(c).read("claude-api", 10)
-        self.assertEqual([("2-0", {"task_id": "task-b"}), ("1-0", {"task_id": "task-a"})], rows)
+        inbox = wk.RedisInbox(c)
+        rows = inbox.read("claude-api", 10)
+        self.assertEqual([("1-0", {"task_id": "task-a"}), ("2-0", {"task_id": "task-b"})], rows)
+        inbox.checkpoint("claude-api", "1-0")
+        self.assertEqual([("2-0", {"task_id": "task-b"})], wk.RedisInbox(c).read("claude-api", 10))
+
+    def test_persisted_scan_reaches_entries_beyond_five_hundred_after_restart(self):
+        c = self.Client()
+        c.streams["fleet:inbox:claude-api"] = [{"task_id": str(i)} for i in range(502)]
+        first = wk.RedisInbox(c)
+        self.assertEqual(500, len(first.read("claude-api", 500)))
+        first.checkpoint("claude-api", "500-0")
+        restarted = wk.RedisInbox(c)
+        self.assertEqual(["501-0", "502-0"],
+                         [id_ for id_, _ in restarted.read("claude-api", 500)])
+        restarted.checkpoint("claude-api", "502-0")
+        c.streams["fleet:inbox:claude-api"].append({"task_id": "new"})
+        self.assertEqual("1-0", wk.RedisInbox(c).read("claude-api", 500)[0][0])
+
+    def test_other_lane_retains_newest_first_adapter_shape(self):
+        c = self.Client()
+        c.streams["fleet:inbox:claude-code-cli"] = [{"task_id": "old"}, {"task_id": "new"}]
+        rows = wk.RedisInbox(c).read("claude-code-cli", 10)
+        self.assertEqual(["new", "old"], [fields["task_id"] for _, fields in rows])
+        self.assertNotIn("fleet:worker:inbox_scan:claude-code-cli", c.kv)
 
     def test_entry_time_prefers_the_stream_clock_then_the_writers_at(self):
         self.assertEqual(1760000000.5, wk.entry_time("1760000000500-0", {}))
@@ -776,6 +1042,10 @@ class ModelAdapterTest(unittest.TestCase):
         with self.assertRaises(wk.ModelRejected):
             m("s", "p")
         m = wk.AnthropicModel(key="k", model="m", post=lambda *a: (200, b'{"content": [], "stop_reason": "max_tokens"}'))
+        with self.assertRaisesRegex(wk.ModelError, "max_tokens"):
+            m("s", "p")
+        partial = b'{"content": [{"type": "text", "text": "Partial answer"}], "stop_reason": "max_tokens"}'
+        m = wk.AnthropicModel(key="k", model="m", post=lambda *a: (200, partial))
         with self.assertRaisesRegex(wk.ModelError, "max_tokens"):
             m("s", "p")
         m = wk.AnthropicModel(key="k", model="m", post=lambda *a: (200, b"not json"))

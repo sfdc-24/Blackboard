@@ -115,6 +115,7 @@ class WorkerDeployTest(unittest.TestCase):
         self.assertEqual(set(), missing)
         self.assertIn("CLAUDE_API_WORKER_ENABLED=off", self.script)
         self.assertIn("CLAUDE_API_LANE_ENABLED=off", self.script)
+        self.assertIn("PHONE_DOC_INTAKE_ENABLED=off", self.script)
         self.assertIn("REDIS_CONNECT=true", self.script)
         self.assertIn("REDIS_HOST=${REDIS_HOST}", self.script)
 
@@ -146,6 +147,15 @@ class WorkerDeployTest(unittest.TestCase):
         self.assertIn("roles/iam.serviceAccountTokenCreator", self.script)
         self.assertNotIn("roles/iam.serviceAccountUser", self.script)
         self.assertIn("template.template.serviceAccount", self.script)
+
+    def test_cost_bounds_are_wired_but_fail_closed_by_default(self):
+        for name, var, default in (("CLAUDE_API_WORKER_MAX_INPUT_TOKENS", "MAX_INPUT_TOKENS", "0"),
+                                   ("CLAUDE_API_WORKER_AUTHORIZED_UNTIL_UTC", "AUTHORIZED_UNTIL_UTC", ""),
+                                   ("CLAUDE_API_WORKER_USD_PER_MTOK_IN", "PRICE_IN", "0"),
+                                   ("CLAUDE_API_WORKER_USD_PER_MTOK_OUT", "PRICE_OUT", "0"),
+                                   ("FLEET_CAD_PER_USD", "CAD_PER_USD", "0")):
+            self.assertIn("${%s:-%s}" % (name, default), self.script)
+            self.assertIn(name + "=${" + var + "}", self.script)
 
 
 class ShellTest(unittest.TestCase):

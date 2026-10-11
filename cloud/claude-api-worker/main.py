@@ -15,8 +15,11 @@ HIS THREE DECISIONS (2026-10-10 21:36Z), EACH ENCODED
      means the laptop is up. Read through drive-intake's own heartbeat_age, so
      the two services cannot disagree about "online".
   2. The spend cap holds. No model call without a reservation first in the
-     shared day ledger fleet:spend:<Toronto day>, in cents CAD, and a cap
-     that is unset reads as ZERO: a worker that forgets its cap calls nothing.
+      shared day ledger fleet:spend:<Toronto day>, in cents CAD, and a cap
+      that is unset reads as ZERO: a worker that forgets its cap calls nothing.
+      A missing price, FX rate, model input/output limit or authorization
+      deadline also blocks the call; admission reserves the configured model
+      input bound and the request's maximum output cost.
      The reservation is one call, one attempt, no automatic retry. A call
      whose outcome is unknown KEEPS its reservation.
   3. Minimal functions, and it runs only when he is not working: a task on
@@ -51,9 +54,9 @@ THE THINGS THAT GO WRONG, AND WHERE EACH IS STOPPED
      the doc; a task id that no longer matches is superseded (the new revision
      comes through intake as its own task) and this entry is never run.
   4. An outcome nobody can prove: a timeout is UNKNOWN, not FAILED and not a
-     reason to run again. One attempt by default (MAX_ATTEMPTS); an attempt
-     whose lease died is counted, and when the attempts are spent the doc says
-     UNKNOWN rather than nothing. A refusal (any HTTP status but 200) is the
+     reason to run again. An attempt whose lease died is not replayed, even if
+     more attempts were configured: the doc says UNKNOWN rather than nothing.
+     A definite refusal (including 401, 429 and 529) is the
      other way round: not an answer and not billed, so the reservation goes
      back, the attempt is not consumed and the task stays open - a fixed key
      or a quieter API finds it waiting - bounded by MAX_REJECTIONS, after
@@ -74,7 +77,6 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
-import math
 import os
 import re
 import socket
@@ -82,7 +84,8 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation, ROUND_CEILING
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -112,6 +115,17 @@ def _load_lane():
 
 lane = _load_lane()
 
+
+def _load_pilot():
+    """Load the local module when tests import main.py without changing sys.path."""
+    spec = importlib.util.spec_from_file_location("phone_intake", os.path.join(HERE, "phone_intake.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+pilot = _load_pilot()
+
 WORKER = "claude-api"
 ACCEPTED = "ACCEPTED"
 SUCCEEDED = "SUCCEEDED"
@@ -124,14 +138,15 @@ INTAKE_WRITER = "drive-intake"
 DEFAULT_REASSIGN = 1800      # his rule: a task to the laptop unanswered 30 min while off is reassigned
 WORK_LEASE = 600             # longer than the model timeout, so a dead lease means a dead attempt
 MODEL_TIMEOUT = 300
-DEFAULT_MAX_ATTEMPTS = 1     # one attempt, no automatic retry (the budget rule of 2026-10-08)
+DEFAULT_MAX_ATTEMPTS = 1     # retained for configuration compatibility; a started call is never replayed
 MAX_REJECTIONS = 3           # HTTP refusals (401, 429, 529...) are not answers and not billed: retried, bounded
 MAX_TASKS_PER_PASS = 1       # one model call per pass; the schedule is the throttle
 INBOX_LOOKBACK = 500
+INPUT_TOKEN_OVERHEAD = 1024  # conservative request-fit check; not used as a billing upper bound
 REQUEST_MAX = 12000          # chars of the request given to the model; cut is SAID, never silent
 RESULT_MAX = 3000            # chars of the answer written into the doc; cut is SAID
 DEFAULT_MAX_TOKENS = 1500
-CLAIM_TTL = 2592000          # 30 days, like every fleet: key here
+CLAIM_TTL = 2592000          # only terminal claims expire; in-flight uncertainty must not expire into a replay
 DONE_TTL = 5184000           # 60 days: a done marker that outlives the inbox entry's usefulness
 RESULT_TTL = 604800          # 7 days for a stored answer whose receipt is still owed
 SPEND_TTL = 259200           # the day ledger lives three days, long enough to be read
@@ -139,6 +154,7 @@ SPEND_TTL = 259200           # the day ledger lives three days, long enough to b
 STATE_ACCEPTED = "accepted"  # accepted:<since>:<attempt>:<rejections> - a call is in flight or died
 STATE_CAPPED = "capped"      # capped:<day>:<attempt>:<rejections> - the day's cap refused it; tomorrow retries
 STATE_RESULTED = "resulted"  # resulted:<since>:<attempt>:<rejections> - answer stored, terminal line owed
+STATE_UNCERTAIN = "uncertain"  # a call happened, but its result could not be confirmed in the store
 STATE_DONE = "done"
 
 # Any receipt in the shared shape, by anyone: "<STATE> - task <id> - request .. - rev .. - recipient .. - by <who> - "
@@ -169,11 +185,15 @@ class ModelError(Exception):
 
 
 class ModelRejected(Exception):
-    """The API refused the request (any status but 200). Not an answer, not billed: refund and retry, bounded."""
+    """A definite API refusal. Not an answer or billed: refund and retry, bounded."""
 
 
 class ModelUnknown(Exception):
     """No answer inside the timeout. It may have been billed; it cannot be proven either way."""
+
+
+class AdmissionTimeMoved(Exception):
+    """The ledger's clock left the selected budget day or authorization window."""
 
 
 def enabled_from_env(environ=None) -> bool:
@@ -404,6 +424,11 @@ def consider(entry_id, fields: dict, deps) -> dict:
         return out
     current_tuple = di.correlate(tuple_["source_doc_id"], text, drive_revision, WORKER)
     if current_tuple["task_id"] != task_id:
+        if getattr(deps, "pilot_docs", None) is not None:
+            tuple_["drive_revision"] = drive_revision
+            recovered = _recover_pilot_result(deps, tuple_, text, out)
+            if recovered is not None:
+                return recovered
         # Edited since it was queued. The edit is its own task through intake; this one is over.
         _mark_done(deps, task_id)
         out.update(status="superseded", now=current_tuple["task_id"])
@@ -454,9 +479,25 @@ def consider(entry_id, fields: dict, deps) -> dict:
         out["status"] = "done"
         return out
 
-    if phase == STATE_RESULTED:
+    if phase in (STATE_RESULTED, STATE_UNCERTAIN):
         # The answer exists; only its line is owed. No model call, whatever the lease says.
-        return _finish_from_store(deps, tuple_, text, current, attempt, out)
+        if phase == STATE_RESULTED:
+            return _finish_from_store(deps, tuple_, text, current, attempt, out)
+        try:
+            kept = deps.claims.result(task_id)
+        except Exception as exc:
+            out.update(status="result_unreadable", error=type(exc).__name__)
+            return out
+        if kept:
+            resulted = _state(STATE_RESULTED, int(now), attempt, rejected)
+            if not deps.claims.advance(task_id, current, resulted):
+                out["status"] = "in_progress"
+                return out
+            return _finish_from_store(deps, tuple_, text, resulted, attempt, out)
+        out["receipt"] = write_receipt(deps, tuple_, text, UNKNOWN, deps.at,
+                                      "a call occurred but its outcome was not kept; charge or reservation remains in the ledger; manual reconciliation needed")
+        out["status"] = "result_persistence_unknown"
+        return out
 
     if phase == STATE_CAPPED:
         if middle == deps.day(now):
@@ -491,7 +532,7 @@ def consider(entry_id, fields: dict, deps) -> dict:
             # Inside its lease, or ahead of this clock (skew, not death): another pass owns it.
             out["status"] = "in_progress"
             return out
-        if attempt >= deps.max_attempts:
+        if attempt >= 1:
             # The attempts are spent and none left a result. The doc gets UNKNOWN, not silence.
             out["receipt"] = write_receipt(
                 deps, tuple_, text, UNKNOWN, deps.at,
@@ -504,11 +545,13 @@ def consider(entry_id, fields: dict, deps) -> dict:
             else:
                 out["status"] = "unknown_receipt_owed"
             return out
-        moved = _state(STATE_ACCEPTED, int(now), attempt + 1, rejected)
+        # A zero-attempt state followed a proven refusal or a receipt/admission failure.
+        # Reacquire it with CAS before any receipt, reservation or model call.
+        moved = _state(STATE_ACCEPTED, int(now), 1, rejected)
         if not deps.claims.advance(task_id, current, moved):
             out["status"] = "in_progress"
             return out
-        current, attempt = moved, attempt + 1
+        current, attempt = moved, 1
 
     # ACCEPTED must be READABLE before anything is reported as picked up (guard 6).
     deadline = datetime.fromtimestamp(now + WORK_LEASE, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -517,38 +560,53 @@ def consider(entry_id, fields: dict, deps) -> dict:
         "attempt %d - lease until %s - model %s" % (attempt, deadline, deps.model_name or "unset"))
     text = di.with_heading(text)
     if out["accepted"] not in ("written", "no_receipt_writer"):
-        deps.claims.advance(task_id, current, _state(STATE_ACCEPTED, 0, attempt - 1, rejected))  # lease given up
+        deps.claims.advance(task_id, current, _state(STATE_ACCEPTED, 0, max(0, attempt - 1), rejected))  # lease given up
         out["status"] = "accepted_receipt_owed"
         return out
 
-    # The cap, BEFORE the call. No reservation, no call (decision 2).
-    day = deps.day(now)
+    # The cap, BEFORE the call. Price and a conservative maximum are required.
+    # Receipt I/O can cross midnight or the authorization cutoff. Redis checks its own
+    # clock in the reserve script as well, so the selected day is valid at admission.
+    admission_now = _now(deps)
+    day = deps.day(admission_now)
+    day_start, day_end = deps.day_window(admission_now)
+    system, prompt = DOCTRINE % RESULT_MAX, request_for_model(text)
+    reserve_cents = call_reservation(deps, system, prompt, admission_now)
     try:
-        reserved = deps.ledger.reserve(day, deps.reserve_cents, deps.cap_cents)
+        reserved = bool(reserve_cents) and deps.ledger.reserve(
+            day, reserve_cents, deps.cap_cents, day_start, day_end,
+            deps.authorized_until, admission_now)
+    except AdmissionTimeMoved:
+        reserved = False
+        out["ledger"] = "admission_time_moved"
     except Exception as exc:  # noqa: BLE001 - a ledger that cannot answer has not reserved
         reserved = False
         out["ledger"] = "unknown:" + type(exc).__name__
     if not reserved:
         spent = _spent(deps, day)
-        detail = ("daily spend cap reached (%s of %d cents CAD reserved on %s); tried again next day"
-                  % (spent, deps.cap_cents, day)) if deps.cap_cents > 0 and deps.reserve_cents > 0 \
-            else "no spend cap or reservation configured; nothing is called until there is one"
+        if out.get("ledger") == "admission_time_moved":
+            detail = "admission day or authorization changed before reservation; no call"
+        elif reserve_cents and deps.cap_cents > 0:
+            detail = ("daily spend cap reached (%s of %d cents CAD reserved on %s); tried again next day"
+                      % (spent, deps.cap_cents, day))
+        else:
+            detail = "no valid cap, reservation, price, exchange rate, model limit or authorization deadline; nothing called"
         out["receipt"] = write_receipt(deps, tuple_, text, QUEUED, deps.at, detail)
-        deps.claims.advance(task_id, current, _state(STATE_CAPPED, day, attempt - 1, rejected))
+        deps.claims.advance(task_id, current, _state(STATE_CAPPED, day, max(0, attempt - 1), rejected))
         out["status"] = "capped"
         return out
 
     # ONE call. Whatever it returns is kept BEFORE the receipt is written (guard 2).
     out["ran"] = True
     try:
-        answer = deps.model(DOCTRINE % RESULT_MAX, request_for_model(text))
-        state, detail, extra, usage = _settle_success(deps, answer, day)
+        answer = deps.model(system, prompt)
+        state, detail, extra, usage = _settle_success(deps, answer, day, reserve_cents)
     except ModelUnknown as exc:
         state, detail, extra, usage = UNKNOWN, "no answer within %ds (%s); the reservation stands" % (
             MODEL_TIMEOUT, type(exc).__name__), "", None
     except Unconfigured as exc:
-        _refund(deps, day)
-        deps.claims.advance(task_id, current, _state(STATE_ACCEPTED, 0, attempt - 1, rejected))
+        _refund(deps, day, reserve_cents)
+        deps.claims.advance(task_id, current, _state(STATE_ACCEPTED, 0, max(0, attempt - 1), rejected))
         out.update(status="unconfigured", error=str(exc), ran=False)
         return out
     except ModelRejected as exc:
@@ -556,10 +614,10 @@ def consider(entry_id, fields: dict, deps) -> dict:
         # is not consumed, and the task stays open for a later pass - a fixed key or a quieter API
         # reopens nothing because nothing was closed. Bounded: after MAX_REJECTIONS the doc says
         # FAILED with the status, so a request the API will never take does not knock every tick.
-        _refund(deps, day)
+        _refund(deps, day, reserve_cents)
         rejected += 1
         if rejected < MAX_REJECTIONS:
-            deps.claims.advance(task_id, current, _state(STATE_ACCEPTED, 0, attempt - 1, rejected))
+            deps.claims.advance(task_id, current, _state(STATE_ACCEPTED, 0, max(0, attempt - 1), rejected))
             out.update(status="rejected", error=str(exc)[:80], rejections=rejected)
             return out
         state, detail, extra, usage = FAILED, "the API refused %d times, last %s; nothing was billed" % (
@@ -569,10 +627,24 @@ def consider(entry_id, fields: dict, deps) -> dict:
     except Exception as exc:  # noqa: BLE001 - a transport failure of unknown depth is UNKNOWN
         state, detail, extra, usage = UNKNOWN, "the call failed (%s); the reservation stands" % type(exc).__name__, "", None
     stored = {"state": state, "detail": detail, "extra": extra, "usage": usage}
+    raw = json.dumps(stored, sort_keys=True)
     try:
-        deps.claims.keep_result(task_id, json.dumps(stored, sort_keys=True))
-    except Exception as exc:  # noqa: BLE001 - the line is still attempted now; a retry would re-call
+        deps.claims.keep_result(task_id, raw)
+        if deps.claims.result(task_id) != raw:
+            raise RuntimeError("result not read back")
+    except Exception as exc:
         out["kept"] = "unknown:" + type(exc).__name__
+        try:
+            if deps.claims.result(task_id) == raw:
+                pass  # the write landed although its acknowledgement was lost
+            else:
+                deps.claims.advance(task_id, current, _state(STATE_UNCERTAIN, int(now), attempt, rejected))
+                out["status"] = "result_persistence_unknown"
+                return out
+        except Exception:
+            deps.claims.advance(task_id, current, _state(STATE_UNCERTAIN, int(now), attempt, rejected))
+            out["status"] = "result_persistence_unknown"
+            return out
     resulted = _state(STATE_RESULTED, int(now), attempt, rejected)
     if not deps.claims.advance(task_id, current, resulted):
         out["status"] = "in_progress"
@@ -587,47 +659,135 @@ def _spent(deps, day):
         return "?"
 
 
-def _refund(deps, day):
+def _refund(deps, day, reserve_cents):
     try:
-        deps.ledger.settle(day, -int(deps.reserve_cents))
+        deps.ledger.settle(day, -int(reserve_cents))
     except Exception:  # noqa: BLE001 - a refund that fails leaves the reservation, the safe side
         pass
 
 
-def _settle_success(deps, answer, day):
+def _settle_success(deps, answer, day, reserve_cents):
     """A real answer: its lines, its usage, and the ledger moved from the reservation to the cost."""
     if not isinstance(answer, dict) or not (answer.get("text") or "").strip():
         raise ModelError("empty answer (stop_reason %s)" % (answer or {}).get("stop_reason"))
-    usage = {"in": int(answer.get("input_tokens") or 0), "out": int(answer.get("output_tokens") or 0),
+    if answer.get("stop_reason") != "end_turn":
+        raise ModelError("incomplete answer (stop_reason %s)" % answer.get("stop_reason"))
+    def token_count(value):
+        return value if type(value) is int and value > 0 else None
+
+    usage = {"in": token_count(answer.get("input_tokens")),
+             "out": token_count(answer.get("output_tokens")),
              "model": str(answer.get("model") or deps.model_name or "")}
-    cents = actual_cents(usage["in"], usage["out"], deps.price_in, deps.price_out, deps.cad_per_usd)
+    # A successful text response without trustworthy usage is still an answer, but
+    # it gives no basis for a refund. Keep the full reservation for reconciliation.
+    known_usage = usage["in"] is not None and usage["out"] is not None
+    cents = actual_cents(usage["in"], usage["out"], deps.price_in, deps.price_out,
+                         deps.cad_per_usd) if known_usage else None
+    output_bound = getattr(deps.model, "max_tokens", deps.max_tokens)
+    overrun = (cents is not None and cents > reserve_cents) or (usage["in"] is not None
+        and usage["in"] > deps.max_input_tokens) or (usage["out"] is not None
+        and usage["out"] > output_bound)
     if cents is not None:
         try:
-            deps.ledger.settle(day, cents - int(deps.reserve_cents))
+            deps.ledger.settle(day, cents - int(reserve_cents))
         except Exception:  # noqa: BLE001 - the reservation stands; never a cheaper number by accident
             cents = None
     try:
-        deps.ledger.record(day, {"by": WORKER, "model": usage["model"], "in": str(usage["in"]),
-                                 "out": str(usage["out"]),
-                                 "cents": str(cents if cents is not None else deps.reserve_cents),
-                                 "settled": "1" if cents is not None else "0"})
+        deps.ledger.record(day, {"by": WORKER, "model": usage["model"],
+                                 "in": str(usage["in"]) if usage["in"] is not None else "?",
+                                 "out": str(usage["out"]) if usage["out"] is not None else "?",
+                                 "cents": str(cents if cents is not None else reserve_cents),
+                                 "settled": "1" if cents is not None else "0",
+                                 "overrun": "1" if overrun else "0"})
     except Exception:  # noqa: BLE001
         pass
-    detail = "model %s - tokens in %d out %d - %s" % (
-        usage["model"], usage["in"], usage["out"],
-        ("%d cents CAD" % cents) if cents is not None else ("%d cents CAD reserved" % deps.reserve_cents))
+    detail = "model %s - tokens in %s out %s - %s" % (
+        usage["model"], usage["in"] if usage["in"] is not None else "?",
+        usage["out"] if usage["out"] is not None else "?",
+        ("%d cents CAD" % cents) if cents is not None else ("%d cents CAD reserved" % reserve_cents))
+    if not known_usage:
+        detail += " - provider usage unknown; reservation retained for reconciliation"
+    if overrun:
+        detail += " - provider usage or charge exceeded the configured bound; budget review needed"
     return SUCCEEDED, detail, result_block(answer["text"]), usage
+
+
+def call_reservation(deps, system, prompt, now=None):
+    """Reserve a configured provider input limit and actual Messages output limit before inference.
+
+    The input limit must be an independently verified bound for the exact model ID;
+    a serialized byte count only rejects requests too large for that bound. Provider
+    usage outside the configured limits is reported, never clipped or refunded.
+    """
+    max_tokens = getattr(deps.model, "max_tokens", deps.max_tokens)
+    now = _now(deps) if now is None else now
+    if deps.reserve_cents <= 0 or deps.cap_cents <= 0 or not isinstance(max_tokens, int) or max_tokens <= 0 \
+            or deps.max_input_tokens <= 0 or deps.authorized_until is None or now >= deps.authorized_until:
+        return None
+    if not valid_prices(deps.price_in, deps.price_out, deps.cad_per_usd):
+        return None
+    request = json.dumps({"model": deps.model_name, "max_tokens": max_tokens, "system": system,
+                          "messages": [{"role": "user", "content": prompt}]}).encode("utf-8")
+    if len(request) + INPUT_TOKEN_OVERHEAD > deps.max_input_tokens:
+        return None
+    worst = actual_cents(deps.max_input_tokens, max_tokens,
+                         deps.price_in, deps.price_out, deps.cad_per_usd)
+    return max(deps.reserve_cents, worst) if worst is not None else None
+
+
+def valid_prices(price_in, price_out, cad_per_usd):
+    try:
+        values = (Decimal(str(price_in)), Decimal(str(price_out)), Decimal(str(cad_per_usd)))
+        return all(value.is_finite() and value > 0 for value in values)
+    except (InvalidOperation, TypeError, ValueError):
+        return False
 
 
 def actual_cents(tokens_in, tokens_out, price_in, price_out, cad_per_usd):
     """Cents CAD for one call, or None when a price is not configured. Rounded UP, never down."""
     try:
-        if price_in is None or price_out is None or cad_per_usd is None:
+        if not valid_prices(price_in, price_out, cad_per_usd):
             return None
-        usd = tokens_in / 1e6 * float(price_in) + tokens_out / 1e6 * float(price_out)
-        return int(math.ceil(usd * float(cad_per_usd) * 100))
-    except (TypeError, ValueError):
+        if int(tokens_in) < 0 or int(tokens_out) < 0:
+            return None
+        usd = (Decimal(int(tokens_in)) * Decimal(str(price_in))
+               + Decimal(int(tokens_out)) * Decimal(str(price_out))) / 1_000_000
+        return int((usd * Decimal(str(cad_per_usd)) * 100).to_integral_value(rounding=ROUND_CEILING))
+    except (InvalidOperation, TypeError, ValueError):
         return None
+
+
+def _recover_pilot_result(deps, tuple_, text, out):
+    """An edited request cannot erase a result from an earlier model call."""
+    task_id = tuple_["task_id"]
+    try:
+        current = deps.claims.state(task_id)
+    except Exception as exc:  # an unreadable claim cannot prove a pre-call state
+        out.update(status="claim_error", error=type(exc).__name__)
+        return out
+    phase, _middle, attempt, rejected = _split(current)
+    if phase == STATE_RESULTED:
+        return _finish_from_store(deps, tuple_, text, current, attempt, out)
+    if phase not in (STATE_ACCEPTED, STATE_UNCERTAIN):
+        return None
+    try:
+        kept = deps.claims.result(task_id)
+    except Exception as exc:  # do not discard a result whose read failed
+        out.update(status="result_unreadable", error=type(exc).__name__)
+        return out
+    if kept:
+        resulted = _state(STATE_RESULTED, int(_now(deps)), attempt, rejected)
+        if not deps.claims.advance(task_id, current, resulted):
+            out["status"] = "in_progress"
+            return out
+        return _finish_from_store(deps, tuple_, text, resulted, attempt, out)
+    if phase == STATE_UNCERTAIN:
+        out["receipt"] = write_receipt(
+            deps, tuple_, text, UNKNOWN, deps.at,
+            "a call occurred but its outcome was not kept; charge or reservation remains in the ledger; manual reconciliation needed")
+        out["status"] = "result_persistence_unknown"
+        return out
+    return None
 
 
 def _finish_from_store(deps, tuple_, text, current, attempt, out, stored=None):
@@ -663,7 +823,17 @@ def run_once(deps) -> dict:
     now = _now(deps)
     out = {"status": "disabled", "considered": []}
     if deps.enabled:
-        out = _api_pass(deps, now)
+        if getattr(deps, "pilot_docs", None) is None:
+            out = _api_pass(deps, now)
+        else:
+            # The API sees the latest approved block. Restore raw Docs before
+            # the existing laptop lane runs, so its contract is untouched.
+            original_docs, original_receipts = deps.docs, deps.receipts
+            deps.docs = deps.receipts = deps.pilot_docs
+            try:
+                out = _api_pass(deps, now)
+            finally:
+                deps.docs, deps.receipts = original_docs, original_receipts
     if deps.lane_enabled:
         out["lane"] = lane.run(_contract(), deps, now)
         if not deps.enabled:
@@ -700,14 +870,23 @@ def _api_pass(deps, now) -> dict:
     except Exception as exc:  # noqa: BLE001
         return {"status": "inbox_error", "error": type(exc).__name__, "considered": []}
     considered, calls = [], 0
-    for entry_id, fields in reversed(entries):        # the stream is read newest first; work oldest first
-        if calls >= MAX_TASKS_PER_PASS:
-            considered.append({"status": "left_for_next_pass", "task": fields.get("task_id"), "ran": False})
-            continue
+    last_entry_id = None
+    for entry_id, fields in entries:  # durable oldest-first sweep; checkpoint only what was considered
+        if getattr(deps, "pilot_docs", None) is not None:
+            deps.docs = deps.receipts = deps.pilot_docs.for_entry(fields)
         result = consider(entry_id, fields, deps)
         if result.get("ran"):
             calls += 1
         considered.append(result)
+        last_entry_id = entry_id
+        if calls >= MAX_TASKS_PER_PASS:
+            break
+    if last_entry_id is not None:
+        try:
+            deps.inbox.checkpoint(WORKER, last_entry_id)
+        except Exception as exc:
+            return {"status": "inbox_checkpoint_error", "error": type(exc).__name__,
+                    "calls": calls, "considered": considered}
     return {"status": "ran" if calls else "idle", "calls": calls, "considered": considered}
 
 
@@ -738,6 +917,8 @@ class AnthropicModel:
         else:
             status, raw = _post(self.URL, body, headers, self.timeout)
         if status != 200:
+            if 500 <= status <= 599 and status != 529:
+                raise ModelUnknown("HTTP %s (billing uncertain)" % status)
             raise ModelRejected("HTTP %s" % status)
         try:
             parsed = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
@@ -749,8 +930,10 @@ class AnthropicModel:
         stop = parsed.get("stop_reason")
         if not text:
             raise ModelError("empty answer (stop_reason %s)" % stop)
-        return {"text": text, "input_tokens": usage.get("input_tokens") or 0,
-                "output_tokens": usage.get("output_tokens") or 0,
+        if stop != "end_turn":
+            raise ModelError("incomplete answer (stop_reason %s)" % stop)
+        return {"text": text, "input_tokens": usage.get("input_tokens"),
+                "output_tokens": usage.get("output_tokens"),
                 "model": parsed.get("model") or self.model, "stop_reason": stop}
 
 
@@ -828,7 +1011,10 @@ class MemoryLedger:
     def __init__(self):
         self.days, self.calls = {}, []
 
-    def reserve(self, day, cents, cap):
+    def reserve(self, day, cents, cap, day_start=0, day_end=2147483647,
+                authorized_until=2147483647, now=0):
+        if not day_start <= now < min(day_end, authorized_until):
+            raise AdmissionTimeMoved()
         if cents <= 0 or cap <= 0:
             return False
         if self.days.get(day, 0) + cents > cap:
@@ -846,9 +1032,16 @@ class MemoryLedger:
         self.calls.append((day, dict(fields)))
 
 
-CAS_LUA = di.CAS_LUA
-# Reserve in one round trip: add, and take it straight back when that crosses the cap.
-RESERVE_LUA = ("local v = redis.call('INCRBY', KEYS[1], ARGV[1]) "
+CAS_LUA = ("if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end "
+           "redis.call('SET', KEYS[1], ARGV[2]) "
+           "if tonumber(ARGV[3]) > 0 then redis.call('EXPIRE', KEYS[1], ARGV[3]) end "
+           "return 1")
+# Redis's clock makes the day and authorization check atomic with the charge.
+RESERVE_LUA = ("redis.replicate_commands() "
+               "local now = tonumber(redis.call('TIME')[1]) "
+               "if now < tonumber(ARGV[4]) or now >= tonumber(ARGV[5]) "
+               "or now >= tonumber(ARGV[6]) then return -1 end "
+               "local v = redis.call('INCRBY', KEYS[1], ARGV[1]) "
                "redis.call('EXPIRE', KEYS[1], ARGV[3]) "
                "if v > tonumber(ARGV[2]) then redis.call('DECRBY', KEYS[1], ARGV[1]) return 0 end "
                "return 1")
@@ -867,13 +1060,14 @@ class RedisClaims:
         return raw or None
 
     def claim(self, task_id, initial):
-        return bool(self.client.set("fleet:worker:claim:" + task_id, initial, nx=True, ex=CLAIM_TTL))
+        return bool(self.client.set("fleet:worker:claim:" + task_id, initial, nx=True))
 
     def state(self, task_id):
         return self._get("fleet:worker:claim:" + task_id)
 
     def advance(self, task_id, current, new):
-        return bool(self.client.eval(CAS_LUA, 1, "fleet:worker:claim:" + task_id, current, new, CLAIM_TTL))
+        ttl = CLAIM_TTL if new == STATE_DONE else 0
+        return bool(self.client.eval(CAS_LUA, 1, "fleet:worker:claim:" + task_id, current, new, ttl))
 
     def done(self, task_id):
         return self._get("fleet:worker:done:" + task_id) is not None
@@ -927,10 +1121,16 @@ class RedisLedger:
     def __init__(self, client):
         self.client = client
 
-    def reserve(self, day, cents, cap):
+    def reserve(self, day, cents, cap, day_start=0, day_end=2147483647,
+                authorized_until=2147483647, now=None):
         if int(cents) <= 0 or int(cap) <= 0:
             return False
-        return bool(self.client.eval(RESERVE_LUA, 1, "fleet:spend:" + day, int(cents), int(cap), SPEND_TTL))
+        outcome = self.client.eval(RESERVE_LUA, 1, "fleet:spend:" + day,
+                                   int(cents), int(cap), SPEND_TTL,
+                                   int(day_start), int(day_end), int(authorized_until))
+        if outcome == -1:
+            raise AdmissionTimeMoved()
+        return bool(outcome)
 
     def settle(self, day, delta):
         value = self.client.incrby("fleet:spend:" + day, int(delta))
@@ -952,8 +1152,43 @@ class RedisInbox:
     def __init__(self, client):
         self.client = client
 
+    @staticmethod
+    def _cursor_key(agent):
+        return "fleet:worker:inbox_scan:" + agent
+
     def read(self, agent, count):
-        rows = self.client.xrevrange("fleet:inbox:" + agent, count=count) or ()
+        stream = "fleet:inbox:" + agent
+        if agent != WORKER:
+            # Other lanes still consume the adapter's original newest-first shape.
+            return self._decode(self.client.xrevrange(stream, count=count) or ())
+        key = self._cursor_key(agent)
+        raw = self.client.get(key)
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        try:
+            state = json.loads(raw) if raw else {}
+        except ValueError:
+            state = {}
+        if not state or state.get("after") == state.get("through"):
+            newest = self.client.xrevrange(stream, count=1) or ()
+            if not newest:
+                return []
+            through = newest[0][0]
+            if isinstance(through, bytes):
+                through = through.decode("utf-8")
+            state = {"after": "", "through": through}
+            self.client.set(key, json.dumps(state))  # no TTL: a restart cannot lose the sweep
+        minimum = "(" + state["after"] if state["after"] else "-"
+        rows = self.client.xrange(stream, min=minimum, max=state["through"], count=count) or ()
+        if not rows:
+            # The stream may have been trimmed; the next pass starts a new sweep.
+            self.client.set(key, "{}")
+            return []
+        self._scan_state = state
+        return self._decode(rows)
+
+    @staticmethod
+    def _decode(rows):
         out = []
         for entry_id, fields in rows:
             decoded = {}
@@ -966,6 +1201,12 @@ class RedisInbox:
             out.append((entry_id.decode("utf-8") if isinstance(entry_id, bytes) else str(entry_id), decoded))
         return out
 
+    def checkpoint(self, agent, entry_id):
+        state = dict(self._scan_state)
+        state["after"] = entry_id
+        self.client.set(self._cursor_key(agent), json.dumps(state))
+        self._scan_state = state
+
 
 def toronto_day(now: float) -> str:
     """The cap is per Toronto calendar day (the owner's budget rule). UTC only if the zone is missing."""
@@ -974,6 +1215,17 @@ def toronto_day(now: float) -> str:
         return datetime.fromtimestamp(now, tz=ZoneInfo("America/Toronto")).strftime("%Y-%m-%d")
     except Exception:  # noqa: BLE001
         return datetime.fromtimestamp(now, tz=timezone.utc).strftime("%Y-%m-%d") + "Z"
+
+
+def toronto_day_window(now: float) -> tuple[int, int]:
+    """UTC epoch bounds for the Toronto day containing now, including DST changes."""
+    try:
+        from zoneinfo import ZoneInfo  # noqa: PLC0415
+        zone = ZoneInfo("America/Toronto")
+    except Exception:  # noqa: BLE001
+        zone = timezone.utc
+    start = datetime.fromtimestamp(now, tz=zone).replace(hour=0, minute=0, second=0, microsecond=0)
+    return int(start.timestamp()), int((start + timedelta(days=1)).timestamp())
 
 
 def _int_env(environ, name, default=0):
@@ -993,12 +1245,23 @@ def _float_env(environ, name):
         return None
 
 
+def _utc_deadline_env(environ, name):
+    raw = environ.get(name) or ""
+    if not raw.endswith("Z"):
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+    except (OverflowError, ValueError):
+        return None
+
+
 class Deps:
     def __init__(self, enabled=False, inbox=None, docs=None, receipts=None, claims=None, ledger=None,
-                 model=None, model_name="", folder_id="", now=None, at="", day=None,
+                 model=None, model_name="", folder_id="", now=None, at="", day=None, day_window=None,
                  heartbeat_window=di.DEFAULT_HEARTBEAT, reassign_after=DEFAULT_REASSIGN,
                  max_attempts=DEFAULT_MAX_ATTEMPTS, cap_cents=0, reserve_cents=0,
-                 price_in=None, price_out=None, cad_per_usd=None, lane_enabled=False, board=None):
+                 price_in=None, price_out=None, cad_per_usd=None, max_tokens=DEFAULT_MAX_TOKENS,
+                 max_input_tokens=0, authorized_until=None, lane_enabled=False, board=None):
         self.enabled = enabled
         self.lane_enabled = lane_enabled
         self.board = board
@@ -1013,6 +1276,7 @@ class Deps:
         self.now = now
         self.at = at
         self.day = day or toronto_day
+        self.day_window = day_window or toronto_day_window
         self.heartbeat_window = heartbeat_window
         self.reassign_after = reassign_after
         self.max_attempts = max_attempts
@@ -1021,6 +1285,9 @@ class Deps:
         self.price_in = price_in
         self.price_out = price_out
         self.cad_per_usd = cad_per_usd
+        self.max_tokens = int(max_tokens)
+        self.max_input_tokens = int(max_input_tokens)
+        self.authorized_until = float(authorized_until) if authorized_until is not None else None
 
 
 def _no_model(_system, _prompt):
@@ -1088,6 +1355,9 @@ def deps_from_env(environ=None, client=None, docs=None, board=None):  # pragma: 
         price_in=_float_env(environ, "CLAUDE_API_WORKER_USD_PER_MTOK_IN"),
         price_out=_float_env(environ, "CLAUDE_API_WORKER_USD_PER_MTOK_OUT"),
         cad_per_usd=_float_env(environ, "FLEET_CAD_PER_USD"),
+        max_tokens=model.max_tokens,
+        max_input_tokens=_int_env(environ, "CLAUDE_API_WORKER_MAX_INPUT_TOKENS", 0),
+        authorized_until=_utc_deadline_env(environ, "CLAUDE_API_WORKER_AUTHORIZED_UNTIL_UTC"),
     )
 
 
@@ -1109,8 +1379,16 @@ def main():  # pragma: no cover - the job entry point
     except Exception as exc:  # noqa: BLE001
         print(json.dumps({"status": "no_docs", "error": type(exc).__name__}))
     board = AppendBoard() if os.environ.get("BUS_URL") and os.environ.get("BUS_SECRET") else None
+    pilot_enabled = enabled_from_env() and os.environ.get("PHONE_DOC_INTAKE_ENABLED") == "on"
+    intake = pilot.run_prepass(client, docs, enabled=True) if pilot_enabled else None
     deps = deps_from_env(client=client, docs=docs, board=board)
+    if pilot_enabled and client is not None and docs is not None:
+        # API entries from these two Docs only; other queued work cannot call the model.
+        deps.inbox = pilot.PilotInbox(deps.inbox, client)
+        deps.pilot_docs = pilot.PilotDocs(docs)
     out = run_once(deps)
+    if pilot_enabled:
+        out["intake"] = intake
     print(json.dumps(out, sort_keys=True))     # statuses and task ids; never the doc's text
     return 0
 

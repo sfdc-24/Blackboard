@@ -24,6 +24,7 @@ COPY scripts/agent_roster.json /app/agent_roster.json
 COPY cloud/drive-intake/main.py /app/drive_intake.py
 COPY cloud/claude-api-worker/gdocs.py /app/gdocs.py
 COPY cloud/claude-api-worker/lane.py /app/lane.py
+COPY cloud/claude-api-worker/phone_intake.py /app/phone_intake.py
 COPY cloud/claude-api-worker/main.py /app/main.py
 
 ENV PYTHONUNBUFFERED=1
