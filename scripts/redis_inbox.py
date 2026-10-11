@@ -400,6 +400,15 @@ def cmd_selftest(_args) -> int:
     assert "do=redis-op|op=set|key=fleet:alive:claude-code-cli|val=" in beat["payload"], beat["payload"]
     assert base64.b64decode(beat["payload"].split("val=")[1].split("|")[0]) == b"1760000000"
     assert accept_value(1760000000.9, 900) == "claude-code-cli:1760000000:900", accept_value(1760000000.9, 900)
+    # THE KEYS, as the rows the verbs post carry them - not only the sentence that names them.
+    acc = request_row("set", ACCEPT_KEY % "task-0123456789abcdef", value=accept_value(1760000000, 900),
+                      row_id="CCC-INBOX-ACCEPT")
+    assert "|op=set|key=fleet:worker:accept:task-0123456789abcdef|val=" in acc["payload"], acc["payload"]
+    assert base64.b64decode(acc["payload"].split("val=")[1].split("|")[0]) == b"claude-code-cli:1760000000:900"
+    fin = request_row("set", DONE_KEY % "task-0123456789abcdef", value=done_value("FAILED", "n", ""),
+                      row_id="CCC-INBOX-DONE")
+    assert "|op=set|key=fleet:worker:done:task-0123456789abcdef|val=" in fin["payload"], fin["payload"]
+    assert json.loads(base64.b64decode(fin["payload"].split("val=")[1].split("|")[0]))["state"] == "FAILED"
     assert accept_value(1760000000, 0) == "claude-code-cli:1760000000"
     done = json.loads(done_value("succeeded", "  Answered  in PR 371.  ", "https://github.com/sfdc-24/Blackboard/pull/371"))
     assert done == {"by": "claude-code-cli", "evidence": "https://github.com/sfdc-24/Blackboard/pull/371",
