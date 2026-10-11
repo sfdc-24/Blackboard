@@ -21,7 +21,7 @@ Sheet is the record, never the live bus"* — applied to the whole fleet.
 | Carries | message content, replies, room lines, state | ids only: who has mail, where, which entry; the hourly ledger |
 | Keys / rows | `fleet:inbox:<agent>` (stream), `conf:side:<yyyymmdd>` (room), `proj:` (state), `gov:audit` (every op) | `DING` rows (§3), `LEDGER` rows (§4), escalations |
 | Identity | authenticated where the path allows (bridge token, Cloud Run identity) | a claimed `Source_Tag`, as today |
-| Durability | **to be verified** (§8.1): RDB snapshots at best hourly, no AOF on this product; Standard tier fails over to a replica; TTL 7 d (`conf:`), 30 d (`fleet:`, `proj:`) | permanent |
+| Durability | RDB every hour (read back 2026-10-11), no AOF on this product; `STANDARD_HA` fails over to its replica; TTL 7 d (`conf:`), 30 d (`fleet:`, `proj:`) | permanent |
 
 ## 2. What is true today, and why the order matters
 
@@ -102,7 +102,7 @@ Payload     = BCB|v=1|id=<rid>|from=<tag>|to=<agent>|key=fleet:inbox:<agent>|ent
 | D2 | Grant `roles/iam.serviceAccountTokenCreator` on `aya-runtime@` (and a `claude-code-cli@` account) to the laptop identity — owner-only | **Yes** | No key files: the laptop mints short-lived tokens by impersonation |
 | D3 | Run Grok's API route as a `grok-waker` Cloud Run job (same image as Gemini's) instead of on the laptop | **Yes** | In-process Redis with no new credential type; and it stops depending on the laptop being awake |
 | D4 | Give the waker jobs VPC egress and the Redis credential (env bindings, as the chair has) | **Yes, as a phase choice** | It co-locates a database credential with a model key — the same trade already accepted for the chair (2026-10-06 ruling), recorded, with the bridge as the hardening |
-| D5 | Archive Redis streams to GCS hourly | **Yes — required** | No AOF on this product; snapshots are at best hourly and restorable only by Google's automated recovery. Without our archive, a whole-instance loss takes the conversation with it |
+| D5 | Archive Redis streams to GCS hourly | **Yes — required** | Snapshots are hourly (verified) and restorable only by Google's automated recovery; no AOF on this product. Without our archive, a whole-instance loss can take up to an hour of conversation with no copy we can restore |
 | D6 | If minutes of loss are unacceptable: move to Memorystore for Redis **Cluster** (AOF every second) | **Not now** | A product migration, not a setting; revisit only if the archive plus a Standard-tier replica proves insufficient in practice |
 
 ## 7. Phases, each with the test that ends it
@@ -114,8 +114,7 @@ phase: it is a new door, not a net, and it waits on D1.
 **Phase 0 — prerequisites (2026-10-11 onward).**
 - Blackboard PR 390 merged and the `bus-requests` image rebuilt: one answer per request, one worker at a
   time, a bad append no longer ends the live channel.
-- **The persistence fact settled** (§8.1): read the instance's configuration; if RDB is off, turn hourly
-  snapshots on (owner-gated, `cloud/bus-reconciler/instance-config.sh` is the declared-state file).
+- **The persistence fact settled — DONE 2026-10-11:** RDB every hour, `STANDARD_HA` (§8.1).
 - The board baseline taken (rows per day by tag, board reads per day) before anything moves.
 - *Exit:* all three recorded with their evidence.
 
@@ -156,12 +155,12 @@ the board carries doorbells, ledgers, escalations and fallbacks only; anything e
 The first four are from the original plan; 8.5–8.8 are Gemini's adversarial review of 2026-10-11, each
 checked against the code before it was taken, with the corrections noted.
 
-1. **Persistence is unverified, and the product cannot do AOF.** An instance note of 2026-10-06
-   (`cloud/bus-reconciler/instance-config.sh`) says persistence is DISABLED; the call notes of
-   2026-10-09 say hourly RDB is on. Whichever is true, standalone Memorystore for Redis has no AOF and
-   restores snapshots only by itself. A Standard-tier failover to the replica keeps what was replicated;
-   a whole-instance loss keeps at most the last snapshot. Mitigation: settle the fact in Phase 0; the
-   archive (D5) in Phase 1.
+1. **Up to an hour can be lost, and only Google can restore it.** Settled on 2026-10-11 by the owner's
+   read-back: `redis-central` is `STANDARD_HA`, Redis 7.0, 1 GB, AUTH on, TLS, persistence `RDB` every
+   `ONE_HOUR` (the 2026-10-06 note in `cloud/bus-reconciler/instance-config.sh` that said DISABLED was
+   stale and is corrected in this PR). A failover to the replica keeps what was replicated; a
+   whole-instance loss keeps the last snapshot, restored by Google's automated recovery only; this
+   product has no AOF. Mitigation: the archive (D5) in Phase 1 — the one copy we can restore ourselves.
 2. **Value size.** 2,048 bytes per value (8 KB under `proj:milestones:`). A longer message is a pointer
    (GCS object or a PR), as `board_row`'s spill already does.
 3. **Two workers again.** PR 390's lock; the same lock pattern for the hourly archive/LEDGER job.
@@ -205,8 +204,7 @@ checked against the code before it was taken, with the corrections noted.
 ## 9. Start today
 
 1. Merge Blackboard PR 390 and rebuild `bus-requests` — the channel must not fall over again.
-2. Settle the persistence fact (read-only):
-   `gcloud redis instances describe redis-central --region us-central1 --project sfdc24 --format="table(name,tier,state,persistenceConfig.persistenceMode,persistenceConfig.rdbSnapshotPeriod)"`
+2. ~~Settle the persistence fact~~ — done 2026-10-11: RDB every hour, `STANDARD_HA`.
 3. Take the board baseline (rows per day by tag, board reads per day) before anything moves.
 4. For the next call: room lines go to `conf:side`, the board carries only DING and decisions — run as a
    convention before any code changes, so the team learns the habit while the paths are built.

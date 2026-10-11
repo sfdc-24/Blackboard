@@ -41,10 +41,14 @@ DECLARED_CONFIG="maxmemory-policy=volatile-lru"
 
 # Facts about the instance that are NOT configuration but shape every design decision, recorded here
 # so the next reader does not have to go and measure them again:
-#   persistence   DISABLED - no RDB, no AOF. A failover or restart loses EVERYTHING in this instance.
-#                 Gemini's ruling of 14:34:52Z follows from it: "Because Redis is volatile, progress
-#                 state must be reconstructible from the repository. Redis acts only as an ephemeral
-#                 accelerator." Nothing here may be the only copy of anything.
+#   persistence   RDB, ONE_HOUR - read back by the owner on 2026-10-11 (gcloud redis instances describe:
+#                 persistenceMode RDB, rdbSnapshotPeriod ONE_HOUR). Until then this line said DISABLED
+#                 (no RDB, no AOF), measured on 2026-10-06; snapshots were enabled in between. A
+#                 whole-instance loss still loses up to an hour, a snapshot is restorable only by
+#                 Google's automated recovery, and this product has no AOF - so Gemini's ruling of
+#                 14:34:52Z still holds: "Because Redis is volatile, progress state must be
+#                 reconstructible from the repository. Redis acts only as an ephemeral accelerator."
+#                 Nothing here may be the only copy of anything (docs/REDIS-PRIMARY.md: the archive).
 #   tier          STANDARD_HA, replicaCount 1, read replicas DISABLED. The replica is for failover,
 #                 not for reads. Kept at Standard because it resizes without interruption; Basic does
 #                 not, and the owner named that himself.
