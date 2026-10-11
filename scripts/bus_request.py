@@ -135,6 +135,7 @@ def parse_request(row):
         "val": field(payload, "val"),
         "enc": field(payload, "enc"),
         "count": field(payload, "count"),
+        "after": field(payload, "after"),
         # haudit only. Ignored by every other op. The manifest in val is digests and lengths;
         # redis_gov refuses anything else and never copies a stored string into the result.
         "gen": field(payload, "gen"),
@@ -445,6 +446,7 @@ def handle(rows, conn, now=None, append=None, max_per_run=MAX_PER_RUN) -> dict:
                                        req.get("op"), req.get("key"), field=req.get("field") or "",
                                        raw_value=req.get("val") or "", enc=req.get("enc") or "",
                                        count=count, now=now, generation=req.get("gen") or "",
+                                       after=req.get("after") or "",
                                        correlation=req.get("cid") or "", head=req.get("head") or "")
             if append:
                 append(row_for(RESULT_ACTION, req, redis_gov.summarise(result),
