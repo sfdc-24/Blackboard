@@ -75,9 +75,11 @@ python scripts/fleet_agent.py request xrange conf:side:20261011 --count 8 --tag 
 It base64-encodes the value, refuses a request that would not fit a row (a request is never spilled —
 a pointer row carries no `op=` for the worker to read), **reads the board first** (the identical row
 already there is not posted again; the same id under a different request is refused before anything
-is appended; a board it cannot read means `NOT SENT`), appends exactly once, and **reads the row back
-as exactly one row** matching id, `Source_Tag`, `Action_Type` and payload — a row with your id but
-another payload, another sender or another row type does not count. Four exit codes, four facts:
+is appended; a board it cannot read, or whose header is not the ten-cell schema, means `NOT SENT`),
+appends exactly once, and **reads the row back as exactly one row on the whole board** under your
+`Row_ID`, matching every cell but the timestamp — a second row under your id, from anyone, with any
+other content, is refused before posting or unconfirmed after it. Row ids are global: choose one
+nobody else would. Four exit codes, four facts:
 
 | Exit | Word in the output | Meaning |
 |---|---|---|

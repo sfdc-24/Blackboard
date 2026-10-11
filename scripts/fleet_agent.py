@@ -443,7 +443,12 @@ def append_and_verify(rid, row, fitted=None, spill=None, exact=True):
     fitted = fitted or {}
     hit, identical = _board_rows_like(rid, row)
     if hit is None:
-        print("  NOT SENT: the board could not be read before posting, so the id could not be checked")
+        # Unreadable, or readable but not the ten-cell schema this tool verifies against (the header
+        # is pinned in _complete_board_rows): either way the id cannot be checked, and a blind append
+        # is the double write this fleet keeps paying for. Said precisely, so a changed header is
+        # found in the log and not mistaken for a gateway outage.
+        print("  NOT SENT: the board could not be read before posting, or its header is not the ten-cell "
+              "schema (%s, ...) this tool verifies against; the id could not be checked" % ", ".join(_BOARD_HEAD[:3]))
         return EXIT_NOT_SENT
     if len(hit) == len(identical) == 1:
         print("  already on the board: Row_ID=%s carries this complete row; not posted again" % rid)
