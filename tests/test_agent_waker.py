@@ -1032,6 +1032,34 @@ class RedisRequests(unittest.TestCase):
                                  "the line stays prose for an agent the hook is not on for")
 
 
+class AnAdapterThatDoesNotSayIsTreatedAsCut(unittest.TestCase):
+    """The cut gate fails closed: an adapter without a last_finish attribute at all gets no Redis
+    request sent on its word (the second adversarial check on c519d1d found grok_agent in that state
+    and the gate silently open). The adapters the hook is on for both report it; this pins the rule
+    for the next one."""
+
+    def test_every_hooked_agents_adapter_reports_its_finish(self):
+        import importlib
+        for tag, cfg in aw.AGENTS.items():
+            if not cfg.get("redis_requests"):
+                continue
+            with self.subTest(tag=tag):
+                mod = importlib.import_module(cfg["module"])
+                source = open(mod.__file__, encoding="utf-8").read()
+                self.assertIn("ask.last_finish", source, "%s never says whether its reply was cut" % cfg["module"])
+
+    def test_the_rule_is_the_one_main_applies(self):
+        # The same expression main() uses, on a bare function with no last_finish: cut.
+        def bare_ask(*a, **k):
+            return "x", "m"
+        finish = getattr(bare_ask, "last_finish", None)
+        self.assertTrue(finish == "MAX_TOKENS" or not hasattr(bare_ask, "last_finish"))
+        bare_ask.last_finish = None
+        self.assertFalse(getattr(bare_ask, "last_finish", None) == "MAX_TOKENS" or not hasattr(bare_ask, "last_finish"))
+        source = open(aw.__file__, encoding="utf-8").read()
+        self.assertIn('model_cut = finish == "MAX_TOKENS" or not hasattr(asker, "last_finish")', source)
+
+
 class GrokSaysWhenItWasCut(unittest.TestCase):
     """Grok on #367 (item 4): the cut gate reads ask.last_finish, which only gemini_agent set. The
     xAI API says finish_reason "length" for a reply cut at max_tokens; grok_agent now says MAX_TOKENS

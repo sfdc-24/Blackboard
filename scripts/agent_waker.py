@@ -1246,8 +1246,13 @@ def main(argv=None) -> int:
         # stop_reason max_tokens) sets ask.last_finish = "MAX_TOKENS". The Redis hook below posts
         # nothing from such a reply, and the reply carries model_stop= and a plain note (board_row,
         # 2026-10-09), so a half answer is never read as a whole one.
-        finish = getattr(getattr(sys.modules.get(cfg["module"]), "ask", None), "last_finish", None)
-        model_cut = finish == "MAX_TOKENS"
+        asker = getattr(sys.modules.get(cfg["module"]), "ask", None)
+        finish = getattr(asker, "last_finish", None)
+        # FAIL CLOSED FOR THE REDIS HOOK: an adapter that never says whether its reply was cut
+        # (no last_finish attribute at all, as grok_agent had until f2b3913) is treated as cut, so
+        # nothing is sent on its word. The reply itself still posts; only the Redis line waits for
+        # an adapter that reports its finish (the second adversarial check on c519d1d).
+        model_cut = finish == "MAX_TOKENS" or not hasattr(asker, "last_finish")
         # What the model says is posted to the board as it is, so a credential or an address it
         # quotes - from a private PR excerpt, a log line, or its own invention - is removed first
         # (Cursor on #343: "the board post is not scrubbed either").
