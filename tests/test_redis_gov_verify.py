@@ -66,6 +66,44 @@ def root_for(specs):
     return head_binding(specs)["manifest_root"]
 
 
+def accepting_receipt():
+    """A forged complete receipt. Counts fit two pages of size 8 (9 documents)."""
+    root = "ab" * 32
+    gen = "c" * 64
+    return {
+        "ok": True,
+        "page_ok": True,
+        "op": gov.VERIFY_OP,
+        "generation": gen,
+        "correlation": "cid-gate",
+        "partial": False,
+        "moved": False,
+        "timeout": False,
+        "head_generation": gen,
+        "head_manifest_root": root,
+        "coverage": {
+            "expected": 9, "seen": 9, "missing": 0, "extra": 0,
+            "changed": 0, "matched": 9, "covered": True,
+        },
+        "audit": "ok",
+        "digest": "cd" * 32,
+        "length": 100,
+        "listed": 9,
+        "pages": 2,
+        "manifest_digest": "ef" * 32,
+        "manifest_root": root,
+        "page_count": 2,
+    }
+
+
+def assert_gate_rejects(test, receipt, label):
+    try:
+        result = gov.backend_receipt_accepts(receipt)
+    except Exception as error:
+        test.fail("%s raised %s" % (label, type(error).__name__))
+    test.assertIs(False, result, label)
+
+
 def b64_pages(pages):
     raw = json.dumps({"pages": pages}, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return base64.b64encode(raw).decode("ascii")
@@ -1153,6 +1191,101 @@ class GenerationAudit(unittest.TestCase):
         self.assertEqual(0, fresh.fetches)
         self.assertEqual(0, fresh.scans)
         self.assertNotIn("ValueError", json.dumps(refused))
+
+    def test_coverage_bad_fails_closed(self):
+        receipt = accepting_receipt()
+        self.assertTrue(gov.backend_receipt_accepts(receipt), receipt)
+        receipt["coverage"] = "bad"
+        assert_gate_rejects(self, receipt, "coverage")
+
+    def test_numeric_manifest_root_fails_closed(self):
+        receipt = accepting_receipt()
+        receipt["manifest_root"] = 1
+        assert_gate_rejects(self, receipt, "manifest_root")
+        receipt = accepting_receipt()
+        receipt["head_manifest_root"] = 1
+        assert_gate_rejects(self, receipt, "head_manifest_root")
+
+    def test_pages_bad_fails_closed(self):
+        receipt = accepting_receipt()
+        receipt["pages"] = "bad"
+        assert_gate_rejects(self, receipt, "pages")
+
+    def test_malformed_receipt_fields_fail_closed(self):
+        """Every field the gate reads, wrong type or inconsistent, is false and does not raise."""
+        base = accepting_receipt()
+        self.assertTrue(gov.backend_receipt_accepts(json.loads(json.dumps(base))), base)
+        wrong = {
+            "ok": (1, "true", "bad"),
+            "page_ok": (1, "bad", False),
+            "partial": (0, 1, "false", "bad"),
+            "moved": (0, "bad"),
+            "timeout": (0, 1, "bad"),
+            "op": (1, "get", True),
+            "audit": (1, "no", True),
+            "correlation": (1, "", True),
+            "generation": (1, "bad", True),
+            "head_generation": (1, "bad", True),
+            "manifest_root": (1, 0, "bad", True, ""),
+            "head_manifest_root": (1, "bad", ""),
+            "digest": (1, "bad", True),
+            "manifest_digest": (1, "bad", b"ab" * 32),
+            "length": ("bad", True, "2", 0, -1),
+            "listed": ("bad", True, "9"),
+            "pages": ("bad", True, "2", ["ab" * 32, "cd" * 32]),
+            "page_count": ("bad", True, "2"),
+            "coverage": ("bad", 1, [], None, True),
+        }
+        for field, values in wrong.items():
+            for value in values:
+                receipt = json.loads(json.dumps(base))
+                receipt[field] = value
+                with self.subTest(field=field, value=value):
+                    assert_gate_rejects(self, receipt, field)
+        for name, value in (
+            ("covered", 1), ("covered", "true"), ("covered", False),
+            ("expected", "bad"), ("expected", True), ("seen", "bad"),
+            ("missing", "bad"), ("extra", "bad"), ("changed", "bad"),
+            ("matched", "bad"), ("matched", True),
+        ):
+            receipt = json.loads(json.dumps(base))
+            receipt["coverage"][name] = value
+            with self.subTest(field="coverage." + name, value=value):
+                assert_gate_rejects(self, receipt, name)
+        for field, value in (("refused", 1), ("error", 1), ("refused", True), ("error", ["x"])):
+            receipt = json.loads(json.dumps(base))
+            receipt[field] = value
+            with self.subTest(field=field, value=value):
+                assert_gate_rejects(self, receipt, field)
+        consistent = json.loads(json.dumps(base))
+        drifts = []
+        listed = json.loads(json.dumps(consistent))
+        listed["listed"] = 10
+        drifts.append(("listed", listed))
+        pages = json.loads(json.dumps(consistent))
+        pages["pages"] = 3
+        drifts.append(("pages", pages))
+        matched = json.loads(json.dumps(consistent))
+        matched["coverage"]["matched"] = 8
+        drifts.append(("matched", matched))
+        missing = json.loads(json.dumps(consistent))
+        missing["coverage"]["missing"] = 1
+        drifts.append(("missing", missing))
+        short = json.loads(json.dumps(consistent))
+        short["listed"] = 8
+        short["coverage"]["expected"] = 8
+        short["coverage"]["seen"] = 8
+        short["coverage"]["matched"] = 8
+        drifts.append(("short-union", short))
+        roots = json.loads(json.dumps(consistent))
+        roots["manifest_root"] = "12" * 32
+        drifts.append(("roots", roots))
+        gens = json.loads(json.dumps(consistent))
+        gens["head_generation"] = "d" * 64
+        drifts.append(("generation", gens))
+        for label, receipt in drifts:
+            with self.subTest(consistency=label):
+                assert_gate_rejects(self, receipt, label)
 
 
 class ScopeAndManifest(unittest.TestCase):
