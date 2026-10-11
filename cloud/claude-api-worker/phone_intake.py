@@ -107,7 +107,7 @@ def request_blocks(text: str) -> list[dict]:
 
 
 def focused_text(text: str, expected_id: str = "", expected_revision: str = "") -> str:
-    """View only the latest owner request plus the actual receipt trail.
+    """View the queued request's exact block plus the actual receipt trail.
 
     This view goes to both intake and the worker. The underlying Google Doc is
     never rewritten or truncated; append/has still operate on its full text.
@@ -115,22 +115,35 @@ def focused_text(text: str, expected_id: str = "", expected_revision: str = "") 
     blocks = request_blocks(text)
     if not blocks:
         return ""
-    latest = blocks[-1]
-    if expected_id and latest["id"] != expected_id:
+    if bool(expected_id) != bool(expected_revision):
         return ""
-    if expected_revision and latest["revision"] != expected_revision:
+    selected = (next((block for block in blocks if
+                     block["id"] == expected_id and block["revision"] == expected_revision), None)
+                if expected_id else blocks[-1])
+    if selected is None:
         return ""
     match = di.RECEIPTS_HEADING.search(text or "")
     trail = (text or "")[match.start():] if match else ""
-    return latest["text"] + ("\n" + trail if trail else "")
+    return selected["text"] + ("\n" + trail if trail else "")
 
 
 class PilotDocs:
     """Exact-ID gate before every read or write, with a request-only read view."""
 
-    def __init__(self, raw_docs, expected=None):
+    def __init__(self, raw_docs, expected=None, require_expected=False):
         self.raw_docs = raw_docs
         self.expected = expected or {}
+        self.require_expected = require_expected
+
+    def for_entry(self, fields):
+        """Bind one worker read to the approved inbox entry, never the Doc's latest block."""
+        record = _entry_tuple(fields) if isinstance(fields, dict) else {}
+        file_id = record.get("source_doc_id") or ""
+        request_id = record.get("request_id") or ""
+        revision = record.get("source_revision") or ""
+        expected = ({file_id: (request_id, revision)}
+                    if allowed(file_id) and request_id and revision else {})
+        return PilotDocs(self.raw_docs, expected, require_expected=True)
 
     def _read_scoped(self, file_id):
         _scope(file_id)
@@ -140,6 +153,8 @@ class PilotDocs:
         return doc
 
     def read(self, file_id):
+        if self.require_expected and file_id not in self.expected:
+            raise OutOfScope("no approved request bound to document read")
         doc = self._read_scoped(file_id)
         view = dict(doc)
         request_id, revision = self.expected.get(file_id, ("", ""))

@@ -834,6 +834,8 @@ def _api_pass(deps, now) -> dict:
     considered, calls = [], 0
     last_entry_id = None
     for entry_id, fields in entries:  # durable oldest-first sweep; checkpoint only what was considered
+        if getattr(deps, "pilot_docs", None) is not None:
+            deps.docs = deps.receipts = deps.pilot_docs.for_entry(fields)
         result = consider(entry_id, fields, deps)
         if result.get("ran"):
             calls += 1
