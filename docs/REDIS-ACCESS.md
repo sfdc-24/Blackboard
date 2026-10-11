@@ -91,7 +91,8 @@ global: choose one nobody else would. A missing filter contract or exactly 200 r
 treated as an incomplete read and stops before append or verification. The marker helps diagnose a
 partial run, but a subprocess
 timeout with no captured marker is still **UNCONFIRMED**: an append may have landed. A completed
-pre-append refusal is `NOT SENT`. Four exit codes, four facts:
+pre-append refusal is `NOT SENT`, except one that says a row already carries the id: that row is
+reconciled from the board on the next run, never posted again. Four exit codes, four facts:
 
 | Exit | Word in the output | Meaning |
 |---|---|---|

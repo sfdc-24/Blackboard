@@ -823,12 +823,22 @@ def post_reply(me: str, cfg: dict, text: str, to: str, answers: str, verbose: bo
     _unlink_quietly(text_path)
     out = (res.stdout or "") + (res.stderr or "")
     ok = "VERIFIED on the board" in out
-    refused_before_append = (res.returncode in (1, 2) and not ok
+    # A ROW UNDER THIS REPLY ID IS NOT "NOT SENT". The id is stable per ask, so the tool's "already used
+    # by different or incomplete content" (exit 2) means an earlier attempt, or an earlier state of the
+    # cursor, put a reply on the board. Releasing the claim on it would call the model again next run,
+    # be refused again, and never converge: the claim stays, and the runner's resolve_inflight marks
+    # the ask answered from the board. Only a refusal that proves nothing is under the id releases it.
+    occupied = re.search(r"^\s*refused before posting: .*already used by different or incomplete content",
+                         out, re.M)
+    refused_before_append = (res.returncode in (1, 2) and not ok and not occupied
                              and not re.search(r"^\s*appending Row_ID=", out, re.M)
                              and re.search(r"^\s*(?:NOT SENT|refused before posting)\b", out, re.M))
     if refused_before_append:
         print("    post NOT SENT: the tool refused before its append; the ask stays open")
         return NOT_SENT
+    if occupied and not ok:
+        print("    post NOT CONFIRMED: a row already carries this reply id; not posted again; the next "
+              "run reconciles it from the board")
     if verbose or not ok:
         print("    " + out.strip()[-400:].replace("\n", "\n    "))
     return ok

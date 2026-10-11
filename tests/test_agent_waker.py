@@ -1020,6 +1020,26 @@ class RedisRequests(unittest.TestCase):
         finally:
             aw.subprocess.run = real
 
+    def test_a_reply_id_already_on_the_board_keeps_the_claim_and_is_not_NOT_SENT(self):
+        # The reply id is stable per ask. After a cursor reset, or when an earlier attempt landed, the
+        # tool refuses with "already used by different or incomplete content" (exit 2). That is a row
+        # under the id: the claim must stay, so the runner's resolve_inflight marks the ask answered
+        # from the board. NOT_SENT would release it, call the model again next run, be refused again,
+        # and never converge, with the watermark held under it.
+        real = aw.subprocess.run
+        try:
+            aw.subprocess.run = self._run("  refused before posting: reply id GEMINI-WAKE-x is already "
+                                          "used by different or incomplete content; not posted again", code=2)
+            res = aw.post_reply("gemini", {"project": "FLEET"}, "text", "grok;ALL", "ASK-1", False)
+            self.assertIs(False, res)
+            self.assertIsNot(aw.NOT_SENT, res)
+            # The tool's own gate before the append, with nothing under the id, still releases.
+            aw.subprocess.run = self._run("  refused before posting: the row would not fit", code=2)
+            self.assertIs(aw.NOT_SENT, aw.post_reply(
+                "gemini", {"project": "FLEET"}, "text", "grok;ALL", "ASK-1", False))
+        finally:
+            aw.subprocess.run = real
+
     def test_a_local_child_can_write_then_timeout_with_no_reported_output(self):
         """Reproduce the timing with a local file; the adapter still treats absent output as unknown."""
         import tempfile
