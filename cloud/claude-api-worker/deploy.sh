@@ -44,7 +44,11 @@ IMAGE="${REPO}/${NAME}:${TAG}"
 GCLOUD="${GCLOUD:-gcloud}"
 SCHED_JOB="${SCHED_JOB:-claude-api-worker-tick}"
 SCHEDULE="${SCHEDULE:-*/5 * * * *}"
-RUN_URI="https://${REGION}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${PROJECT}/jobs/${JOB}:run"
+# v2, not v1 namespaces. roles/run.invoker grants run.jobs.run, which is what v2 :run needs.
+# The v1 /apis/run.googleapis.com/v1/namespaces/.../jobs/NAME:run form also reads the job, which
+# run.invoker does not grant, so v1 forces the role up to run.developer for no benefit.
+# scripts/gcp_scheduler_bootstrap.py, and docs/CLOUD-CREDENTIAL-CONTRACT.md.
+RUN_URI="https://run.googleapis.com/v2/projects/${PROJECT}/locations/${REGION}/jobs/${JOB}:run"
 
 # The five, and only five, secrets this job may read. BUS_URL/BUS_SECRET are for the lane's one
 # doorbell row through scripts/append.py; without them the lane reports no_board and still mirrors.
@@ -73,6 +77,10 @@ FOLDER_ID="${DRIVE_INTAKE_FOLDER_ID:-1gZlJFDD2Wm419YOuolIXC3HXwzXOWYfP}"
 HEARTBEAT_SECONDS="${DRIVE_INTAKE_HEARTBEAT_SECONDS:-300}"
 
 setup() {
+  # The APIs the job calls (Docs, Drive) and the ones this script uses; enabling is idempotent.
+  "$GCLOUD" services enable docs.googleapis.com drive.googleapis.com run.googleapis.com \
+    cloudscheduler.googleapis.com secretmanager.googleapis.com cloudbuild.googleapis.com \
+    --project "$PROJECT"
   "$GCLOUD" iam service-accounts describe "$SA" --project "$PROJECT" >/dev/null 2>&1 ||
     "$GCLOUD" iam service-accounts create "$SA_NAME" --project "$PROJECT" \
       --display-name "claude-api worker: one bounded answer per tick, and the laptop lane"
@@ -85,10 +93,13 @@ setup() {
       --condition None >/dev/null
     echo "granted secretAccessor on ${secret} to ${SA}"
   done
-  # The ticker runs the job (run.invoker on the job) and must be usable by the scheduler agent.
+  # THE STEP WHOSE ABSENCE IS INVISIBLE. Without TokenCreator on the invoker, the ticker sits at
+  # status code -1 with no lastAttemptTime and no logs: it never attempts. run.invoker on the job
+  # is a different grant and does not mint the OAuth token. Same binding as
+  # scripts/gcp_scheduler_bootstrap.py, proven 2026-09-23.
   "$GCLOUD" iam service-accounts add-iam-policy-binding "$INVOKER" --project "$PROJECT" \
     --member "serviceAccount:service-${PROJECT_NUMBER}@gcp-sa-cloudscheduler.iam.gserviceaccount.com" \
-    --role roles/iam.serviceAccountUser >/dev/null
+    --role roles/iam.serviceAccountTokenCreator >/dev/null
   echo "NOW, IN DRIVE (yours): share folder ${FOLDER_ID} (Viewer) and the two originals (Editor) with ${SA}"
 }
 
@@ -132,8 +143,10 @@ readback() {
   # Check: the service account is claude-api-worker, not default; all five secrets present (three env,
   # two mounts); no env value rewritten into a C:/... path; egress private-ranges-only; both flags off
   # until you turn them on; the model id is the one you meant.
+  # The v2 job resource, the same projection cloud/bus-reconciler/deploy.sh reads back.
+  # spec.template.spec.template.spec is the Knative shape and prints empty here.
   "$GCLOUD" run jobs describe "$JOB" --project "$PROJECT" --region "$REGION" \
-    --format 'yaml(spec.template.spec.template.spec.serviceAccountName,spec.template.spec.template.spec.containers[0].env,spec.template.spec.template.spec.containers[0].image,spec.template.metadata.annotations)'
+    --format 'yaml(template.template.serviceAccount,template.template.containers[0].env,template.template.containers[0].image,template.template.vpcAccess,template.template.maxRetries)'
   "$GCLOUD" scheduler jobs describe "$SCHED_JOB" --project "$PROJECT" --location "$REGION" \
     --format 'yaml(schedule,state,lastAttemptTime,status,httpTarget.uri)' || true
   "$GCLOUD" run jobs executions list --job "$JOB" --project "$PROJECT" --region "$REGION" --limit 5 || true

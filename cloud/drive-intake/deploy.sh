@@ -30,6 +30,7 @@
 set -euo pipefail
 
 PROJECT="${PROJECT:-sfdc24}"
+PROJECT_NUMBER="${PROJECT_NUMBER:-96522051727}"
 REGION="${REGION:-us-central1}"
 SERVICE="${SERVICE:-drive-intake}"
 NAME="drive-intake"
@@ -63,8 +64,35 @@ FOLDER_ID="${DRIVE_INTAKE_FOLDER_ID:-1gZlJFDD2Wm419YOuolIXC3HXwzXOWYfP}"
 API_WORKER="${DRIVE_INTAKE_API_WORKER:-claude-api}"
 HEARTBEAT_SECONDS="${DRIVE_INTAKE_HEARTBEAT_SECONDS:-300}"
 POLL_SECONDS="${DRIVE_INTAKE_POLL_SECONDS:-120}"
+# The ring. "polled": the worker polls its inbox and the laptop lane rings the laptop itself, so the
+# put IS the hand-off and DISPATCHED is reachable without #359 (Cursor on 0bee083: a deploy with no
+# wake variables could never reach it). Set INBOX_WAKE_URL/INBOX_WAKE_SECRET instead once #359 lands.
+RING="${DRIVE_INTAKE_RING:-polled}"
+
+# One grant, safe in either order. setup runs before tokens in the printed order, so the two
+# tokens do not exist yet when setup walks the list; tokens creates them afterwards. A grant that
+# lives only in setup is skipped, and deploy then cannot mount the secret.
+grant_secret() {
+  local secret="$1"
+  if ! "$GCLOUD" secrets describe "$secret" --project "$PROJECT" >/dev/null 2>&1; then
+    echo "secret ${secret} does not exist yet; run: deploy.sh tokens (the two tokens) or create it" >&2
+    return 0
+  fi
+  if ! "$GCLOUD" iam service-accounts describe "$SA" --project "$PROJECT" >/dev/null 2>&1; then
+    echo "service account ${SA} does not exist yet; run deploy.sh setup to grant ${secret}" >&2
+    return 0
+  fi
+  "$GCLOUD" secrets add-iam-policy-binding "$secret" --project "$PROJECT" \
+    --member "serviceAccount:${SA}" --role roles/secretmanager.secretAccessor \
+    --condition None >/dev/null
+  echo "granted secretAccessor on ${secret} to ${SA}"
+}
 
 setup() {
+  # The APIs the service calls (Docs, Drive) and the ones this script uses; enabling is idempotent.
+  "$GCLOUD" services enable docs.googleapis.com drive.googleapis.com run.googleapis.com \
+    cloudscheduler.googleapis.com secretmanager.googleapis.com cloudbuild.googleapis.com \
+    --project "$PROJECT"
   "$GCLOUD" iam service-accounts describe "$SA" --project "$PROJECT" >/dev/null 2>&1 ||
     "$GCLOUD" iam service-accounts create "$SA_NAME" --project "$PROJECT" \
       --display-name "Drive intake: read the folder, append receipts, write fleet: keys"
@@ -72,13 +100,15 @@ setup() {
     "$GCLOUD" iam service-accounts create "$INVOKER_NAME" --project "$PROJECT" \
       --display-name "Drive intake poller: Cloud Scheduler's identity for POST /poll"
   for secret in "${SECRETS[@]}"; do
-    "$GCLOUD" secrets describe "$secret" --project "$PROJECT" >/dev/null 2>&1 ||
-      { echo "secret ${secret} does not exist yet; run: deploy.sh tokens (the two tokens) or create it" >&2; continue; }
-    "$GCLOUD" secrets add-iam-policy-binding "$secret" --project "$PROJECT" \
-      --member "serviceAccount:${SA}" --role roles/secretmanager.secretAccessor \
-      --condition None >/dev/null
-    echo "granted secretAccessor on ${secret} to ${SA}"
+    grant_secret "$secret"
   done
+  # THE STEP WHOSE ABSENCE IS INVISIBLE. Without TokenCreator on the invoker, the poller sits at
+  # status code -1 with no lastAttemptTime and no logs: it never attempts. The same binding
+  # scripts/gcp_scheduler_bootstrap.py grants, proven 2026-09-23. The Cloud Scheduler service
+  # agent is the principal that mints the OIDC token; run.invoker on the service is not this.
+  "$GCLOUD" iam service-accounts add-iam-policy-binding "$INVOKER" --project "$PROJECT" \
+    --member "serviceAccount:service-${PROJECT_NUMBER}@gcp-sa-cloudscheduler.iam.gserviceaccount.com" \
+    --role roles/iam.serviceAccountTokenCreator >/dev/null
   echo "NOW, IN DRIVE (yours): share folder ${FOLDER_ID} (Viewer) and the two originals (Editor) with ${SA}"
 }
 
@@ -87,11 +117,14 @@ tokens() {
   for secret in DRIVE_INTAKE_POLL_TOKEN DRIVE_INTAKE_CHANNEL_TOKEN; do
     if "$GCLOUD" secrets describe "$secret" --project "$PROJECT" >/dev/null 2>&1; then
       echo "${secret} exists; not replaced (add a version by hand if you mean to rotate it)"
-      continue
+    else
+      python -c "import secrets,sys; sys.stdout.write(secrets.token_hex(32))" |
+        "$GCLOUD" secrets create "$secret" --project "$PROJECT" --replication-policy automatic --data-file=-
+      echo "${secret} created with one version"
     fi
-    python -c "import secrets,sys; sys.stdout.write(secrets.token_hex(32))" |
-      "$GCLOUD" secrets create "$secret" --project "$PROJECT" --replication-policy automatic --data-file=-
-    echo "${secret} created with one version"
+    # setup's walk cannot grant a secret that does not exist yet, and the printed order is
+    # setup then tokens. Grant here too, including when the secret already existed.
+    grant_secret "$secret"
   done
 }
 
@@ -106,7 +139,7 @@ deploy() {
     --image "$IMAGE" --service-account "$SA" \
     --no-allow-unauthenticated --min-instances 0 --max-instances 2 \
     --set-secrets "${CA_PATH}=REDIS_CA_CERT:latest,${AUTH_PATH}=REDIS_AUTH_STRING:latest,DRIVE_INTAKE_POLL_TOKEN=DRIVE_INTAKE_POLL_TOKEN:latest,DRIVE_INTAKE_CHANNEL_TOKEN=DRIVE_INTAKE_CHANNEL_TOKEN:latest" \
-    --set-env-vars "DRIVE_INTAKE_ENABLED=off,REDIS_CONNECT=true,REDIS_HOST=${REDIS_HOST},REDIS_PORT=${REDIS_PORT},DRIVE_INTAKE_FOLDER_ID=${FOLDER_ID},DRIVE_INTAKE_API_WORKER=${API_WORKER},DRIVE_INTAKE_HEARTBEAT_SECONDS=${HEARTBEAT_SECONDS},DRIVE_INTAKE_POLL_SECONDS=${POLL_SECONDS}" \
+    --set-env-vars "DRIVE_INTAKE_ENABLED=off,REDIS_CONNECT=true,REDIS_HOST=${REDIS_HOST},REDIS_PORT=${REDIS_PORT},DRIVE_INTAKE_FOLDER_ID=${FOLDER_ID},DRIVE_INTAKE_API_WORKER=${API_WORKER},DRIVE_INTAKE_HEARTBEAT_SECONDS=${HEARTBEAT_SECONDS},DRIVE_INTAKE_POLL_SECONDS=${POLL_SECONDS},DRIVE_INTAKE_RING=${RING}" \
     --network "$NETWORK" --subnet "$SUBNET" --vpc-egress "$EGRESS" \
     --cpu 1 --memory 512Mi --timeout 60
   "$GCLOUD" run services add-iam-policy-binding "$SERVICE" --project "$PROJECT" --region "$REGION" \
@@ -119,16 +152,23 @@ service_url() {
 }
 
 schedule() {
-  local url token verb=create
+  local url token verb=create header_flag
   url="$(service_url)"
   # The poll token rides in its own header: Authorization carries the OIDC token Cloud Run checks.
   # Read from Secret Manager at this moment, handed to the scheduler, never echoed.
+  # Audience is the service URL, not /poll: Cloud Run checks the token against the service.
   token="$("$GCLOUD" secrets versions access latest --secret DRIVE_INTAKE_POLL_TOKEN --project "$PROJECT")"
   "$GCLOUD" scheduler jobs describe "$SCHED_JOB" --project "$PROJECT" --location "$REGION" >/dev/null 2>&1 && verb=update
+  # create takes --headers. update rejects it; the flag there is --update-headers. One flag for
+  # both means the second schedule, the idempotent one, fails and the header stays stale.
+  header_flag="--headers"
+  if [ "$verb" = update ]; then
+    header_flag="--update-headers"
+  fi
   "$GCLOUD" scheduler jobs "$verb" http "$SCHED_JOB" --project "$PROJECT" --location "$REGION" \
     --schedule "$SCHEDULE" --http-method POST --uri "${url}/poll" \
     --oidc-service-account-email "$INVOKER" --oidc-token-audience "$url" \
-    --headers "X-Drive-Intake-Poll-Token=${token}" \
+    "$header_flag" "X-Drive-Intake-Poll-Token=${token}" \
     --attempt-deadline 60s
   echo "scheduler ${SCHED_JOB} ${verb}d: ${SCHEDULE} -> POST ${url}/poll as ${INVOKER}"
 }
@@ -144,7 +184,9 @@ readback() {
   local url
   url="$(service_url)"
   echo "healthz:"
-  curl -s -H "Authorization: Bearer $("$GCLOUD" auth print-identity-token --audiences "$url")" "${url}/healthz"; echo
+  # A user account's identity token (no --audiences: that flag is for service accounts) is accepted
+  # by a private Cloud Run service when the account holds run.invoker, which the project owner does.
+  curl -s -H "Authorization: Bearer $("$GCLOUD" auth print-identity-token)" "${url}/healthz"; echo
   echo "a scheduler with no lastAttemptTime has never attempted; poll reads unknown until the first tick"
 }
 
@@ -163,5 +205,5 @@ case "${1:-}" in
   readback) readback ;;
   on) flag on ;;
   off) flag off ;;
-  *) sed -n '2,25p' "$0"; exit 2 ;;
+  *) sed -n '2,28p' "$0"; exit 2 ;;
 esac

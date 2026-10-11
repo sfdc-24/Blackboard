@@ -160,6 +160,7 @@ on:
       - "cloud/drive-intake/deploy.sh"
       - "cloud/claude-api-worker/deploy.sh"
       - "tests/test_telephone_deploy.py"
+      - "tests/test_telephone_smoke.py"
       - ".github/workflows/python-suites.yml"
   push:
     branches: [main]
@@ -301,6 +302,7 @@ on:
       - "cloud/drive-intake/deploy.sh"
       - "cloud/claude-api-worker/deploy.sh"
       - "tests/test_telephone_deploy.py"
+      - "tests/test_telephone_smoke.py"
       - ".github/workflows/python-suites.yml"
 
 permissions:
@@ -390,7 +392,8 @@ jobs:
                    tests/test_drive_intake.py \
                    tests/test_claude_api_worker.py \
                    tests/test_claude_api_lane.py \
-                   tests/test_telephone_deploy.py; do
+                   tests/test_telephone_deploy.py \
+                   tests/test_telephone_smoke.py; do
             if [ -f "$t" ]; then echo "present : $t"; else echo "absent  : $t"; fi
           done
 
@@ -501,6 +504,18 @@ jobs:
           if [ -f tests/test_claude_api_worker.py ]; then
             python_bin="$(command -v python3)"
             sudo unshare -n -- "$python_bin" -m unittest tests.test_claude_api_worker tests.test_claude_api_lane tests.test_telephone_deploy -v
+          else
+            echo "not on this branch; skipping"
+          fi
+
+      # The two telephone entry points as processes on loopback (tests/test_telephone_smoke.py):
+      # drive-intake's real server with the flag off and on, the worker job with its flags off and
+      # on, no cloud around them. Loopback only, so not under unshare -n, whose lo is down.
+      - name: telephone entry points on loopback (no network beyond this runner)
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_telephone_smoke.py ]; then
+            python3 -m unittest tests.test_telephone_smoke -v
           else
             echo "not on this branch; skipping"
           fi
