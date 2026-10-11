@@ -103,7 +103,8 @@ class Settings:
     pilot_notify: str = ""
     # The telephone trail (step 4 of the broken-telephone fix): the private
     # drive-intake service's URL and its poll token. Off when the URL is empty;
-    # off, the endpoint is 404 and nothing is read.
+    # off, the endpoint is 404 and nothing is read. On, a read still requires
+    # the doc id the server stored on that live session.
     telephone_url: str = ""
     telephone_token: str = ""
 

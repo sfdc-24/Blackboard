@@ -23,6 +23,9 @@ LINE = re.compile(
     r"rev (?P<rev>\S+) - recipient (?P<recipient>\S+) - by (?P<by>\S+) - "
     r"(?P<at>\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)(?P<rest>.*)$")
 ID_TAIL = re.compile(r"\s+-\s+id\s+(?P<id>[0-9a-f]{16})\s*$")
+# The same heading the receipt writer puts in before the first line
+# (drive-intake RECEIPTS_HEADING). Everything above it is the request.
+RECEIPTS_HEADING = re.compile(r"(?mi)^\s*(?:#+\s*)?(?:CONVERSPAN\s+)?RECEIPTS\s*:?\s*$")
 RESULT_PREFIX = "> "
 RESULT_LINES_MAX = 200
 DETAIL_CHARS_MAX = 400
@@ -37,15 +40,29 @@ def bounded(value: str, limit: int) -> str:
     return value[:limit] + " [cut here at %d of %d characters]" % (limit, len(value))
 
 
-def parse(text: str) -> list:
-    """Every receipt line in the doc, in order, each with the answer lines that follow it.
+def receipts_section(text: str) -> str:
+    """Only the lines under the first RECEIPTS heading.
 
-    A line in the shared shape is a receipt wherever it sits. A line starting with "> " belongs
-    to the receipt above it (the worker and the lane write the answer that way). Anything else
-    is not the trail and is not returned. Bounded: a long answer is cut and SAYS so (PR 354).
+    The writer always creates that heading before it appends a receipt. A
+    receipt-shaped line above it is the owner's request, and the page must
+    not be given it or the "> " lines under it.
+    """
+    match = RECEIPTS_HEADING.search(text or "")
+    if not match:
+        return ""
+    return (text or "")[match.end():]
+
+
+def parse(text: str) -> list:
+    """Every receipt line under the RECEIPTS heading, in order, each with the answer lines under it.
+
+    A line in the shared shape is a receipt only inside that section. A line starting with "> "
+    belongs to the receipt above it (the worker and the lane write the answer that way). Anything
+    else, including a receipt-shaped line in the request, is not the trail and is not returned.
+    Bounded: a long answer is cut and SAYS so (PR 354).
     """
     entries = []
-    for raw in (text or "").splitlines():
+    for raw in receipts_section(text).splitlines():
         match = LINE.match(raw)
         if match:
             rest = match.group("rest") or ""

@@ -1664,6 +1664,7 @@ class TrailPageTest(unittest.TestCase):
 
     def test_the_parser_ignores_prose_and_bounds_the_answer(self):
         text = ("hello - task task-0123456789abcdef - request x\n"                       # not the shape
+                "RECEIPTS\n"
                 "SUCCEEDED - task task-0123456789abcdef - request R - rev abc - recipient claude-api - by claude-api - 2026-10-11T04:05:09Z - id cccccccccccccccc\n"
                 + "".join("> line %d\n" % i for i in range(205)))
         entries = trail_mod.parse(text)
@@ -1673,14 +1674,42 @@ class TrailPageTest(unittest.TestCase):
         self.assertEqual("[answer cut here at 200 lines]", entries[0]["result"][-1])
         self.assertEqual([], trail_mod.parse("> an answer with no line above it\n"))
         long_line = "SUCCEEDED - task task-0123456789abcdef - request R - rev abc - recipient claude-api - by claude-api - 2026-10-11T04:05:09Z - " + "d" * 900 + " - id cccccccccccccccc"
-        detail = trail_mod.parse(long_line)[0]["detail"]
+        detail = trail_mod.parse("RECEIPTS\n" + long_line)[0]["detail"]
         self.assertTrue(detail.startswith("d" * 400) and detail.endswith("[cut here at 400 of 900 characters]"), detail[-50:])
         # the worker keeps an answer to 3000 characters, often as ONE line: kept whole, and a longer
         # one is cut out loud (Cursor on e080da3: 400 silently was the one cut that did not say so)
         one_line = "SUCCEEDED - task task-0123456789abcdef - request R - rev abc - recipient claude-api - by claude-api - 2026-10-11T04:05:09Z - id cccccccccccccccc\n> " + "a" * 3000 + "\n> " + "b" * 3500 + "\n"
-        result = trail_mod.parse(one_line)[0]["result"]
+        result = trail_mod.parse("RECEIPTS\n" + one_line)[0]["result"]
         self.assertEqual("a" * 3000, result[0])
         self.assertTrue(result[1].startswith("b" * 3000) and result[1].endswith("[cut here at 3000 of 3500 characters]"), result[1][-50:])
+
+    def test_a_receipt_shaped_line_outside_the_receipts_section_is_not_returned(self):
+        outside = (
+            "SUCCEEDED - task task-0123456789abcdef - request OT-SECRET - rev abcdef012345 - "
+            "recipient claude-api - by claude-api - 2026-10-11T04:00:00Z - id 1111111111111111\n"
+            "> owner secret\n")
+        inside = (
+            "DISPATCHED - task task-fedcba9876543210 - request OT-20261010 - rev abcdef012345 - "
+            "recipient claude-api - by drive-intake - 2026-10-11T04:01:00Z - id 2222222222222222\n"
+            "> the real answer\n")
+        self.assertEqual([], trail_mod.parse(outside))                 # no RECEIPTS heading: nothing
+        for heading in ("RECEIPTS\n", "# RECEIPTS\n", "CONVERSPAN RECEIPTS:\n"):
+            entries = trail_mod.parse(outside + heading + inside)
+            self.assertEqual(["DISPATCHED"], [e["state"] for e in entries], heading)
+            self.assertEqual(["the real answer"], entries[0]["result"], heading)
+            self.assertEqual("2222222222222222", entries[0]["id"], heading)
+            dumped = json.dumps(entries)
+            self.assertNotIn("owner secret", dumped)
+            self.assertNotIn("OT-SECRET", dumped)
+            self.assertNotIn("1111111111111111", dumped)
+        d = deps(docs=Docs(text=outside + "\nRECEIPTS\n" + inside, revision="r9"))
+        out = di.trail_for_doc(d, FILE)
+        self.assertEqual(["DISPATCHED"], [e["state"] for e in out["entries"]])
+        self.assertEqual(["the real answer"], out["entries"][0]["result"])
+        dumped = json.dumps(out)
+        self.assertNotIn("owner secret", dumped)
+        self.assertNotIn("OT-SECRET", dumped)
+        self.assertNotIn("1111111111111111", dumped)
 
     def test_the_route_wants_the_token_first_then_the_flag_then_a_file_id(self):
         d, t = self.trail_doc()

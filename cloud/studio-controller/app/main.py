@@ -1516,9 +1516,12 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
     # v0.1): "the Converspan page shows the live task/receipt trail during a call". The record is
     # the originating Drive doc; drive-intake reads it and parses the receipt shape back
     # (GET /trail?doc=); this service reads that as its own identity (an OIDC token for the
-    # private service) plus the shared poll token, for a LIVE SESSION only, and hands the page
-    # receipts and the answer lines - never the owner's request. One upstream read per doc per
-    # few seconds, whatever the page asks, because every read is a Docs read.
+    # private service) plus the shared poll token, and hands the page receipts and the answer
+    # lines - never the owner's request. The query names a doc. That name is authorized only
+    # when it is the doc this live session already has stored (telephone_doc, written by
+    # bind_telephone_doc, never by the query). A stopped, expired, deleted, or unknown session
+    # is refused before any read. One upstream read per session and doc per few seconds,
+    # because every read is a Docs read and one session's cache is not another's.
     TELEPHONE_DOC = re.compile(r"[A-Za-z0-9_-]{10,128}\Z")
     TELEPHONE_CACHE_SECONDS = 5.0
     TELEPHONE_MAX_BYTES = 262144
@@ -1560,6 +1563,38 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             raise TelephoneUnavailable("drive-intake gave no object")
         return {key: body.get(key) for key in TELEPHONE_KEYS if key in body}
 
+    def bind_telephone_doc(session_id: str, doc: str) -> None:
+        """Record the one Drive doc this live session may read.
+
+        Server-side only: no request body writes telephone_doc. The telephone
+        query is checked against this field and is not itself the binding.
+        Off with the trail (no STUDIO_TELEPHONE_URL), this refuses and stores nothing.
+        """
+        if not settings.telephone_url:
+            raise HTTPException(404, "the telephone trail is off")
+        if not TELEPHONE_DOC.fullmatch(doc or ""):
+            raise HTTPException(400, "doc must be a Drive file id")
+
+        def change(current):
+            if current.get("stopped") or int(current.get("expires_at") or 0) <= int(clock()):
+                raise HTTPException(410, "session has ended")
+            current["telephone_doc"] = doc
+            return current
+
+        try:
+            update_state(session_id, change)
+        except SessionNotFound as exc:
+            raise HTTPException(404, "session not found") from exc
+
+    app.state.bind_telephone_doc = bind_telephone_doc
+
+    def session_owns_doc(state: dict, doc: str) -> bool:
+        """True when the server-stored doc id is exactly the one asked for."""
+        bound = state.get("telephone_doc")
+        if not isinstance(bound, str) or len(bound) != len(doc):
+            return False
+        return hmac.compare_digest(bound, doc)
+
     @app.get("/v1/session/{session_id}/telephone")
     async def telephone(request: Request, session_id: str, doc: str = Query("")):
         """The doc's receipt trail for THIS session's page. Off unless STUDIO_TELEPHONE_URL is set."""
@@ -1567,10 +1602,17 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         require_session(request, session_id)
         if not settings.telephone_url:
             raise HTTPException(404, "the telephone trail is off")
+        # Live session before any doc work: unknown and deleted are 404, stopped and expired are 410.
+        state = await asyncio.to_thread(live_state, session_id)
         if not TELEPHONE_DOC.fullmatch(doc or ""):
             raise HTTPException(400, "doc must be a Drive file id")
+        if not session_owns_doc(state, doc):
+            # Same answer for an unbound session and for a doc it does not own.
+            # Nothing about that doc's contents, size, or whether it exists.
+            raise HTTPException(403, "this session is not bound to that doc")
         now = clock()
-        cached = app.state.telephone_cache.get(doc)
+        cache_key = (session_id, doc)
+        cached = app.state.telephone_cache.get(cache_key)
         if cached and 0 <= now - cached[0] < TELEPHONE_CACHE_SECONDS:
             return cached[1]
         try:
@@ -1579,7 +1621,7 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             raise HTTPException(502, str(exc)) from exc
         except Exception as exc:  # noqa: BLE001 - a transport failure, named by type only
             raise HTTPException(502, "the trail could not be read: " + type(exc).__name__) from exc
-        app.state.telephone_cache[doc] = (now, trail)
+        app.state.telephone_cache[cache_key] = (now, trail)
         return trail
 
     @app.get("/v1/leads")

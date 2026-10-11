@@ -1,13 +1,15 @@
 """The telephone trail on the studio controller: a live session's page reads the doc's receipts.
 
-Off unless the URL is set (404). A session token for THIS session, the doc id checked, the
-upstream read carrying this service's identity and the shared token, only the trail keys handed
-on, never the request, one upstream read per doc per few seconds, and a refusal upstream named as
-502, never forged into a trail.
+Off unless the URL is set (404). A session token for THIS session, the session still live, the
+doc id checked and equal to the doc the server stored on that session, the upstream read carrying
+this service's identity and the shared token, only the trail keys handed on, never the request,
+one upstream read per session and doc per few seconds, and a refusal upstream named as 502, never
+forged into a trail.
 """
 import json
 import unittest
 
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from tests.test_studio_controller import (  # noqa: E402  (sets sys.path for app.*)
@@ -69,8 +71,8 @@ class TelephoneTests(unittest.TestCase):
                           email_sender=self.email_sender, telephone_client=self.upstream,
                           identity_token=lambda audience: "idtok-for-" + audience)
 
-    def session(self, client):
-        key = "browser-instance-1234567890"
+    def session(self, client, creation_id="create-1"):
+        key = "browser-instance-" + creation_id + "-1234567890"
         started = client.post("/v1/auth/start", headers=ORIGIN, json={"email": "operator@example.com", "client_key": key})
         self.assertEqual(200, started.status_code, started.text)
         code = self.email_sender.calls[-1][1]
@@ -78,10 +80,20 @@ class TelephoneTests(unittest.TestCase):
             "challenge_id": started.json()["challenge_id"], "email": "operator@example.com", "code": code, "client_key": key})
         self.assertEqual(200, verified.status_code, verified.text)
         made = client.post("/v1/session", headers={**ORIGIN, "Authorization": "Bearer " + verified.json()["token"]},
-                           json={"title": "Test", "creation_id": "create-1"})
+                           json={"title": "Test", "creation_id": creation_id})
         self.assertEqual(200, made.status_code, made.text)
         body = made.json()
         return body["session_id"], {**ORIGIN, "Authorization": "Bearer " + body["token"]}
+
+    def bind(self, client, session_id, doc):
+        """The server stores the doc on the session. The query never does this."""
+        client.app.state.bind_telephone_doc(session_id, doc)
+
+    def forget(self, session_id):
+        name = "studio_session_" + session_id
+        with self.store.lock:
+            self.store.data.pop(name, None)
+            self.store.generation.pop(name, None)
 
     def test_off_is_404_even_for_a_live_session_and_nothing_upstream_is_called(self):
         with TestClient(self.app(telephone_url="")) as client:
@@ -105,6 +117,7 @@ class TelephoneTests(unittest.TestCase):
     def test_the_trail_is_read_as_this_service_with_the_shared_token_and_only_the_trail_keys_come_back(self):
         with TestClient(self.app()) as client:
             sid, headers = self.session(client)
+            self.bind(client, sid, DOC)
             response = client.get("/v1/session/%s/telephone" % sid, params={"doc": DOC}, headers=headers)
             self.assertEqual(200, response.status_code, response.text)
             body = response.json()
@@ -123,6 +136,7 @@ class TelephoneTests(unittest.TestCase):
     def test_one_upstream_read_per_doc_every_five_seconds_whatever_the_page_asks(self):
         with TestClient(self.app()) as client:
             sid, headers = self.session(client)
+            self.bind(client, sid, DOC)
             for _ in range(3):
                 self.assertEqual(200, client.get("/v1/session/%s/telephone" % sid, params={"doc": DOC}, headers=headers).status_code)
             self.assertEqual(1, len(self.upstream.calls))
@@ -130,8 +144,14 @@ class TelephoneTests(unittest.TestCase):
             self.assertEqual(200, client.get("/v1/session/%s/telephone" % sid, params={"doc": DOC}, headers=headers).status_code)
             self.assertEqual(2, len(self.upstream.calls))
             other_doc = "1gZlJFDD2Wm419YOuolIXC3HXwzXOWYfP"
-            self.assertEqual(200, client.get("/v1/session/%s/telephone" % sid, params={"doc": other_doc}, headers=headers).status_code)
-            self.assertEqual(3, len(self.upstream.calls))               # a different doc is its own read
+            # This session is not bound to the other doc, so the page asking does not read it.
+            refused = client.get("/v1/session/%s/telephone" % sid, params={"doc": other_doc}, headers=headers)
+            self.assertEqual(403, refused.status_code, refused.text)
+            self.assertEqual(2, len(self.upstream.calls))
+            sid2, headers2 = self.session(client, "create-2")
+            self.bind(client, sid2, other_doc)
+            self.assertEqual(200, client.get("/v1/session/%s/telephone" % sid2, params={"doc": other_doc}, headers=headers2).status_code)
+            self.assertEqual(3, len(self.upstream.calls))               # a bound different doc is its own read
 
     def test_a_refusal_or_a_broken_answer_upstream_is_502_and_never_a_trail(self):
         for answer, words in ((Answer(401, {"error": "bad poll token"}), "answered 401"),
@@ -140,6 +160,7 @@ class TelephoneTests(unittest.TestCase):
                               (Answer(200, raw=b'{"status": "ok", "pad": "' + b"x" * 300000 + b'"}'), "larger")):
             with TestClient(self.app(upstream=FakeTelephone(answer))) as client:
                 sid, headers = self.session(client)
+                self.bind(client, sid, DOC)
                 response = client.get("/v1/session/%s/telephone" % sid, params={"doc": DOC}, headers=headers)
                 self.assertEqual(502, response.status_code, response.text)
                 self.assertIn(words, response.json()["detail"])
@@ -149,6 +170,7 @@ class TelephoneTests(unittest.TestCase):
                 raise ConnectionError("down")
         with TestClient(self.app(upstream=Broken())) as client:
             sid, headers = self.session(client)
+            self.bind(client, sid, DOC)
             response = client.get("/v1/session/%s/telephone" % sid, params={"doc": DOC}, headers=headers)
             self.assertEqual(502, response.status_code)
             self.assertIn("ConnectionError", response.json()["detail"])
@@ -162,6 +184,7 @@ class TelephoneTests(unittest.TestCase):
                          telephone_client=self.upstream, identity_token=lambda audience: "")
         with TestClient(app) as client:
             sid, headers = self.session(client)
+            self.bind(client, sid, DOC)
             self.assertEqual(200, client.get("/v1/session/%s/telephone" % sid, params={"doc": DOC}, headers=headers).status_code)
             self.assertNotIn("Authorization", self.upstream.calls[-1][2])
             self.assertEqual("poll-secret", self.upstream.calls[-1][2]["X-Drive-Intake-Poll-Token"])
@@ -186,6 +209,111 @@ class TelephoneTests(unittest.TestCase):
         with TestClient(self.app()) as client:
             pass
         self.assertFalse(self.upstream.closed)
+
+    def test_a_stopped_deleted_or_unknown_session_is_refused_before_any_doc_read(self):
+        with TestClient(self.app()) as client:
+            sid, headers = self.session(client)
+            self.bind(client, sid, DOC)
+            stopped = client.post("/v1/session/%s/commands" % sid, headers=headers, json={
+                "command_id": "stop-1", "session_id": sid, "type": "stop", "expected_version": 1})
+            self.assertEqual(200, stopped.status_code, stopped.text)
+            response = client.get("/v1/session/%s/telephone" % sid, params={"doc": DOC}, headers=headers)
+            self.assertEqual(410, response.status_code, response.text)
+            self.assertEqual([], self.upstream.calls)
+
+            sid, headers = self.session(client, "create-deleted")
+            self.bind(client, sid, DOC)
+            self.forget(sid)
+            response = client.get("/v1/session/%s/telephone" % sid, params={"doc": DOC}, headers=headers)
+            self.assertEqual(404, response.status_code, response.text)
+            self.assertIn("session not found", response.text)
+            self.assertEqual([], self.upstream.calls)
+
+            ghost = "s-not-a-session"
+            token = mint_token(ghost, 2000, self.configured.session_secret)
+            response = client.get("/v1/session/%s/telephone" % ghost, params={"doc": DOC},
+                                  headers={**ORIGIN, "Authorization": "Bearer " + token})
+            self.assertEqual(404, response.status_code, response.text)
+            self.assertIn("session not found", response.text)
+            self.assertEqual([], self.upstream.calls)
+
+    def test_a_doc_not_bound_server_side_is_refused_with_no_content_size_or_existence_leak(self):
+        with TestClient(self.app()) as client:
+            sid, headers = self.session(client)
+            self.bind(client, sid, DOC)
+            other = "1gZlJFDD2Wm419YOuolIXC3HXwzXOWYfP"
+            missing = "0123456789abcdefghij"
+            wrong = client.get("/v1/session/%s/telephone" % sid, params={"doc": other}, headers=headers)
+            absent = client.get("/v1/session/%s/telephone" % sid, params={"doc": missing}, headers=headers)
+            self.assertEqual(403, wrong.status_code, wrong.text)
+            self.assertEqual({"detail": "this session is not bound to that doc"}, wrong.json())
+            self.assertEqual(wrong.json(), absent.json())
+            self.assertEqual(len(wrong.content), len(absent.content))
+            for body in (wrong.text, absent.text):
+                self.assertNotIn("entries", body)
+                self.assertNotIn("NEVER HANDED ON", body)
+                self.assertNotIn("r7", body)
+                self.assertNotIn("revision", body)
+            self.assertEqual([], self.upstream.calls)
+            # A second live session with no binding is refused the same way, even for the doc that exists upstream.
+            sid2, headers2 = self.session(client, "create-unbound")
+            naked = client.get("/v1/session/%s/telephone" % sid2, params={"doc": DOC}, headers=headers2)
+            self.assertEqual(wrong.json(), naked.json())
+            self.assertEqual([], self.upstream.calls)
+            owned = client.get("/v1/session/%s/telephone" % sid, params={"doc": DOC}, headers=headers)
+            self.assertEqual(200, owned.status_code, owned.text)
+            self.assertEqual(["REQUESTED"], [e["state"] for e in owned.json()["entries"]])
+            self.assertEqual(1, len(self.upstream.calls))
+
+    def test_a_cached_trail_cannot_be_served_across_sessions(self):
+        with TestClient(self.app()) as client:
+            sid, headers = self.session(client)
+            self.bind(client, sid, DOC)
+            first = client.get("/v1/session/%s/telephone" % sid, params={"doc": DOC}, headers=headers)
+            self.assertEqual(200, first.status_code, first.text)
+            self.assertEqual([(sid, DOC)], list(client.app.state.telephone_cache))
+            self.assertEqual(1, len(self.upstream.calls))
+            sid2, headers2 = self.session(client, "create-2")
+            leaked = client.get("/v1/session/%s/telephone" % sid2, params={"doc": DOC}, headers=headers2)
+            self.assertEqual(403, leaked.status_code, leaked.text)
+            self.assertNotIn("task-0123456789abcdef", leaked.text)
+            self.assertNotIn("NEVER HANDED ON", leaked.text)
+            self.assertNotIn("entries", leaked.text)
+            self.assertEqual(1, len(self.upstream.calls))
+            # A doc-only cache slot is the old key. Neither session is served from it.
+            client.app.state.telephone_cache[DOC] = (self.now[0], {"status": "ok", "entries": [], "secret": "CROSS-SESSION"})
+            again = client.get("/v1/session/%s/telephone" % sid, params={"doc": DOC}, headers=headers)
+            self.assertEqual(first.json(), again.json())
+            self.assertNotIn("CROSS-SESSION", again.text)
+            self.assertEqual(1, len(self.upstream.calls))
+            self.bind(client, sid2, DOC)
+            second = client.get("/v1/session/%s/telephone" % sid2, params={"doc": DOC}, headers=headers2)
+            self.assertEqual(200, second.status_code, second.text)
+            self.assertNotIn("CROSS-SESSION", second.text)
+            self.assertEqual(2, len(self.upstream.calls))          # its own read, not the other session's slot
+            self.assertIn((sid2, DOC), client.app.state.telephone_cache)
+            self.assertNotEqual(id(client.app.state.telephone_cache[(sid, DOC)]),
+                                id(client.app.state.telephone_cache[(sid2, DOC)]))
+
+    def test_the_trail_stays_off_when_studio_telephone_url_is_unset(self):
+        import os
+        from unittest import mock
+        base = {k: v for k, v in os.environ.items() if not k.startswith("STUDIO_")}
+        base.update({"STUDIO_ALLOWED_ORIGINS": "https://www.sfdc24.com", "STUDIO_SESSION_SECRET": "s" * 40,
+                     "STUDIO_STATE_URI": "file://unused"})
+        with mock.patch.dict(os.environ, base, clear=True):
+            off = Settings.from_env()
+        self.assertEqual("", off.telephone_url)
+        with TestClient(self.app(telephone_url="")) as client:
+            sid, headers = self.session(client)
+            response = client.get("/v1/session/%s/telephone" % sid, params={"doc": DOC}, headers=headers)
+            self.assertEqual(404, response.status_code, response.text)
+            self.assertIn("off", response.text)
+            self.assertEqual([], self.upstream.calls)
+            with self.assertRaises(HTTPException) as caught:
+                client.app.state.bind_telephone_doc(sid, DOC)
+            self.assertEqual(404, caught.exception.status_code)
+            self.assertEqual([], self.upstream.calls)
 
 
 if __name__ == "__main__":
