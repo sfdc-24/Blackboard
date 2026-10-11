@@ -255,6 +255,40 @@ class PhoneIntakeTests(unittest.TestCase):
         self.assertIn("Handle the second change.", calls[0])
         self.assertNotIn("Edited after queueing.", calls[0])
 
+    def test_edit_during_accepted_receipt_retry_never_calls_model(self):
+        self.fresh()
+        original_append = self.docs.append
+        edited = False
+
+        def edit_before_append(file_id, expected_revision, receipt_id, receipt):
+            nonlocal edited
+            if not edited and "ACCEPTED - task" in receipt:
+                edited = True
+                doc = self.docs.documents[file_id]
+                doc["text"] = doc["text"].replace(
+                    "Summarize the new change.", "Edited during receipt retry.")
+                doc["revision_id"] = "r99"
+            return original_append(file_id, expected_revision, receipt_id, receipt)
+
+        self.docs.append = edit_before_append
+        calls = []
+        views = pilot.PilotDocs(self.docs)
+        deps = worker.Deps(
+            enabled=True, inbox=pilot.PilotInbox(worker.RedisInbox(self.redis), self.redis),
+            docs=self.docs, receipts=self.docs, claims=worker.MemoryClaims(),
+            ledger=worker.MemoryLedger(), model=lambda *_: calls.append(1),
+            model_name="offline-mock", folder_id=pilot.FOLDER_ID, now=self.now,
+            at="2026-10-11T05:00:00Z", cap_cents=100, reserve_cents=1,
+            price_in=1, price_out=1, cad_per_usd=1, max_input_tokens=12000,
+            authorized_until=self.now + 3600)
+        deps.pilot_docs = views
+        out = worker.run_once(deps)
+        self.assertTrue(edited)
+        self.assertEqual(out["calls"], 0)
+        self.assertEqual(calls, [])
+        self.assertEqual(out["considered"][0]["status"], "accepted_receipt_owed")
+        self.assertNotIn("SUCCEEDED - task", self.docs.documents[self.doc]["text"])
+
     def test_shared_parser_request_alias_cannot_smuggle_a_different_id(self):
         self.pass_once()
         smuggled = block().replace("REQUEST: owner-20261011-01",

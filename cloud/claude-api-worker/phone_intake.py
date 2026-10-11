@@ -162,7 +162,11 @@ class PilotDocs:
         return view
 
     def append(self, file_id, expected_revision, receipt_id, block):
-        self._read_scoped(file_id)
+        doc = self._read_scoped(file_id)
+        if self.require_expected:
+            if file_id not in self.expected or not focused_text(
+                    doc.get("text") or "", *self.expected[file_id]):
+                raise OutOfScope("approved request changed before receipt append")
         return self.raw_docs.append(file_id, expected_revision, receipt_id, block)
 
     def has(self, file_id, receipt_id):
