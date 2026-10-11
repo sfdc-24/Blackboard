@@ -5,10 +5,13 @@ A deploy script drifts from its code silently: a renamed env var in main.py and 
 running with the default. So every `environ.get("NAME")` the two services read must be set by the
 script that deploys them, or be on the short list of optional ones, and nothing else.
 """
+import importlib.util
+import math
 import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -74,6 +77,25 @@ def env_names_set(script_text):
     return names
 
 
+def quoted(script_text, name):
+    """The single-quoted python a script keeps in NAME='...'."""
+    return script_text.split(name + "='\n", 1)[1].split("\n'\n", 1)[0]
+
+
+def load(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def gate():
+    """The worker script's cost gate, as python: problems(env, now)."""
+    namespace = {"__name__": "cost_gate"}
+    exec(quoted((WORKER / "deploy.sh").read_text(encoding="utf-8"), "COST_MISSING_PY"), namespace)
+    return namespace["problems"]
+
+
 class IntakeDeployTest(unittest.TestCase):
     script = (INTAKE / "deploy.sh").read_text(encoding="utf-8")
 
@@ -119,8 +141,11 @@ class IntakeDeployTest(unittest.TestCase):
         # The id is checked against the shape main.py accepts BEFORE anything is read or sent. Pinned
         # to the literal, and to FILE_ID_OK itself once the /trail route (#376) is on this branch.
         self.assertIn("DOC_ID_OK='^[A-Za-z0-9_-]{10,128}$'", self.script)
-        self.assertLess(trail.index('grep -Eq "$DOC_ID_OK"'), trail.index("service_url"))
-        self.assertLess(trail.index('grep -Eq "$DOC_ID_OK"'), trail.index("secrets versions access"))
+        whole = '[[ "$doc" =~ $DOC_ID_OK ]]'                     # the whole argument; grep answers per line
+        self.assertLess(trail.index(whole), trail.index("service_url"))
+        self.assertLess(trail.index(whole), trail.index("secrets versions access"))
+        self.assertNotIn("grep", commands(trail))
+        self.assertIn("curl -sS --fail-with-body", trail)         # an HTTP refusal is not a proof
         main_text = (INTAKE / "main.py").read_text(encoding="utf-8")
         file_id_ok = re.search(r'FILE_ID_OK = re\.compile\(r"([^"]+)"\)', main_text)
         if file_id_ok:
@@ -153,11 +178,17 @@ class IntakeDeployTest(unittest.TestCase):
         flag = function_body(self.script, "flag")
         self.assertIn('WORKER_JOB="${WORKER_JOB:-claude-api-worker}"', self.script)
         self.assertLess(flag.index('grep -qx "PHONE_DOC_INTAKE_ENABLED=on"'), flag.index("run services update"))
-        self.assertIn('[ "$1" = on ] && env_lines jobs "$WORKER_JOB"', flag)
+        self.assertIn('if ! other="$(env_lines jobs "$WORKER_JOB")"; then', flag)   # unreadable is a refusal
         self.assertIn("exit 2", flag)
         env_lines = function_body(self.script, "env_lines")
         self.assertIn("--format json", env_lines)
         self.assertIn('"$PYTHON" -c "$ENV_LINES_PY"', env_lines)
+        self.assertNotIn("|| true", env_lines)                    # a failed read is never an empty answer
+        self.assertNotIn("2>/dev/null", env_lines)
+        # One reader, two scripts: the worker's copy must be this one, to the byte.
+        worker = (WORKER / "deploy.sh").read_text(encoding="utf-8")
+        self.assertEqual(env_lines, function_body(worker, "env_lines"))
+        self.assertEqual(quoted(self.script, "ENV_LINES_PY"), quoted(worker, "ENV_LINES_PY"))
 
 
 class WorkerDeployTest(unittest.TestCase):
@@ -221,10 +252,12 @@ class WorkerDeployTest(unittest.TestCase):
         worker_on = function_body(self.script, "worker_on")
         self.assertLess(worker_on.index("cost_missing"), worker_on.index("flag CLAUDE_API_WORKER_ENABLED on"))
         self.assertIn("exit 2", worker_on)
-        self.assertIn('env_lines jobs "$JOB" | "$PYTHON" -c "$COST_MISSING_PY"', function_body(self.script, "cost_missing"))
+        cost_missing = function_body(self.script, "cost_missing")
+        self.assertIn('lines="$(env_lines jobs "$JOB")" || return 1', cost_missing)
+        self.assertIn('"$PYTHON" -c "$COST_MISSING_PY"', cost_missing)
+        self.assertIn('if ! missing="$(cost_missing)"; then', worker_on)             # unreadable is a refusal
         for name in COST_INPUTS + ("CLAUDE_API_WORKER_MODEL",):
-            self.assertIn('"%s"' % name, self.script.split("COST_MISSING_PY=", 1)[1].split("\n'\n", 1)[0], name)
-        self.assertIn("return float(value) == 0", self.script)                   # "0" and "0.0" are unset; a date is set
+            self.assertIn('"%s"' % name, quoted(self.script, "COST_MISSING_PY"), name)
         self.assertIn("cost) cost_readback ;;", self.script)
         self.assertIn("deploy.sh cost", self.script)
         env_lines = function_body(self.script, "env_lines")
@@ -283,24 +316,66 @@ printf '%s\n' "$*" >> "$FAKE_LOG"
 case "$*" in
   *"value(status.url)"*) echo "https://drive-intake-fake-uc.a.run.app" ;;
   *"serviceAccountName"*) printf '%s\n' "$FAKE_STUDIO_SA" ;;
-  *"run jobs describe"*"--format json"*) printf '%s' "$FAKE_JOB_JSON" ;;
-  *"run services describe"*"--format json"*) printf '%s' "$FAKE_SERVICE_JSON" ;;
+  *"run jobs describe"*"--format json"*) describe "${FAKE_JOB_FAILS:-}" "$FAKE_JOB_JSON" job ;;
+  *"run services describe"*"--format json"*) describe "${FAKE_SERVICE_FAILS:-}" "$FAKE_SERVICE_JSON" service ;;
   *"secrets versions access"*) printf '%s' "tok-123" ;;
   *"auth print-identity-token"*) printf '%s' "idt-456" ;;
 esac
 '''
+# How a describe goes wrong, in gcloud's own words: absent, denied, down, or an answer that is not JSON.
+FAKE_DESCRIBE = r'''describe() {
+  case "$1" in
+    notfound) echo "ERROR: (gcloud.run.describe) Cannot find $3 [x]" >&2; exit 1 ;;
+    denied) echo "ERROR: (gcloud.run.describe) PERMISSION_DENIED: Permission denied on resource x (or it may not exist). NOT_FOUND is not what this says" >&2; exit 1 ;;
+    down) echo "ERROR: (gcloud.run.describe) UNAVAILABLE: The service is currently unavailable." >&2; exit 1 ;;
+    garbage) printf '%s' "Updates are available for some Google Cloud CLI components." ;;
+    list) printf '%s' "[]" ;;
+    *) printf '%s' "$2" ;;
+  esac
+}
+'''
+FAKE_GCLOUD = FAKE_GCLOUD.replace('printf', FAKE_DESCRIBE + 'printf', 1)
+# curl as curl behaves: an HTTP error is exit 0 unless --fail-with-body asked for 22.
 FAKE_CURL = r'''#!/usr/bin/env bash
 printf 'curl %s\n' "$*" >> "$FAKE_LOG"
+if [ -n "${FAKE_CURL_HTTP:-}" ]; then
+  printf '%s' '{"error":"not found"}'
+  case "$*" in *--fail-with-body*) exit 22 ;; esac
+  exit 0
+fi
 printf '%s' '{"status":"ok","enabled":true}'
+'''
+# A python that writes CRLF into the pipe, as Windows CPython does, on any platform.
+FAKE_CRLF_PYTHON = r'''#!/usr/bin/env bash
+"$REAL_PYTHON" "$@" | sed 's/$/\r/'
+exit "${PIPESTATUS[0]}"
 '''
 JOB_JSON = '{"template":{"template":{"containers":[{"env":[%s]}]}}}'                 # the v2 job shape
 SERVICE_JSON = '{"spec":{"template":{"spec":{"containers":[{"env":[%s]}]}}}}'        # the Knative service shape
 DOC = "1gZlJFDD2Wm419YOuolIXC3HXwzXOWYfP"
 SET = dict(CLAUDE_API_WORKER_MODEL="m", CLAUDE_API_WORKER_USD_PER_MTOK_IN="0.1", CLAUDE_API_WORKER_USD_PER_MTOK_OUT="0.5",
            FLEET_CAD_PER_USD="1.45", CLAUDE_API_WORKER_MAX_INPUT_TOKENS="100000",
-           CLAUDE_API_WORKER_AUTHORIZED_UNTIL_UTC="2026-10-15T04:00:00Z")
-DEFAULTS = dict(CLAUDE_API_WORKER_MODEL="m", CLAUDE_API_WORKER_USD_PER_MTOK_IN="0", CLAUDE_API_WORKER_USD_PER_MTOK_OUT="0",
+           CLAUDE_API_WORKER_AUTHORIZED_UNTIL_UTC="2099-01-01T00:00:00Z",
+           FLEET_SPEND_CAP_CENTS_CAD="2500", CLAUDE_API_WORKER_RESERVE_CENTS_CAD="5", CLAUDE_API_WORKER_MAX_TOKENS="1500")
+DEFAULTS = dict(SET, CLAUDE_API_WORKER_USD_PER_MTOK_IN="0", CLAUDE_API_WORKER_USD_PER_MTOK_OUT="0",
                 FLEET_CAD_PER_USD="0", CLAUDE_API_WORKER_MAX_INPUT_TOKENS="0", CLAUDE_API_WORKER_AUTHORIZED_UNTIL_UTC="")
+NOW = 1_760_000_000.0                                              # 2025-10-09, inside SET's deadline
+# Present, and still nothing the worker can use. The value on the right is what main.py reads it as.
+UNUSABLE = (
+    ("CLAUDE_API_WORKER_USD_PER_MTOK_IN", "-0.1"), ("CLAUDE_API_WORKER_USD_PER_MTOK_IN", "nan"),
+    ("CLAUDE_API_WORKER_USD_PER_MTOK_OUT", "inf"), ("CLAUDE_API_WORKER_USD_PER_MTOK_OUT", "0.5 USD"),
+    ("FLEET_CAD_PER_USD", "-1.45"), ("FLEET_CAD_PER_USD", "1,45"), ("FLEET_CAD_PER_USD", "1e-400"),
+    ("CLAUDE_API_WORKER_MAX_INPUT_TOKENS", "100000.0"), ("CLAUDE_API_WORKER_MAX_INPUT_TOKENS", "-5"),
+    ("CLAUDE_API_WORKER_MAX_INPUT_TOKENS", "100k"),
+    ("CLAUDE_API_WORKER_AUTHORIZED_UNTIL_UTC", "2099-01-01T00:00:00+00:00"),
+    ("CLAUDE_API_WORKER_AUTHORIZED_UNTIL_UTC", "2099-01-01T00:00:00z"),
+    ("CLAUDE_API_WORKER_AUTHORIZED_UNTIL_UTC", "2099-01-01"),
+    ("CLAUDE_API_WORKER_AUTHORIZED_UNTIL_UTC", "2099-13-01T00:00:00Z"),
+    ("CLAUDE_API_WORKER_AUTHORIZED_UNTIL_UTC", "2020-01-01T00:00:00Z"),          # well-formed, and past
+    ("FLEET_SPEND_CAP_CENTS_CAD", "0"), ("FLEET_SPEND_CAP_CENTS_CAD", "25.00"),
+    ("CLAUDE_API_WORKER_RESERVE_CENTS_CAD", "0"), ("CLAUDE_API_WORKER_MAX_TOKENS", "0"),
+    ("CLAUDE_API_WORKER_MODEL", "  "),
+)
 
 
 def env_items(**values):
@@ -318,7 +393,7 @@ class FakeGcloudTest(unittest.TestCase):
         if not cls.bash:
             raise unittest.SkipTest("no bash on this box")
         cls.tmp = Path(tempfile.mkdtemp(prefix="fake-gcloud-"))
-        for name, text in (("gcloud", FAKE_GCLOUD), ("curl", FAKE_CURL)):
+        for name, text in (("gcloud", FAKE_GCLOUD), ("curl", FAKE_CURL), ("crlf-python", FAKE_CRLF_PYTHON)):
             (cls.tmp / name).write_text(text, encoding="utf-8", newline="\n")
             os.chmod(cls.tmp / name, 0o755)
         cls.calls = 0
@@ -327,14 +402,15 @@ class FakeGcloudTest(unittest.TestCase):
     def tearDownClass(cls):
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
-    def verb(self, script, *args, job=None, service=None, studio_sa="studio-sa@sfdc24.iam.gserviceaccount.com"):
+    def verb(self, script, *args, job=None, service=None, studio_sa="studio-sa@sfdc24.iam.gserviceaccount.com",
+             **fakes):
         type(self).calls += 1
         log = self.tmp / ("calls-%d.log" % self.calls)
         env = dict(os.environ, GCLOUD=(self.tmp / "gcloud").as_posix(),
                    PATH=str(self.tmp) + os.pathsep + os.environ.get("PATH", ""),
                    FAKE_LOG=log.as_posix(), FAKE_STUDIO_SA=studio_sa,
                    FAKE_JOB_JSON=JOB_JSON % env_items(**(job or {})),
-                   FAKE_SERVICE_JSON=SERVICE_JSON % env_items(**(service or {})))
+                   FAKE_SERVICE_JSON=SERVICE_JSON % env_items(**(service or {})), **fakes)
         run = subprocess.run([self.bash, str(script), *args], capture_output=True, text=True, cwd=str(REPO), env=env)
         calls = log.read_text(encoding="utf-8").splitlines() if log.exists() else []
         return run, calls
@@ -360,14 +436,14 @@ class FakeGcloudTest(unittest.TestCase):
         run, _ = self.verb(WORKER / "deploy.sh", "cost", job=dict(DEFAULTS, CLAUDE_API_WORKER_USD_PER_MTOK_IN="0.1"))
         self.assertEqual(0, run.returncode, run.stderr)
         self.assertIn("CLAUDE_API_WORKER_USD_PER_MTOK_IN=0.1", run.stdout)
-        self.assertIn("unset or zero on claude-api-worker:", run.stdout)
-        missing = run.stdout.split("unset or zero on claude-api-worker:", 1)[1]
+        self.assertIn("missing or unusable on claude-api-worker:", run.stdout)
+        missing = run.stdout.split("missing or unusable on claude-api-worker:", 1)[1]
         self.assertIn("CLAUDE_API_WORKER_USD_PER_MTOK_OUT", missing)
         self.assertIn("CLAUDE_API_WORKER_AUTHORIZED_UNTIL_UTC", missing)
         self.assertNotIn("CLAUDE_API_WORKER_USD_PER_MTOK_IN", missing)
         run, _ = self.verb(WORKER / "deploy.sh", "cost", job=SET)
         self.assertEqual(0, run.returncode, run.stderr)
-        self.assertIn("every cost input is set", run.stdout)
+        self.assertIn("every cost input on claude-api-worker is one the worker can use", run.stdout)
 
     def test_the_two_intakes_refuse_each_other_and_each_flips_when_the_other_is_off(self):
         run, calls = self.verb(INTAKE / "deploy.sh", "on", job=dict(PHONE_DOC_INTAKE_ENABLED="on"))
@@ -419,6 +495,161 @@ class FakeGcloudTest(unittest.TestCase):
         self.assertIn("https://drive-intake-fake-uc.a.run.app/trail?doc=" + DOC, curls[0])
         self.assertEqual('{"status":"ok","enabled":true}\n', run.stdout)
         self.assertNotIn("tok-123", run.stdout)
+
+    def test_trail_on_an_http_refusal_prints_the_body_and_fails(self):
+        # Until #376 is deployed the route is a 404. curl -s exits 0 on that, and the proof command
+        # then "succeeds" on a missing route (Cursor and Copilot on 9eced7e).
+        run, calls = self.verb(INTAKE / "deploy.sh", "trail", DOC, FAKE_CURL_HTTP="404")
+        self.assertEqual(1, run.returncode, run.stderr)
+        self.assertIn('{"error":"not found"}', run.stdout)                           # what the service said
+        self.assertIn("NOT read", run.stderr)
+        self.assertIn("not a proof", run.stderr)
+        self.assertNotIn("tok-123", run.stdout + run.stderr)
+
+    def test_a_doc_id_with_a_good_line_in_it_never_reaches_gcloud(self):
+        # The newline is made inside bash (printf %b): a Windows parent cuts an argument at one, and
+        # the script would then be handed the good line alone.
+        script = (INTAKE / "deploy.sh").as_posix()
+        for bad in ("bad\\n" + DOC, DOC + "\\nbad", DOC + "\\n", "\\n" + DOC):
+            run, calls = self.verb("-c", 'printf -v doc "%b" "$1"; exec bash "$0" trail "$doc"', script, bad)
+            self.assertEqual(2, run.returncode, repr(bad))
+            self.assertIn("usage: deploy.sh trail", run.stderr, repr(bad))
+            self.assertEqual([], calls, repr(bad))
+        run, calls = self.verb("-c", 'printf -v doc "%b" "$1"; exec bash "$0" trail "$doc"', script, DOC)   # the control
+        self.assertEqual(0, run.returncode, run.stderr)
+        self.assertEqual(1, len([c for c in calls if c.startswith("curl ")]), calls)
+
+    def test_an_interlock_that_cannot_read_the_other_side_refuses(self):
+        # A denied describe, an outage and an answer that is not the resource all used to print
+        # nothing, and nothing read as "the other intake is off" (Cursor and Copilot on 9eced7e).
+        for how in ("denied", "down", "garbage", "list"):
+            run, calls = self.verb(INTAKE / "deploy.sh", "on", job=dict(PHONE_DOC_INTAKE_ENABLED="on"), FAKE_JOB_FAILS=how)
+            self.assertEqual(2, run.returncode, how + run.stderr)
+            self.assertIn("could not be read back", run.stderr, how)
+            self.assertEqual([], [c for c in calls if "run services update" in c], how)
+            run, calls = self.verb(WORKER / "deploy.sh", "pilot", "on", service=dict(DRIVE_INTAKE_ENABLED="on"),
+                                   FAKE_SERVICE_FAILS=how)
+            self.assertEqual(2, run.returncode, how + run.stderr)
+            self.assertIn("could not be read back", run.stderr, how)
+            self.assertEqual([], [c for c in calls if "run jobs update" in c], how)
+            run, calls = self.verb(WORKER / "deploy.sh", "worker", "on", job=SET, FAKE_JOB_FAILS=how)
+            self.assertEqual(2, run.returncode, how + run.stderr)
+            self.assertEqual([], [c for c in calls if "run jobs update" in c], how)
+        run, _ = self.verb(WORKER / "deploy.sh", "cost", job=SET, FAKE_JOB_FAILS="denied")
+        self.assertEqual(1, run.returncode, run.stderr)
+        self.assertNotIn("worker on is allowed", run.stdout)
+        # gcloud's own words reach the terminal: the reason is not swallowed with the answer.
+        self.assertIn("PERMISSION_DENIED", run.stderr)
+        # Absent is the one failure that IS "off": nothing there to collide with.
+        run, calls = self.verb(INTAKE / "deploy.sh", "on", FAKE_JOB_FAILS="notfound")
+        self.assertEqual(0, run.returncode, run.stderr)
+        self.assertEqual(1, len([c for c in calls if "run services update" in c and "DRIVE_INTAKE_ENABLED=on" in c]), calls)
+        run, calls = self.verb(WORKER / "deploy.sh", "pilot", "on", FAKE_SERVICE_FAILS="notfound")
+        self.assertEqual(0, run.returncode, run.stderr)
+        self.assertEqual(1, len([c for c in calls if "run jobs update" in c and "PHONE_DOC_INTAKE_ENABLED=on" in c]), calls)
+        run, calls = self.verb(WORKER / "deploy.sh", "worker", "on", FAKE_JOB_FAILS="notfound")    # no job: nothing to turn on
+        self.assertEqual(2, run.returncode, run.stderr)
+        self.assertEqual([], [c for c in calls if "run jobs update" in c])
+
+    def test_the_interlock_holds_when_python_writes_crlf_into_the_pipe(self):
+        # Windows CPython writes \r\n, and grep -x does not match "NAME=on\r": both verbs turned
+        # their flag on beside the other intake (Cursor on 9eced7e). Any platform, by a wrapper.
+        crlf = dict(PYTHON=(self.tmp / "crlf-python").as_posix(), REAL_PYTHON=sys.executable.replace("\\", "/"))
+        run, calls = self.verb(INTAKE / "deploy.sh", "on", job=dict(PHONE_DOC_INTAKE_ENABLED="on"), **crlf)
+        self.assertEqual(2, run.returncode, run.stderr)
+        self.assertIn("one intake at a time", run.stderr)
+        self.assertEqual([], [c for c in calls if "run services update" in c])
+        run, calls = self.verb(WORKER / "deploy.sh", "pilot", "on", service=dict(DRIVE_INTAKE_ENABLED="on"), **crlf)
+        self.assertEqual(2, run.returncode, run.stderr)
+        self.assertEqual([], [c for c in calls if "run jobs update" in c])
+        run, calls = self.verb(WORKER / "deploy.sh", "worker", "on", job=SET, **crlf)        # and a good job still flips
+        self.assertEqual(0, run.returncode, run.stderr)
+        run, calls = self.verb(WORKER / "deploy.sh", "worker", "on", job=DEFAULTS, **crlf)
+        self.assertEqual(2, run.returncode, run.stderr)
+        self.assertNotIn("\r", run.stderr)
+
+    def test_worker_on_refuses_values_the_worker_would_read_as_nothing(self):
+        # Present is not usable (Cursor and Copilot on 9eced7e): each of these deployed, flipped the
+        # flag, and left every task with the daily QUEUED "nothing called" line.
+        for name, value in (("CLAUDE_API_WORKER_USD_PER_MTOK_IN", "-0.1"),
+                            ("CLAUDE_API_WORKER_MAX_INPUT_TOKENS", "100000.0"),
+                            ("CLAUDE_API_WORKER_AUTHORIZED_UNTIL_UTC", "2099-01-01T00:00:00+00:00"),
+                            ("CLAUDE_API_WORKER_AUTHORIZED_UNTIL_UTC", "2020-01-01T00:00:00Z")):
+            run, calls = self.verb(WORKER / "deploy.sh", "worker", "on", job=dict(SET, **{name: value}))
+            self.assertEqual(2, run.returncode, (name, value, run.stderr))
+            self.assertIn(name, run.stderr)
+            self.assertEqual([], [c for c in calls if "run jobs update" in c], (name, value))
+
+
+class CostGateTest(unittest.TestCase):
+    """The gate in `worker on` against the worker it gates. A value the gate passes must be one
+    main.py's own readers turn into a reservation; the gate may be stricter, never looser."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.problems = staticmethod(gate())
+        cls.wk = load("claude_api_worker_for_deploy", WORKER / "main.py")
+
+    def runtime_can_call(self, env, now):
+        """main.py's verdict on this env, by its own readers and the conditions call_reservation states."""
+        wk = self.wk
+        until = wk._utc_deadline_env(env, "CLAUDE_API_WORKER_AUTHORIZED_UNTIL_UTC")
+        return bool(
+            (env.get("CLAUDE_API_WORKER_MODEL") or "").strip()
+            and wk._int_env(env, "CLAUDE_API_WORKER_RESERVE_CENTS_CAD", 0) > 0
+            and wk._int_env(env, "FLEET_SPEND_CAP_CENTS_CAD", 0) > 0
+            and wk._int_env(env, "CLAUDE_API_WORKER_MAX_TOKENS", wk.DEFAULT_MAX_TOKENS) > 0
+            and wk._int_env(env, "CLAUDE_API_WORKER_MAX_INPUT_TOKENS", 0) > 0
+            and until is not None and now < until
+            and wk.valid_prices(wk._float_env(env, "CLAUDE_API_WORKER_USD_PER_MTOK_IN"),
+                                wk._float_env(env, "CLAUDE_API_WORKER_USD_PER_MTOK_OUT"),
+                                wk._float_env(env, "FLEET_CAD_PER_USD")))
+
+    def test_the_good_set_passes_both_and_the_defaults_fail_both(self):
+        self.assertEqual([], self.problems(dict(SET), NOW))
+        self.assertTrue(self.runtime_can_call(dict(SET), NOW))
+        named = " ".join(self.problems(dict(DEFAULTS), NOW))
+        for name in COST_INPUTS:
+            self.assertIn(name, named)
+        self.assertFalse(self.runtime_can_call(dict(DEFAULTS), NOW))
+        self.assertEqual([], self.problems({k: v for k, v in SET.items() if k != "CLAUDE_API_WORKER_MAX_TOKENS"}, NOW))
+
+    def test_every_unusable_value_is_named_and_none_of_them_would_have_called(self):
+        for name, value in UNUSABLE:
+            env = dict(SET, **{name: value})
+            found = self.problems(env, NOW)
+            self.assertEqual(1, len(found), (name, value, found))
+            self.assertTrue(found[0].startswith(name + " ("), (name, value, found))
+            # The control: main.py reads the same value as nothing it can call with. A row in the
+            # table that the worker WOULD call with is a gate refusing a good deploy.
+            self.assertFalse(self.runtime_can_call(env, NOW), (name, value))
+
+    def test_the_gate_is_never_looser_than_the_worker(self):
+        # Every cell the gate passes, the worker must pass. Wider than the table above: shapes the
+        # two readers could disagree on (spaces, signs, exponents, fractions of a second, offsets).
+        prices = ("0.1", " 0.1 ", "+0.1", "1e-3", "1E2", ".5", "5.", "0x10", "1_0", "", "0", "0.0", "-0", "NaN", "Infinity")
+        ints = ("100000", " 100000 ", "+7", "1_000", "07", "1e5", "100000.0", "", "0", "-1", "0x10")
+        dates = ("2099-01-01T00:00:00Z", "2099-01-01T00:00:00.000Z", "2099-01-01 00:00:00Z", "20990101T000000Z",
+                 "2099-01-01T00:00Z", "2099-01-01T00:00:00ZZ", "Z", "", "2099-01-01T00:00:00+00:00Z",
+                 "2025-10-09T08:53:20Z", "2025-10-09T08:53:21Z")
+        cells = [(n, v) for n in ("CLAUDE_API_WORKER_USD_PER_MTOK_IN", "CLAUDE_API_WORKER_USD_PER_MTOK_OUT", "FLEET_CAD_PER_USD")
+                 for v in prices]
+        cells += [(n, v) for n in ("CLAUDE_API_WORKER_MAX_INPUT_TOKENS", "FLEET_SPEND_CAP_CENTS_CAD",
+                                   "CLAUDE_API_WORKER_RESERVE_CENTS_CAD", "CLAUDE_API_WORKER_MAX_TOKENS") for v in ints]
+        cells += [("CLAUDE_API_WORKER_AUTHORIZED_UNTIL_UTC", v) for v in dates]
+        passed = 0
+        for name, value in cells:
+            env = dict(SET, **{name: value})
+            if not self.problems(env, NOW):
+                passed += 1
+                self.assertTrue(self.runtime_can_call(env, NOW), (name, value))
+        self.assertGreater(passed, 20)                                # the sweep is not vacuous
+        self.assertTrue(math.isfinite(NOW))
+        # The deadline is exclusive, as the worker's is: at the second itself nothing is called.
+        at = dict(SET, CLAUDE_API_WORKER_AUTHORIZED_UNTIL_UTC="2025-10-09T08:53:20Z")
+        self.assertEqual(NOW, self.wk._utc_deadline_env(at, "CLAUDE_API_WORKER_AUTHORIZED_UNTIL_UTC"))
+        self.assertEqual(1, len(self.problems(at, NOW)))
+        self.assertEqual([], self.problems(at, NOW - 1))
 
 
 if __name__ == "__main__":

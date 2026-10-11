@@ -88,14 +88,20 @@ DOC_ID_OK='^[A-Za-z0-9_-]{10,128}$'
 
 # The env of a deployed resource, one NAME=VALUE per line, read back from the job or the service
 # that RUNS, never from this shell. Python parses the JSON (jobs are the v2 shape, services the
-# Knative one): no awk over yaml, no value split on a comma. A resource that does not exist prints
-# nothing, which every caller treats as "off" and "unset".
+# Knative one): no awk over yaml, no value split on a comma.
+#
+# ABSENT IS NOT THE SAME AS UNREADABLE. Only gcloud saying the resource is not there prints nothing
+# and returns 0, which a caller may read as "off". A denied describe, a transient failure, an answer
+# that is not JSON or a python that will not start returns non-zero, and every caller that turns a
+# flag on refuses on it: an interlock that cannot read the other side has not checked it.
 ENV_LINES_PY='
 import json, sys
 try:
     doc = json.load(sys.stdin)
+    if not isinstance(doc, dict):
+        raise ValueError("not an object")
 except ValueError:
-    sys.exit(0)
+    sys.exit(3)
 template = doc.get("template", {}).get("template") or doc.get("spec", {}).get("template", {}).get("spec", {})
 for container in template.get("containers") or []:
     for item in container.get("env") or []:
@@ -104,8 +110,23 @@ for container in template.get("containers") or []:
 '
 # env_lines jobs|services NAME
 env_lines() {
-  "$GCLOUD" run "$1" describe "$2" --project "$PROJECT" --region "$REGION" --format json 2>/dev/null |
-    "$PYTHON" -c "$ENV_LINES_PY" || true
+  local json err status=0
+  err="$(mktemp)"
+  json="$("$GCLOUD" run "$1" describe "$2" --project "$PROJECT" --region "$REGION" --format json 2>"$err")" || status=$?
+  if [ "$status" -ne 0 ]; then
+    if grep -Eqi "cannot find|NOT_FOUND|could not be found" "$err" && ! grep -qi "denied" "$err"; then
+      rm -f "$err"
+      return 0
+    fi
+    cat "$err" >&2
+    rm -f "$err"
+    echo "could not read $1 $2 back (gcloud exit ${status}); nothing is assumed about it" >&2
+    return 1
+  fi
+  rm -f "$err"
+  # tr: a Windows python writes CRLF into the pipe, and grep -x NAME=on does not match a line that
+  # still ends in a carriage return, so the interlock read "on" as "off".
+  printf "%s" "$json" | "$PYTHON" -c "$ENV_LINES_PY" | tr -d "\r"
 }
 
 # One grant, safe in either order. setup runs before tokens in the printed order, so the two
@@ -233,9 +254,17 @@ flag() {
   # One intake at a time: with the worker's pilot intake on as well, one request becomes two tasks,
   # two calls and two answers, and the pilot's inbox filter checkpoints the worker past this
   # service's rows for good. The job is read back, not assumed.
-  if [ "$1" = on ] && env_lines jobs "$WORKER_JOB" | grep -qx "PHONE_DOC_INTAKE_ENABLED=on"; then
-    echo "refused: ${WORKER_JOB} has PHONE_DOC_INTAKE_ENABLED=on; one intake at a time (cloud/claude-api-worker/deploy.sh pilot off first)" >&2
-    exit 2
+  # A job that cannot be read back is not a job whose pilot is off: refuse on that too.
+  local other
+  if [ "$1" = on ]; then
+    if ! other="$(env_lines jobs "$WORKER_JOB")"; then
+      echo "refused: ${WORKER_JOB} could not be read back, so its pilot intake flag is unknown; one intake at a time" >&2
+      exit 2
+    fi
+    if grep -qx "PHONE_DOC_INTAKE_ENABLED=on" <<<"$other"; then
+      echo "refused: ${WORKER_JOB} has PHONE_DOC_INTAKE_ENABLED=on; one intake at a time (cloud/claude-api-worker/deploy.sh pilot off first)" >&2
+      exit 2
+    fi
   fi
   "$GCLOUD" run services update "$SERVICE" --project "$PROJECT" --region "$REGION" \
     --update-env-vars "DRIVE_INTAKE_ENABLED=$1"
@@ -269,16 +298,23 @@ trail() {
   # {"enabled": false, "trail": null}. The poll token is read from Secret Manager at this moment and
   # rides in its own header, never printed; Authorization carries your own identity token, as
   # readback sends it.
-  local doc="${2:-}" url token
-  if ! printf '%s' "$doc" | grep -Eq "$DOC_ID_OK"; then
+  # The whole argument, in bash: grep answers per LINE, so "bad<newline>good-id" passed it.
+  # --fail-with-body: a 401, 403, 404 (the route is not deployed until #376 is) or 5xx prints what
+  # the service said and EXITS NON-ZERO. This verb is the proof; a refusal must not read as one.
+  local doc="${2:-}" url token status=0
+  if ! [[ "$doc" =~ $DOC_ID_OK ]]; then
     echo "usage: deploy.sh trail <Drive file id>" >&2
     exit 2
   fi
   url="$(service_url)"
   token="$("$GCLOUD" secrets versions access latest --secret DRIVE_INTAKE_POLL_TOKEN --project "$PROJECT")"
-  curl -s -H "Authorization: Bearer $("$GCLOUD" auth print-identity-token)" \
-    -H "X-Drive-Intake-Poll-Token: ${token}" "${url}/trail?doc=${doc}"
+  curl -sS --fail-with-body -H "Authorization: Bearer $("$GCLOUD" auth print-identity-token)" \
+    -H "X-Drive-Intake-Poll-Token: ${token}" "${url}/trail?doc=${doc}" || status=$?
   echo
+  if [ "$status" -ne 0 ]; then
+    echo "the trail was NOT read (curl exit ${status}): this is not a proof" >&2
+    exit 1
+  fi
 }
 
 case "${1:-}" in

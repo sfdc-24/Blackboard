@@ -15,7 +15,7 @@
 #   heartbeat window          DRIVE_INTAKE_HEARTBEAT_SECONDS (300)
 #   THE FIVE #374 MADE FAIL-CLOSED. Unset, the job deploys, `worker on` would succeed, and every task
 #   gets QUEUED "no valid cap, reservation, price..." in the doc: it CALLS NOTHING. So `worker on`
-#   reads the job back first and refuses while any of them is unset or zero (`deploy.sh cost` shows).
+#   reads the job back first and refuses while any of them is missing or unusable (`deploy.sh cost` shows).
 #     CLAUDE_API_WORKER_USD_PER_MTOK_IN / _OUT   the price of YOUR model id, from the Claude pricing page
 #     CLAUDE_API_WORKER_MAX_INPUT_TOKENS         the input size that price holds for (a tier bound, not the context window)
 #     FLEET_CAD_PER_USD                          a ceiling rate: every cost is rounded UP into CAD cents
@@ -99,14 +99,20 @@ INTAKE_SERVICE="${INTAKE_SERVICE:-drive-intake}"
 
 # The env of a deployed resource, one NAME=VALUE per line, read back from the job or the service
 # that RUNS, never from this shell. Python parses the JSON (jobs are the v2 shape, services the
-# Knative one): no awk over yaml, no value split on a comma. A resource that does not exist prints
-# nothing, which every caller treats as "off" and "unset".
+# Knative one): no awk over yaml, no value split on a comma.
+#
+# ABSENT IS NOT THE SAME AS UNREADABLE. Only gcloud saying the resource is not there prints nothing
+# and returns 0, which a caller may read as "off". A denied describe, a transient failure, an answer
+# that is not JSON or a python that will not start returns non-zero, and every caller that turns a
+# flag on refuses on it: an interlock that cannot read the other side has not checked it.
 ENV_LINES_PY='
 import json, sys
 try:
     doc = json.load(sys.stdin)
+    if not isinstance(doc, dict):
+        raise ValueError("not an object")
 except ValueError:
-    sys.exit(0)
+    sys.exit(3)
 template = doc.get("template", {}).get("template") or doc.get("spec", {}).get("template", {}).get("spec", {})
 for container in template.get("containers") or []:
     for item in container.get("env") or []:
@@ -115,8 +121,23 @@ for container in template.get("containers") or []:
 '
 # env_lines jobs|services NAME
 env_lines() {
-  "$GCLOUD" run "$1" describe "$2" --project "$PROJECT" --region "$REGION" --format json 2>/dev/null |
-    "$PYTHON" -c "$ENV_LINES_PY" || true
+  local json err status=0
+  err="$(mktemp)"
+  json="$("$GCLOUD" run "$1" describe "$2" --project "$PROJECT" --region "$REGION" --format json 2>"$err")" || status=$?
+  if [ "$status" -ne 0 ]; then
+    if grep -Eqi "cannot find|NOT_FOUND|could not be found" "$err" && ! grep -qi "denied" "$err"; then
+      rm -f "$err"
+      return 0
+    fi
+    cat "$err" >&2
+    rm -f "$err"
+    echo "could not read $1 $2 back (gcloud exit ${status}); nothing is assumed about it" >&2
+    return 1
+  fi
+  rm -f "$err"
+  # tr: a Windows python writes CRLF into the pipe, and grep -x NAME=on does not match a line that
+  # still ends in a carriage return, so the interlock read "on" as "off".
+  printf "%s" "$json" | "$PYTHON" -c "$ENV_LINES_PY" | tr -d "\r"
 }
 
 setup() {
@@ -201,33 +222,82 @@ flag() {
   echo "$1=$2 on ${JOB}"
 }
 
-# The names whose absence makes the worker call nothing (main.py call_reservation: no price, rate,
-# input bound or deadline means no reservation, and no reservation means no call). The model id
-# is on the list because an empty one is Unconfigured on every pass.
+# What makes the worker call nothing, judged the way main.py judges it (call_reservation, _int_env,
+# _float_env, valid_prices, _utc_deadline_env): a value that is present but that the worker reads as
+# zero, None or past is as unset as an empty one. A negative or NaN price, 100000.0 for the input
+# bound (int() refuses it and the worker reads 0), a deadline ending +00:00 or a lowercase z, a
+# deadline already passed. Never looser than the worker; the deadline shape is stricter on purpose.
+# The model id is on the list because an empty one is Unconfigured on every pass.
 COST_MISSING_PY='
-import sys
-env = dict(line.rstrip("\n").split("=", 1) for line in sys.stdin if "=" in line)
-names = ("CLAUDE_API_WORKER_MODEL", "CLAUDE_API_WORKER_USD_PER_MTOK_IN", "CLAUDE_API_WORKER_USD_PER_MTOK_OUT",
-         "FLEET_CAD_PER_USD", "CLAUDE_API_WORKER_MAX_INPUT_TOKENS", "CLAUDE_API_WORKER_AUTHORIZED_UNTIL_UTC")
-def unset(value):
+import math, re, sys, time
+from datetime import datetime
+
+DEADLINE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
+
+def positive_int(raw, default=0):
     try:
-        return float(value) == 0
+        return int(raw or default) > 0
     except ValueError:
-        return not value.strip()
-print(" ".join(name for name in names if unset(env.get(name, ""))))
+        return False
+
+def positive_price(raw):
+    try:
+        value = float(raw)
+    except ValueError:
+        return False
+    return math.isfinite(value) and value > 0
+
+def deadline(raw):
+    if not DEADLINE.fullmatch(raw):
+        return None
+    try:
+        return datetime.fromisoformat(raw[:-1] + "+00:00").timestamp()
+    except (OverflowError, ValueError):
+        return None
+
+def problems(env, now):
+    found = []
+    def bad(name, why):
+        found.append("%s (%s)" % (name, why))
+    if not env.get("CLAUDE_API_WORKER_MODEL", "").strip():
+        bad("CLAUDE_API_WORKER_MODEL", "empty")
+    for name in ("CLAUDE_API_WORKER_USD_PER_MTOK_IN", "CLAUDE_API_WORKER_USD_PER_MTOK_OUT", "FLEET_CAD_PER_USD"):
+        if not positive_price(env.get(name, "")):
+            bad(name, "not a finite number above zero")
+    for name in ("CLAUDE_API_WORKER_MAX_INPUT_TOKENS", "FLEET_SPEND_CAP_CENTS_CAD", "CLAUDE_API_WORKER_RESERVE_CENTS_CAD"):
+        if not positive_int(env.get(name, "")):
+            bad(name, "not a whole number above zero")
+    if "CLAUDE_API_WORKER_MAX_TOKENS" in env and not positive_int(env["CLAUDE_API_WORKER_MAX_TOKENS"], 1):
+        bad("CLAUDE_API_WORKER_MAX_TOKENS", "not a whole number above zero")
+    until = deadline(env.get("CLAUDE_API_WORKER_AUTHORIZED_UNTIL_UTC", ""))
+    if until is None:
+        bad("CLAUDE_API_WORKER_AUTHORIZED_UNTIL_UTC", "not YYYY-MM-DDTHH:MM:SSZ")
+    elif now >= until:
+        bad("CLAUDE_API_WORKER_AUTHORIZED_UNTIL_UTC", "already passed")
+    return found
+
+if __name__ == "__main__":
+    lines = (line.rstrip("\r\n") for line in sys.stdin)
+    print(", ".join(problems(dict(line.split("=", 1) for line in lines if "=" in line), time.time())))
 '
+# Prints what is missing or unusable; non-zero when the job could not be read back at all.
 cost_missing() {
-  env_lines jobs "$JOB" | "$PYTHON" -c "$COST_MISSING_PY"
+  local lines
+  lines="$(env_lines jobs "$JOB")" || return 1
+  printf "%s\n" "$lines" | "$PYTHON" -c "$COST_MISSING_PY" | tr -d "\r"
 }
 
 cost_readback() {
-  env_lines jobs "$JOB" | grep -E "^(CLAUDE_API_WORKER_(MODEL|MAX_TOKENS|MAX_INPUT_TOKENS|AUTHORIZED_UNTIL_UTC|USD_PER_MTOK_IN|USD_PER_MTOK_OUT|RESERVE_CENTS_CAD)|FLEET_CAD_PER_USD|FLEET_SPEND_CAP_CENTS_CAD)=" || true
-  local missing
-  missing="$(cost_missing)"
+  local lines missing
+  if ! lines="$(env_lines jobs "$JOB")" || ! missing="$(cost_missing)"; then
+    echo "${JOB} could not be read back; worker on refuses until it can be" >&2
+    exit 1
+  fi
+  grep -E "^(CLAUDE_API_WORKER_(MODEL|MAX_TOKENS|MAX_INPUT_TOKENS|AUTHORIZED_UNTIL_UTC|USD_PER_MTOK_IN|USD_PER_MTOK_OUT|RESERVE_CENTS_CAD)|FLEET_CAD_PER_USD|FLEET_SPEND_CAP_CENTS_CAD)=" <<<"$lines" || true
   if [ -z "$missing" ]; then
-    echo "every cost input is set on ${JOB}; worker on is allowed"
+    echo "every cost input on ${JOB} is one the worker can use; worker on is allowed"
   else
-    echo "unset or zero on ${JOB}: ${missing}; worker on refuses until deploy runs with them set"
+    echo "missing or unusable on ${JOB}: ${missing}; worker on refuses until deploy runs with them set"
   fi
 }
 
@@ -235,9 +305,12 @@ worker_on() {
   # Read the JOB back, not this shell: the job is what runs. Refuse rather than deploy a worker
   # that writes QUEUED into the doc once a day per task and never calls (#374's fail-closed inputs).
   local missing
-  missing="$(cost_missing)"
+  if ! missing="$(cost_missing)"; then
+    echo "refused: ${JOB} could not be read back, so its cost inputs are unknown" >&2
+    exit 2
+  fi
   if [ -n "$missing" ]; then
-    echo "refused: unset or zero on ${JOB}, so the worker would call nothing: ${missing}" >&2
+    echo "refused: missing or unusable on ${JOB}, so the worker would call nothing: ${missing}" >&2
     echo "export them and run: bash cloud/claude-api-worker/deploy.sh deploy, then worker on" >&2
     exit 2
   fi
@@ -248,7 +321,13 @@ pilot_on() {
   # The pilot is a SECOND intake over the two originals. With drive-intake's flag on as well, one
   # request becomes two tasks (two revisions of the same words), two calls and two answers in the
   # doc, and the pilot's inbox filter checkpoints the worker past the service's rows for good.
-  if env_lines services "$INTAKE_SERVICE" | grep -qx "DRIVE_INTAKE_ENABLED=on"; then
+  # A service that cannot be read back is not a service that is off: refuse on that too.
+  local other
+  if ! other="$(env_lines services "$INTAKE_SERVICE")"; then
+    echo "refused: ${INTAKE_SERVICE} could not be read back, so its intake flag is unknown; one intake at a time" >&2
+    exit 2
+  fi
+  if grep -qx "DRIVE_INTAKE_ENABLED=on" <<<"$other"; then
     echo "refused: ${INTAKE_SERVICE} has DRIVE_INTAKE_ENABLED=on; one intake at a time (cloud/drive-intake/deploy.sh off first)" >&2
     exit 2
   fi

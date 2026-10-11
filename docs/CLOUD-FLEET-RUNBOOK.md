@@ -200,7 +200,12 @@ UP into CAD cents, so a high rate only over-reserves), and
 `CLAUDE_API_WORKER_AUTHORIZED_UNTIL_UTC` (his authorization deadline, `...Z`;
 no call at or after it, checked on Redis's clock inside the reservation). The
 cap stays `FLEET_SPEND_CAP_CENTS_CAD` (2500 unless he sets it). `deploy.sh cost`
-prints the inputs as deployed; `worker on` refuses while any is unset.
+prints the inputs as deployed. `worker on` refuses while any is missing, and
+while any is a value the worker would read as nothing: a negative or
+non-numeric price or rate, `100000.0` for the input bound (the worker reads a
+whole number or zero), a deadline not written `YYYY-MM-DDTHH:MM:SSZ` or already
+passed, a zero cap or reservation. It also refuses when the job cannot be read
+back at all.
 
 **One intake at a time.** #374 also ships `PHONE_DOC_INTAKE_ENABLED`, a second
 intake inside the worker job over the two originals only (owner request blocks
@@ -210,7 +215,9 @@ different revisions of the same words), two calls and two answers in the doc,
 and the pilot's inbox filter checkpoints the worker past the service's rows for
 good. So `drive-intake/deploy.sh on` reads the job back and refuses while the
 pilot is on, and `claude-api-worker/deploy.sh pilot on` refuses while the
-service's flag is on. Turn one off before the other goes on.
+service's flag is on. Turn one off before the other goes on. Either verb also
+refuses when it cannot read the other side back: a denied or failed `describe`
+is not "off". Only a resource gcloud says does not exist counts as off.
 
 **Step 4: the trail on the call page (#376, site #309).** drive-intake answers
 `GET /trail?doc=<id>` (poll token, then flag, then id) with the doc's receipt
@@ -230,7 +237,9 @@ itself never leaves the doc.
 **The proof: the acceptance gate.** The architecture doc's milestone 4 is one
 authorized, real, laptop-offline round trip, confirmed by readback. Read the
 trail from the terminal with `bash cloud/drive-intake/deploy.sh trail <doc id>`
-(the service's own reading of the doc; needs the flag on) after each hop:
+(the service's own reading of the doc; needs the flag on) after each hop. The
+verb exits non-zero and says "this is not a proof" on any HTTP refusal,
+including the 404 it gets until #376 is deployed:
 
 | hop | the line that proves it | written by |
 |---|---|---|
