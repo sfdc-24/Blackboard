@@ -33,6 +33,21 @@ WHAT IT DOES NOT DO
     python scripts/redis_inbox.py send --to grok --text "..."    one message
     python scripts/redis_inbox.py read [--wait 180] [--count 20] new messages to me
     python scripts/redis_inbox.py selftest                       the grammar, no network
+
+THE LAPTOP LANE (step 3 of the broken-telephone fix, Converspan Channel Architecture v0.1)
+    The cloud routes a Drive request to this laptop only while fleet:alive:claude-code-cli is
+    fresh (cloud/drive-intake reads it; 300 s is the owner's window). This laptop cannot reach
+    Redis or write a Google Doc, so each of its three words is ONE governed row, executed inside
+    the VPC under this principal and audited in gov:audit; cloud/claude-api-worker/lane.py turns
+    the acceptance and the terminal word into lines in the originating doc, and says it did.
+
+    python scripts/redis_inbox.py beat [--every 240 --hours 8]  I am here (one row per beat)
+    python scripts/redis_inbox.py accept --task task-<id> [--lease 900]
+    python scripts/redis_inbox.py done --task task-<id> --state SUCCEEDED --note "..." --evidence https://...
+
+    A beat is a row, and a row is money (the owner, 2026-10-04): post one only while a session is
+    at work, and a loop never outlives --hours. The done note travels on the PUBLIC board: a status
+    and a pointer, never the work itself (Aya, 2026-10-10).
 """
 from __future__ import annotations
 
@@ -62,6 +77,13 @@ MAX_TEXT = 900                      # one message, not a document: the row carri
 # "no answer". The owner's mark for this path is a complete reply within a few minutes, so the
 # default sits inside that and above the measurement, and the caller can still shorten it.
 WAIT_SECONDS = 180
+HEARTBEAT_KEY = "fleet:alive:%s" % ME     # what cloud/drive-intake reads: epoch seconds, this clock
+ACCEPT_KEY = "fleet:worker:accept:%s"     # cloud/claude-api-worker/lane.py reads these two
+DONE_KEY = "fleet:worker:done:%s"
+TERMINAL = ("SUCCEEDED", "FAILED")
+NOTE_MAX = 300
+BEAT_EVERY = 240                           # inside the reader's 300 s window, with a worker pass to spare
+BEAT_HOURS = 8
 
 
 def stamp() -> str:
@@ -244,6 +266,71 @@ def cmd_read(args) -> int:
     return 0
 
 
+def task_id_ok(task: str) -> str:
+    task = (task or "").strip()
+    if len(task) != 21 or not task.startswith("task-") or any(c not in "0123456789abcdef" for c in task[5:]):
+        raise SystemExit("not a task id (task-<16 hex>): %r" % task)
+    return task
+
+
+def accept_value(now: float, lease: int) -> str:
+    """'claude-code-cli:<epoch>[:<lease seconds>]' - the shape lane.py parses, nothing else."""
+    lease = max(0, int(lease or 0))
+    return "%s:%d%s" % (ME, int(now), (":%d" % lease) if lease else "")
+
+
+def done_value(state: str, note: str, evidence: str) -> str:
+    """The terminal word as JSON: by, state, a bounded note, an https link. The note is cut and SAYS so."""
+    state = (state or "").strip().upper()
+    if state not in TERMINAL:
+        raise SystemExit("--state must be one of %s" % ", ".join(TERMINAL))
+    note = " ".join((note or "").split())
+    if len(note) > NOTE_MAX:
+        note = note[:NOTE_MAX].rstrip() + " [note cut at %d of %d characters]" % (NOTE_MAX, len(note))
+    evidence = (evidence or "").strip()
+    if evidence and (not evidence.startswith("https://") or any(c.isspace() for c in evidence)):
+        raise SystemExit("--evidence must be one https:// link, or absent")
+    return json.dumps({"by": ME, "state": state, "note": note, "evidence": evidence}, sort_keys=True)
+
+
+def cmd_beat(args) -> int:
+    """One beat, or a loop of them under a cap. Not waited for: the next beat supersedes this one."""
+    every = int(args.every or 0)
+    if every and every < 60:
+        raise SystemExit("--every under 60 s is a row a minute; the reader's window is 300 s")
+    stop = time.time() + float(args.hours) * 3600 if every else None
+    while True:
+        value = "%d" % int(time.time())
+        rid = post(request_row("set", HEARTBEAT_KEY, value=value))
+        print("beat %s posted as %s (the worker writes it on its next pass)" % (value, rid))
+        if not every:
+            return 0
+        if time.time() + every > stop:
+            print("beat loop: the cap of %g h is reached; stopping. Start it again if the session goes on." % float(args.hours))
+            return 0
+        time.sleep(every)
+
+
+def cmd_accept(args) -> int:
+    task = task_id_ok(args.task)
+    rid = post(request_row("set", ACCEPT_KEY % task, value=accept_value(time.time(), args.lease)))
+    print("accept of %s posted as %s" % (task, rid))
+    got = answer(rid, args.wait, since=args.since or stamp())
+    print("worker: %s" % (got["payload"][:300] if got else not_yet(args.wait, rid)))
+    return 0 if got else 2
+
+
+def cmd_done(args) -> int:
+    task = task_id_ok(args.task)
+    value = done_value(args.state, args.note, args.evidence)
+    print("NOTE: the note and the link travel on the public board. Sending: %s" % value)
+    rid = post(request_row("set", DONE_KEY % task, value=value))
+    print("done for %s posted as %s" % (task, rid))
+    got = answer(rid, args.wait, since=args.since or stamp())
+    print("worker: %s" % (got["payload"][:300] if got else not_yet(args.wait, rid)))
+    return 0 if got else 2
+
+
 def cmd_selftest(_args) -> int:
     """The grammar, with no network and no row: what the worker will be asked."""
     row = request_row("xadd", KEY % "grok", value=message("hello  there\n\nagain"),
@@ -290,6 +377,33 @@ def cmd_selftest(_args) -> int:
     assert "--wait 180" in __doc__ and "--wait 120" not in __doc__, __doc__
     assert "exactly what this prints" not in __doc__, __doc__
     assert "governed worker stopped" not in (answer.__doc__ or ""), answer.__doc__
+    # THE LAPTOP LANE. A beat is a plain epoch under fleet:alive:, which drive-intake's reader
+    # parses as a float; accept and done are the exact shapes cloud/claude-api-worker/lane.py
+    # parses, so a value this writes is never a value that lane refuses.
+    beat = request_row("set", HEARTBEAT_KEY, value="1760000000", row_id="CCC-INBOX-BEAT")
+    assert "do=redis-op|op=set|key=fleet:alive:claude-code-cli|val=" in beat["payload"], beat["payload"]
+    assert base64.b64decode(beat["payload"].split("val=")[1].split("|")[0]) == b"1760000000"
+    assert accept_value(1760000000.9, 900) == "claude-code-cli:1760000000:900", accept_value(1760000000.9, 900)
+    assert accept_value(1760000000, 0) == "claude-code-cli:1760000000"
+    done = json.loads(done_value("succeeded", "  Answered  in PR 371.  ", "https://github.com/sfdc-24/Blackboard/pull/371"))
+    assert done == {"by": "claude-code-cli", "evidence": "https://github.com/sfdc-24/Blackboard/pull/371",
+                    "note": "Answered in PR 371.", "state": "SUCCEEDED"}, done
+    cut = json.loads(done_value("FAILED", "x" * 400, ""))["note"]
+    assert cut.endswith("[note cut at 300 of 400 characters]"), cut[-60:]
+    for bad in (("DONE", "", ""), ("SUCCEEDED", "", "http://plain"), ("SUCCEEDED", "", "https://a b")):
+        try:
+            done_value(*bad)
+        except SystemExit:
+            continue
+        raise AssertionError("accepted %r" % (bad,))
+    for bad in ("task-123", "fleet:worker:done:x", "task-0123456789abcdeg"):
+        try:
+            task_id_ok(bad)
+        except SystemExit:
+            continue
+        raise AssertionError("accepted %r" % bad)
+    assert task_id_ok(" task-0123456789abcdef ") == "task-0123456789abcdef"
+    assert "beat [--every 240 --hours 8]" in __doc__ and "public board" in __doc__.lower(), __doc__
     print("selftest OK: the grammar is what redis_gov parses, and only fleet:inbox: is addressed")
     return 0
 
@@ -297,9 +411,9 @@ def cmd_selftest(_args) -> int:
 def main(argv=()) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="what", required=True)
-    for name in ("send", "read", "selftest"):
+    for name in ("send", "read", "selftest", "beat", "accept", "done"):
         p = sub.add_parser(name)
-        if name != "selftest":
+        if name not in ("selftest", "beat"):
             p.add_argument("--wait", type=float, default=WAIT_SECONDS,
                            help="seconds to wait for the worker (default %d)" % WAIT_SECONDS)
             p.add_argument("--since", default="", help="board timestamp to read answers from")
@@ -308,8 +422,22 @@ def main(argv=()) -> int:
             p.add_argument("--text", required=True)
         if name == "read":
             p.add_argument("--count", type=int, default=20)
+        if name == "beat":
+            p.add_argument("--every", type=int, default=0,
+                           help="loop: seconds between beats (0 = one beat; %d fits the 300 s window)" % BEAT_EVERY)
+            p.add_argument("--hours", type=float, default=BEAT_HOURS,
+                           help="the loop's cap in hours (default %d); it never runs past it" % BEAT_HOURS)
+        if name in ("accept", "done"):
+            p.add_argument("--task", required=True, help="task-<16 hex>, from the doorbell row or the doc")
+        if name == "accept":
+            p.add_argument("--lease", type=int, default=900, help="seconds this session gives itself")
+        if name == "done":
+            p.add_argument("--state", required=True, help="SUCCEEDED or FAILED")
+            p.add_argument("--note", default="", help="at most %d characters; it is PUBLIC" % NOTE_MAX)
+            p.add_argument("--evidence", default="", help="one https:// link to the PR or the evidence")
     args = parser.parse_args(list(argv))
-    return {"send": cmd_send, "read": cmd_read, "selftest": cmd_selftest}[args.what](args)
+    return {"send": cmd_send, "read": cmd_read, "selftest": cmd_selftest, "beat": cmd_beat,
+            "accept": cmd_accept, "done": cmd_done}[args.what](args)
 
 
 if __name__ == "__main__":
