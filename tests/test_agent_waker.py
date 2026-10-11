@@ -587,8 +587,6 @@ class TheBoardIsTheSharedDEDUPE(unittest.TestCase):
 
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
 
 
 class RedisRequests(unittest.TestCase):
@@ -658,7 +656,7 @@ class RedisRequests(unittest.TestCase):
         argv = calls[0]
         self.assertTrue(argv[1].endswith(os.path.join("scripts", "fleet_agent.py")))
         self.assertEqual(["request", "set", "proj:k", "--tag", "gemini", "--project", "FLEET",
-                          "--val", "v|with pipe"], argv[2:])
+                          "--id", aw.request_id("gemini", ""), "--val", "v|with pipe"], argv[2:])
 
     def test_post_request_without_the_read_back_is_not_ok(self):
         class Done:
@@ -681,8 +679,77 @@ class RedisRequests(unittest.TestCase):
                 self.assertIn("REDIS-OP|op=xadd|key=conf:side:YYYYMMDD", cfg["doctrine"])
                 self.assertIn("governed Redis request", aw.hands_note(tag, cfg))
 
+    def test_a_credential_shaped_key_or_field_is_refused_before_anything_is_posted(self):
+        # Copilot on #365: the key reaches the row's gist, the audit and the worker's logs verbatim.
+        calls = []
+        real = aw.subprocess.run
+        aw.subprocess.run = lambda *a, **k: calls.append(a)
+        try:
+            for part, request in (
+                ("key", {"op": "get", "key": "proj:AKIAIOSFODNN7EXAMPLE", "val": None, "field": None, "count": None}),
+                ("field", {"op": "hset", "key": "proj:h", "val": "v", "field": "AKIAIOSFODNN7EXAMPLE", "count": None}),
+            ):
+                with self.subTest(part=part):
+                    ok, why = aw.post_request("gemini", {"project": "FLEET"}, request, False)
+                    self.assertFalse(ok)
+                    self.assertIn("refused, nothing posted", why)
+        finally:
+            aw.subprocess.run = real
+        self.assertEqual([], calls, "no subprocess, so no row and no log line")
+
+    def test_the_hands_note_for_a_refused_request_never_quotes_the_key(self):
+        # The refusal sentence is posted on the reply row as written; the key it refused must not ride it.
+        request = {"op": "get", "key": "proj:AKIAIOSFODNN7EXAMPLE", "val": None, "field": None, "count": None}
+        ok, why = aw.post_request("gemini", {"project": "FLEET"}, request, False)
+        self.assertFalse(ok)
+        note = aw.unconfirmed_note(request, why)
+        self.assertNotIn("AKIA", note)
+        self.assertIn("not confirmed as posted", note)
+        self.assertNotIn("not posted", note.replace("not confirmed as posted", ""))
+
+    def test_the_request_id_is_stable_per_source_ask_so_a_retry_cannot_write_twice(self):
+        first = aw.request_id("gemini", "GROK-ASK-REDIS-20261011T0400Z")
+        self.assertEqual(first, aw.request_id("gemini", "GROK-ASK-REDIS-20261011T0400Z"))
+        self.assertNotEqual(first, aw.request_id("gemini", "GROK-ASK-REDIS-20261011T0401Z"))
+        self.assertNotEqual(first, aw.request_id("grok", "GROK-ASK-REDIS-20261011T0400Z"))
+        self.assertRegex(first, r"^[A-Za-z0-9][A-Za-z0-9._-]{3,63}$")      # bus_request's id grammar
+
+        class Done:
+            stdout, stderr = "  VERIFIED on the board: Row_ID=GEMINI-REDIS-x Source_Tag=gemini", ""
+        argv = []
+        real = aw.subprocess.run
+        aw.subprocess.run = lambda a, **k: argv.append(a) or Done()
+        try:
+            aw.post_request("gemini", {"project": "FLEET"},
+                            {"op": "set", "key": "proj:k", "val": "v", "field": None, "count": None},
+                            False, answers="GROK-ASK-REDIS-20261011T0400Z")
+        finally:
+            aw.subprocess.run = real
+        self.assertIn("--id", argv[0])
+        self.assertEqual(first, argv[0][argv[0].index("--id") + 1])
+
+    def test_a_missing_read_back_is_not_confirmed_never_absent(self):
+        class Done:
+            stdout, stderr = "  append said: ok:true\n  COULD NOT VERIFY", ""
+        real = aw.subprocess.run
+        aw.subprocess.run = lambda *a, **k: Done()
+        try:
+            ok, why = aw.post_request("grok", {"project": "FLEET"},
+                                      {"op": "get", "key": "proj:k", "val": None, "field": None, "count": None}, False)
+        finally:
+            aw.subprocess.run = real
+        self.assertFalse(ok)
+        self.assertTrue(why.startswith("not confirmed"), why)
+
+    def test_the_redis_line_is_named_as_the_one_exception_to_no_pipes(self):
+        for tag in ("gemini", "grok"):
+            self.assertIn("ONE\n  exception to the no-pipes rule", aw.AGENTS[tag]["doctrine"])
+
     def test_an_agent_without_the_flag_is_told_nothing_and_posts_nothing(self):
         cfg = aw.AGENTS["foundry"]
         self.assertFalse(cfg.get("redis_requests"))
         self.assertNotIn("REDIS-OP", cfg["doctrine"])
         self.assertNotIn("Redis", aw.hands_note("foundry", cfg))
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

@@ -129,7 +129,8 @@ REDIS, which you may read and write through your adapter, governed and audited:
   text of your answer. The governed worker judges it under the access list and answers you
   with ONE later row (AYA_RESULT) saying OK or REFUSED and why. Until that row exists nothing
   has been written: never say a value is in Redis, only that you asked.
-- One operation per reply. A value may not contain a pipe."""
+- One operation per reply. A value may not contain a pipe. This REDIS-OP line is the ONE
+  exception to the no-pipes rule above: it is lifted out of your answer before posting."""
 
 # THE BUDGET, AND WHY IT IS NOT THE 700 THIS FILE SHIPPED WITH
 #
@@ -854,15 +855,36 @@ def redis_request(text: str):
     return request, body
 
 
-def post_request(me: str, cfg: dict, request: dict, verbose: bool):
+def request_id(me: str, answers: str) -> str:
+    """The request row id for the REDIS-OP line in this agent's reply to `answers` - STABLE, never random.
+
+    Copilot on #365: the write is dispatched before the reply's durable posting phase, so an ask that is
+    retried after an unconfirmed post would post a SECOND request with a fresh id, and the worker's
+    per-request run marker (gov:req:<id>) could not tell it from a new one. With the id derived from the
+    source ask, a retry posts the same id, the board's RESULT-row idempotency skips it, and the marker
+    refuses it even if the row slips through. Same shape as reply_row_id, inside bus_request's id grammar."""
+    digest = hashlib.sha256(str(answers or "").encode("utf-8")).hexdigest()[:12]
+    return "%s-REDIS-%s" % (re.sub(r"[^A-Za-z0-9]", "", me.upper())[:12], digest)
+
+
+def post_request(me: str, cfg: dict, request: dict, verbose: bool, answers: str = ""):
     """Post the request through fleet_agent request, never a hand-built row. (ok, row id or reason).
 
-    The value goes by argument after okf_land's secret scrub, so a credential the model quoted cannot
-    be written into Redis through this path either. fleet_agent base64-encodes it and reads the row
-    back; "VERIFIED on the board" is the only ok."""
+    EVERYTHING THE MODEL CHOSE IS SCRUBBED OR REFUSED before it reaches the board, the audit, Redis or
+    a log line. The value is scrubbed (okf_land.scrub_secrets). The key and the field are not scrubbed
+    but REFUSED when scrubbing would change them: a key is an address in Redis, and a credential-shaped
+    key would land verbatim in the row's gist, the audit entry and the worker's logs (Copilot on #365).
+    The request id is request_id(): stable per source ask, so a retried ask cannot write twice.
+    fleet_agent base64-encodes the value and reads the row back; "VERIFIED on the board" is the only ok,
+    and anything else is NOT CONFIRMED - never "absent": a timeout may have landed (append contract)."""
+    for part in ("key", "field"):
+        chosen = request.get(part)
+        if chosen and okf_land.scrub_secrets(str(chosen)) != str(chosen):
+            return False, "the %s carries a credential- or address-shaped token; refused, nothing posted" % part
     args = [sys.executable, os.path.join(REPO, "scripts", "fleet_agent.py"),
             "request", request["op"], request["key"],
-            "--tag", me, "--project", cfg.get("project", "FLEET")]
+            "--tag", me, "--project", cfg.get("project", "FLEET"),
+            "--id", request_id(me, answers)]
     if request.get("val") is not None:
         args += ["--val", okf_land.scrub_secrets(str(request["val"]))]
     if request.get("field"):
@@ -880,7 +902,17 @@ def post_request(me: str, cfg: dict, request: dict, verbose: bool):
     if found:
         return True, found.group(1)
     reason = " ".join(out.split())[-200:] or "no output from fleet_agent request"
-    return False, reason
+    return False, "not confirmed: " + reason
+
+
+def unconfirmed_note(request: dict, detail: str) -> str:
+    """The hands-note sentence for a REDIS-OP line whose request row is not confirmed on the board.
+
+    NEVER THE KEY: a refused key is one that must not reach the board, and the hands text is posted as
+    written. NEVER "not posted": fleet_agent appends once, and a timeout or a missing read-back does not
+    prove the row is absent (Copilot on #365)."""
+    return ("The Redis request in this reply (%s) is not confirmed as posted: %s."
+            % (request.get("op", "?"), detail))
 
 
 def call_agent(cfg: dict, prompt: str, max_tokens: int = DEFAULT_MAX_TOKENS):
@@ -1075,14 +1107,13 @@ def main(argv=None) -> int:
         if cfg.get("redis_requests"):
             request, text = redis_request(text)
             if request and not args.dry_run:
-                ok, detail = post_request(me, cfg, request, args.verbose)
+                ok, detail = post_request(me, cfg, request, args.verbose, answers=src_id)
                 if ok:
                     redis_row = detail
                     note = "    redis request posted: %s (%s %s)" % (detail, request["op"], request["key"])
                 else:
-                    redis_outcome = ("The Redis request in this reply (%s %s) was NOT posted: %s."
-                                     % (request["op"], request["key"], detail))
-                    note = "    redis request NOT posted: %s" % detail
+                    redis_outcome = unconfirmed_note(request, detail)
+                    note = "    redis request not confirmed: %s" % detail
                 print(note)
                 log(me, note)
         body = " ".join(okf_land.scrub_secrets(text).split())

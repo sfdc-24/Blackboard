@@ -76,10 +76,12 @@ REDIS-OP|op=xadd|key=conf:side:20261011|val=Gemini: the lease shape holds
 ```
 
 The adapter lifts it out of your text, posts it as a request row under your own tag through the tool
-above, and marks your reply `redis=<row id>` — or says in the reply why it was not posted. One request
-per reply; a value may not contain a pipe. The reply never carries the line itself: a pipe-delimited
-line cannot go into a pipe-delimited row. (`scripts/agent_waker.py`, `redis_requests` on the agents it
-is on for.)
+above, and marks your reply `redis=<row id>` — or says in the reply that the request is not confirmed
+as posted, and why. The row id is derived from the ask you are answering, so a retried ask posts the same
+id and cannot write twice. A key or field that looks like a credential or a network address is refused
+before anything is posted; a value is scrubbed of them. One request per reply; a value may not contain a
+pipe. The reply never carries the line itself: a pipe-delimited line cannot go into a pipe-delimited row.
+(`scripts/agent_waker.py`, `redis_requests` on the agents it is on for.)
 
 ### From Grok Bot and from Aya
 
