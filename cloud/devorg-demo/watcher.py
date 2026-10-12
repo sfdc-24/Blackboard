@@ -15,8 +15,13 @@ ONE EXECUTION IS ONE ARMING, BOUND TO ONE ROOM, AND CONSUMED DURABLY (Aya: memor
 - DEMO_ARMED=1 or the job exits at its config, naming the missing variable and never a value.
 - DEMO_ROOM is required and exact; the transcript's OWN HEADER must name that room on every read, or
   the run refuses. There is no "whichever transcript appears next" mode.
+- DEMO_TRANSCRIPT_OBJECT is required and exact: the ONE approved transcript object, accepted only as
+  conference/transcripts/<DEMO_ROOM>/<name>-conference-transcript.md. It is fetched BY NAME and the
+  bucket is never listed (Aya on 8798b78: the runtime identity holds rights only under studio/), so
+  the access it needs is a GET on that one object. It must exist and name the bound room in its own
+  header BEFORE the arming is consumed: a wrong object never spends the one-shot.
 - Before anything is heard, the arming is CONSUMED: a create-once object (ifGenerationMatch=0) under
-  conference/devorg-demo/ keyed by the room. A Cloud Run retry or a rerun of the same arming finds
+  studio/devorg-demo/ keyed by the room. A Cloud Run retry or a rerun of the same arming finds
   the object and refuses - memory-only state cannot survive a platform retry, so the bucket holds
   the one-shot. The deploy also sets the job's maxRetries to 0; this guard assumes it did not.
 - The arming expires (DEMO_EXPIRES_MINUTES, 1..45, monotonic clock).
@@ -57,10 +62,11 @@ THE ORG, AND THE ONE WRITE
   assignment rule, and this org's rules reassign and notify on escalation.
 
 RECEIPTS
-- One JSON object per event to gs://<TRANSCRIPT_BUCKET>/conference/devorg-demo/ (the shape shared
-  with the site's demo page), each carrying the room, the Case and the correlation it answers, and
-  one log line each, best effort: the restore outranks the paper trail. An org error is logged as
-  its status and errorCode only - never the error body, which can carry record data.
+- One JSON object per event to gs://<TRANSCRIPT_BUCKET>/studio/devorg-demo/ (the shape shared with
+  the site's demo page; the prefix the runtime identity already writes under), each carrying the
+  room, the Case and the correlation it answers, and one log line each, best effort: the restore
+  outranks the paper trail. An org error is logged as its status and errorCode only - never the
+  error body, which can carry record data.
 
 TWO MORE GATES AT THE WRITE, AND A RECOVERY (Aya on 3ac1457)
 - The expiry is rechecked immediately before the PATCH: polling and reads can cross the deadline
@@ -72,9 +78,21 @@ TWO MORE GATES AT THE WRITE, AND A RECOVERY (Aya on 3ac1457)
   (a resolved marker), restores only the journal's known applied value, and leaves any third value
   for a human.
 
-Exit: 0 done, or expired unspent; 1 a write's outcome is not the asked value, an unexpected error
-(restored first), or a restore whose own outcome is UNKNOWN; 2 config refused; 3 token or org
-refused, or a recovery finding a third value; 4 transcript, journal or one-shot guard refused.
+A READ-ONLY PREFLIGHT (Aya on 8798b78)
+- DEMO_PREFLIGHT=1 checks what an arming would need and changes NOTHING: the configured org host is
+  a developer or sandbox host; the credential's org is the pinned org and a Developer Edition or
+  sandbox; the Case holds Medium; the approved transcript object answers a GET and its own header
+  names the bound room; the room's arming guard reads as absent on an explicit 404 only (a 403
+  here is the risk Claude flagged: without a list right, absence may answer 403). It consumes no
+  arming, writes no object and no receipt, sends no update, and refuses to combine with an arming
+  or a recovery. What it cannot prove without writing is the right to CREATE under
+  studio/devorg-demo/, and it says so rather than guessing.
+
+Exit: 0 done, or expired unspent, or a preflight whose every check passed; 1 a write's outcome is
+not the asked value, an unexpected error (restored first), or a restore whose own outcome is
+UNKNOWN; 2 config refused; 3 token or org refused, or a recovery finding a third value; 4
+transcript, journal or one-shot guard refused. A failing preflight exits with its first failing
+check's code.
 """
 from __future__ import annotations
 
@@ -91,7 +109,9 @@ import urllib.request
 
 API = "v62.0"
 PREFIX = "conference/transcripts"
-RECEIPTS = "conference/devorg-demo"
+# The state prefix - receipts, the consumed arming, the journal and the resolved marker - sits under
+# studio/ because that is where the runtime identity already holds object rights (Aya on 8798b78).
+RECEIPTS = "studio/devorg-demo"
 # The approved scope, pinned in source. Changing any of these is a source change for review,
 # never a configuration choice.
 APPROVED_ORG = "00Dbm00000wK2ibEAC"
@@ -103,6 +123,10 @@ POLL_SECONDS = 2.0
 ORG_ID = re.compile(r"^00D[A-Za-z0-9]{12}(?:[A-Za-z0-9]{3})?$")
 CASE_ID = re.compile(r"^500[A-Za-z0-9]{12}(?:[A-Za-z0-9]{3})?$")
 ROOM = re.compile(r"^conf-[a-z0-9][a-z0-9-]{0,60}$")
+# The one approved transcript object: exactly one name directly under the room's folder, in the
+# shape the watcher has always accepted; the captured room is held against DEMO_ROOM.
+TRANSCRIPT_OBJECT = re.compile(r"^" + re.escape(PREFIX) + r"/(conf-[a-z0-9][a-z0-9-]{0,60})/"
+                               r"[A-Za-z0-9][A-Za-z0-9._-]{0,120}-conference-transcript\.md$")
 ALLOWED_HOSTS = ("develop.my.salesforce.com", "sandbox.my.salesforce.com", "scratch.my.salesforce.com")
 OWNER_LINE = re.compile(r"^- \*\*\[(\d{2}:\d{2}:\d{2})Z\] Owner:\*\* (.*)$")
 SENTENCE = re.compile(r"[^.?!]+[.?!]*")
@@ -240,24 +264,16 @@ class Store:
         status, _ = _http(req, 15)
         return status
 
-    def transcript_of(self, room: str) -> str | None:
-        """The bound room's one transcript object name, or None while it does not exist yet."""
-        url = ("https://storage.googleapis.com/storage/v1/b/%s/o?prefix=%s&fields=items(name)"
-               % (self.bucket, urllib.parse.quote("%s/%s/" % (PREFIX, room), safe="")))
-        status, body = self._get(url)
-        if status != 200:
-            raise Refused(4, "listing the room's transcripts answered HTTP %d" % status)
-        names = [item["name"] for item in json.loads(body.decode("utf-8")).get("items", [])
-                 if item["name"].endswith("-conference-transcript.md")]
-        if len(names) > 1:
-            raise Refused(4, "the bound room has %d transcripts" % len(names))
-        return names[0] if names else None
-
     def read(self, name: str) -> str:
+        """The ONE approved transcript object, fetched by its exact name. The bucket is never
+        listed (Aya on 8798b78). Anything but 200 refuses: without a list right, a missing object
+        may answer 403 rather than 404, so neither is treated as "not there yet"."""
         status, body = self._get("https://storage.googleapis.com/storage/v1/b/%s/o/%s?alt=media"
                                  % (self.bucket, urllib.parse.quote(name, safe="")))
         if status != 200:
-            raise Refused(4, "reading the transcript answered HTTP %d" % status)
+            raise Refused(4, "reading the approved transcript object answered HTTP %d%s" % (
+                status, " (no read on it, or it does not exist and there is no list right)"
+                if status == 403 else ""))
         return body.decode("utf-8", "replace")
 
     def read_json(self, name: str) -> dict:
@@ -383,22 +399,27 @@ def config(environ) -> dict:
     """The arming, from the execution's environment. The environment CONFIRMS the pinned scope,
     it cannot choose one. Refuses by NAME; no value is ever printed. With DEMO_RECOVER_CORRELATION
     set, this is the bounded RECOVERY of one journalled operation instead: no arming is consumed,
-    no transcript is read, and the two modes refuse to combine."""
+    no transcript is read. With DEMO_PREFLIGHT=1 it is the READ-ONLY preflight: the same bindings
+    as an arming, checked, and nothing consumed or written. The three modes refuse to combine."""
     recover = environ.get("DEMO_RECOVER_CORRELATION", "")
+    preflight = environ.get("DEMO_PREFLIGHT", "") == "1"
+    armed = environ.get("DEMO_ARMED") == "1"
+    if sum((bool(recover), preflight, armed)) > 1:
+        raise Refused(2, "arming, recovery and preflight are different runs: one at a time")
     if recover:
-        if environ.get("DEMO_ARMED") == "1":
-            raise Refused(2, "recovery and arming are different runs: not both")
         if not RECOVERY.match(recover):
             raise Refused(2, "DEMO_RECOVER_CORRELATION is malformed")
-    elif environ.get("DEMO_ARMED") != "1":
+    elif not (armed or preflight):
         raise Refused(0, "not armed (DEMO_ARMED is not 1): nothing read, nothing written")
-    out = {"recover": recover}
-    rooms = () if recover else (("DEMO_ROOM", ROOM),)
+    out = {"recover": recover, "preflight": preflight}
+    rooms = () if recover else (("DEMO_ROOM", ROOM), ("DEMO_TRANSCRIPT_OBJECT", TRANSCRIPT_OBJECT))
     for name, shape in (("DEMO_ORG_ID", ORG_ID), ("DEMO_CASE_ID", CASE_ID)) + rooms:
         value = environ.get(name, "")
-        if not shape.match(value):
+        if not shape.fullmatch(value):
             raise Refused(2, "%s is missing or malformed" % name)
         out[name] = value
+    if not recover and TRANSCRIPT_OBJECT.fullmatch(out["DEMO_TRANSCRIPT_OBJECT"]).group(1) != out["DEMO_ROOM"]:
+        raise Refused(2, "DEMO_TRANSCRIPT_OBJECT is not under the bound room")
     if out["DEMO_ORG_ID"][:15] != APPROVED_ORG[:15]:
         raise Refused(2, "DEMO_ORG_ID is not the approved org")
     if out["DEMO_CASE_ID"][:15] != APPROVED_CASE[:15]:
@@ -599,12 +620,79 @@ def recover(store: Store, org: Org, correlation_id: str) -> int:
     return 0
 
 
+def preflight(armed: dict) -> int:
+    """READ-ONLY: what an arming would need, checked and reported one line each. It consumes no
+    arming, writes no object and no receipt, and sends no update - its only calls are the token,
+    two queries, one transcript GET and one guard GET. Every check runs that can; the exit is the
+    first failing check's code, 0 when all pass."""
+    failures = []
+
+    def check(name, step):
+        try:
+            detail = step()
+        except Refused as refusal:
+            say("preflight FAIL %s: %s" % (name, refusal))
+            failures.append(refusal.code)
+            return False
+        except Exception as error:  # noqa: BLE001 - a preflight reports, it never raises
+            say("preflight FAIL %s: %s" % (name, type(error).__name__))
+            failures.append(1)
+            return False
+        say("preflight PASS %s%s" % (name, (": " + detail) if detail else ""))
+        return True
+
+    store = Store(armed["bucket"])
+    held = {}
+
+    def host():
+        held["org"] = Org(armed["Headless_domain"], armed["Headless_consumer_key"],
+                          armed["Headless_consumer_secret"])
+
+    def identity():
+        found = held["org"].identity()
+        if found["org_id"][:15] != APPROVED_ORG[:15]:
+            raise Refused(3, "the credential's org is not the approved org")
+        if found["type"] != "Developer Edition" and not found["sandbox"]:
+            raise Refused(3, "the org is neither a Developer Edition nor a sandbox")
+        return found["type"]
+
+    def case():
+        priority = held["org"].case(APPROVED_CASE)["Priority"]
+        if priority != BEFORE_VALUE:
+            raise Refused(3, "the Case does not hold %s" % BEFORE_VALUE)
+        return priority
+
+    def transcript():
+        header = front_matter(store.read(armed["DEMO_TRANSCRIPT_OBJECT"]))
+        if header.get("room") != armed["DEMO_ROOM"]:
+            raise Refused(4, "the transcript's own header does not name the bound room")
+        return "state %s" % (header.get("state") or "(none)")
+
+    def guard():
+        name = "%s/arming-%s.json" % (RECEIPTS, armed["DEMO_ROOM"])
+        if store.read_json_if_absent_is_known(name) is not None:
+            raise Refused(4, "this room's arming was already consumed")
+        return "absent (an explicit 404)"
+
+    if check("the org host is a developer or sandbox host", host):
+        if check("the credential's org is the pinned developer org", identity):
+            check("the Case holds %s" % BEFORE_VALUE, case)
+    check("the approved transcript object answers and names the bound room", transcript)
+    check("the room's arming guard reads as absent", guard)
+    say("preflight NOT PROVEN: the right to create objects under %s/ (only a write proves it)" % RECEIPTS)
+    say("preflight %s: nothing consumed, nothing written, nothing changed"
+        % ("passed" if not failures else "failed"))
+    return failures[0] if failures else 0
+
+
 def run(environ, clock=time.monotonic, sleep=time.sleep) -> int:
     try:
         armed = config(environ)
     except Refused as refusal:
         say(str(refusal))
         return refusal.code
+    if armed["preflight"]:
+        return preflight(armed)
     try:
         store = Store(armed["bucket"])
         org = Org(armed["Headless_domain"], armed["Headless_consumer_key"], armed["Headless_consumer_secret"])
@@ -618,6 +706,10 @@ def run(environ, clock=time.monotonic, sleep=time.sleep) -> int:
         case = org.case(APPROVED_CASE)
         if case["Priority"] != BEFORE_VALUE:
             raise Refused(3, "the Case does not hold %s at arming; the approved cycle starts there" % BEFORE_VALUE)
+        # The approved transcript object must answer, by its exact name, and name the bound room in
+        # its own header BEFORE the one-shot is spent: a wrong or unreadable object never consumes it.
+        if front_matter(store.read(armed["DEMO_TRANSCRIPT_OBJECT"])).get("room") != armed["DEMO_ROOM"]:
+            raise Refused(4, "the transcript's own header does not name the bound room")
         # The one-shot: this arming is consumed durably BEFORE anything is heard. A platform retry
         # or a second execution bound to the same room finds the object and refuses.
         if not store.create_once("%s/arming-%s.json" % (RECEIPTS, armed["DEMO_ROOM"]),
@@ -631,16 +723,10 @@ def run(environ, clock=time.monotonic, sleep=time.sleep) -> int:
     demo = Demo(org, store, armed["DEMO_ROOM"], clock=clock, deadline=deadline)
     say("armed %d minutes: Case %s, Priority %s now, room %s"
         % (armed["minutes"], case["CaseNumber"], case["Priority"], armed["DEMO_ROOM"]))
-    watched, seen, live_seen = None, 0, False
+    watched, seen, live_seen = armed["DEMO_TRANSCRIPT_OBJECT"], 0, False
     code = 0
     try:
         while clock() < deadline:
-            if watched is None:
-                watched = store.transcript_of(armed["DEMO_ROOM"])
-                if watched is None:
-                    sleep(POLL_SECONDS)
-                    continue
-                say("found the room's transcript")
             text = store.read(watched)
             header = front_matter(text)
             if header.get("room") != armed["DEMO_ROOM"]:

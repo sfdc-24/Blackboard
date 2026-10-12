@@ -30,6 +30,7 @@ watcher = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(watcher)
 
 ROOM = "conf-demo-abc123"
+OBJECT = "conference/transcripts/%s/20261012T130000Z-conference-transcript.md" % ROOM
 ORG = watcher.APPROVED_ORG
 CASE = watcher.APPROVED_CASE
 
@@ -42,7 +43,7 @@ def transcript(state: str, owner_texts, room: str = ROOM) -> str:
 
 def env(**extra) -> dict:
     base = {"DEMO_ARMED": "1", "DEMO_ORG_ID": ORG, "DEMO_CASE_ID": CASE, "DEMO_ROOM": ROOM,
-            "DEMO_EXPIRES_MINUTES": "5", "TRANSCRIPT_BUCKET": "bucket",
+            "DEMO_TRANSCRIPT_OBJECT": OBJECT, "DEMO_EXPIRES_MINUTES": "5", "TRANSCRIPT_BUCKET": "bucket",
             "Headless_domain": "x.develop.my.salesforce.com", "Headless_consumer_key": "k",
             "Headless_consumer_secret": "s"}
     base.update(extra)
@@ -50,22 +51,35 @@ def env(**extra) -> dict:
 
 
 class FakeStore:
-    """The bucket as the run sees it: a list of texts served in order (the last repeats), a record
-    of receipts, and a real create-once ledger that survives across runs when shared."""
+    """The bucket as the run sees it: the ONE approved object, served as a list of snapshots in
+    order (the last repeats; before the arming is consumed it is not advanced, as the pre-arm
+    check is one more look at the same live object), a record of receipts, and a real create-once
+    ledger that survives across runs when shared. It has no listing: there is none to call."""
 
-    def __init__(self, texts, exists=True, events=None):
+    def __init__(self, texts, exists=True, events=None, guard=None):
         self.texts = list(texts)
         self.exists = exists
         self.receipts = []
         self.created = set()
         self.events = events if events is not None else []
-
-    def transcript_of(self, room):
-        assert room == ROOM, "asked for a room the arming did not bind"
-        return "conference/transcripts/%s/t.md" % room if self.exists else None
+        self.reads = []
+        self.guard = guard              # None = an explicit 404; a dict = present; an int = HTTP status
 
     def read(self, name):
+        assert name == OBJECT, "read an object the arming did not name: %s" % name
+        self.reads.append(name)
+        if not self.exists:
+            raise watcher.Refused(4, "reading the approved transcript object answered HTTP 403")
+        if not any("arming-" in made for made in self.created):
+            return self.texts[0]
         return self.texts.pop(0) if len(self.texts) > 1 else self.texts[0]
+
+    def read_json_if_absent_is_known(self, name):
+        if isinstance(self.guard, int):
+            raise watcher.Refused(4, "the guard object answered HTTP %d, which is not absence" % self.guard)
+        if name in self.created:
+            return {"kind": "arming"}
+        return self.guard
 
     def receipt(self, entry):
         self.receipts.append(entry)
@@ -298,14 +312,21 @@ class NothingReplays(unittest.TestCase):
         self.assertEqual(0, run(env(DEMO_EXPIRES_MINUTES="1"), store, org))
         self.assertEqual([], org.sets)
 
-    def test_a_transcript_whose_header_names_another_room_refuses(self):
+    def test_a_transcript_whose_header_names_another_room_refuses_before_the_arming_is_spent(self):
         org = FakeOrg()
         store = FakeStore([transcript("live", [], room="conf-other-room")])
         self.assertEqual(4, run(env(), store, org))
         self.assertEqual([], org.sets)
+        self.assertEqual(set(), store.created, "a wrong object must never consume the one-shot")
 
-    def test_a_missing_transcript_expires_unspent(self):
-        self.assertEqual(0, run(env(DEMO_EXPIRES_MINUTES="1"), FakeStore([], exists=False), FakeOrg()))
+    def test_an_unreadable_or_missing_transcript_refuses_before_the_arming_is_spent(self):
+        # Without a list right a missing object may answer 403, not 404: neither is "not there
+        # yet", and neither spends the one-shot.
+        org = FakeOrg()
+        store = FakeStore([], exists=False)
+        self.assertEqual(4, run(env(), store, org))
+        self.assertEqual([], org.sets)
+        self.assertEqual(set(), store.created)
 
     def test_to_low_is_refused_as_out_of_scope(self):
         org = FakeOrg()
@@ -518,6 +539,132 @@ class ASentenceIsARequestOnlyInOneShape(unittest.TestCase):
         self.assertEqual({"type": "call-transcript", "room": ROOM, "state": "live"}, header)
         self.assertEqual({}, watcher.front_matter("no header\n---\nstate: live\n"))
         self.assertEqual({}, watcher.front_matter("---\nstate: live\n"))   # never closed
+
+
+class OneExactObjectAndTheStudioPrefix(unittest.TestCase):
+    """Aya on 8798b78: the runtime identity holds rights only under studio/. The transcript is one
+    exactly named object fetched by name, never a listing; all state lives under studio/devorg-demo/."""
+
+    def test_the_transcript_object_is_required_exact_and_under_the_bound_room(self):
+        for bad in (None, "",
+                    "conference/transcripts/%s/" % ROOM,                                    # a prefix
+                    "conference/transcripts/conf-other-room/x-conference-transcript.md",    # another room
+                    "conference/transcripts/%s/a/b-conference-transcript.md" % ROOM,        # nested
+                    "conference/transcripts/%s/x-conference-transcript.txt" % ROOM,         # wrong kind
+                    "studio/transcripts/%s/x-conference-transcript.md" % ROOM,              # wrong root
+                    "conference/transcripts/%s/-conference-transcript.md" % ROOM,           # no name
+                    OBJECT + "\n"):                                                         # trailing newline
+            self.assertEqual(2, run(env(DEMO_TRANSCRIPT_OBJECT=bad), FakeStore([]), UntouchableOrg()), bad)
+
+    def test_only_the_named_object_is_ever_read(self):
+        org = FakeOrg()
+        store = FakeStore([transcript("live", []),
+                           transcript("live", ["Set the demo case priority to high."]),
+                           transcript("live", ["Set the demo case priority to high.",
+                                               "Set the demo case priority to medium."])])
+        self.assertEqual(0, run(env(), store, org))
+        self.assertTrue(store.reads)
+        self.assertEqual({OBJECT}, set(store.reads))
+
+    def test_every_state_object_is_under_studio_devorg_demo(self):
+        self.assertEqual("studio/devorg-demo", watcher.RECEIPTS)
+        org = FakeOrg()
+        store = FakeStore([transcript("live", []),
+                           transcript("live", ["Set the demo case priority to high."])])
+        self.assertEqual(0, run(env(DEMO_EXPIRES_MINUTES="1"), store, org))
+        self.assertTrue(store.created)
+        for name in store.created:
+            self.assertTrue(name.startswith("studio/devorg-demo/"), name)
+
+    def test_the_real_store_reads_by_name_and_never_lists(self):
+        self.assertFalse(hasattr(watcher.Store, "transcript_of"), "the listing must be gone")
+        calls = []
+
+        def fake_http(req, timeout):
+            calls.append(req.full_url)
+            return 200, transcript("live", []).encode("utf-8")
+        kept = watcher._http
+        watcher._http = fake_http
+        self.addCleanup(setattr, watcher, "_http", kept)
+        store = watcher.Store("bucket")
+        store.token = lambda: "t"
+        store.read(OBJECT)
+        self.assertEqual(1, len(calls))
+        self.assertIn("/o/" + watcher.urllib.parse.quote(OBJECT, safe="") + "?alt=media", calls[0])
+        self.assertNotIn("prefix=", calls[0])
+
+    def test_the_real_store_takes_neither_403_nor_404_as_not_there_yet(self):
+        for status in (403, 404, 500):
+            kept = watcher._http
+            watcher._http = lambda req, timeout, s=status: (s, b"")
+            try:
+                store = watcher.Store("bucket")
+                store.token = lambda: "t"
+                with self.assertRaises(watcher.Refused) as caught:
+                    store.read(OBJECT)
+                self.assertEqual(4, caught.exception.code, status)
+            finally:
+                watcher._http = kept
+
+
+class NoWriteStore(FakeStore):
+    """A store a preflight may read from and must never write to."""
+
+    def receipt(self, entry):
+        raise AssertionError("the preflight wrote a receipt")
+
+    def create_once(self, name, entry):
+        raise AssertionError("the preflight wrote %s" % name)
+
+
+class TheReadOnlyPreflight(unittest.TestCase):
+    """DEMO_PREFLIGHT=1: what an arming would need, checked; nothing consumed, written or changed."""
+
+    def preflight_env(self, **extra):
+        return env(**dict({"DEMO_ARMED": None, "DEMO_PREFLIGHT": "1"}, **extra))
+
+    def test_a_clean_preflight_passes_and_changes_nothing(self):
+        org = FakeOrg()
+        store = NoWriteStore([transcript("live", [])])
+        self.assertEqual(0, run(self.preflight_env(), store, org))
+        self.assertEqual([], org.sets)
+        self.assertEqual(set(), store.created)
+        self.assertEqual([OBJECT], store.reads)
+
+    def test_it_refuses_to_combine_with_an_arming_or_a_recovery(self):
+        self.assertEqual(2, run(self.preflight_env(DEMO_ARMED="1"), NoWriteStore([]), UntouchableOrg()))
+        both = self.preflight_env()
+        both["DEMO_RECOVER_CORRELATION"] = "a" * 16
+        self.assertEqual(2, run(both, NoWriteStore([]), UntouchableOrg()))
+
+    def test_it_needs_the_same_exact_bindings_as_an_arming(self):
+        for name in ("DEMO_ROOM", "DEMO_TRANSCRIPT_OBJECT", "DEMO_ORG_ID", "DEMO_CASE_ID",
+                     "Headless_consumer_secret"):
+            self.assertEqual(2, run(self.preflight_env(**{name: None}), NoWriteStore([]), UntouchableOrg()), name)
+
+    def test_the_wrong_org_fails_and_the_storage_checks_still_report(self):
+        org = FakeOrg(org_id="00D000000000001AAA")
+        store = NoWriteStore([transcript("live", [])])
+        self.assertEqual(3, run(self.preflight_env(), store, org))
+        self.assertEqual([OBJECT], store.reads, "the transcript check runs regardless")
+        self.assertEqual([], org.sets)
+
+    def test_a_case_not_holding_medium_fails(self):
+        org = FakeOrg(priority="High")
+        self.assertEqual(3, run(self.preflight_env(), NoWriteStore([transcript("live", [])]), org))
+        self.assertEqual([], org.sets)
+
+    def test_a_transcript_naming_another_room_or_unreadable_fails(self):
+        self.assertEqual(4, run(self.preflight_env(),
+                                NoWriteStore([transcript("live", [], room="conf-other-room")]), FakeOrg()))
+        self.assertEqual(4, run(self.preflight_env(), NoWriteStore([], exists=False), FakeOrg()))
+
+    def test_a_consumed_or_unreadable_arming_guard_fails(self):
+        self.assertEqual(4, run(self.preflight_env(),
+                                NoWriteStore([transcript("live", [])], guard={"kind": "arming"}), FakeOrg()))
+        # 403 on the guard is the flagged risk: not absence, so the preflight says so.
+        self.assertEqual(4, run(self.preflight_env(),
+                                NoWriteStore([transcript("live", [])], guard=403), FakeOrg()))
 
 
 class TheOrgClientItself(unittest.TestCase):
