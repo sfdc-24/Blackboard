@@ -257,12 +257,13 @@ class NarrowRedis(FakeRedis):
 
     def eval(self, script, numkeys, *args):
         assert script == rc.CAS_LUA and numkeys == 2, "a script this path does not own"
-        key, members, rid, field, held, value = args[:6]
+        key, members, rid, field, read, held, value = args[:7]
         if rid not in self.sets.get(members, set()):
             return "not-a-member"
-        if any(name not in self.hashes.get(key, {}) for name in args[6:]):
+        if any(name not in self.hashes.get(key, {}) for name in args[7:]):
             return "incomplete"
-        if self.hashes[key].get(field, "") != held:
+        there = self.hashes[key].get(field)                      # None when the field does not exist
+        if (there is not None) if read == "0" else (there is None or there != held):
             return "changed"
         self.hashes[key][field] = value
         self.writes.append((key, field))
@@ -282,6 +283,11 @@ class NarrowRedis(FakeRedis):
 
     def srem(self, key, member):
         raise AssertionError("SREM %s sent by the capability path" % key)
+
+
+def put(conn, caps):
+    """rc.write judged at NOW, so a stored time in these fixtures is never 'the future' by the wall clock."""
+    return rc.write(conn, caps, now=NOW)
 
 
 def run(argv, caps=None, conn="none", now=None):
@@ -342,7 +348,7 @@ class TheWriteIsGuardedAndAtomic(unittest.TestCase):
         conn = NarrowRedis()
         before_hashes, before_sets = copy.deepcopy(conn.hashes), copy.deepcopy(conn.sets)
         obs = observation("alpha", read=right(), push=said(can="no"))
-        out = rc.write(conn, capfile(obs))
+        out = put(conn, capfile(obs))
         key, field = rc.AGENT_KEY % "alpha", rc.CAP_PREFIX + SITE
         self.assertEqual(["%s %s" % (key, field)], out["written"])
         self.assertEqual(([], [], [], [], []), (out["same"], out["refused"], out["lost"], out["changed_elsewhere"], out["not_read_back"]))
@@ -356,7 +362,7 @@ class TheWriteIsGuardedAndAtomic(unittest.TestCase):
     def test_an_id_that_is_not_a_member_means_nothing_is_written_for_anyone(self):
         conn = NarrowRedis()
         before = copy.deepcopy(conn.hashes)
-        out = rc.write(conn, capfile(observation("alpha", read=right()), observation("ghost", read=right())))
+        out = put(conn, capfile(observation("alpha", read=right()), observation("ghost", read=right())))
         self.assertEqual(([], 1), (out["written"], len(out["refused"])))
         self.assertIn("creates no instance", out["refused"][0])
         self.assertEqual(([], before), (conn.writes, conn.hashes))
@@ -365,7 +371,7 @@ class TheWriteIsGuardedAndAtomic(unittest.TestCase):
     def test_a_missing_hash_is_refused_and_never_created(self):
         conn = NarrowRedis()
         del conn.hashes[rc.AGENT_KEY % "alpha"]                   # still a member of the set: a half-written copy
-        out = rc.write(conn, capfile(observation("alpha", read=right())))
+        out = put(conn, capfile(observation("alpha", read=right())))
         self.assertIn("missing or incomplete (15 of 15", out["refused"][0])
         self.assertEqual([], conn.writes)
         self.assertNotIn(rc.AGENT_KEY % "alpha", conn.hashes, "the old HSET would have made a hash of one field here")
@@ -373,26 +379,26 @@ class TheWriteIsGuardedAndAtomic(unittest.TestCase):
     def test_an_incomplete_hash_is_refused_and_not_completed(self):
         conn = NarrowRedis()
         del conn.hashes[rc.AGENT_KEY % "alpha"]["wake"]
-        out = rc.write(conn, capfile(observation("alpha", read=right()), observation("beta", read=right())))
+        out = put(conn, capfile(observation("alpha", read=right()), observation("beta", read=right())))
         self.assertIn("missing or incomplete (1 of 15", out["refused"][0])
         self.assertEqual([], conn.writes, "and beta, whose hash is whole, is not written either")
 
     def test_an_identical_observation_is_a_retry_and_writes_nothing(self):
         conn, caps = NarrowRedis(), capfile(observation("alpha", read=right()))
-        rc.write(conn, caps)
+        put(conn, caps)
         conn.writes.clear()
-        out = rc.write(conn, caps)
+        out = put(conn, caps)
         self.assertEqual(([], 1, []), (out["written"], len(out["same"]), out["refused"]))
         self.assertEqual([], conn.writes)
 
     def test_older_evidence_never_overwrites_newer(self):
         conn = NarrowRedis()
         newer = observation("alpha", read=right(checked=LATER), push=said(checked=LATER))
-        rc.write(conn, capfile(newer))
+        put(conn, capfile(newer))
         conn.writes.clear()
         for stale in (observation("alpha", read=right(checked=STAMP), push=said(checked=LATER)),      # one right older
                       observation("alpha", read=right(can="no", checked=EARLIER, evidence=EARLIER), push=said(checked=LATER))):
-            out = rc.write(conn, capfile(stale))
+            out = put(conn, capfile(stale))
             self.assertIn("stale: read was checked at %s in Redis" % LATER, out["refused"][0])
         self.assertEqual([], conn.writes)
         self.assertEqual(rc.cap_value(newer), conn.hashes[rc.AGENT_KEY % "alpha"][rc.CAP_PREFIX + SITE])
@@ -400,30 +406,80 @@ class TheWriteIsGuardedAndAtomic(unittest.TestCase):
     def test_the_same_check_time_with_a_different_claim_is_a_conflict_not_a_win_for_the_later_writer(self):
         conn = NarrowRedis()
         first = observation("alpha", read=right())
-        rc.write(conn, capfile(first))
+        put(conn, capfile(first))
         conn.writes.clear()
-        out = rc.write(conn, capfile(observation("alpha", read=right(can="no"))))
+        out = put(conn, capfile(observation("alpha", read=right(can="no"))))
         self.assertIn("conflict: read has the same check time", out["refused"][0])
-        out = rc.write(conn, capfile(observation("alpha", identity="login another-bot", read=right())))
+        out = put(conn, capfile(observation("alpha", identity="login another-bot", read=right())))
         self.assertIn("conflict: no check here is newer", out["refused"][0], "a different identity at the same moment")
         self.assertEqual([], conn.writes)
         self.assertEqual(rc.cap_value(first), conn.hashes[rc.AGENT_KEY % "alpha"][rc.CAP_PREFIX + SITE])
 
     def test_a_newer_check_replaces_the_stored_one(self):
         conn = NarrowRedis()
-        rc.write(conn, capfile(observation("alpha", read=right())))
+        put(conn, capfile(observation("alpha", read=right())))
         newer = observation("alpha", read=right(can="no", evidence=LATER, checked=LATER))
-        out = rc.write(conn, capfile(newer))
+        out = put(conn, capfile(newer))
         self.assertEqual(1, len(out["written"]))
         self.assertEqual(rc.cap_value(newer), conn.hashes[rc.AGENT_KEY % "alpha"][rc.CAP_PREFIX + SITE])
 
-    def test_a_stored_value_this_path_cannot_read_is_not_overwritten(self):
-        for junk in ("{}", "not json", '{"rights": {"read": {"checked_at": "soon"}}}', '["a list"]'):
+    def test_an_empty_string_is_a_stored_value_not_an_absent_one(self):
+        """Aya on a79a3ca: "" was taken for absence, so a field that EXISTED and was empty was written
+        over as if nothing had been there. None alone is absence."""
+        self.assertEqual(("write", ""), rc.decide(None, observation("alpha", read=right()), NOW))
+        self.assertEqual(("refuse", rc.UNREADABLE), rc.decide("", observation("alpha", read=right()), NOW))
+        self.assertEqual(("refuse", rc.UNREADABLE), rc.decide(b"", observation("alpha", read=right()), NOW))
+        conn = NarrowRedis()
+        key, field = rc.AGENT_KEY % "alpha", rc.CAP_PREFIX + SITE
+        conn.hashes[key][field] = ""
+        out = put(conn, capfile(observation("alpha", read=right())))
+        self.assertIn(rc.UNREADABLE, out["refused"][0])
+        self.assertEqual(([], ""), (conn.writes, conn.hashes[key][field]))
+        # And in the script itself: expecting ABSENCE, a field that exists and is empty is "changed".
+        args = (key, rc.ROSTER_SET, "alpha", field, "0", "", "NEW") + rc.CANONICAL_FIELDS
+        self.assertEqual("changed", conn.eval(rc.CAS_LUA, 2, *args))
+        del conn.hashes[key][field]
+        self.assertEqual("written", conn.eval(rc.CAS_LUA, 2, *args))
+
+    def test_a_stored_value_is_judged_whole_before_it_is_compared_or_replaced(self):
+        """Aya on a79a3ca: a stored JSON holding five checked_at fields and nothing else was comparable,
+        and so replaceable. Every way a stored value can fall short of a whole observation is refused."""
+        whole = observation("alpha", read=right(checked=EARLIER, evidence=EARLIER))
+        good = json.loads(rc.cap_value(whole))
+
+        def broken(change):
+            held = json.loads(json.dumps(good))
+            change(held)
+            return json.dumps(held, sort_keys=True, separators=(",", ":"))
+        only_times = json.dumps({"runtime_identity": "login example-bot",
+                                 "rights": {name: {"checked_at": EARLIER} for name in rc.RIGHTS}}, sort_keys=True, separators=(",", ":"))
+        junk = (
+            only_times,                                                               # the hole itself
+            "{}", "not json", '["a list"]', "null", "0",
+            broken(lambda h: h["rights"]["read"].__setitem__("can", "granted")),
+            broken(lambda h: h["rights"]["read"].__setitem__("status", "approved")),
+            broken(lambda h: h["rights"]["read"].__setitem__("basis", "acl")),         # verified on an access list
+            broken(lambda h: h["rights"]["read"].__setitem__("basis", "inferred")),
+            broken(lambda h: h["rights"]["read"].__setitem__("source_event", "")),
+            broken(lambda h: h["rights"]["read"].__setitem__("checked_at", "2026-02-30T00:00:00Z")),
+            broken(lambda h: h["rights"]["read"].__setitem__("checked_at", "2026-10-13T00:00:00Z")),   # the future, at NOW
+            broken(lambda h: h["rights"].pop("deploy")),
+            broken(lambda h: h["rights"].__setitem__("admin", dict(good["rights"]["read"]))),
+            broken(lambda h: h.__setitem__("runtime_identity", "")),
+            broken(lambda h: h.pop("runtime_identity")),
+            broken(lambda h: h.__setitem__("granted", True)),
+            json.dumps(good, indent=1),                                               # the same content, not this path's text
+        )
+        newer = observation("alpha", read=right(checked=LATER, evidence=LATER))
+        for stored in junk:
+            self.assertEqual(("refuse", rc.UNREADABLE), rc.decide(stored, newer, NOW), stored[:60])
             conn = NarrowRedis()
-            conn.hashes[rc.AGENT_KEY % "alpha"][rc.CAP_PREFIX + SITE] = junk
-            out = rc.write(conn, capfile(observation("alpha", read=right())))
-            self.assertIn("is not one this path can read", out["refused"][0], junk)
-            self.assertEqual(junk, conn.hashes[rc.AGENT_KEY % "alpha"][rc.CAP_PREFIX + SITE])
+            conn.hashes[rc.AGENT_KEY % "alpha"][rc.CAP_PREFIX + SITE] = stored
+            out = put(conn, capfile(newer))
+            self.assertIn(rc.UNREADABLE, out["refused"][0], stored[:60])
+            self.assertEqual(([], stored), (conn.writes, conn.hashes[rc.AGENT_KEY % "alpha"][rc.CAP_PREFIX + SITE]))
+        # A whole, valid, older observation in this path's own text IS replaced by a newer one.
+        self.assertEqual(("write", ""), rc.decide(rc.cap_value(whole), newer, NOW))
 
     def test_a_value_that_moved_between_the_read_and_the_write_is_not_overwritten(self):
         class Raced(NarrowRedis):
@@ -431,7 +487,7 @@ class TheWriteIsGuardedAndAtomic(unittest.TestCase):
                 self.hashes[args[0]][args[3]] = "written by somebody else in between"
                 return super().eval(script, numkeys, *args)
         conn = Raced()
-        out = rc.write(conn, capfile(observation("alpha", read=right())))
+        out = put(conn, capfile(observation("alpha", read=right())))
         self.assertEqual(([], 1), (out["written"], len(out["lost"])))
         self.assertIn(": changed", out["lost"][0])
         self.assertEqual("written by somebody else in between", conn.hashes[rc.AGENT_KEY % "alpha"][rc.CAP_PREFIX + SITE])
@@ -443,7 +499,7 @@ class TheWriteIsGuardedAndAtomic(unittest.TestCase):
                 del self.hashes[args[0]]
                 return super().eval(script, numkeys, *args)
         conn = Vanished()
-        out = rc.write(conn, capfile(observation("alpha", read=right())))
+        out = put(conn, capfile(observation("alpha", read=right())))
         self.assertIn(": incomplete", out["lost"][0])
         self.assertNotIn(rc.AGENT_KEY % "alpha", conn.hashes)
 
@@ -451,7 +507,7 @@ class TheWriteIsGuardedAndAtomic(unittest.TestCase):
             def eval(self, script, numkeys, *args):
                 self.sets[args[1]].discard(args[2])
                 return super().eval(script, numkeys, *args)
-        out = rc.write(Removed(), capfile(observation("alpha", read=right())))
+        out = put(Removed(), capfile(observation("alpha", read=right())))
         self.assertIn(": not-a-member", out["lost"][0])
 
     def test_a_field_that_does_not_read_back_and_a_field_that_moved_elsewhere_are_both_failures(self):
@@ -461,7 +517,7 @@ class TheWriteIsGuardedAndAtomic(unittest.TestCase):
                 self.hashes[args[0]][args[3]] = "{}"
                 self.hashes[args[0]]["state"] = "changed by somebody else"
                 return answer
-        out = rc.write(Lossy(), capfile(observation("alpha", read=right())))
+        out = put(Lossy(), capfile(observation("alpha", read=right())))
         self.assertEqual(1, len(out["not_read_back"]))
         self.assertEqual(["%s: field state" % (rc.AGENT_KEY % "alpha")], out["changed_elsewhere"])
         self.assertEqual(1, run(["write"], capfile(observation("alpha", read=right())), conn=Lossy()))
@@ -624,7 +680,7 @@ class VerifyReadsAndNeverWrites(unittest.TestCase):
     def test_the_rosters_verify_and_this_one_each_keep_their_own(self):
         data, caps = roster(), capfile(observation("alpha", read=right()))
         conn = NarrowRedis(data)
-        rc.write(conn, caps)
+        put(conn, caps)
         self.assertEqual(([], []), (rs.verify(conn, data), rc.verify(conn, caps)))
         conn.hashes[rc.AGENT_KEY % "alpha"]["stray"] = "x"
         self.assertEqual(["%s: field stray is in Redis and not in the file" % (rc.AGENT_KEY % "alpha")], rs.verify(conn, data))
@@ -636,7 +692,7 @@ class VerifyReadsAndNeverWrites(unittest.TestCase):
         its own file, so nothing is lost, and this verify reports it missing."""
         data, caps = roster(), capfile(observation("alpha", read=right()))
         conn = NarrowRedis(data)
-        rc.write(conn, caps)
+        put(conn, caps)
         plain = FakeRedis()
         plain.hashes, plain.sets = conn.hashes, conn.sets
         rs.seed(plain, data)
@@ -671,13 +727,25 @@ class TheLuaItself(unittest.TestCase):
         )
         for rid, held, want in cases:
             real, double = self.server(), NarrowRedis()
-            args = (rc.AGENT_KEY % rid if rid == "ghost" else key, rc.ROSTER_SET, rid, field, held, "NEW") + rc.CANONICAL_FIELDS
+            args = (rc.AGENT_KEY % rid if rid == "ghost" else key, rc.ROSTER_SET, rid, field,
+                    "0" if held == "" else "1", held, "NEW") + rc.CANONICAL_FIELDS
             self.assertEqual(want, real.eval(rc.CAS_LUA, 2, *args), (rid, held))
             self.assertEqual(want, double.eval(rc.CAS_LUA, 2, *args), (rid, held))
+        # ABSENT IS NOT EMPTY, in the script's own text: a field that exists and holds "" is not absence,
+        # and a value that was read must still be exactly there.
+        for there, read, held, want in (("", "0", "", "changed"), ("", "1", "", "written"), ("OLD", "1", "OLD", "written"),
+                                        ("OLD", "1", "OTHER", "changed"), ("OLD", "0", "", "changed"), (None, "1", "", "changed")):
+            real, double = self.server(), NarrowRedis()
+            if there is not None:
+                real.hset(key, field, there)
+                double.hashes[key][field] = there
+            args = (key, rc.ROSTER_SET, "alpha", field, read, held, "NEW") + rc.CANONICAL_FIELDS
+            self.assertEqual((want, want), (real.eval(rc.CAS_LUA, 2, *args), double.eval(rc.CAS_LUA, 2, *args)), (there, read, held))
+            self.assertEqual("NEW" if want == "written" else there, real.hget(key, field), (there, read, held))
         real, double = self.server(), NarrowRedis()
         real.hdel(key, "wake")
         del double.hashes[key]["wake"]
-        args = (key, rc.ROSTER_SET, "alpha", field, "", "NEW") + rc.CANONICAL_FIELDS
+        args = (key, rc.ROSTER_SET, "alpha", field, "0", "", "NEW") + rc.CANONICAL_FIELDS
         self.assertEqual(("incomplete", "incomplete"), (real.eval(rc.CAS_LUA, 2, *args), double.eval(rc.CAS_LUA, 2, *args)))
         self.assertIsNone(real.hget(key, field), "nothing was set on an incomplete hash")
         real = self.server()
@@ -689,16 +757,16 @@ class TheLuaItself(unittest.TestCase):
         conn = self.server()
         before = {key: conn.hgetall(key) for key in conn.keys("*") if conn.type(key) == "hash"}
         caps = capfile(observation("alpha", read=right()))
-        out = rc.write(conn, caps)
+        out = put(conn, caps)
         key, field = rc.AGENT_KEY % "alpha", rc.CAP_PREFIX + SITE
         self.assertEqual((1, [], [], []), (len(out["written"]), out["lost"], out["changed_elsewhere"], out["not_read_back"]))
         after = {k: conn.hgetall(k) for k in conn.keys("*") if conn.type(k) == "hash"}
         self.assertEqual(rc.cap_value(caps["observations"][0]), after[key].pop(field))
         self.assertEqual(before, after)
         self.assertEqual([], rc.verify(conn, caps))
-        self.assertEqual(1, len(rc.write(conn, caps)["same"]), "and a second run is a retry")
+        self.assertEqual(1, len(put(conn, caps)["same"]), "and a second run is a retry")
         stale = capfile(observation("alpha", read=right(checked=EARLIER, evidence=EARLIER)))
-        self.assertIn("stale", rc.write(conn, stale)["refused"][0])
+        self.assertIn("stale", put(conn, stale)["refused"][0])
 
 
 if __name__ == "__main__":

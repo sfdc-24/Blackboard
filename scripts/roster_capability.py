@@ -31,15 +31,25 @@ WHERE IT LIVES
 WHAT `write` MAY DO, AND NOTHING ELSE
     One compare-and-set per observation, in one Lua script on the server (CAS_LUA): the id is a
     member of v1:agent:roster, every one of the fifteen canonical fields exists on its hash, and the
-    cap: field still holds exactly what was read a moment before; only then is that ONE field set.
+    cap: field is still exactly what was read a moment before; only then is that ONE field set.
     A missing or incomplete hash is refused, never created. No DEL, HDEL, SADD or SREM is ever sent.
     BEFORE ANY WRITE, every observation is judged against what Redis holds:
+        no such field               it may be written. ABSENT MEANS ABSENT: a field that exists and
+                                    holds an empty string is a stored value, and a bad one.
         the same value              a retry: nothing is written
+        anything that is not a whole, valid observation in this path's own form
+                                    refused: it is not overwritten. A stored value is judged by the
+                                    same check as the file's, every field of it, never by its times alone.
         a check OLDER than stored   refused as stale: newer evidence is not overwritten
         the same check time, a different state      refused as a conflict
-        a stored value this cannot read             refused: it is not overwritten
     ONE REFUSAL AND NOTHING IS WRITTEN for any observation.
     It never loads the roster FILE: a roster baked into an old image is an old roster.
+    EACH FIELD IS ITS OWN COMPARE-AND-SET, NOT ONE BATCH. If one loses its race the others stay set;
+    the output names every field and what happened to it, and the exit is 1.
+
+RUNNING IT IN A JOB (Aya on a79a3ca): give the WHOLE command vector, never an argument added to an
+    existing job's: python -B /app/roster_capability.py verify. A job whose arguments still end in
+    `roster_seed.py seed` seeds. And an image for it is built at a tag of its own, never :v1.
 """
 from __future__ import annotations
 
@@ -70,6 +80,7 @@ CAN = ("yes", "no", "unknown")                       # what was observed. Never 
 STATUS = ("verified", "reported", "unknown")
 BASIS = ("executed", "acl", "stated", "none")
 BASIS_FOR = {"verified": ("executed",), "reported": ("acl", "stated"), "unknown": ("none",)}
+OBSERVATION_KEYS = ("id", "resource", "runtime_identity", "rights")
 RIGHT_KEYS = ("can", "status", "basis", "source_event", "evidence_at", "checked_at")
 STALE_AFTER_SECONDS = 24 * 60 * 60
 FUTURE_SKEW_SECONDS = 5 * 60                         # a clock may run a little ahead; a time beyond this is refused
@@ -79,18 +90,24 @@ _RESOURCE = re.compile(r"^[a-z][a-z0-9]{1,15}:[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$"
 _STAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
 # COMPARE-AND-SET, ONE COMMAND ON THE SERVER. KEYS: the instance hash, the roster set. ARGV: the id,
-# the cap field, the value read a moment ago ("" for absent), the new value, then the canonical fields.
+# the cap field, whether a value was read ('1') or the field was ABSENT ('0'), the value read (unused
+# when absent), the new value, then the canonical fields.
 # A read followed by a separate HSET could overwrite evidence written in between, or create a hash
 # that was deleted in between (Aya on be4a776); in one script the checks and the write are one step.
+# ABSENT IS NOT EMPTY (Aya on a79a3ca): a field that exists and holds "" is a stored value. Expecting
+# absence, the field must not exist at all.
 CAS_LUA = """
 if redis.call('sismember', KEYS[2], ARGV[1]) ~= 1 then return 'not-a-member' end
-for i = 5, #ARGV do
+for i = 6, #ARGV do
   if redis.call('hexists', KEYS[1], ARGV[i]) ~= 1 then return 'incomplete' end
 end
 local held = redis.call('hget', KEYS[1], ARGV[2])
-if held == false then held = '' end
-if held ~= ARGV[3] then return 'changed' end
-redis.call('hset', KEYS[1], ARGV[2], ARGV[4])
+if ARGV[3] == '0' then
+  if held ~= false then return 'changed' end
+else
+  if held == false or held ~= ARGV[4] then return 'changed' end
+end
+redis.call('hset', KEYS[1], ARGV[2], ARGV[5])
 return 'written'
 """
 
@@ -117,12 +134,71 @@ def _text(value):
     return value.decode("utf-8", "replace") if isinstance(value, bytes) else value
 
 
+def _latest(now=None):
+    return (now or datetime.datetime.now(datetime.timezone.utc)) + datetime.timedelta(seconds=FUTURE_SKEW_SECONDS)
+
+
+def state_problems(state, where, latest) -> list:
+    """Everything wrong with ONE right's state."""
+    if not isinstance(state, dict) or set(state) != set(RIGHT_KEYS):
+        return ["%s: a state is exactly %s" % (where, ", ".join(RIGHT_KEYS))]
+    can, status, basis = state["can"], state["status"], state["basis"]
+    if can not in CAN or status not in STATUS or basis not in BASIS:
+        return ["%s: can is one of %s, status one of %s, basis one of %s; not %r / %r / %r. An observation is "
+                "never a grant or a denial" % (where, CAN, STATUS, BASIS, can, status, basis)]
+    problems = []
+    if (can == "unknown") != (status == "unknown"):
+        problems.append("%s: unknown is unknown in both, or in neither (%s / %s)" % (where, can, status))
+    if basis not in BASIS_FOR[status]:
+        problems.append("%s: %s needs basis %s, not %s. An access list or a statement is REPORTED; only what the "
+                        "runtime did is verified" % (where, status, " or ".join(BASIS_FOR[status]), basis))
+    checked = _time(state["checked_at"])
+    if checked is None:
+        problems.append("%s: checked_at must be a real time, YYYY-MM-DDTHH:MM:SSZ: when somebody last looked" % where)
+    elif checked > latest:
+        problems.append("%s: checked_at is in the future" % where)
+    if status == "unknown":
+        if state["evidence_at"] != "" or not isinstance(state["source_event"], str):
+            problems.append("%s: unknown has no evidence time" % where)
+        return problems
+    if not _plain(state["source_event"], 240):
+        problems.append("%s: %s needs its source_event: what was run, or who said it" % (where, status))
+    evidence = _time(state["evidence_at"])
+    if evidence is None:
+        problems.append("%s: evidence_at must be a real time, YYYY-MM-DDTHH:MM:SSZ" % where)
+    elif evidence > latest:
+        problems.append("%s: evidence_at is in the future" % where)
+    elif checked is not None and evidence > checked:
+        problems.append("%s: the evidence is dated after its own check" % where)
+    return problems
+
+
+def observation_problems(obs, where, latest) -> list:
+    """Everything wrong with ONE observation whose id and resource are already known to be sound.
+
+    THE FILE'S OBSERVATIONS GO THROUGH THIS, AND SO DOES A VALUE READ BACK FROM REDIS before it is
+    compared with anything (decide): a stored value is judged whole, never by its times alone."""
+    problems = []
+    if set(obs) != set(OBSERVATION_KEYS):
+        problems.append("%s: an observation is id, resource, runtime_identity and rights, nothing else" % where)
+    if not _plain(obs.get("runtime_identity"), 200):
+        problems.append("%s: no runtime_identity. Say WHICH login or account was observed" % where)
+    rights = obs.get("rights")
+    if not isinstance(rights, dict) or set(rights) != set(RIGHTS):
+        problems.append("%s: rights must be exactly %s, each its own state" % (where, ", ".join(RIGHTS)))
+        return problems
+    for right in RIGHTS:
+        problems.extend(state_problems(rights[right], "%s, %s" % (where, right), latest))
+    if not problems and len(cap_value(obs).encode("utf-8")) > CAP_VALUE_BYTES:
+        problems.append("%s: the value is over %d bytes" % (where, CAP_VALUE_BYTES))
+    return problems
+
+
 def check(data, now=None) -> list:
     """Everything wrong with the capability file. Empty means it may be written.
 
     STRICT ON PURPOSE: this is read by agents deciding who to hand work to."""
-    now = now or datetime.datetime.now(datetime.timezone.utc)
-    latest = now + datetime.timedelta(seconds=FUTURE_SKEW_SECONDS)
+    latest = _latest(now)
     problems, seen = [], set()
     if not isinstance(data, dict) or not isinstance(data.get("observations"), list):
         return ["the file needs an observations list"]
@@ -144,54 +220,7 @@ def check(data, now=None) -> list:
         if (rid.lower(), resource) in seen:
             problems.append("%s appears twice" % where)
         seen.add((rid.lower(), resource))
-        if set(obs) != {"id", "resource", "runtime_identity", "rights"}:
-            problems.append("%s: an observation is id, resource, runtime_identity and rights, nothing else" % where)
-        if not _plain(obs.get("runtime_identity"), 200):
-            problems.append("%s: no runtime_identity. Say WHICH login or account was observed" % where)
-        rights = obs.get("rights")
-        if not isinstance(rights, dict) or set(rights) != set(RIGHTS):
-            problems.append("%s: rights must be exactly %s, each its own state" % (where, ", ".join(RIGHTS)))
-            continue
-        sound = True
-        for right in RIGHTS:
-            state = rights[right]
-            before = len(problems)
-            if not isinstance(state, dict) or set(state) != set(RIGHT_KEYS):
-                problems.append("%s, %s: a state is exactly %s" % (where, right, ", ".join(RIGHT_KEYS)))
-                sound = False
-                continue
-            can, status, basis = state["can"], state["status"], state["basis"]
-            if can not in CAN or status not in STATUS or basis not in BASIS:
-                problems.append("%s, %s: can is one of %s, status one of %s, basis one of %s; not %r / %r / %r. "
-                                "An observation is never a grant or a denial" % (where, right, CAN, STATUS, BASIS, can, status, basis))
-                sound = False
-                continue
-            if (can == "unknown") != (status == "unknown"):
-                problems.append("%s, %s: unknown is unknown in both, or in neither (%s / %s)" % (where, right, can, status))
-            if basis not in BASIS_FOR[status]:
-                problems.append("%s, %s: %s needs basis %s, not %s. An access list or a statement is REPORTED; "
-                                "only what the runtime did is verified" % (where, right, status, " or ".join(BASIS_FOR[status]), basis))
-            checked = _time(state["checked_at"])
-            if checked is None:
-                problems.append("%s, %s: checked_at must be a real time, YYYY-MM-DDTHH:MM:SSZ: when somebody last looked" % (where, right))
-            elif checked > latest:
-                problems.append("%s, %s: checked_at is in the future" % (where, right))
-            if status == "unknown":
-                if state["evidence_at"] != "" or not isinstance(state["source_event"], str):
-                    problems.append("%s, %s: unknown has no evidence time" % (where, right))
-            else:
-                if not _plain(state["source_event"], 240):
-                    problems.append("%s, %s: %s needs its source_event: what was run, or who said it" % (where, right, status))
-                evidence = _time(state["evidence_at"])
-                if evidence is None:
-                    problems.append("%s, %s: evidence_at must be a real time, YYYY-MM-DDTHH:MM:SSZ" % (where, right))
-                elif evidence > latest:
-                    problems.append("%s, %s: evidence_at is in the future" % (where, right))
-                elif checked is not None and evidence > checked:
-                    problems.append("%s, %s: the evidence is dated after its own check" % (where, right))
-            sound = sound and len(problems) == before
-        if sound and len(cap_value(obs).encode("utf-8")) > CAP_VALUE_BYTES:
-            problems.append("%s: the value is over %d bytes" % (where, CAP_VALUE_BYTES))
+        problems.extend(observation_problems(obs, where, latest))
     return problems
 
 
@@ -222,32 +251,50 @@ def expected(data) -> dict:
     return out
 
 
-def decide(stored, obs) -> tuple:
+UNREADABLE = "the stored value is not a whole, valid observation in this path's own form, so it is not overwritten"
+
+
+def stored_observation(stored, obs, now=None):
+    """The observation a stored value holds, or None when it is not one.
+
+    JUDGED WHOLE (Aya on a79a3ca): five checked_at fields and nothing else used to be enough to be
+    compared, and then replaced. A stored value now goes through the file's own check - every can,
+    status, basis, source and time, and the identity - and must be the very text this path writes."""
+    try:
+        held = json.loads(stored)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(held, dict) or set(held) != {"runtime_identity", "rights"}:
+        return None
+    was = {"id": obs["id"], "resource": obs["resource"], "runtime_identity": held["runtime_identity"], "rights": held["rights"]}
+    if observation_problems(was, "stored", _latest(now)) or cap_value(was) != stored:
+        return None
+    return was
+
+
+def decide(stored, obs, now=None) -> tuple:
     """("write" | "same" | "refuse", why) for one observation against what Redis holds for its field.
 
     NEWER EVIDENCE IS NEVER OVERWRITTEN BY OLDER, and two different claims about one moment are a
     conflict a person settles, not something the later writer wins."""
     stored = _text(stored)
-    if stored in (None, ""):
+    if stored is None:                                # NONE ALONE IS ABSENCE. An empty string is a stored value.
         return "write", ""
     if stored == cap_value(obs):
         return "same", ""
-    try:
-        held = json.loads(stored)
-        pairs = [(right, held["rights"][right], obs["rights"][right]) for right in RIGHTS]
-        times = [(right, _time(old["checked_at"]), _time(new["checked_at"]), old, new) for right, old, new in pairs]
-    except (ValueError, KeyError, TypeError):
-        return "refuse", "the stored value is not one this path can read, so it is not overwritten"
-    if any(was is None for _, was, _, _, _ in times):
-        return "refuse", "the stored value is not one this path can read, so it is not overwritten"
+    was = stored_observation(stored, obs, now)
+    if was is None:
+        return "refuse", UNREADABLE
     newer = False
-    for right, was, now, old, new in times:
-        if now < was:
+    for right in RIGHTS:
+        old, new = was["rights"][right], obs["rights"][right]
+        before, here = _time(old["checked_at"]), _time(new["checked_at"])
+        if here < before:
             return "refuse", ("stale: %s was checked at %s in Redis and at %s here; newer evidence is not overwritten"
                               % (right, old["checked_at"], new["checked_at"]))
-        if now == was and old != new:
+        if here == before and old != new:
             return "refuse", "conflict: %s has the same check time (%s) and a different state" % (right, new["checked_at"])
-        newer = newer or now > was
+        newer = newer or here > before
     if not newer:
         return "refuse", "conflict: no check here is newer than the stored one, and the value differs"
     return "write", ""
@@ -261,7 +308,7 @@ def _hash(conn, key) -> dict:
     return {_text(name): _text(value) for name, value in (conn.hgetall(key) or {}).items()}
 
 
-def write(conn, data) -> dict:
+def write(conn, data, now=None) -> dict:
     """Judge every observation, then compare-and-set the ones that are new. See the module's account."""
     out = {"written": [], "same": [], "refused": [], "lost": [], "changed_elsewhere": [], "not_read_back": []}
     members, plan, before = _members(conn), [], {}
@@ -279,11 +326,11 @@ def write(conn, data) -> dict:
             out["refused"].append("%s: the hash is missing or incomplete (%d of %d canonical fields absent); it is "
                                   "not created or completed here" % (where, len(absent), len(CANONICAL_FIELDS)))
             continue
-        verdict, why = decide(held.get(field), obs)
+        verdict, why = decide(held.get(field), obs, now)
         if verdict == "refuse":
             out["refused"].append("%s: %s" % (where, why))
             continue
-        plan.append((where, obs, key, field, verdict, held.get(field, "")))
+        plan.append((where, obs, key, field, verdict, held.get(field)))      # None when the field is absent
     if out["refused"]:
         return out                                    # one refusal, and nothing is written for anyone
     ours, lost = {}, set()
@@ -292,7 +339,8 @@ def write(conn, data) -> dict:
         if verdict == "same":
             out["same"].append(where)
             continue
-        answer = _text(conn.eval(CAS_LUA, 2, key, ROSTER_SET, obs["id"], field, held, cap_value(obs), *CANONICAL_FIELDS))
+        answer = _text(conn.eval(CAS_LUA, 2, key, ROSTER_SET, obs["id"], field, "0" if held is None else "1",
+                                 "" if held is None else held, cap_value(obs), *CANONICAL_FIELDS))
         if answer == "written":
             out["written"].append(where)
         else:
@@ -378,10 +426,16 @@ def main(argv=None) -> int:
             print("REFUSED, NOTHING WRITTEN FOR ANYONE: " + line)
         if out["refused"]:
             return 1
-        print("written: %d field(s) by compare-and-set; already the same: %d; nothing else was sent"
-              % (len(out["written"]), len(out["same"])))
+        # EACH FIELD IS ITS OWN COMPARE-AND-SET, NOT ONE BATCH: some may be set and one not. So every
+        # field is named with what happened to it, and a partial run is told apart from a whole one.
+        print("written: %d field(s) by compare-and-set; already the same: %d; not written: %d; nothing else was sent"
+              % (len(out["written"]), len(out["same"]), len(out["lost"])))
+        for line in out["written"]:
+            print("  WRITTEN  " + line)
+        for line in out["same"]:
+            print("  SAME     " + line)
         for line in out["lost"]:
-            print("NOT WRITTEN, IT MOVED BETWEEN THE READ AND THE WRITE: " + line)
+            print("  NOT WRITTEN, IT MOVED BETWEEN THE READ AND THE WRITE  " + line)
         for line in out["changed_elsewhere"]:
             print("CHANGED WHILE WRITING (not by this path): " + line)
         for line in out["not_read_back"]:
