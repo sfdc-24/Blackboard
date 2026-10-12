@@ -389,6 +389,70 @@ class TheLedger(unittest.TestCase):
         self.assertEqual(1, rows["fleet:inbox:gemini"]["unread"])
         self.assertIsNone(rows["conf:side:20261011"]["unread"], "a room is not an inbox")
 
+    def test_cursor_on_5a487d3_a_trimmed_range_survives_two_more_failed_runs(self):
+        # Cursor's exact sequence: the first run writes 1001-0_1003-0 and dies on its ledger; 1001-0 is trimmed;
+        # the recovery run replaces the pending range and dies on its new upload; the next dies on its ledger;
+        # the one after finishes. The first object must be named by that ledger before the cursor passes it.
+        conn = seeded()
+        bucket = Bucket(fail_on="LEDGER-r1")
+        with self.assertRaises(ConnectionError):
+            ra.run(conn, bucket.put, now=NOW, run_id="r1")
+        orphan = [n for n in bucket.objects if "conf__side" in n][0]
+        self.assertTrue(orphan.endswith("/1001-0_1003-0.jsonl"))
+        conn.data["conf:side:20261011"].pop(0)
+        for run_id, failing in (("r2", "conf__side__20261011/1002-0_"), ("r3", "LEDGER-r3")):
+            bucket.fail_on = failing
+            with self.assertRaises(ConnectionError):
+                ra.run(conn, bucket.put, now=NOW + datetime.timedelta(hours=1), run_id=run_id)
+            self.assertEqual(orphan, conn.hget(ra.SUPERSEDED_KEY, "conf:side:20261011"),
+                             "the pointer is durable after %s fails" % run_id)
+            self.assertIsNone(conn.hget(ra.CURSOR_KEY, "conf:side:20261011"))
+        bucket.fail_on = None
+        out = ra.run(conn, bucket.put, now=NOW + datetime.timedelta(hours=2), run_id="r4")
+        self.assertIn(orphan, json.loads(bucket.objects[out["ledger"]])["superseded"])
+        self.assertEqual("1003-0", conn.hget(ra.CURSOR_KEY, "conf:side:20261011"))
+        self.assertEqual({}, conn.data.get(ra.SUPERSEDED_KEY) or {}, "named, then cleared")
+        later = ra.run(conn, bucket.put, now=NOW + datetime.timedelta(hours=3), run_id="r5")
+        self.assertEqual([], json.loads(bucket.objects[later["ledger"]])["superseded"], "named once, not every hour")
+
+    def test_a_crash_after_the_cursor_moved_leaves_no_false_superseded(self):
+        # Phase 3 dies between moving a cursor and clearing its pending range. That range is committed (its
+        # ledger is durable), so the next run must neither rewrite it nor report it as superseded.
+        conn, bucket = seeded(), Bucket()
+        real_hdel = conn.hdel
+
+        def dies_clearing(key, *fields):
+            if key == ra.PENDING_KEY:
+                raise ConnectionError("worker lost")
+            real_hdel(key, *fields)
+        conn.hdel = dies_clearing
+        with self.assertRaises(ConnectionError):
+            ra.run(conn, bucket.put, now=NOW, run_id="r1")
+        conn.hdel = real_hdel
+        self.assertEqual("1003-0", conn.hget(ra.CURSOR_KEY, "conf:side:20261011"))
+        out = ra.run(conn, bucket.put, now=NOW + datetime.timedelta(hours=1), run_id="r2")
+        ledger = json.loads(bucket.objects[out["ledger"]])
+        self.assertEqual(([], 0), (ledger["superseded"], ledger["totals"]["new"]))
+        self.assertEqual({}, conn.data.get(ra.PENDING_KEY) or {})
+
+    def test_a_lower_cap_after_a_crash_names_the_larger_range_it_cannot_rewrite(self):
+        conn, bucket = FakeRedis(), Bucket(fail_on="LEDGER-r1")
+        for k in range(7):
+            conn.xadd("fleet:inbox:grok", {"text": str(k)})
+        original = ra.MAX_PER_STREAM
+        try:
+            ra.MAX_PER_STREAM = 5
+            with self.assertRaises(ConnectionError):
+                ra.run(conn, bucket.put, now=NOW, run_id="r1")
+            ra.MAX_PER_STREAM = 3
+            bucket.fail_on = None
+            out = ra.run(conn, bucket.put, now=NOW + datetime.timedelta(hours=1), run_id="r2")
+        finally:
+            ra.MAX_PER_STREAM = original
+        ledger = json.loads(bucket.objects[out["ledger"]])
+        self.assertEqual(["redis-archive/streams/fleet__inbox__grok/1001-0_1005-0.jsonl"], ledger["superseded"])
+        self.assertEqual("1003-0", conn.hget(ra.CURSOR_KEY, "fleet:inbox:grok"))
+
     def test_a_pending_range_for_a_stream_that_expired_is_named_and_dropped(self):
         conn = seeded()
         bucket = Bucket(fail_on="LEDGER-r1")

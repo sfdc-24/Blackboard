@@ -158,7 +158,9 @@ copy we can restore ourselves.
 nothing archived is removed. One archiver at a time (`gov:archive:lock`, released compare-and-delete).
 A cursor moves only after the run's ledger is written; a range written and not yet committed is held in
 `gov:archive:pending`, so a run that dies before its ledger leaves every cursor where it was, and the next
-run - in any hour - writes the same range to the same object name (found, not doubled) and names it.
+run - in any hour - writes the same range to the same object name (found, not doubled) and names it. A
+range that can no longer be rewritten as it was (trimmed meanwhile) is kept in `gov:archive:superseded`
+until a ledger's `superseded` list names its object.
 
 ## The broken-telephone path (Drive → intake → worker or laptop → the doc)
 

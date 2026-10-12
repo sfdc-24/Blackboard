@@ -22,8 +22,10 @@ WHAT ONE RUN DOES
        SHA-256, and for an inbox the unread count after its reader's cursor (fleet:cursor:<agent>) - as one
        create-only JSON object under <prefix>/<date>/<hour>/, named by the run and its own hash.
     5. Only then moves each cursor and clears its pending range. Every object is therefore named by a
-       ledger: this run's, or - if the run died before its ledger - the next run's. At-least-once, never
-       lost, never doubled.
+       ledger: this run's, or - if the run died before its ledger - the next run's. A pending range that
+       can no longer be written again as it was (its first entry trimmed, or the cap changed) is recorded
+       in gov:archive:superseded BEFORE it is replaced, and stays there until a ledger names it. At-least-
+       once, never lost, never doubled.
     6. Posts ONE board row that names the ledger and carries its hash. Nobody is woken: the row is
        addressed to `ledger`, which is no agent.
 
@@ -67,6 +69,11 @@ CURSOR_KEY = "gov:archive:cursor"        # hash: stream key -> last archived ent
 # It is what makes a retry in ANY later hour write the SAME object instead of a second copy (Copilot on
 # 0bda93e: the name used to carry the run's hour, so a crash then the next hour duplicated the range).
 PENDING_KEY = "gov:archive:pending"
+# hash: stream key -> space-separated object names that may exist from a range written and never committed,
+# and that the pending range no longer describes (its first entry was trimmed, or the run's cap changed).
+# Written BEFORE the pending range is replaced and cleared only after a durable ledger names them, so a
+# second failed run cannot lose the pointer (Cursor on 5a487d3: it used to live only in memory).
+SUPERSEDED_KEY = "gov:archive:superseded"
 READER_CURSOR = "fleet:cursor:%s"        # an inbox reader's own cursor (REDIS-PRIMARY 5.1); may not exist
 BATCH = 1000
 MAX_PER_STREAM = 50000                   # per run; the rest is the next hour's, and the ledger says so
@@ -150,20 +157,26 @@ def stage_stream(conn, key: str, put, folder: str, dry_run=False) -> dict:
     more = len(entries) > MAX_PER_STREAM
     entries = entries[:MAX_PER_STREAM]
     pending = text(conn.hget(PENDING_KEY, key)).split()
-    if len(pending) == 2 and entries and entries[0][0] == pending[0]:
+    open_range = len(pending) == 2 and order(pending[1]) > order(cursor)     # written, never committed
+    if open_range and entries and entries[0][0] == pending[0]:
         # A range written before and not yet committed: write EXACTLY that range again, whatever the hour.
         pinned = [e for e in entries if order(e[0]) <= order(pending[1])]
         more = more or len(pinned) < len(entries)
         entries = pinned
-        pending = []
     found = unread(conn, key)
     row = {"key": key, "new": len(entries), "after": cursor, "length": int(conn.xlen(key) or 0),
            "unread": None if found is None else found[0],
            "unread_capped": None if found is None else found[1], "more": more}
-    if len(pending) == 2 and order(pending[1]) > order(cursor):
-        # A range written and never committed whose first entry is gone (the stream was trimmed): its
-        # object may exist, so THIS ledger names it - no object is ever left unnamed.
-        row["superseded"] = "%s/%s/%s_%s.jsonl" % (folder, safe_key(key), pending[0], pending[1])
+    if open_range and not (entries and [entries[0][0], entries[-1][0]] == pending):
+        # The open range can no longer be written again as it was (its first entry was trimmed, or the cap
+        # changed), so its object - which may exist - gets a different name from what this run writes.
+        # Recorded durably BEFORE the pending range is replaced below; a ledger names it later.
+        old = "%s/%s/%s_%s.jsonl" % (folder, safe_key(key), pending[0], pending[1])
+        row["superseded"] = old
+        if not dry_run:
+            names = text(conn.hget(SUPERSEDED_KEY, key)).split()
+            if old not in names:
+                conn.hset(SUPERSEDED_KEY, key, " ".join(names + [old]))
     if not entries:
         row["last"] = cursor
         return row
@@ -237,6 +250,11 @@ def run(conn, put, append=None, now=None, run_id="", dry_run=False, prefix=DEFAU
             pair = text(conn.hget(PENDING_KEY, k)).split()
             if len(pair) == 2:
                 orphans.append("%s/%s/%s_%s.jsonl" % (objects_folder, safe_key(k), pair[0], pair[1]))
+        recorded = [text(k) for k in (conn.hkeys(SUPERSEDED_KEY) or [])]
+        for k in recorded:
+            orphans.extend(text(conn.hget(SUPERSEDED_KEY, k)).split())
+        orphans.extend(r["superseded"] for r in rows if r.get("superseded"))     # a dry run recorded nothing
+        orphans = sorted(set(orphans))
         ledger = {"run": run_id, "hour": now.strftime("%Y-%m-%dT%HZ"), "at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
                   "dry_run": bool(dry_run), "streams": rows, "dropped_cursors": stale, "superseded": orphans,
                   "totals": {"new": sum(r["new"] for r in rows),
@@ -262,6 +280,8 @@ def run(conn, put, append=None, now=None, run_id="", dry_run=False, prefix=DEFAU
                 conn.hset(CURSOR_KEY, r["key"], r["last"])
         if rows or gone:
             conn.hdel(PENDING_KEY, *([r["key"] for r in rows] + gone))
+        if recorded:
+            conn.hdel(SUPERSEDED_KEY, *recorded)
         if stale:
             conn.hdel(CURSOR_KEY, *stale)
         if append is not None:
