@@ -850,12 +850,12 @@ REDIS_OP_MARK = "REDIS-OP|"
 REDIS_OPS = ("get", "hgetall", "xrange", "set", "del", "hset", "hput", "xadd")
 
 
-REQUEST_FIELDS = ("op", "key", "val", "field", "count")
+REQUEST_FIELDS = ("op", "key", "val", "field", "count", "after")
 REQUEST_STATES = ("posted", "unconfirmed", "refused", "cut", "malformed")
 # Exactly the fields each op takes (Aya's supplement to #367): a get with a val, a del with a count,
 # an hset without a field is a line the model misread, not one to guess at. xrange may omit count.
 REQUEST_SHAPES = {
-    "get": {"op", "key"}, "hgetall": {"op", "key"}, "xrange": {"op", "key", "count"},
+    "get": {"op", "key"}, "hgetall": {"op", "key"}, "xrange": {"op", "key", "count", "after"},
     "set": {"op", "key", "val"}, "del": {"op", "key"}, "hset": {"op", "key", "field", "val"},
     "hput": {"op", "key", "val"}, "xadd": {"op", "key", "val"},
 }
@@ -918,17 +918,26 @@ def redis_request(text: str, report: dict = None):
             why.append("a write with no val")
             continue
         shape = {name for name, value in fields.items() if value != ""}
-        if shape != REQUEST_SHAPES[op] and not (op == "xrange" and shape == {"op", "key"}):
+        # xrange takes key, and count, after (a stream entry id, main #392), both or neither.
+        if (op == "xrange" and not ({"op", "key"} <= shape <= REQUEST_SHAPES["xrange"])) or (
+                op != "xrange" and shape != REQUEST_SHAPES[op]):
             dropped += 1
             why.append("the %s op takes exactly %s" % (op, ", ".join(sorted(REQUEST_SHAPES[op]))))
             continue
         request = {"op": op, "key": key, "val": fields.get("val") or None, "field": fields.get("field") or None,
                    "count": fields.get("count") or None}
+        if fields.get("after"):              # xrange after a cursor (main, #392); absent, unchanged
+            request["after"] = fields["after"]
         # count is model-chosen too: anything but a small whole number is malformed here, so it never
         # reaches argparse, whose error message would echo it into the waker's output and the reply.
         if request["count"] is not None and not re.fullmatch(r"[1-9][0-9]{0,3}", request["count"]):
             request, dropped = None, dropped + 1
             why.append("count is not a whole number from 1 to 9999")
+        elif request.get("after") is not None and not (
+                re.fullmatch(r"[0-9]{1,20}-[0-9]{1,20}", request["after"])
+                and all(int(p) <= 2 ** 64 - 1 for p in request["after"].split("-"))):
+            request, dropped = None, dropped + 1
+            why.append("after is not a stream entry id <ms>-<seq>")
     body = "\n".join(kept)
     if dropped:
         # No pipe in this note: it is posted into a pipe-delimited row (the rule the line itself broke).
@@ -1008,6 +1017,8 @@ def post_request(me: str, cfg: dict, request: dict, verbose: bool, answers: str 
         args += ["--field", request["field"]]
     if request.get("count"):
         args += ["--count", str(request["count"])]
+    if request.get("after"):
+        args += ["--after", str(request["after"])]
     try:
         res = subprocess.run(args, cwd=REPO, capture_output=True, text=True, timeout=POST_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:

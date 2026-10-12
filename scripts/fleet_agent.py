@@ -644,7 +644,8 @@ REQUEST_OPS = ("get", "hgetall", "xrange", "set", "del", "hset", "hput", "xadd")
 _REQUEST_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{3,63}$")
 
 
-def request_row(tag, op, key, val=None, field=None, count=None, project="FLEET", rid=None, now=None):
+def request_row(tag, op, key, val=None, field=None, count=None, project="FLEET", rid=None, now=None,
+                after=None):
     """(rid, row) for one governed Redis request, in the exact shape bus_request.parse_request reads.
 
     The value always travels base64 (enc=b64): the payload has no escaping, so a pipe or a newline in
@@ -684,6 +685,12 @@ def request_row(tag, op, key, val=None, field=None, count=None, project="FLEET",
         parts.append("enc=b64")
     if count is not None:
         parts.append("count=%d" % int(count))
+    if after:
+        pieces = str(after).strip().split("-")
+        if (op != "xrange" or not re.fullmatch(r"[0-9]{1,20}-[0-9]{1,20}", str(after).strip())
+                or any(int(p) > 2 ** 64 - 1 for p in pieces)):
+            raise ValueError("--after is for xrange only, and is a stream entry id <ms>-<seq>")
+        parts.append("after=%s" % str(after).strip())
     parts += ["from=%s" % tag, "to=%s" % REQUEST_WORKER]
     payload = "|".join(parts)
     if len(payload) > board_row.ROW_LIMIT:
@@ -708,7 +715,8 @@ def cmd_request(args):
     posting" and NOT SENT are refused, UNCONFIRMED is unconfirmed."""
     try:
         rid, row = request_row(args.tag, args.op, args.key, val=args.val, field=args.field,
-                               count=args.count, project=args.project, rid=args.id)
+                               count=args.count, project=args.project, rid=args.id,
+                               after=getattr(args, "after", None))
     except ValueError as why:
         print("  refused before posting: %s" % why)
         return EXIT_REFUSED
@@ -768,6 +776,8 @@ def build_parser():
     rq.add_argument("--val", default=None, help="the value (set, hset, xadd) or a JSON object (hput)")
     rq.add_argument("--field", default=None, help="the hash field, for hset")
     rq.add_argument("--count", type=int, default=None, help="entries to return, for xrange")
+    rq.add_argument("--after", default=None,
+                    help="xrange only: the entries after this stream id (<ms>-<seq>), oldest first")
     rq.add_argument("--tag", default="claude-code-cli")
     rq.add_argument("--project", default="FLEET")
     rq.add_argument("--id", required=True,

@@ -147,6 +147,20 @@ class FakeRedis:
         entries = list(reversed(self.data.get(key) or []))
         return entries[:count] if count else entries
 
+    def xrange(self, key, min="-", max="+", count=None):
+        """Redis XRANGE, oldest first, with the exclusive "(" bound of Redis 6.2+ on min."""
+        self._need(key, "stream")
+        order = lambda entry_id: tuple(int(p) for p in entry_id.split("-"))   # noqa: E731
+        if min == "-":
+            keep = lambda i: True                                             # noqa: E731
+        elif min.startswith("("):
+            keep = lambda i: order(i) > order(min[1:])                       # noqa: E731
+        else:
+            keep = lambda i: order(i) >= order(min)                          # noqa: E731
+        assert max == "+", "the governed read never bounds the top"
+        entries = [(i, f) for i, f in (self.data.get(key) or []) if keep(i)]
+        return entries[:count] if count else entries
+
     def pipeline(self, transaction=True):
         return FakePipeline(self)
 
@@ -493,6 +507,128 @@ class TheServerSetsTheTTL(unittest.TestCase):
         self.assertNotIn(gov.AUDIT_STREAM, conn.ttls)
 
 
+class XrangeAfterACursor(unittest.TestCase):
+    """An inbox read asks for everything after the last entry it saw, oldest first, and is told whether
+    more is waiting - so a burst larger than one page is paged, never cut to the newest (REDIS-PRIMARY
+    5.1). Without it, xrange returns the newest n, and the oldest of a burst of n+1 is never read."""
+
+    def stream(self, n):
+        conn = FakeRedis()
+        for k in range(1, n + 1):
+            self.assertTrue(run(conn, "grok", "xadd", "fleet:inbox:gemini", val="m%d" % k)["ok"])
+        return conn
+
+    def read(self, conn, after="", count=10, op="xrange", key="fleet:inbox:gemini"):
+        return gov.execute(conn, ACL, "gemini", "REQ-A", op, key, count=count, after=after)
+
+    def test_pages_oldest_first_and_says_when_more_is_waiting(self):
+        conn = self.stream(25)
+        first = self.read(conn, after="0-0", count=20)
+        self.assertTrue(first["ok"])
+        self.assertEqual(["m%d" % k for k in range(1, 21)], [e["text"] for e in first["value"]])
+        self.assertTrue(first["more"])
+        second = self.read(conn, after=first["value"][-1]["id"], count=20)
+        self.assertEqual(["m%d" % k for k in range(21, 26)], [e["text"] for e in second["value"]])
+        self.assertFalse(second["more"])
+
+    def test_the_newest_n_read_loses_the_oldest_of_a_burst_which_is_why_after_exists(self):
+        conn = self.stream(21)
+        newest = self.read(conn, count=20)
+        self.assertNotIn("m1", [e["text"] for e in newest["value"]])
+        paged = self.read(conn, after="0-0", count=20)
+        self.assertEqual("m1", paged["value"][0]["text"])
+
+    def test_after_the_last_entry_is_empty_not_an_error(self):
+        conn = self.stream(3)
+        got = self.read(conn, after="3-0")
+        self.assertTrue(got["ok"])
+        self.assertEqual(0, got["entries"])
+        self.assertFalse(got["more"])
+
+    def test_the_cursor_is_exclusive(self):
+        conn = self.stream(3)
+        self.assertEqual(["m3"], [e["text"] for e in self.read(conn, after="2-0")["value"]])
+
+    def test_after_on_any_other_op_is_refused_and_audited(self):
+        conn = self.stream(1)
+        got = self.read(conn, after="1-0", op="get", key="fleet:x")
+        self.assertFalse(got["ok"])
+        self.assertIn("xrange only", got["refused"])
+        self.assertFalse(conn.audit()[-1]["ok"] in (True, "true", "1"))
+
+    def test_a_malformed_cursor_is_refused(self):
+        conn = self.stream(1)
+        for bad in ("1", "1-", "-1", "a-b", "(1-0", "1-0|op=del", "+", "-", "$", "1-0\n2-0"):
+            got = self.read(conn, after=bad)
+            self.assertFalse(got["ok"], bad)
+            self.assertIn("stream entry id", got["refused"], bad)
+
+    def test_a_cursor_part_above_the_unsigned_64_bit_maximum_is_refused_and_the_maximum_is_not(self):
+        conn = self.stream(1)
+        top = str(2 ** 64 - 1)
+        for bad in (str(2 ** 64) + "-0", "0-" + str(2 ** 64), "99999999999999999999-0"):
+            got = self.read(conn, after=bad)
+            self.assertFalse(got["ok"], bad)
+            self.assertIn("stream entry id", got["refused"], bad)
+        for edge in (top + "-0", "0-" + top, str(2 ** 63) + "-1"):
+            self.assertTrue(self.read(conn, after=edge)["ok"], edge)
+
+    def test_after_the_largest_id_is_an_empty_page_without_asking_redis(self):
+        # Cursor on 2dc187a: Redis 7.0 rejects XRANGE with an exclusive start at the largest id, so the
+        # read must not send it. Nothing can follow that id: the answer is an empty page.
+        top = str(2 ** 64 - 1) + "-" + str(2 ** 64 - 1)
+
+        class RejectsTheTop(FakeRedis):
+            def xrange(self, key, min="-", max="+", count=None):
+                if min == "(" + top:
+                    raise RuntimeError("ERR invalid start ID for the interval")
+                return FakeRedis.xrange(self, key, min=min, max=max, count=count)
+        conn = RejectsTheTop()
+        self.assertTrue(run(conn, "grok", "xadd", "fleet:inbox:gemini", val="m1")["ok"])
+        got = self.read(conn, after=top)
+        self.assertEqual((True, 0, False, top), (got["ok"], got["entries"], got["more"], got["last"]))
+        self.assertIn("[after=%s more=false last=%s]" % (top, top), gov.summarise(got))
+
+    def test_last_is_the_stream_id_even_when_an_entry_has_a_field_named_id(self):
+        conn = self.stream(2)
+        conn.data["fleet:inbox:gemini"].append(("9-2", {"id": "not-a-cursor", "text": "written elsewhere"}))
+        got = self.read(conn, after="0-0")
+        self.assertEqual("9-2", got["last"])
+        self.assertIn("last=9-2]", gov.summarise(got))
+
+    def test_the_board_answer_says_where_the_page_stands_before_the_entries(self):
+        conn = self.stream(25)
+        first = self.read(conn, after="0-0", count=20)
+        line = gov.summarise(first)
+        self.assertIn("[after=0-0 more=true last=%s]" % first["value"][-1]["id"], line)
+        self.assertLess(line.index("more=true"), line.index("m1"), "before the entries, so truncation keeps it")
+        last = gov.summarise(self.read(conn, after=first["value"][-1]["id"], count=20))
+        self.assertIn("more=false", last)
+        empty = gov.summarise(self.read(conn, after=conn.data["fleet:inbox:gemini"][-1][0]))
+        self.assertIn("more=false last=%s]" % conn.data["fleet:inbox:gemini"][-1][0], empty)
+        self.assertNotIn("more=", gov.summarise(self.read(conn)), "the newest-n read is unchanged")
+
+    def test_the_read_still_obeys_the_access_list(self):
+        conn = self.stream(1)
+        conn.data["probe:x"] = []
+        got = gov.execute(conn, ACL, "stranger", "REQ-A", "xrange", "fleet:inbox:gemini", after="0-0")
+        self.assertFalse(got["ok"])
+
+    def test_without_after_the_answer_is_unchanged(self):
+        conn = self.stream(2)
+        got = self.read(conn)
+        self.assertNotIn("more", got)
+        self.assertNotIn("after", got)
+        self.assertEqual(["m1", "m2"], [e["text"] for e in got["value"]])
+
+
+def without_answer_markers(data):
+    """Redis as the request left it, minus the worker's own gov:req: one-answer markers. Since main's
+    #390 every answer, a refusal included, is recorded once under gov:req:<digest> so it is never
+    answered twice; the marker holds the row id and a state, never the requested key or value."""
+    return {k: v for k, v in data.items() if not str(k).startswith("gov:req:")}
+
+
 class EndToEndThroughTheBoardWorker(unittest.TestCase):
     """A board row in, a Redis change and ONE RESULT row out - through bus_request.handle(), the
     function the bus-requests job actually runs."""
@@ -551,6 +687,42 @@ class EndToEndThroughTheBoardWorker(unittest.TestCase):
                 self.assertEqual([], out["refused"])
                 self.assertEqual("green", conn.data["conf:side:20261011"][0][1]["text"])
                 self.assertIn("green", written[1]["payload"])
+
+    def test_after_rides_the_row_from_the_tool_to_the_read(self):
+        import datetime
+        import fleet_agent
+        conn = FakeRedis()
+        for k in range(1, 4):
+            gov.execute(conn, ACL, "grok", "SEED", "xadd", "conf:side:20261011", raw_value="m%d" % k)
+        when = self.now - datetime.timedelta(minutes=1)
+        # The side stream: through a board row the worker answers no other key (#367's board rule).
+        rid, row = fleet_agent.request_row("gemini", "xrange", "conf:side:20261011", count=5, after="1-0",
+                                           now=when, rid="REQ-AFTER-0001")
+        self.assertIn("|after=1-0|", row[5])
+        out, written, conn = self.run_rows([row], conn)
+        self.assertEqual(["OK"], [a["status"] for a in out["answered"]])
+        self.assertIn('"m2"', written[0]["payload"])
+        self.assertIn('"m3"', written[0]["payload"])
+        self.assertNotIn('"m1"', written[0]["payload"])
+
+    def test_the_board_rule_takes_after_on_an_xrange_and_nowhere_else(self):
+        ok = self.row("gemini", "do=redis-op|op=xrange|key=conf:side:20261011|count=2|after=1-0", req="REQ-AFT-OK")
+        bad = (self.row("gemini", "do=redis-op|op=xadd|key=conf:side:20261011|val=aGk=|enc=b64|after=1-0",
+                        req="REQ-AFT-W"),
+               self.row("gemini", "do=redis-op|op=xrange|key=conf:side:20261011|after=1|count=2", req="REQ-AFT-F"),
+               self.row("gemini", "do=redis-op|op=xrange|key=conf:side:20261011|after=1-0|count=2",
+                        req="REQ-AFT-O"))                  # not the order the tool writes: not canonical
+        self.assertTrue(self.br.board_shared_request(self.br.parse_request(ok)))
+        for row in bad:
+            with self.subTest(payload=row[5]):
+                self.assertFalse(self.br.board_shared_request(self.br.parse_request(row)))
+
+    def test_the_tool_refuses_after_where_the_worker_would(self):
+        import fleet_agent
+        for op, after in (("get", "1-0"), ("xrange", "1"), ("xrange", "1-0|op=del"),
+                          ("xrange", str(2 ** 64) + "-0")):
+            with self.assertRaises(ValueError):
+                fleet_agent.request_row("gemini", op, "fleet:inbox:gemini", after=after)
 
     def test_the_row_fleet_agent_builds_is_the_row_the_worker_answers(self):
         """The tool and the worker agree, proved on the real row - not a hand-written one.
@@ -669,7 +841,7 @@ class EndToEndThroughTheBoardWorker(unittest.TestCase):
         git_out, git_written, git_conn = self.run_rows([git_row])
         self.assertEqual(1, len(git_out["refused"]))
         self.assertIn("no field name", git_written[0]["payload"])
-        self.assertEqual({}, git_conn.data, "Git ambiguity is refused before a run claim")
+        self.assertEqual({}, without_answer_markers(git_conn.data), "Git ambiguity runs no Redis op")
 
     def test_a_stranger_with_the_same_tool_gets_no_row_and_writes_nothing(self):
         import datetime
@@ -706,8 +878,7 @@ class EndToEndThroughTheBoardWorker(unittest.TestCase):
         self.assertIn("REFUSED", rows[0]["payload"])
         self.assertEqual([], out["answered"])
         self.assertEqual([], conn.audit())
-        self.assertNotIn(self.br.run_marker(self.br.parse_request(self.row(
-            "gemini", "do=redis-op|op=set|key=v1:bus:row:R-1|val=Zm9yZ2Vk|enc=b64"))), conn.data)
+        self.assertEqual({}, without_answer_markers(conn.data), "the refusal runs no Redis op")
 
     def test_spoofed_board_tags_cannot_read_or_write_private_keys(self):
         """A caller can claim Gemini (or any ACL principal); the worker must ignore that claim
@@ -731,7 +902,10 @@ class EndToEndThroughTheBoardWorker(unittest.TestCase):
         out, written, _ = self.run_rows(rows, conn)
         self.assertEqual([], out["answered"])
         self.assertEqual(len(cases), len(out["refused"]))
-        self.assertEqual(before, conn.data, "no marker, read audit, or operation reached Redis")
+        self.assertEqual(before, without_answer_markers(conn.data), "no read audit or operation reached Redis")
+        for marker in [v for k, v in conn.data.items() if str(k).startswith("gov:req:")]:
+            for private in ("fleet:inbox:", "proj:private", "private-", "cHJpdmF0ZS13cml0ZS1zZWNyZXQ="):
+                self.assertNotIn(private, str(marker), "a one-answer marker carries no key or value")
         published = repr(written) + repr(out)
         for private in ("fleet:inbox:", "proj:private", "gov:audit", "private-",
                         "cHJpdmF0ZS13cml0ZS1zZWNyZXQ="):
@@ -764,7 +938,10 @@ class EndToEndThroughTheBoardWorker(unittest.TestCase):
         out, written, _ = self.run_rows(rows, conn)
         self.assertEqual([], out["answered"])
         self.assertEqual(len(rows), len(out["refused"]))
-        self.assertEqual({}, conn.data, "rejections are before markers and every Redis operation")
+        self.assertEqual({}, without_answer_markers(conn.data), "rejections run no Redis operation")
+        for marker in conn.data.values():
+            for private in ("fleet:inbox:grok", "private-secret", "c2VjcmV0", "cHJpdmF0ZQ=="):
+                self.assertNotIn(private, str(marker), "a one-answer marker carries no key or value")
         published = repr(written) + repr(out)
         for private in ("fleet:inbox:grok", "private-secret", "c2VjcmV0", "cHJpdmF0ZQ=="):
             self.assertNotIn(private, published)
