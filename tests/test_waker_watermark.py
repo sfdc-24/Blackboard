@@ -141,6 +141,157 @@ class WatermarkFloor(unittest.TestCase):
         self.assertGreaterEqual(self._state()["watermark"], "2026-09-20T15:00:00Z")
 
 
+class LaptopRedisClaim(unittest.TestCase):
+    """GROK'S API ROUTE IS A LAPTOP PASS, and until this a laptop pass refused every REDIS-OP line,
+    because nothing on the laptop could fence a retried ask. Now the pass holds an OS lock, writes
+    its claim to a synced file BEFORE the request append, and the next pass settles any claim left
+    behind from the board: answered when the reply is there, quarantined when it is not, and never
+    asked again either way. Driven end to end through main() with a fake model, board and poster."""
+
+    SRC = "CCC-SIDE-ASK-001"
+    LINE = "Done.\nREDIS-OP|op=xadd|key=conf:side:20261011|val=the lease shape holds"
+
+    def setUp(self):
+        import types
+        self.tmp = tempfile.mkdtemp()
+        self.model_calls, self.requests, self.replies = [], [], []
+        self.request_answer = ("posted", None)
+        self.reply_answer = True
+        self.claims_seen_at_request = None
+        self.board = [row(self.SRC, "2026-10-11T15:00:00Z")]
+        outer = self
+
+        def ask(prompt, max_tokens=None):
+            outer.model_calls.append(prompt)
+            return (outer.LINE, "fake-route")
+        ask.last_finish = "STOP"
+        self.real = (aw.state_path, aw.read_since, aw.post_reply, aw.post_request, aw.log,
+                     aw.load_env, aw.reserve_redis_side_effect, aw.AGENTS["grok"])
+        aw.sys.modules["fake_claim_adapter"] = types.SimpleNamespace(ask=ask)
+        aw.AGENTS["grok"] = dict(aw.AGENTS["grok"], module="fake_claim_adapter")
+        aw.state_path = lambda me: os.path.join(self.tmp, "." + me + "_waker_state.json")
+        aw.log = lambda me, line: None
+        aw.load_env = lambda: {}
+        aw.read_since = lambda env, since: {"rows": [r for r in self.board if str(r[1]) > since],
+                                            "total": len(self.board), "filtered": len(self.board)}
+
+        def post_request(me, cfg, request, verbose, answers=""):
+            outer.requests.append(answers)
+            outer.claims_seen_at_request = outer.claims()     # None under a runner's own claim
+            state, detail = outer.request_answer
+            return state, (detail or aw.request_id(me, answers))
+        aw.post_request = post_request
+
+        def post_reply(me, cfg, text, to, answers, verbose, phase="DONE"):
+            outer.replies.append(text)
+            if isinstance(outer.reply_answer, BaseException):
+                raise outer.reply_answer
+            return outer.reply_answer
+        aw.post_reply = post_reply
+
+    def tearDown(self):
+        (aw.state_path, aw.read_since, aw.post_reply, aw.post_request, aw.log,
+         aw.load_env, aw.reserve_redis_side_effect, aw.AGENTS["grok"]) = self.real
+        aw.sys.modules.pop("fake_claim_adapter", None)
+
+    def run_pass(self):
+        return aw.main(["--agent", "grok", "--max", "3", "--since-hours", "999999"])
+
+    def claims(self):
+        try:
+            with open(aw.claims_path("grok"), encoding="utf-8") as fh:
+                return json.load(fh)
+        except FileNotFoundError:
+            return None
+
+    def state(self):
+        with open(aw.state_path("grok"), encoding="utf-8") as fh:
+            return json.load(fh)
+
+    def test_the_claim_is_on_disk_before_the_request_append_and_gone_after_the_reply(self):
+        self.assertEqual(0, self.run_pass())
+        self.assertEqual([self.SRC], self.requests, "the laptop pass now sends the request")
+        claim = self.claims_seen_at_request[self.SRC]
+        self.assertEqual(("posting", aw.request_id("grok", self.SRC)), (claim["phase"], claim["request"]))
+        self.assertEqual({}, self.claims(), "the reply landed: the claim is cleared")
+        self.assertIn(self.SRC, self.state()["answered_ids"])
+        self.assertIn("redis_state=posted", self.replies[0])
+
+    def test_an_unconfirmed_reply_leaves_the_claim_and_the_next_pass_quarantines_without_asking(self):
+        self.reply_answer = False
+        self.run_pass()
+        self.assertIn(self.SRC, self.claims())
+        self.run_pass()
+        self.assertEqual((1, [self.SRC]), (len(self.model_calls), self.requests),
+                         "never asked again, never requested again")
+        self.assertIn(self.SRC, self.state().get("unknown_ids") or [])
+        self.assertNotIn(self.SRC, self.state()["answered_ids"])
+        self.assertEqual({}, self.claims())
+
+    def test_a_reply_that_did_land_is_reconciled_as_answered(self):
+        self.reply_answer = False
+        self.run_pass()
+        self.board.append([aw.reply_row_id("grok", self.SRC), "2026-10-11T15:05:00Z", "grok",
+                           "claude-code-cli;ALL", "DONE",
+                           "BCB|v=1|%s|answers=%s|evidence=STATED|" % (aw.WAKER_REPLY_MARK, self.SRC)])
+        self.run_pass()
+        self.assertEqual(1, len(self.model_calls))
+        self.assertIn(self.SRC, self.state()["answered_ids"])
+        self.assertNotIn(self.SRC, self.state().get("unknown_ids") or [])
+        self.assertEqual({}, self.claims())
+
+    def test_a_crash_after_the_request_leaves_a_claim_and_the_lock_goes_with_the_process(self):
+        self.reply_answer = RuntimeError("the pass died mid-reply")
+        with self.assertRaises(RuntimeError):
+            self.run_pass()
+        self.assertIn(self.SRC, self.claims(), "the claim reached the disk before the request")
+        self.reply_answer = True
+        self.assertEqual(0, self.run_pass(), "the lock did not outlive the pass")
+        self.assertEqual(1, len(self.model_calls))
+        self.assertIn(self.SRC, self.state().get("unknown_ids") or [])
+
+    def test_a_not_sent_reply_after_a_refused_request_clears_the_claim_and_the_ask_is_asked_again(self):
+        self.request_answer = ("refused", "refused before posting; nothing was sent")
+        self.reply_answer = aw.NOT_SENT
+        self.run_pass()
+        self.assertEqual({}, self.claims(), "nothing of this ask reached the board")
+        self.request_answer, self.reply_answer = ("posted", None), True
+        self.run_pass()
+        self.assertEqual(2, len(self.model_calls), "asked again on the next pass")
+        self.assertIn(self.SRC, self.state()["answered_ids"])
+
+    def test_a_not_sent_reply_after_a_posted_request_keeps_the_claim(self):
+        self.reply_answer = aw.NOT_SENT
+        self.run_pass()
+        self.assertIn(self.SRC, self.claims(), "the request may have run")
+        self.run_pass()
+        self.assertEqual(1, len(self.model_calls))
+        self.assertIn(self.SRC, self.state().get("unknown_ids") or [])
+
+    def test_a_second_pass_while_one_holds_the_lock_does_nothing(self):
+        held = aw._PassLock(aw.state_path("grok") + ".lock")
+        self.assertTrue(held.acquire())
+        try:
+            self.assertEqual(0, self.run_pass())
+        finally:
+            held.release()
+        self.assertEqual(([], []), (self.model_calls, self.requests))
+        self.assertFalse(os.path.exists(aw.state_path("grok")), "no state written by the pass that yielded")
+
+    def test_a_runner_with_its_own_claim_takes_no_lock_and_writes_no_claim_file(self):
+        aw.reserve_redis_side_effect = lambda answers_id: True
+        self.run_pass()
+        self.assertEqual([self.SRC], self.requests)
+        self.assertFalse(os.path.exists(aw.state_path("grok") + ".lock"))
+        self.assertIsNone(self.claims())
+
+    def test_an_unreadable_claim_file_stops_the_pass(self):
+        with open(aw.claims_path("grok"), "w", encoding="utf-8") as fh:
+            fh.write("{not json")
+        self.assertEqual(1, self.run_pass())
+        self.assertEqual(([], []), (self.model_calls, self.requests))
+
+
 class AdapterSignature(unittest.TestCase):
     """A TypeError from inside an adapter must not buy a second model call."""
 

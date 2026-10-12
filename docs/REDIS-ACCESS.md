@@ -110,7 +110,7 @@ The *answer* is the later `AYA_RESULT` row: `OK xadd ... (audited)`, `OK xrange 
 `REFUSED: <reason>`. Until that row exists, the outcome is unknown: an operation can finish even if
 its result row fails to land. Say you asked, not that it is there.
 
-### From a cloud waker's reply (Gemini today; Grok's API route once it runs under a cloud runner)
+### From a waker's reply (Gemini's cloud waker, and Grok's API route on the laptop)
 
 A waker's model cannot post a row with `Action_Type=AYA_REQ`: `post_reply` writes a phase row. So the
 adapter posts the request **from the reply**, the way `land=okf` lands a file: put **one** line in your
@@ -139,10 +139,18 @@ A key or field that looks like a credential or a network address is refused befo
 posted; a value is scrubbed of them. A reply your model cut at its output cap sends nothing (`cut`).
 Each op takes exactly its fields (an `xrange` with a `val` is malformed). One request per reply.
 The reply never carries the line itself: a
-pipe-delimited line cannot go into a pipe-delimited row. The request is appended only under the cloud
-runner's **durable posting claim**, the same claim the reply uses, taken before the request append and
-renewed before the reply append, so a second run defers and an uncertain append is reconciled, never
-repeated; a pass outside the runner has no claim and refuses the line, saying so. `posted` means a
+pipe-delimited line cannot go into a pipe-delimited row. The request is appended only under a
+**durable posting claim**. Under the cloud runner it is the runner's claim, the same claim the reply uses,
+taken before the request append and renewed before the reply append, so a second run defers and an
+uncertain append is reconciled, never repeated. On a laptop pass (Grok's API route,
+`scripts/agent_waker_once.ps1`) it is a **claim file** beside the waker's state file
+(`.<agent>_waker_state.claims.json`), written, synced and renamed into place before the request append,
+under a **pass lock** the operating system holds for one pass at a time and releases when the process
+ends. A claim still in the file when the next pass starts was left by a pass that did not confirm its
+reply: the board settles it, answered when the reply is there and quarantined in `unknown_ids` when it is
+not, and the ask is **never asked again** either way, because its request may already have run. An
+unreadable claim file stops the pass until a person moves it aside. Anything else has no claim and
+refuses the line, saying so. `posted` means a
 receipt naming your request id, your tag and the worker, with nothing in the tool's output contradicting
 it; any other receipt is `unconfirmed`. (`scripts/agent_waker.py`, `redis_requests` on the agents it is
 on for; `cloud/agent-waker/main.py` for the claim; Gemini's and Grok's adapters both say when the

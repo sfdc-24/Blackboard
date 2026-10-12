@@ -98,6 +98,12 @@ zoom-agent/.tokens.json
 .foundry_waker_state.json
 .grok_wa_inbox_state.json
 .gemini_waker_state.json
+.grok_waker_state.json
+.claude-api_waker_state.json
+# A laptop pass's Redis posting claims and its pass lock (scripts/agent_waker.py): per machine
+.*_waker_state.claims.json
+.*_waker_state.claims.json.tmp
+.*_waker_state.json.lock
 
 # WhatsApp media fetched by scripts/wa_media.py. This is HIS content -
 # conference photographs, voice notes - pulled from Meta's media API into
