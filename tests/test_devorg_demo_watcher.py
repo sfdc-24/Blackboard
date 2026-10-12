@@ -316,6 +316,85 @@ class NothingReplays(unittest.TestCase):
         self.assertEqual(["refused"], [r["kind"] for r in store.receipts])
 
 
+class TheWriteItselfIsGated(unittest.TestCase):
+    """The two gates rechecked immediately before the PATCH, and the bounded recovery."""
+
+    def source(self):
+        return {"kind": "transcript", "room": ROOM, "line_time": "13:05:00", "place": 5,
+                "correlation": "a" * 16}
+
+    def test_a_case_drifted_off_medium_aborts_before_the_write(self):
+        # An edit from elsewhere after arming must abort the mutation, not widen the cycle.
+        org = FakeOrg(priority="Low")
+        store = FakeStore([])
+        demo = watcher.Demo(org, store, ROOM)
+        demo.act("High", self.source())
+        self.assertEqual([], org.sets)
+        self.assertEqual(["refused"], [r["kind"] for r in store.receipts])
+        self.assertIn("does not hold Medium now", store.receipts[0]["why"])
+
+    def test_the_deadline_is_rechecked_immediately_before_the_write(self):
+        # Polling and reads can cross the deadline after the loop entered.
+        org = FakeOrg()
+        store = FakeStore([])
+        demo = watcher.Demo(org, store, ROOM, clock=lambda: 100.0, deadline=99.0)
+        demo.act("High", self.source())
+        self.assertEqual([], org.sets)
+        self.assertEqual(["refused"], [r["kind"] for r in store.receipts])
+        self.assertIn("expired before the write", store.receipts[0]["why"])
+
+    def recovery_env(self):
+        base = env(DEMO_ARMED=None, DEMO_ROOM=None)
+        base["DEMO_RECOVER_CORRELATION"] = "a" * 16
+        return base
+
+    def journal_store(self):
+        store = FakeStore([])
+        store.journal = {"kind": "pending-undo", "correlation": "a" * 16, "room": ROOM,
+                         "case_id": CASE, "field": "Priority", "restore_to": "Medium", "before": "Medium"}
+        store.read_json = lambda name: dict(store.journal)
+        return store
+
+    def test_recovery_restores_the_journalled_operation_once(self):
+        org = FakeOrg(priority="High")
+        store = self.journal_store()
+        self.assertEqual(0, run(self.recovery_env(), store, org))
+        self.assertEqual([(CASE, "Medium")], org.sets)
+        undo = [r for r in store.receipts if r["kind"] == "undo"]
+        self.assertEqual(1, len(undo))
+        self.assertTrue(undo[0]["held"])
+        self.assertIn("recovery", undo[0]["why"])
+        # And only once: the resolved marker refuses a second recovery.
+        again = FakeOrg(priority="High")
+        store.texts = []
+        self.assertEqual(4, run(self.recovery_env(), store, again))
+        self.assertEqual([], again.sets)
+
+    def test_recovery_of_a_case_already_at_the_restore_value_reconciles(self):
+        org = FakeOrg(priority="Medium")
+        store = self.journal_store()
+        self.assertEqual(0, run(self.recovery_env(), store, org))
+        self.assertEqual([], org.sets)
+        self.assertEqual(["undo"], [r["kind"] for r in store.receipts])
+
+    def test_recovery_leaves_a_third_value_to_a_human(self):
+        org = FakeOrg(priority="Low")
+        store = self.journal_store()
+        self.assertEqual(3, run(self.recovery_env(), store, org))
+        self.assertEqual([], org.sets)
+        self.assertEqual(["refused"], [r["kind"] for r in store.receipts])
+
+    def test_recovery_and_arming_refuse_to_combine(self):
+        bad = self.recovery_env()
+        bad["DEMO_ARMED"] = "1"
+        self.assertEqual(2, run(bad, FakeStore([]), UntouchableOrg()))
+
+    def test_a_malformed_recovery_correlation_refuses(self):
+        bad = self.recovery_env()
+        bad["DEMO_RECOVER_CORRELATION"] = "not-hex"
+        self.assertEqual(2, run(bad, FakeStore([]), UntouchableOrg()))
+
+
 class ASentenceIsARequestOnlyInOneShape(unittest.TestCase):
     def test_the_shapes_that_ask(self):
         for text, value in (("Set the demo case priority to high.", "High"),
@@ -347,6 +426,13 @@ class ASentenceIsARequestOnlyInOneShape(unittest.TestCase):
         for text in ("Do not do this. Set the demo case priority to high.",
                      "Set the demo case priority to high. Actually no.",
                      "Wait. Set the demo case priority to high."):
+            self.assertIsNone(watcher.request(text), text)
+
+    def test_a_question_anywhere_in_the_line_refuses_the_whole_line(self):
+        # A hypothetical beside an imperative poisons the whole utterance (Aya on 3ac1457).
+        for text in ("Would this be the right command? Set the demo case priority to high.",
+                     "Set the demo case priority to high. Or should we?",
+                     "What happens if I say it? Set the demo case priority to high."):
             self.assertIsNone(watcher.request(text), text)
 
     def test_two_asking_sentences_in_one_line_refuse(self):

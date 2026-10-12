@@ -35,8 +35,9 @@ WHAT A LINE MUST BE
 - An Owner line of the bound room's transcript, WRITTEN AFTER this execution first saw that
   transcript live, and seen while the transcript still says live: a snapshot that says closed is a
   record of a finished call, and no command is taken from it (closed is checked BEFORE new lines).
-- A negation ANYWHERE in the line refuses the whole line ("Do not do this. Set the ..." is not a
-  request; a substring cannot carry a negation, and neither can sentence order).
+- A negation or a question mark ANYWHERE in the line refuses the whole line ("Do not do this.
+  Set the ..." and "Would this be right? Set the ..." are not requests; a substring cannot carry
+  a negation, and neither can sentence order).
 - One sentence of the shape: an instruction verb, then "the demo case priority" with nothing else
   between its words, ending "to high" or "to medium": "Set the demo case priority to high." /
   "Put the demo case priority back to medium." A question, two values in one sentence, extra words
@@ -61,9 +62,19 @@ RECEIPTS
   one log line each, best effort: the restore outranks the paper trail. An org error is logged as
   its status and errorCode only - never the error body, which can carry record data.
 
+TWO MORE GATES AT THE WRITE, AND A RECOVERY (Aya on 3ac1457)
+- The expiry is rechecked immediately before the PATCH: polling and reads can cross the deadline
+  after the loop entered. And the Case must hold Medium NOW, read just before the write: an edit
+  from elsewhere after arming must abort the mutation, not widen the cycle. Salesforce REST has no
+  field-conditional update; read-abort plus the read-back is the close.
+- DEMO_RECOVER_CORRELATION=<id> runs the bounded RECOVERY of that one journalled operation instead
+  of a watch: it consumes no arming, reads no transcript, makes no new change, is itself one-shot
+  (a resolved marker), restores only the journal's known applied value, and leaves any third value
+  for a human.
+
 Exit: 0 done, or expired unspent; 1 a write's outcome is not the asked value, an unexpected error
 (restored first), or a restore whose own outcome is UNKNOWN; 2 config refused; 3 token or org
-refused; 4 transcript or one-shot guard refused.
+refused, or a recovery finding a third value; 4 transcript, journal or one-shot guard refused.
 """
 from __future__ import annotations
 
@@ -160,16 +171,16 @@ def owner_lines(markdown: str) -> list:
 
 
 def request(text: str):
-    """The Priority value one Owner line asks for, or None: no negation anywhere in the line, and
+    """The Priority value one Owner line asks for, or None: no negation and no question mark
+    ANYWHERE in the line (a hypothetical beside an imperative poisons the whole utterance), and
     exactly one asking sentence of the exact shape."""
-    if NEGATION.search(text):
+    if NEGATION.search(text) or "?" in text:
         return None
     asked = []
     for sentence in SENTENCE.findall(text):
-        sentence = sentence.strip()
-        if not sentence or sentence.endswith("?"):
-            continue
         body = sentence.rstrip(".!").strip()
+        if not body:
+            continue
         hit = INSTRUCTION.match(body)
         if not hit:
             continue
@@ -248,6 +259,15 @@ class Store:
         if status != 200:
             raise Refused(4, "reading the transcript answered HTTP %d" % status)
         return body.decode("utf-8", "replace")
+
+    def read_json(self, name: str) -> dict:
+        status, body = self._get("https://storage.googleapis.com/storage/v1/b/%s/o/%s?alt=media"
+                                 % (self.bucket, urllib.parse.quote(name, safe="")))
+        if status == 404:
+            raise Refused(4, "there is no such journal object")
+        if status != 200:
+            raise Refused(4, "reading the journal answered HTTP %d" % status)
+        return json.loads(body.decode("utf-8"))
 
     def receipt(self, entry: dict) -> None:
         """Best effort: a receipt that cannot land is said and skipped; the restore outranks it."""
@@ -345,13 +365,25 @@ class Org:
 
 # ---------------------------------------------------------------- the arming and the run
 
+RECOVERY = re.compile(r"^[0-9a-f]{16}$")
+
+
 def config(environ) -> dict:
     """The arming, from the execution's environment. The environment CONFIRMS the pinned scope,
-    it cannot choose one. Refuses by NAME; no value is ever printed."""
-    if environ.get("DEMO_ARMED") != "1":
+    it cannot choose one. Refuses by NAME; no value is ever printed. With DEMO_RECOVER_CORRELATION
+    set, this is the bounded RECOVERY of one journalled operation instead: no arming is consumed,
+    no transcript is read, and the two modes refuse to combine."""
+    recover = environ.get("DEMO_RECOVER_CORRELATION", "")
+    if recover:
+        if environ.get("DEMO_ARMED") == "1":
+            raise Refused(2, "recovery and arming are different runs: not both")
+        if not RECOVERY.match(recover):
+            raise Refused(2, "DEMO_RECOVER_CORRELATION is malformed")
+    elif environ.get("DEMO_ARMED") != "1":
         raise Refused(0, "not armed (DEMO_ARMED is not 1): nothing read, nothing written")
-    out = {}
-    for name, shape in (("DEMO_ORG_ID", ORG_ID), ("DEMO_CASE_ID", CASE_ID), ("DEMO_ROOM", ROOM)):
+    out = {"recover": recover}
+    rooms = () if recover else (("DEMO_ROOM", ROOM),)
+    for name, shape in (("DEMO_ORG_ID", ORG_ID), ("DEMO_CASE_ID", CASE_ID)) + rooms:
         value = environ.get(name, "")
         if not shape.match(value):
             raise Refused(2, "%s is missing or malformed" % name)
@@ -380,9 +412,10 @@ class Demo:
     never heard counts as a write until the org says otherwise, and the journal of what to put back
     is durable BEFORE the write leaves."""
 
-    def __init__(self, org: Org, store: Store, room: str):
+    def __init__(self, org: Org, store: Store, room: str, clock=time.monotonic, deadline: float = float("inf")):
         self.org, self.store = org, store
         self.room = room
+        self.clock, self.deadline = clock, deadline
         self.changed = None             # the correlation of the one CONFIRMED change
         self.in_flight = None           # the correlation of a write whose outcome is unknown
         self.restored = False
@@ -405,7 +438,23 @@ class Demo:
             return                      # the same line is never run twice
         self.handled.add(source["correlation"])
         if value == AFTER_VALUE and self.changed is None and self.in_flight is None:
+            # The deadline is rechecked HERE, immediately before anything mutates: polling and
+            # reads between loop entry and this point can cross it (Aya on 3ac1457).
+            if self.clock() >= self.deadline:
+                self.receipt(kind="refused", correlation=source["correlation"], source=source,
+                             asked=value, before=None, read_back=None, held=None,
+                             why="the arming expired before the write")
+                return
             held = self.org.case(APPROVED_CASE)["Priority"]
+            # The Case must hold Medium NOW, not merely at arming: an edit from elsewhere after
+            # arming would otherwise run a cycle nobody approved (Aya on 3ac1457). Salesforce REST
+            # has no field-conditional update, so the close is read-abort-readback; the read-back
+            # below verifies the end state either way.
+            if held != BEFORE_VALUE:
+                self.receipt(kind="refused", correlation=source["correlation"], source=source,
+                             asked=value, before=held, read_back=None, held=None,
+                             why="the Case does not hold %s now" % BEFORE_VALUE)
+                return
             # The journal first, durably: if this process dies between the PATCH and its read-back,
             # the pending object says what must be reconciled and to which value.
             created = self.store.create_once(
@@ -466,6 +515,40 @@ class Demo:
             self.held_wrong = True
 
 
+def recover(store: Store, org: Org, correlation_id: str) -> int:
+    """The bounded recovery of ONE journalled operation: restore its known applied value, exactly
+    once, and nothing else. It consumes no arming, reads no transcript, makes no new change; a Case
+    holding anything but the applied or the restore value is a human's decision, not this path's."""
+    journal = store.read_json("%s/pending-%s.json" % (RECEIPTS, correlation_id))
+    if journal.get("case_id") != APPROVED_CASE or journal.get("restore_to") != BEFORE_VALUE:
+        raise Refused(4, "that journal does not describe the approved operation")
+    room = str(journal.get("room", ""))
+    if not ROOM.match(room):
+        raise Refused(4, "that journal does not name a room")
+    if not store.create_once("%s/resolved-%s.json" % (RECEIPTS, correlation_id),
+                             {"kind": "resolved", "correlation": correlation_id, "at": now_stamp()}):
+        raise Refused(4, "that operation was already recovered")
+    demo = Demo(org, store, room)
+    held = org.case(APPROVED_CASE)["Priority"]
+    if held == BEFORE_VALUE:
+        demo.receipt(kind="undo", correlation="undo-" + correlation_id, undoes=correlation_id,
+                     asked=BEFORE_VALUE, before=held, read_back=held, held=True,
+                     why="recovery: the Case already holds the restore value")
+        return 0
+    if held != AFTER_VALUE:
+        demo.receipt(kind="refused", correlation="undo-" + correlation_id, undoes=correlation_id,
+                     asked=BEFORE_VALUE, before=held, read_back=None, held=None,
+                     why="recovery refused: the Case holds neither the applied nor the restore value")
+        say("the Case holds a third value; a human decides")
+        return 3
+    org.set_priority(APPROVED_CASE, BEFORE_VALUE)
+    read_back = org.case(APPROVED_CASE)["Priority"]
+    demo.receipt(kind="undo", correlation="undo-" + correlation_id, undoes=correlation_id,
+                 asked=BEFORE_VALUE, before=held, read_back=read_back, held=read_back == BEFORE_VALUE,
+                 why="recovery of the journalled operation")
+    return 0 if read_back == BEFORE_VALUE else 1
+
+
 def run(environ, clock=time.monotonic, sleep=time.sleep) -> int:
     try:
         armed = config(environ)
@@ -480,6 +563,8 @@ def run(environ, clock=time.monotonic, sleep=time.sleep) -> int:
             raise Refused(3, "the credential's org is not the approved org")
         if identity["type"] != "Developer Edition" and not identity["sandbox"]:
             raise Refused(3, "the org is neither a Developer Edition nor a sandbox")
+        if armed["recover"]:
+            return recover(store, org, armed["recover"])
         case = org.case(APPROVED_CASE)
         if case["Priority"] != BEFORE_VALUE:
             raise Refused(3, "the Case does not hold %s at arming; the approved cycle starts there" % BEFORE_VALUE)
@@ -493,7 +578,7 @@ def run(environ, clock=time.monotonic, sleep=time.sleep) -> int:
         say(str(refusal))
         return refusal.code
     deadline = clock() + armed["minutes"] * 60
-    demo = Demo(org, store, armed["DEMO_ROOM"])
+    demo = Demo(org, store, armed["DEMO_ROOM"], clock=clock, deadline=deadline)
     say("armed %d minutes: Case %s, Priority %s now, room %s"
         % (armed["minutes"], case["CaseNumber"], case["Priority"], armed["DEMO_ROOM"]))
     watched, seen, live_seen = None, 0, False
