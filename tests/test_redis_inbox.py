@@ -156,6 +156,45 @@ class Reading(unittest.TestCase):
         self.assertNotIn("page cut", out)
         self.assertEqual("5-0", self.saved())
 
+    def test_cursor_on_f2c3a3d_a_field_named_id_cannot_carry_the_cursor_past_a_cut_entry(self):
+        # Raw 1-0 with a field id=100-0, raw 2-0 with id=101-0 and a 250-character text, raw 3-0 unread.
+        # The cursor used to be saved at the field's 100-0, behind which both later entries vanished.
+        conn = stream([])
+        conn.data[KEY] = [("1-0", {"id": "100-0", "text": "short", "by": "x", "at": "t"}),
+                          ("2-0", {"id": "101-0", "text": "y" * 250, "by": "x", "at": "t"}),
+                          ("3-0", {"text": "after-cut", "by": "x", "at": "t"})]
+        worker = Worker(conn)
+        code, out = self.read(worker)
+        self.assertEqual("1-0", self.saved(), "stopped at the raw id before the cut entry")
+        self.assertEqual("1-0", conn.data.get("fleet:cursor:claude-code-cli"))
+        self.assertNotIn("after-cut", out)
+        code, out = self.read(worker)
+        self.assertEqual("1-0", self.saved(), "the cut entry still stops it")
+        code, out = self.read(worker, "--past-cut")
+        self.assertEqual("3-0", self.saved())
+        self.assertIn("after-cut", self.shown(out))
+
+    def test_a_worker_that_shows_a_field_named_id_over_the_stream_id_moves_nothing(self):
+        import redis_gov
+        conn = stream([])
+        conn.data[KEY] = [("1-0", {"id": "100-0", "text": "a", "by": "x", "at": "t"}),
+                          ("2-0", {"text": "b", "by": "x", "at": "t"})]
+        old_view = lambda i, f: {"id": str(i), **{k: redis_gov.preview(v) for k, v in f.items()}}  # noqa: E731
+        with mock.patch.object(redis_gov, "entry_view", old_view):
+            code, out = self.read(Worker(conn))
+        self.assertEqual(3, code, out)
+        self.assertIn("shown ids are not stream ids in order", out)
+        self.assertIsNone(self.saved())
+
+    def test_an_answer_from_anyone_but_the_worker_moves_nothing(self):
+        worker = Worker(stream(["a", "b"]))
+        real = worker.answer
+        worker.answer = lambda rid, wait, since: dict(real(rid, wait, since), **{"from": "grok"})
+        code, out = self.read(worker)
+        self.assertEqual(3, code, out)
+        self.assertIn("not bus-reconciler", out)
+        self.assertIsNone(self.saved())
+
     def test_the_page_cap_says_more_is_waiting(self):
         worker = Worker(stream(["m%d" % k for k in range(1, 10)]))
         code, out = self.read(worker, "--count", "2", "--pages", "2")
@@ -199,10 +238,24 @@ class ThePage(unittest.TestCase):
             self.assertEqual("unparsed", inbox.page_of(self.payload(text), KEY, text.split("after=")[1].split()[0])
                              ["status"], text)
 
-    def test_ids_are_numbers(self):
+    def test_a_last_beyond_the_entries_shown_is_not_read(self):
+        # Cursor on f2c3a3d: last=50-0 with one entry 1-0 moved both cursors to 50-0.
+        text = 'OK xrange %s [after=0-0 more=false last=50-0]: [{"id": "1-0", "text": "x"}]' % KEY
+        self.assertEqual("unparsed", inbox.page_of(self.payload(text), KEY, "0-0")["status"])
+
+    def test_shown_ids_must_be_in_order_after_the_cursor(self):
+        for ids in (("2-0", "1-0"), ("1-0", "1-0"), ("100-0", "x")):
+            body = json.dumps([{"id": i, "text": "t"} for i in ids])
+            text = "OK xrange %s [after=0-0 more=false last=%s]: %s" % (KEY, ids[-1], body)
+            self.assertEqual("unparsed", inbox.page_of(self.payload(text), KEY, "0-0")["status"], ids)
+
+    def test_ids_are_numbers_in_ascii_digits(self):
         self.assertLess(inbox.stream_id("9-0"), inbox.stream_id("10-0"))
-        for bad in ("", "9", "9-", "-1", "a-b", "1-0-0", "18446744073709551616-0", "0" * 21 + "-0"):
+        for bad in ("", "9", "9-", "-1", "a-b", "1-0-0", "18446744073709551616-0", "0" * 21 + "-0",
+                    "\u0661-\u0660", "\uff11-\uff10", "\u00b9-0"):
             self.assertIsNone(inbox.stream_id(bad), bad)
+            with self.assertRaises(SystemExit):
+                inbox.request_row("xrange", KEY, after=bad)
 
     def test_after_rides_only_an_xrange_and_only_a_stream_id(self):
         row = inbox.request_row("xrange", KEY, count=4, after="10-0")

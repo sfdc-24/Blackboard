@@ -589,6 +589,15 @@ class XrangeAfterACursor(unittest.TestCase):
         self.assertEqual((True, 0, False, top), (got["ok"], got["entries"], got["more"], got["last"]))
         self.assertIn("[after=%s more=false last=%s]" % (top, top), gov.summarise(got))
 
+    def test_the_shown_id_is_the_stream_id_and_a_field_named_id_is_kept_beside_it(self):
+        # Cursor on PR 397: the field used to overwrite the shown id, in both reads; a reader that keeps its
+        # cursor by the shown id could then skip messages. The field's own value is kept, never dropped.
+        conn = self.stream(1)
+        conn.data["fleet:inbox:gemini"].append(("9-2", {"id": "100-0", "text": "written elsewhere"}))
+        for got in (self.read(conn, after="0-0"), self.read(conn)):
+            shown = got["value"][-1]
+            self.assertEqual(("9-2", "100-0", "written elsewhere"), (shown["id"], shown["field:id"], shown["text"]))
+
     def test_last_is_the_stream_id_even_when_an_entry_has_a_field_named_id(self):
         conn = self.stream(2)
         conn.data["fleet:inbox:gemini"].append(("9-2", {"id": "not-a-cursor", "text": "written elsewhere"}))

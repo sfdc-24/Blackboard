@@ -90,6 +90,7 @@ BEAT_HOURS = 8
 # worker's `after=` (PR 392), page by its `more`/`last`, persist the cursor, and NEVER move it over data
 # that was cut or not parsed. The bounds stay as they are: redis_gov quotes a value at PREVIEW_CHARS and
 # a RESULT body at 1500, and a board row is at most 1500 characters in all (scripts/board_row.py).
+WORKER = "bus-reconciler"                 # the only author of an answer this reads
 CURSOR_KEY = "fleet:cursor:%s"            # the recipient's own read cursor; the hourly archive reads it
 PREVIEW_CHARS = 200                       # redis_gov.PREVIEW_CHARS: a longer value arrives as 200 + "..."
 READ_COUNT = 4                            # a page of 4 fits one row; a cut page is asked again smaller
@@ -233,10 +234,11 @@ def read_timeout(waited: float, request_id: str) -> str:
 def stream_id(value):
     """`<ms>-<seq>` as a tuple of two unsigned 64-bit integers, or None. Ids are compared as numbers:
     as strings "9-0" sorts after "10-0", which is how the old reader could skip or repeat a message."""
-    parts = str(value or "").split("-")
-    if len(parts) != 2 or not all(p.isdigit() and 0 < len(p) <= 20 for p in parts):
+    # ASCII digits only: str.isdigit() also passes Arabic-Indic, fullwidth and superscript digits, which
+    # redis_gov refuses (and int() raises on "¹") - Cursor on PR 397.
+    if not re.fullmatch(r"[0-9]{1,20}-[0-9]{1,20}", str(value or "")):
         return None
-    pair = (int(parts[0]), int(parts[1]))
+    pair = tuple(int(p) for p in str(value).split("-"))
     return pair if max(pair) <= U64_MAX else None
 
 
@@ -296,10 +298,15 @@ def page_of(payload: str, key: str, after: str) -> dict:
     if not isinstance(entries, list) or not all(isinstance(e, dict) for e in entries):
         return {"status": "unparsed", "why": "the body is not a list of entries"}
     last = m["last"]
-    if (not entries) != (last == after):
-        return {"status": "unparsed", "why": "last=%s does not fit %d entries after %s" % (last, len(entries), after)}
-    if entries and stream_id(last) <= stream_id(after):
-        return {"status": "unparsed", "why": "last=%s is not after the cursor %s" % (last, after)}
+    # Every shown id is a stream id, in order, after the cursor, and `last` IS the last of them. A worker
+    # from before PR 397 showed a field named `id` in place of the stream id, so such a page is not read
+    # rather than trusted; and a `last` beyond the entries shown would skip the ones between (Cursor).
+    ids = [stream_id(e.get("id")) for e in entries]
+    if None in ids or any(b <= a for a, b in zip([stream_id(after)] + ids, ids)):
+        return {"status": "unparsed", "why": "the shown ids are not stream ids in order after %s (a worker "
+                                             "from before PR 397 shows a field named id over them)" % after}
+    if (str(entries[-1]["id"]) if entries else after) != last:
+        return {"status": "unparsed", "why": "last=%s is not the last id shown after %s" % (last, after)}
     return {"status": "ok", "entries": entries, "more": m["more"] == "true", "last": last}
 
 
@@ -313,16 +320,13 @@ def advance(page: dict, cursor: str, past_cut: bool):
     """(the entries to show, the new cursor, why it stopped early or ""). The cursor moves to the page's
     `last` - the raw stream id the worker names, never a rendered entry's "id" - unless an entry's text
     was cut at the preview bound. Then it stops just BEFORE that entry, which stays unread, unless the
-    reader says --past-cut. If the ids needed to stop there cannot be trusted, it does not move at all."""
+    reader says --past-cut. page_of has already proved every shown id is the stream id, in order."""
     entries = page["entries"]
     if past_cut:
         return entries, page["last"], ""
     for n, entry in enumerate(entries):
         if text_cut(entry):
-            ids = [stream_id(e.get("id")) for e in entries[:n + 1]]
-            if None in ids or any(b <= a for a, b in zip([stream_id(cursor)] + ids, ids)):
-                return entries[:n + 1], cursor, "an entry's text was cut and the ids are not usable: nothing moved"
-            stop = str(entries[n - 1]["id"]) if n else cursor
+            stop = str(entries[n - 1]["id"]) if n else cursor        # page_of proved these are stream ids
             return entries[:n + 1], stop, ("entry %s arrived cut at %d characters; the cursor stops before it "
                                            "(read --past-cut to move on)" % (entry.get("id"), PREVIEW_CHARS))
     return entries, page["last"], ""
@@ -353,7 +357,8 @@ def cmd_read(args) -> int:
             print(read_timeout(args.wait, rid))
             code = 2
             break
-        page = page_of(got["payload"], key, cursor)
+        page = (page_of(got["payload"], key, cursor) if got.get("from") == WORKER else
+                {"status": "unparsed", "why": "the answer row is from %r, not %s" % (got.get("from"), WORKER)})
         if page["status"] == "cut" and count > 1:
             count = max(1, count // 2)
             print("page cut (%s); asking again for %d" % (page["why"], count))
@@ -381,8 +386,9 @@ def cmd_read(args) -> int:
     if cursor != start:
         rid = post(request_row("set", CURSOR_KEY % ME, value=cursor))
         saved = answer(rid, args.wait, since=args.since or stamp())
-        print("cursor %s -> %s (local); in Redis: %s" % (start, cursor, "saved" if saved and "|text=OK" in
-                                                          saved["payload"] else "NOT confirmed, the local one stands"))
+        ok = bool(saved) and saved.get("from") == WORKER and "|text=OK" in saved["payload"]
+        print("cursor %s -> %s (local); in Redis: %s" % (start, cursor, "saved" if ok else
+                                                          "NOT confirmed, the local one stands"))
     print("%d shown from %s, cursor %s" % (shown, key, cursor))
     return code
 
