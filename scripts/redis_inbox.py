@@ -31,7 +31,7 @@ WHAT IT DOES NOT DO
     answers its id is where the truth is.
 
     python scripts/redis_inbox.py send --to grok --text "..."    one message
-    python scripts/redis_inbox.py read [--wait 180] [--count 20] new messages to me
+    python scripts/redis_inbox.py read [--wait 180] [--count 4]  new messages to me, after my cursor
     python scripts/redis_inbox.py selftest                       the grammar, no network
 
 THE LAPTOP LANE (step 3 of the broken-telephone fix, Converspan Channel Architecture v0.1)
@@ -56,6 +56,7 @@ import base64
 import datetime
 import json
 import os
+import re
 import secrets
 import subprocess
 import sys
@@ -85,6 +86,15 @@ NOTE_MAX = 300
 BEAT_EVERY = 240                           # the most a loop may wait: the reader's window is 300 s and a
                                            # worker pass (10 to 60 s) has to land the next beat inside it
 BEAT_HOURS = 8
+# THE READ (Aya, 2026-10-12, row AYA-392-MERGED-CURSOR-INTEGRATION-20261012): read after a cursor with the
+# worker's `after=` (PR 392), page by its `more`/`last`, persist the cursor, and NEVER move it over data
+# that was cut or not parsed. The bounds stay as they are: redis_gov quotes a value at PREVIEW_CHARS and
+# a RESULT body at 1500, and a board row is at most 1500 characters in all (scripts/board_row.py).
+CURSOR_KEY = "fleet:cursor:%s"            # the recipient's own read cursor; the hourly archive reads it
+PREVIEW_CHARS = 200                       # redis_gov.PREVIEW_CHARS: a longer value arrives as 200 + "..."
+READ_COUNT = 4                            # a page of 4 fits one row; a cut page is asked again smaller
+READ_PAGES = 5                            # pages per call, so a cold start over a long inbox has a cost cap
+U64_MAX = 2 ** 64 - 1
 
 
 def stamp() -> str:
@@ -120,7 +130,7 @@ def message(text: str) -> str:
 
 
 def request_row(op: str, key: str, *, value: str | None = None, count: int | None = None,
-                row_id: str | None = None) -> dict:
+                row_id: str | None = None, after: str | None = None) -> dict:
     """One governed request, in the grammar scripts/bus_request.py parses.
 
     The value travels as base64 (enc=b64) because the board's payload is pipe-separated and a
@@ -135,6 +145,10 @@ def request_row(op: str, key: str, *, value: str | None = None, count: int | Non
         fields.append("enc=b64")
     if count is not None:
         fields.append("count=%d" % int(count))
+    if after is not None:
+        if op != "xrange" or stream_id(after) is None:
+            raise SystemExit("after= is an xrange stream id, <ms>-<seq>: %r" % after)
+        fields.append("after=" + after)
     return {
         "row_id": rid,
         "source_tag": ME,
@@ -216,6 +230,16 @@ def read_timeout(waited: float, request_id: str) -> str:
             + "\nNothing was read, which is not the same as an empty inbox.")
 
 
+def stream_id(value):
+    """`<ms>-<seq>` as a tuple of two unsigned 64-bit integers, or None. Ids are compared as numbers:
+    as strings "9-0" sorts after "10-0", which is how the old reader could skip or repeat a message."""
+    parts = str(value or "").split("-")
+    if len(parts) != 2 or not all(p.isdigit() and 0 < len(p) <= 20 for p in parts):
+        return None
+    pair = (int(parts[0]), int(parts[1]))
+    return pair if max(pair) <= U64_MAX else None
+
+
 def seen() -> dict:
     try:
         with open(BOOKMARK, encoding="utf-8") as fh:
@@ -240,6 +264,70 @@ def entries_of(payload: str) -> list:
         return []
 
 
+_PAGE = re.compile(r"OK xrange (?P<key>\S+) \[after=(?P<after>\S+) more=(?P<more>true|false) "
+                   r"last=(?P<last>\S+)\]: (?P<body>.*)", re.S)
+
+
+def page_of(payload: str, key: str, after: str) -> dict:
+    """One RESULT row of an `xrange after=` read, judged. status is "ok" only when the WHOLE page is here:
+    the page line is the one asked for, and the body is complete JSON. "cut": the row or the body was cut
+    at its bound (asked again smaller). "unparsed": anything else, including a worker that predates
+    `after=` and answered the newest-N read instead. Only an "ok" page may move the cursor."""
+    head, _, text = payload.partition("|text=")
+    if not _:
+        return {"status": "unparsed", "why": "no text= in the answer"}
+    if re.search(r"(^|\|)(truncated=1|full=)", head + "|" + text):
+        return {"status": "cut", "why": "the answer was longer than one row (truncated=1 or full=)"}
+    if text.startswith("REFUSED") or text.startswith("FAILED"):
+        return {"status": "unparsed", "why": text[:200]}
+    m = _PAGE.fullmatch(text.strip())
+    if not m:
+        return {"status": "unparsed",
+                "why": "no [after= more= last=] page line: the worker may predate xrange after= (PR 392)"}
+    if m["key"] != key or m["after"] != after or stream_id(m["last"]) is None:
+        return {"status": "unparsed", "why": "the page is not the one asked for (%s after %s)" % (m["key"], m["after"])}
+    body = m["body"]
+    try:
+        entries = json.loads(body)
+    except ValueError:
+        if body.endswith("..."):
+            return {"status": "cut", "why": "the body was cut at its 1500-character bound"}
+        return {"status": "unparsed", "why": "the body is not JSON"}
+    if not isinstance(entries, list) or not all(isinstance(e, dict) for e in entries):
+        return {"status": "unparsed", "why": "the body is not a list of entries"}
+    last = m["last"]
+    if (not entries) != (last == after):
+        return {"status": "unparsed", "why": "last=%s does not fit %d entries after %s" % (last, len(entries), after)}
+    if entries and stream_id(last) <= stream_id(after):
+        return {"status": "unparsed", "why": "last=%s is not after the cursor %s" % (last, after)}
+    return {"status": "ok", "entries": entries, "more": m["more"] == "true", "last": last}
+
+
+def text_cut(entry: dict) -> bool:
+    """redis_gov quoted this entry's text at PREVIEW_CHARS: what arrived is not the whole message."""
+    text = str(entry.get("text", ""))
+    return len(text) == PREVIEW_CHARS + 3 and text.endswith("...")
+
+
+def advance(page: dict, cursor: str, past_cut: bool):
+    """(the entries to show, the new cursor, why it stopped early or ""). The cursor moves to the page's
+    `last` - the raw stream id the worker names, never a rendered entry's "id" - unless an entry's text
+    was cut at the preview bound. Then it stops just BEFORE that entry, which stays unread, unless the
+    reader says --past-cut. If the ids needed to stop there cannot be trusted, it does not move at all."""
+    entries = page["entries"]
+    if past_cut:
+        return entries, page["last"], ""
+    for n, entry in enumerate(entries):
+        if text_cut(entry):
+            ids = [stream_id(e.get("id")) for e in entries[:n + 1]]
+            if None in ids or any(b <= a for a, b in zip([stream_id(cursor)] + ids, ids)):
+                return entries[:n + 1], cursor, "an entry's text was cut and the ids are not usable: nothing moved"
+            stop = str(entries[n - 1]["id"]) if n else cursor
+            return entries[:n + 1], stop, ("entry %s arrived cut at %d characters; the cursor stops before it "
+                                           "(read --past-cut to move on)" % (entry.get("id"), PREVIEW_CHARS))
+    return entries, page["last"], ""
+
+
 def cmd_send(args) -> int:
     to = canonical(args.to)
     rid = post(request_row("xadd", KEY % to, value=message(args.text)))
@@ -250,21 +338,53 @@ def cmd_send(args) -> int:
 
 
 def cmd_read(args) -> int:
-    rid = post(request_row("xrange", KEY % ME, count=args.count))
-    got = answer(rid, args.wait, since=args.since or stamp())
-    if not got:
-        print(read_timeout(args.wait, rid))
-        return 2
-    rows = entries_of(got["payload"])
-    last = seen().get("last_id") or ""
-    fresh = [e for e in rows if str(e.get("id") or "") > last]
-    for entry in fresh:
-        print("%s | from %s | %s" % (entry.get("at", "?"), entry.get("by", "?"),
-                                     str(entry.get("text", ""))[:400]))
-    if fresh:
-        remember(str(fresh[-1].get("id") or last))
-    print("%d new of %d in %s" % (len(fresh), len(rows), KEY % ME))
-    return 0
+    """Everything after my cursor, oldest first, page by page. The cursor is persisted after every whole
+    page (the local bookmark) and once at the end in Redis (fleet:cursor:<me>, which the archive's
+    unread count reads). A page that was cut or not understood moves nothing."""
+    key = KEY % ME
+    start = (args.after or seen().get("last_id") or "0-0").strip()
+    if stream_id(start) is None:
+        raise SystemExit("the read cursor is not a stream id: %r (fix %s or pass --after)" % (start, BOOKMARK))
+    cursor, count, shown, code = start, max(1, min(int(args.count), 20)), 0, 0
+    for _page in range(max(1, int(args.pages))):
+        rid = post(request_row("xrange", key, count=count, after=cursor))
+        got = answer(rid, args.wait, since=args.since or stamp())
+        if not got:
+            print(read_timeout(args.wait, rid))
+            code = 2
+            break
+        page = page_of(got["payload"], key, cursor)
+        if page["status"] == "cut" and count > 1:
+            count = max(1, count // 2)
+            print("page cut (%s); asking again for %d" % (page["why"], count))
+            continue
+        if page["status"] != "ok":
+            print("NOT READ, cursor stays at %s: %s" % (cursor, page["why"]))
+            code = 3
+            break
+        entries, moved, stopped = advance(page, cursor, args.past_cut)
+        for entry in entries:
+            print("%s | %s | from %s | %s%s" % (entry.get("id", "?"), entry.get("at", "?"), entry.get("by", "?"),
+                                                str(entry.get("text", "")), "  [cut by the reader's bound]"
+                                                if text_cut(entry) else ""))
+        shown += len(entries)
+        if moved != cursor:
+            cursor = moved
+            remember(cursor)
+        if stopped:
+            print(stopped)
+            break
+        if not page["more"]:
+            break
+    else:
+        print("more is waiting after %s: read again (each page is one row)" % cursor)
+    if cursor != start:
+        rid = post(request_row("set", CURSOR_KEY % ME, value=cursor))
+        saved = answer(rid, args.wait, since=args.since or stamp())
+        print("cursor %s -> %s (local); in Redis: %s" % (start, cursor, "saved" if saved and "|text=OK" in
+                                                          saved["payload"] else "NOT confirmed, the local one stands"))
+    print("%d shown from %s, cursor %s" % (shown, key, cursor))
+    return code
 
 
 def task_id_ok(task: str) -> str:
@@ -464,7 +584,13 @@ def build_parser() -> argparse.ArgumentParser:
             p.add_argument("--to", required=True)
             p.add_argument("--text", required=True)
         if name == "read":
-            p.add_argument("--count", type=int, default=20)
+            p.add_argument("--count", type=int, default=READ_COUNT,
+                           help="entries per page, 1..20 (default %d); a cut page is asked again smaller" % READ_COUNT)
+            p.add_argument("--pages", type=int, default=READ_PAGES,
+                           help="pages per call (default %d); each page is one board row" % READ_PAGES)
+            p.add_argument("--after", default="", help="read after this stream id instead of the saved cursor")
+            p.add_argument("--past-cut", action="store_true",
+                           help="move the cursor past entries whose text arrived cut at %d characters" % PREVIEW_CHARS)
         if name == "beat":
             p.add_argument("--every", type=int, default=0,
                            help="loop: seconds between beats, 60..%d (0 = one beat); the reader's window is 300 s" % BEAT_EVERY)

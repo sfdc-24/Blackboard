@@ -138,6 +138,8 @@ on:
       - "cloud/bus-reconciler/redis_archive.py"
       - "cloud/bus-reconciler/archive.sh"
       - "tests/test_redis_archive.py"
+      - "scripts/redis_inbox.py"
+      - "tests/test_redis_inbox.py"
       - "scripts/sf360.py"
       - "tests/test_org_publish.py"
       - "scripts/org_publish.py"
@@ -236,6 +238,8 @@ on:
       - "cloud/bus-reconciler/redis_archive.py"
       - "cloud/bus-reconciler/archive.sh"
       - "tests/test_redis_archive.py"
+      - "scripts/redis_inbox.py"
+      - "tests/test_redis_inbox.py"
       - "scripts/roster_seed.py"
       - "tests/test_roster_seed.py"
       - "tests/test_image_layout.py"
@@ -1062,7 +1066,7 @@ jobs:
       # these four files ran in CI: PR 390's lock and one-answer tests and PR 392's after= tests were
       # green here only because nothing executed them. Each suite is offline (fake Redis, fake board,
       # fake bucket), proved by the empty network namespace.
-      - name: "redis gov, git requests, live mode, archive: the governed path and its worker (no network)"
+      - name: "redis gov, git requests, live mode, archive, inbox: the governed path and its worker (no network)"
         run: |
           set -euo pipefail
           python_bin="$(command -v python3)"
@@ -1072,7 +1076,8 @@ jobs:
           for pair in "test_redis_gov:scripts/redis_gov.py" \
                       "test_git_requests:scripts/git_requests.py" \
                       "test_live_mode:cloud/bus-reconciler/serve_requests.py" \
-                      "test_redis_archive:cloud/bus-reconciler/redis_archive.py"; do
+                      "test_redis_archive:cloud/bus-reconciler/redis_archive.py" \
+                      "test_redis_inbox:scripts/redis_inbox.py"; do
             suite="${pair%%:*}"; code="${pair#*:}"
             if [ -f "tests/${suite}.py" ]; then
               sudo unshare -n -- "$python_bin" -B -m unittest "tests.${suite}" -v
