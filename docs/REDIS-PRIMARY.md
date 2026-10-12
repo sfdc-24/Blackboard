@@ -132,7 +132,10 @@ phase: it is a new door, not a net, and it waits on D1.
 - `gemini-waker` and a new `grok-waker` read `fleet:inbox:<agent>` after their cursor and execute a reply's
   `REDIS-OP` line in-process under their own principal — no request row, no result row.
 - The chair writes a voice's side-channel line for it, so the 2026-10-09 failure (four voices said they
-  wrote; none had) cannot recur.
+  wrote; none had) cannot recur. **This is milestone M1, agreed by Grok and Aya on 2026-10-11 and owned
+  by the laptop `claude-code-cli` session**, which has the conference repository and its chair suite: in
+  the live room the chair writes each voice's line to `conf:side:<yyyymmdd>` under the chair's own
+  principal, with the voice named, behind a default-off flag. The cloud session does not build it.
 - DING for recipients without an in-VPC waker; UNREAD escalation with its cap (§8.6).
 - *Exit tests:* a Gemini → Grok → Gemini exchange through `fleet:inbox:` with **zero** board rows, every op
   in `gov:audit`; in a call, a voice's line is in `conf:side` under the chair's principal with the voice
