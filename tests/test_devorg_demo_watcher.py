@@ -352,7 +352,14 @@ class TheWriteItselfIsGated(unittest.TestCase):
         store = FakeStore([])
         store.journal = {"kind": "pending-undo", "correlation": "a" * 16, "room": ROOM,
                          "case_id": CASE, "field": "Priority", "restore_to": "Medium", "before": "Medium"}
-        store.read_json = lambda name: dict(store.journal)
+
+        def read_json(name):
+            if "pending-" in name:
+                return dict(store.journal)
+            if name in store.created:
+                return {"kind": "resolved"}
+            raise watcher.Refused(4, "there is no such journal object")
+        store.read_json = read_json
         return store
 
     def test_recovery_restores_the_journalled_operation_once(self):
@@ -393,6 +400,44 @@ class TheWriteItselfIsGated(unittest.TestCase):
         bad = self.recovery_env()
         bad["DEMO_RECOVER_CORRELATION"] = "not-hex"
         self.assertEqual(2, run(bad, FakeStore([]), UntouchableOrg()))
+
+    def test_a_failed_recovery_keeps_the_journal_pending_for_a_retry(self):
+        # The resolved marker is committed only AFTER an authoritative Medium read-back: a marker
+        # written first blocked the retry while Medium was unverified (the reviewer on 67494c5).
+        broken = FakeOrg(priority="High", fail_set=True)
+        store = self.journal_store()
+        self.assertEqual(1, run(self.recovery_env(), store, broken))
+        self.assertFalse(any("resolved-" in name for name in store.created))
+        healed = FakeOrg(priority="High")
+        self.assertEqual(0, run(self.recovery_env(), store, healed))
+        self.assertEqual([(CASE, "Medium")], healed.sets)
+        self.assertTrue(any("resolved-" in name for name in store.created))
+
+    def test_the_finally_restore_refuses_a_third_value_like_recovery(self):
+        # A concurrent edit to Low is someone else's work: the restore must not write over it.
+        org = FakeOrg(priority="Low")
+        store = FakeStore([])
+        demo = watcher.Demo(org, store, ROOM)
+        demo.changed = "a" * 16
+        demo.restore("the arming ended")
+        self.assertEqual([], org.sets)
+        self.assertEqual(["refused"], [r["kind"] for r in store.receipts])
+        self.assertTrue(demo.undo_unknown)
+        self.assertFalse(demo.restored)
+
+    def test_the_deadline_is_rechecked_at_the_mutation_boundary_itself(self):
+        # Entry passes; the reads and the journal write cross the deadline; the PATCH must not go.
+        ticks = iter([98.0, 100.0])     # entry check, then the boundary check
+        org = FakeOrg()
+        store = FakeStore([])
+        demo = watcher.Demo(org, store, ROOM, clock=lambda: next(ticks), deadline=99.0)
+        demo.act("High", self.source())
+        self.assertEqual([], org.sets)
+        kinds = [r["kind"] for r in store.receipts]
+        self.assertEqual(["refused"], kinds)
+        self.assertIn("mutation boundary", store.receipts[0]["why"])
+        self.assertTrue(any("pending-" in name for name in store.created),
+                        "the journal may exist; recovering it reconciles harmlessly")
 
 
 class ASentenceIsARequestOnlyInOneShape(unittest.TestCase):

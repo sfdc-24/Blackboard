@@ -464,6 +464,14 @@ class Demo:
                  "before": held, "at": now_stamp(), "source": source})
             if not created:
                 raise Refused(4, "this request's pending journal already exists: a rerun does not re-run it")
+            # The FINAL expiry check sits at the mutation boundary itself: the reads and the journal
+            # write above take real time too (Aya on 67494c5). A journal without a write is harmless:
+            # recovering it finds Medium and reconciles.
+            if self.clock() >= self.deadline:
+                self.receipt(kind="refused", correlation=source["correlation"], source=source,
+                             asked=value, before=held, read_back=None, held=None,
+                             why="the arming expired at the mutation boundary")
+                return
             # IN FLIGHT the moment the PATCH leaves (Aya on 6753b44: a commit followed by a timeout
             # left the change unrecorded and skipped the restore).
             self.in_flight = source["correlation"]
@@ -483,7 +491,10 @@ class Demo:
 
     def restore(self, why: str) -> None:
         """Put BEFORE_VALUE back - after a confirmed change, and equally after an uncertain write.
-        Restored is claimed ONLY from a read-back holding it; a failing attempt is UNKNOWN."""
+        Only this operation's KNOWN applied value is restored over: a third value is someone else's
+        concurrent edit, refused and left for a human exactly as recovery refuses it (Aya on
+        67494c5). Restored is claimed ONLY from a read-back holding it; a failing attempt is
+        UNKNOWN, and the dedicated recovery command is the retry, never a fresh arming."""
         if self.restored or self.undo_unknown or (self.changed is None and self.in_flight is None):
             return
         base = self.changed or self.in_flight
@@ -491,16 +502,24 @@ class Demo:
             why = "%s, reconciling a write whose outcome was never heard" % why
         try:
             held = self.org.case(APPROVED_CASE)["Priority"]
-            if held != BEFORE_VALUE:
+            if held == BEFORE_VALUE:
+                read_back = held
+            elif held == AFTER_VALUE:
                 self.org.set_priority(APPROVED_CASE, BEFORE_VALUE)
                 read_back = self.org.case(APPROVED_CASE)["Priority"]
             else:
-                read_back = held
+                self.undo_unknown = True
+                self.held_wrong = True
+                say("the Case holds a third value; a human decides; the pending journal for %s remains" % base)
+                self.receipt(kind="refused", correlation="undo-" + base, undoes=base,
+                             asked=BEFORE_VALUE, before=held, read_back=None, held=None,
+                             why="%s; restore refused: the Case holds neither the applied nor the restore value" % why)
+                return
         except Exception as error:  # noqa: BLE001 - an unknown outcome is reported, never claimed
             self.undo_unknown = True
             self.held_wrong = True
-            say("UNDO UNKNOWN (%s): the pending journal for %s remains; reconcile by hand or rerun "
-                "a fresh arming" % (type(error).__name__, base))
+            say("UNDO UNKNOWN (%s): the pending journal for %s remains; the retry is the dedicated "
+                "recovery run, DEMO_RECOVER_CORRELATION=%s" % (type(error).__name__, base, base))
             try:
                 self.receipt(kind="undo-unknown", correlation="undo-" + base, undoes=base,
                              asked=BEFORE_VALUE, before=None, read_back=None, held=None, why=why)
@@ -525,28 +544,49 @@ def recover(store: Store, org: Org, correlation_id: str) -> int:
     room = str(journal.get("room", ""))
     if not ROOM.match(room):
         raise Refused(4, "that journal does not name a room")
-    if not store.create_once("%s/resolved-%s.json" % (RECEIPTS, correlation_id),
-                             {"kind": "resolved", "correlation": correlation_id, "at": now_stamp()}):
+    marker = "%s/resolved-%s.json" % (RECEIPTS, correlation_id)
+    try:
+        store.read_json(marker)
+    except Refused:
+        pass                            # not recovered yet: proceed
+    else:
         raise Refused(4, "that operation was already recovered")
     demo = Demo(org, store, room)
+
+    def resolved() -> None:
+        # The marker is committed ONLY after an authoritative Medium read-back (Aya on 67494c5:
+        # a marker written first blocked the retry while Medium was unverified). A repeat recovery
+        # before the marker lands simply reconciles, so a failed marker write is said, not fatal.
+        try:
+            if not store.create_once(marker, {"kind": "resolved", "correlation": correlation_id,
+                                              "at": now_stamp()}):
+                say("that operation was already marked recovered")
+        except Refused as refusal:
+            say("the resolved marker was not written (%s); a repeat recovery will reconcile" % refusal)
+
     held = org.case(APPROVED_CASE)["Priority"]
     if held == BEFORE_VALUE:
         demo.receipt(kind="undo", correlation="undo-" + correlation_id, undoes=correlation_id,
                      asked=BEFORE_VALUE, before=held, read_back=held, held=True,
                      why="recovery: the Case already holds the restore value")
+        resolved()
         return 0
     if held != AFTER_VALUE:
         demo.receipt(kind="refused", correlation="undo-" + correlation_id, undoes=correlation_id,
                      asked=BEFORE_VALUE, before=held, read_back=None, held=None,
                      why="recovery refused: the Case holds neither the applied nor the restore value")
-        say("the Case holds a third value; a human decides")
+        say("the Case holds a third value; a human decides; the journal remains pending")
         return 3
     org.set_priority(APPROVED_CASE, BEFORE_VALUE)
     read_back = org.case(APPROVED_CASE)["Priority"]
     demo.receipt(kind="undo", correlation="undo-" + correlation_id, undoes=correlation_id,
                  asked=BEFORE_VALUE, before=held, read_back=read_back, held=read_back == BEFORE_VALUE,
                  why="recovery of the journalled operation")
-    return 0 if read_back == BEFORE_VALUE else 1
+    if read_back != BEFORE_VALUE:
+        say("the restore did not hold; the journal remains pending")
+        return 1
+    resolved()
+    return 0
 
 
 def run(environ, clock=time.monotonic, sleep=time.sleep) -> int:
