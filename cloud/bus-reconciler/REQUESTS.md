@@ -125,6 +125,14 @@ gcloud run jobs create bus-requests --project=sfdc24 --region=us-central1 \
 #     intends, so a live run MUST pass a timeout that covers LOOP_UNTIL (Cursor on 39ebd38). This is
 #     the exact command run for the 2026-10-08 10 PM ET call (execution bus-requests-rk5zr):
 gcloud run jobs execute bus-requests --region=us-central1 --project=sfdc24   --update-env-vars=LOOP_UNTIL=2026-10-09T03:30:00Z,LOOP_INTERVAL=10,LOOP_MAX_MINUTES=340   --task-timeout=6h --async
+#     ONE WORKER AT A TIME (gov:worker:lock). A second execution started while one holds the lock logs
+#     "another worker holds gov:worker:lock (<execution>)" and exits 0 without a pass - it is not a failure,
+#     the holder is answering. A worker that dies frees the lock within 5 minutes. It is renewed before every board read and append, by
+#     compare-and-renew (one Lua call), so a slow pass keeps it and a new holder is never overwritten.
+#     THE SCHEDULE ALREADY STARTS ONE: bus-requests-every-4h (58 */4 * * *, UTC) is enabled, each run in live
+#     mode. Before the lock is deployed, an execution started by hand beside it is the 2026-10-11 collision
+#     (kdn8k, the 20:58Z tick, and 27gvw, started 22:09Z). Read `gcloud run jobs executions list` first.
+#     Before 2026-10-11 there was no lock: two live executions answered one request twice, and both exited 2.
 #     Without GITHUB_READ_TOKEN the git channel is read every 144 s (two repos under GitHub's 60
 #     unauthenticated calls an hour); with it, once a minute.
 
