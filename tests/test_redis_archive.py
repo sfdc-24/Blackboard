@@ -510,5 +510,48 @@ class DryRun(unittest.TestCase):
         self.assertIsNone(conn.hget(ra.CURSOR_KEY, "conf:side:20261011"))
 
 
+class TheDeployScriptsPinTheImage(unittest.TestCase):
+    """archive.sh deploys only a build it is told by name; deploy.sh builds to the tag it is given. The
+    shared :v1 may predate redis_archive.py, and rebuilding it could move every job on the image."""
+
+    def gcloud(self, args, env=None):
+        import os
+        import subprocess
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            log = os.path.join(tmp, "calls.log")
+            fake = os.path.join(tmp, "gcloud")
+            with open(fake, "w") as f:
+                f.write('#!/usr/bin/env bash\necho "$*" >> "%s"\nexit 0\n' % log)
+            os.chmod(fake, 0o755)
+            run_env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "GCLOUD": fake,
+                       "REDIS_HOST": "192.0.2.10"}             # TEST-NET-1: an address that is nobody's
+            run_env.update(env or {})
+            done = subprocess.run(["bash"] + args, cwd=str(ROOT), env=run_env, capture_output=True, text=True)
+            calls = open(log).read() if os.path.exists(log) else ""
+        return done.returncode, calls, done.stderr
+
+    def test_archive_deploy_refuses_without_a_named_image_and_touches_nothing(self):
+        code, calls, err = self.gcloud(["cloud/bus-reconciler/archive.sh", "deploy"])
+        self.assertNotEqual(0, code)
+        self.assertEqual("", calls, "no gcloud call before the refusal")
+        self.assertIn("set IMAGE", err)
+
+    def test_archive_deploy_runs_the_named_build(self):
+        pinned = "us-central1-docker.pkg.dev/p/r/bus-reconciler@sha256:" + "a" * 64
+        code, calls, _ = self.gcloud(["cloud/bus-reconciler/archive.sh", "deploy"], {"IMAGE": pinned})
+        self.assertEqual(0, code)
+        self.assertIn("--image %s " % pinned, calls)
+        self.assertNotIn(":v1", calls)
+
+    def test_deploy_build_writes_the_tag_it_is_given_and_v1_only_by_default(self):
+        tag = "us-central1-docker.pkg.dev/sfdc24/cloud-run-source-deploy/bus-reconciler:git-f488553"
+        _, calls, _ = self.gcloud(["cloud/bus-reconciler/deploy.sh", "build"], {"IMAGE": tag})
+        self.assertIn("_IMAGE=%s" % tag, calls)
+        self.assertNotIn(":v1", calls)
+        _, calls, _ = self.gcloud(["cloud/bus-reconciler/deploy.sh", "build"])
+        self.assertIn("_IMAGE=us-central1-docker.pkg.dev/sfdc24/cloud-run-source-deploy/bus-reconciler:v1", calls)
+
+
 if __name__ == "__main__":
     unittest.main()

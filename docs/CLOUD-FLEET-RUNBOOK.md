@@ -153,7 +153,9 @@ copy we can restore ourselves.
 | every new entry of `conf:side:*`, `fleet:inbox:*` and `gov:audit`, once an hour, create-only | job `redis-archive` on the bus-reconciler image → `gs://sfdc24-fleet-state/redis-archive/streams/<key>/<first>_<last>.jsonl`, named by the range and never the hour | `REDIS_ARCHIVE_ENABLED` | `cloud/bus-reconciler/archive.sh` |
 | the LEDGER: per stream the entries archived, newest id, object and SHA-256, and an inbox's unread count after `fleet:cursor:<agent>` | `redis-archive/<date>/<hour>/LEDGER-<execution>-<hash>.json`, and ONE board row (`Action_Type=LEDGER`, addressed to `ledger`, which wakes nobody) | same | same |
 
-**Order:** `setup`, `deploy.sh build`, `deploy`, `dryrun` (writes nothing), `on`, `run`, then
+**Order:** `setup`; `IMAGE=<registry>/bus-reconciler:git-<sha7> deploy.sh build` (a new tag from a clean
+checkout of `main`: the shared `:v1` is never rebuilt for this, so no other job moves); `IMAGE=<that tag or
+its digest> archive.sh deploy` (it refuses without one); `dryrun` (writes nothing), `on`, `run`, then
 `verify <the ledger path the run printed>`, then `schedule` (hourly at :05 UTC). **Rollback** is `off`;
 nothing archived is removed. One archiver at a time (`gov:archive:lock`, released compare-and-delete).
 A cursor moves only after the run's ledger is written; a range written and not yet committed is held in
