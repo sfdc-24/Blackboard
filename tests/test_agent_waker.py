@@ -600,6 +600,8 @@ class RedisRequests(unittest.TestCase):
     """
 
     def test_a_well_formed_line_is_the_request_and_leaves_the_body(self):
+        req, _ = aw.redis_request("REDIS-OP|op=xrange|key=fleet:inbox:gemini|count=5|after=1791756204281-0")
+        self.assertEqual(("xrange", "1791756204281-0", "5"), (req["op"], req["after"], req["count"]))
         req, body = aw.redis_request("Short answer.\nREDIS-OP|op=xadd|key=conf:side:20261011|val=the lease holds\nMore.")
         self.assertEqual({"op": "xadd", "key": "conf:side:20261011", "val": "the lease holds",
                           "field": None, "count": None}, req)

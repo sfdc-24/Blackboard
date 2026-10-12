@@ -120,6 +120,19 @@ _FIELD = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
 PREVIEW_CHARS = 200          # how much of a value an audit entry or a RESULT row may quote
 MAX_HASH_FIELDS = 50
 MAX_RANGE = 20
+# A stream entry id, `<ms>-<seq>`, for `xrange after=`: an inbox reader asks for everything after the last
+# entry it read, so a burst of more than MAX_RANGE messages is paged, never silently cut to the newest.
+STREAM_ID = re.compile(r"[0-9]{1,20}-[0-9]{1,20}")
+U64_MAX = 2 ** 64 - 1
+
+
+def stream_id_ok(value: str) -> bool:
+    """`<ms>-<seq>`, each part an unsigned 64-bit integer as Redis requires. 20 digits alone admit
+    99999999999999999999, which Redis rejects at XRANGE with a generic error (Copilot on 6b1d459)."""
+    if not STREAM_ID.fullmatch(value or ""):
+        return False
+    ms, seq = value.split("-")
+    return int(ms) <= U64_MAX and int(seq) <= U64_MAX
 
 
 class Refused(Exception):
@@ -304,13 +317,14 @@ def _audit_alone(conn, fields) -> None:
 
 def execute(conn, acl: dict, raw_tag: str, via: str, op: str, key: str, field: str = "",
             raw_value: str = "", enc: str = "", count: int = 10, now=None, generation: str = "",
-            correlation: str = "", head: str = "") -> dict:
+            correlation: str = "", head: str = "", after: str = "") -> dict:
     """Do one governed operation. Always returns a result dict; never raises into the caller.
 
     Every outcome - refused, read, written, or failed - leaves exactly one gov:audit entry, and a
     write's entry is committed in the SAME transaction as the write.
 
-    generation, correlation and head are read only by haudit. Other ops ignore them."""
+    generation, correlation and head are read only by haudit. Other ops ignore them.
+    after is read only by xrange; on any other op it is refused, so a caller cannot believe it paged."""
     who = principal(acl, raw_tag)
     op = (op or "").strip().lower()
     key = (key or "").strip()
@@ -321,6 +335,11 @@ def execute(conn, acl: dict, raw_tag: str, via: str, op: str, key: str, field: s
         if op == VERIFY_OP and not verifier_enabled():
             raise Refused("the verifier is off")
         check(acl, who, op, key, field)
+        after = (after or "").strip()
+        if after and op != "xrange":
+            raise Refused("after= is for xrange only")
+        if after and not stream_id_ok(after):
+            raise Refused("after= must be a stream entry id, <ms>-<seq>")
         value = decode_value(raw_value, enc, acl, key) if op in ("set", "hset", "xadd") else None
         if op == "hset" and not field:
             raise Refused("hset needs field=")
@@ -332,7 +351,7 @@ def execute(conn, acl: dict, raw_tag: str, via: str, op: str, key: str, field: s
             return _audit_generation(conn, acl, who, raw_tag, via, key, field, raw_value, enc,
                                      echoed_generation, echoed_correlation, (head or "").strip(), now)
         if op in OPS_READ:
-            return _read(conn, acl, who, raw_tag, via, op, key, count, now)
+            return _read(conn, acl, who, raw_tag, via, op, key, count, now, after)
         return _write(conn, acl, who, raw_tag, via, op, key, field, value, now)
     except Refused as why:
         try:
@@ -462,7 +481,7 @@ def backend_receipt_accepts(receipt) -> bool:
     return True
 
 
-def _read(conn, acl, who, raw_tag, via, op, key, count, now) -> dict:
+def _read(conn, acl, who, raw_tag, via, op, key, count, now, after="") -> dict:
     if op == "get":
         value = conn.get(key)
         out = {"ok": True, "op": op, "key": key, "found": value is not None, "value": preview(value)}
@@ -471,7 +490,24 @@ def _read(conn, acl, who, raw_tag, via, op, key, count, now) -> dict:
         items = sorted(found.items())[:MAX_HASH_FIELDS]
         out = {"ok": True, "op": op, "key": key, "fields": len(found),
                "value": {k: preview(v) for k, v in items}, "truncated": len(found) > MAX_HASH_FIELDS}
-    else:                                                                       # xrange
+    elif after:                                                                 # xrange after a cursor
+        # OLDEST FIRST from just past the cursor (exclusive "(", Redis 6.2+; redis-central is 7.0). One
+        # more than asked is read so the answer can say whether a next page exists, without a second call.
+        n = max(1, min(int(count or 10), MAX_RANGE))
+        if tuple(int(p) for p in after.split("-")) == (U64_MAX, U64_MAX):
+            # Nothing can follow the largest id, and Redis 7.0 rejects an exclusive start there ("invalid
+            # start ID for the interval", Cursor on 2dc187a): the empty page IS the answer, with no call.
+            entries = []
+        else:
+            entries = conn.xrange(key, min="(" + after, max="+", count=n + 1) or []
+        more = len(entries) > n
+        entries = entries[:n]
+        # `last` - the next after= - is the raw stream id, never the rendered entry's "id": a field named
+        # `id` overwrites that key in the rendering (Cursor on 2dc187a).
+        out = {"ok": True, "op": op, "key": key, "entries": len(entries), "after": after, "more": more,
+               "last": str(entries[-1][0]) if entries else after,
+               "value": [{"id": str(i), **{k: preview(v) for k, v in f.items()}} for i, f in entries]}
+    else:                                                                       # xrange, the newest n
         n = max(1, min(int(count or 10), MAX_RANGE))
         entries = conn.xrevrange(key, count=n) or []
         out = {"ok": True, "op": op, "key": key, "entries": len(entries),
@@ -1380,7 +1416,14 @@ def summarise(result: dict) -> str:
         body = body.replace("|", "/")
         if len(body) > 1500:
             body = body[:1500] + "..."
-        return "OK %s %s: %s" % (result["op"], result["key"], body)
+        # A paged read says where it stands BEFORE the entries, so a body cut at 1500 characters cannot
+        # take it away: the cursor it read after, whether another page waits, and the last id returned -
+        # the next after= - even when that entry itself was cut (Copilot on 6b1d459: `more` was dropped).
+        page = ""
+        if "after" in result:
+            page = " [after=%s more=%s last=%s]" % (
+                result["after"], "true" if result.get("more") else "false", result.get("last", result["after"]))
+        return "OK %s %s%s: %s" % (result["op"], result["key"], page, body)
     return "OK %s %s%s ttl=%s old=%s new=%s (audited)" % (
         result["op"], result["key"], (" field=" + result["field"]) if result.get("field") else "",
         result.get("ttl"), result.get("old_sha") or "-", result.get("new_sha") or "-")

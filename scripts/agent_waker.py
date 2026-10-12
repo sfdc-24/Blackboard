@@ -844,6 +844,8 @@ def redis_request(text: str):
             continue
         request = {"op": op, "key": key, "val": fields.get("val"), "field": fields.get("field") or None,
                    "count": fields.get("count") or None}
+        if fields.get("after"):              # xrange after a cursor; absent, the request is unchanged
+            request["after"] = fields["after"]
         if request["val"] is None and op in ("set", "hset", "hput", "xadd"):
             request, dropped = None, dropped + 1
     body = "\n".join(kept)
@@ -869,6 +871,8 @@ def post_request(me: str, cfg: dict, request: dict, verbose: bool):
         args += ["--field", request["field"]]
     if request.get("count"):
         args += ["--count", str(request["count"])]
+    if request.get("after"):
+        args += ["--after", str(request["after"])]
     try:
         res = subprocess.run(args, cwd=REPO, capture_output=True, text=True, timeout=POST_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
