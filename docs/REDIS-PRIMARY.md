@@ -137,9 +137,17 @@ phase: it is a new door, not a net, and it waits on D1.
   the live room the chair writes each voice's line to `conf:side:<yyyymmdd>` under the chair's own
   principal, with the voice named, behind a default-off flag. The cloud session does not build it.
   **Before it is switched on (Aya, 2026-10-12):** (1) a per-room boundary - the flag belongs to the chair
-  pool, so on is on for every room; the proposal is a room-prefix allowlist that fails closed; and (2) a
-  ruling on the chair writing to Redis directly rather than through the governed worker. Her review also
-  found a private key's body stored beside its masked header; a line that carries one is now withheld whole.
+  pool, so on is on for every room. Her ruling (row `AYA-M1-EXACT-ROOM-DESIGN-20261012`): an **exact
+  room-id allowlist that fails closed when empty**, not prefix matching, and the first acceptance in an
+  explicitly authorized **synthetic** room, separate from real owner and client rooms (an owner's room id
+  is minted when its call starts, so only a synthetic room can be named in advance); and (2) a ruling on
+  the chair writing to Redis directly rather than through the governed worker, still open. Her review
+  also found a private key's body stored beside its masked header; a line that carries one is now
+  withheld whole.
+- **The inbox reader (after M1; Aya, row `AYA-392-MERGED-CURSOR-INTEGRATION-20261012`).**
+  `scripts/redis_inbox.py read` consumes `after`/`more`/`last`, persists `fleet:cursor:<agent>`, and never
+  moves the cursor over a cut or unparsed page or a value cut at the preview bound (Blackboard PR 397).
+  The 200-character preview and the 1500-character row stay as they are.
 - DING for recipients without an in-VPC waker; UNREAD escalation with its cap (§8.6).
 - *Exit tests:* a Gemini → Grok → Gemini exchange through `fleet:inbox:` with **zero** board rows, every op
   in `gov:audit`; in a call, a voice's line is in `conf:side` under the chair's principal with the voice
