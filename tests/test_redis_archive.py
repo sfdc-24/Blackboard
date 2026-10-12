@@ -1,8 +1,9 @@
 """The hourly Redis archive and its LEDGER (cloud/bus-reconciler/redis_archive.py; REDIS-PRIMARY D5).
 
-What must hold: every entry reaches an object before its cursor moves; an archived range is never
-rewritten; a crash between the object and the cursor re-finds the object instead of losing or doubling
-it; one archiver at a time; the ledger hashes what it names; the board row carries no entry's text."""
+What must hold: every entry reaches an object, and that object a durable ledger, before its cursor moves;
+an archived range is never rewritten; a crash anywhere before the ledger re-finds the same object in any
+later hour instead of losing or doubling it; every object is named by some ledger; one archiver at a time;
+the ledger hashes what it names; the board row carries no entry's text."""
 import datetime
 import hashlib
 import json
@@ -82,6 +83,14 @@ class FakeRedis:
         for f in fields:
             (self.data.get(key) or {}).pop(f, None)
 
+    def eval(self, script, numkeys, key, me):
+        """DROP_LUA, atomic as on the server: delete only if the value is still ours."""
+        assert script == ra.DROP_LUA
+        if self.get(key) == me:
+            self.delete(key)
+            return 1
+        return 0
+
 
 class Bucket:
     """A create-only object store: a second write to one name raises Exists, like ifGenerationMatch=0."""
@@ -122,7 +131,9 @@ class OneRun(unittest.TestCase):
         self.assertEqual("ok", out["status"])
         archived = sorted(n for n in bucket.objects if n.endswith(".jsonl"))
         self.assertEqual(3, len(archived))
-        self.assertTrue(all(n.startswith("redis-archive/2026-10-11/23/") for n in archived))
+        self.assertTrue(all(n.startswith("redis-archive/streams/") for n in archived),
+                        "objects are named by stream and range, never by the hour")
+        self.assertTrue(out["ledger"].startswith("redis-archive/2026-10-11/23/LEDGER-"))
         self.assertFalse(any("hello" in n for n in bucket.objects), "a string key is not a stream")
         side = [n for n in archived if "conf__side" in n][0]
         self.assertEqual(["room 0", "room 1", "room 2"], [e["fields"]["text"] for e in entries(bucket.objects[side])])
@@ -133,9 +144,10 @@ class OneRun(unittest.TestCase):
         last = conn.data["conf:side:20261011"][-1][0]
         self.assertEqual(last, conn.hget(ra.CURSOR_KEY, "conf:side:20261011"))
         conn.xadd("conf:side:20261011", {"by": "aya", "text": "later"})
+        before = set(bucket.objects)
         out = ra.run(conn, bucket.put, now=NOW + datetime.timedelta(hours=1), run_id="r2")
         self.assertEqual(1, out["new"])
-        later = [n for n in bucket.objects if n.startswith("redis-archive/2026-10-12/00/")]
+        later = [n for n in set(bucket.objects) - before]
         body = [bucket.objects[n] for n in later if n.endswith(".jsonl")][0]
         self.assertEqual(["later"], [e["fields"]["text"] for e in entries(body)])
 
@@ -147,7 +159,7 @@ class OneRun(unittest.TestCase):
         added = set(bucket.objects) - before
         self.assertEqual(0, out["new"])
         self.assertEqual(1, len(added))
-        self.assertTrue(next(iter(added)).endswith("LEDGER-r2.json"))
+        self.assertRegex(next(iter(added)), r"/LEDGER-r2-[0-9a-f]{12}\.json$")
 
 
 class NeverLostNeverRewritten(unittest.TestCase):
@@ -158,14 +170,76 @@ class NeverLostNeverRewritten(unittest.TestCase):
         self.assertIsNone(conn.hget(ra.CURSOR_KEY, "conf:side:20261011"), "no object, no cursor move")
         self.assertIsNone(conn.get(ra.LOCK_KEY), "the lock is released on the way out")
 
-    def test_a_crash_after_the_object_and_before_the_cursor_finds_the_object_and_moves_on(self):
-        conn, bucket = seeded(), Bucket()
-        ra.run(conn, bucket.put, now=NOW, run_id="r1")
-        conn.hdel(ra.CURSOR_KEY, "conf:side:20261011")           # the cursor write that never happened
+    def test_a_failed_ledger_moves_no_cursor_and_the_next_hour_names_the_same_objects(self):
+        # Copilot on 0bda93e, both blockers at once: objects written, then the ledger upload fails. No cursor
+        # may move, and the next run - an hour later - must write no second copy and must name them.
+        conn = seeded()
+        bucket = Bucket(fail_on="LEDGER-r1")
+        with self.assertRaises(ConnectionError):
+            ra.run(conn, bucket.put, now=NOW, run_id="r1")
+        self.assertIsNone(conn.hget(ra.CURSOR_KEY, "conf:side:20261011"), "no ledger, no cursor")
+        written = sorted(n for n in bucket.objects if n.endswith(".jsonl"))
+        self.assertEqual(3, len(written))
+        conn.xadd("conf:side:20261011", {"by": "aya", "text": "arrived meanwhile"})
+        bucket.fail_on = None
+        out = ra.run(conn, bucket.put, now=NOW + datetime.timedelta(hours=1), run_id="r2")
+        ledger = json.loads(bucket.objects[out["ledger"]])
+        named = sorted(r["object"] for r in ledger["streams"] if r.get("object"))
+        self.assertEqual(written, named, "the same three objects, named by the next ledger")
+        self.assertEqual(["exists"] * 3, [r["written"] for r in ledger["streams"] if r.get("object")])
+        side = [r for r in ledger["streams"] if r["key"] == "conf:side:20261011"][0]
+        self.assertTrue(side["more"], "the entry that arrived meanwhile waits for the next run")
+        self.assertEqual(3, len([n for n in bucket.objects if n.endswith(".jsonl")]), "no second copy of any range")
+        third = ra.run(conn, bucket.put, now=NOW + datetime.timedelta(hours=2), run_id="r3")
+        self.assertEqual(1, third["new"])
+        self.assertEqual(4, len([n for n in bucket.objects if n.endswith(".jsonl")]))
+
+    def test_a_crash_between_the_object_and_the_ledger_in_the_same_hour_is_the_same(self):
+        conn = seeded()
+        bucket = Bucket(fail_on="LEDGER-r1")
+        with self.assertRaises(ConnectionError):
+            ra.run(conn, bucket.put, now=NOW, run_id="r1")
+        bucket.fail_on = None
         out = ra.run(conn, bucket.put, now=NOW, run_id="r1-retry")
-        side = [s for s in json.loads(bucket.objects[out["ledger"]])["streams"] if s["key"] == "conf:side:20261011"][0]
-        self.assertEqual("exists", side["written"])
+        rows = json.loads(bucket.objects[out["ledger"]])["streams"]
+        self.assertTrue(all(r["written"] == "exists" for r in rows if r.get("object")))
         self.assertEqual(conn.data["conf:side:20261011"][-1][0], conn.hget(ra.CURSOR_KEY, "conf:side:20261011"))
+        self.assertEqual({}, conn.data.get(ra.PENDING_KEY) or {}, "committed ranges leave nothing pending")
+
+    def test_a_retried_task_with_the_same_run_id_writes_its_own_ledger(self):
+        # Cloud Run retries a task under the same execution name. The first attempt wrote its ledger and died
+        # before moving a cursor; the retry has more to archive. It must not find the first ledger ("exists")
+        # and commit a range that ledger never named.
+        conn, bucket = seeded(), Bucket()
+        real_hset = conn.hset
+
+        def dies_committing(key, field, value):
+            if key == ra.CURSOR_KEY:
+                raise ConnectionError("worker lost")
+            real_hset(key, field, value)
+        conn.hset = dies_committing
+        with self.assertRaises(ConnectionError):
+            ra.run(conn, bucket.put, now=NOW, run_id="r1")
+        conn.hset = real_hset
+        conn.xadd("fleet:inbox:aya", {"text": "for aya"})
+        out = ra.run(conn, bucket.put, now=NOW, run_id="r1")
+        self.assertEqual(2, len([n for n in bucket.objects if "/LEDGER-r1-" in n]), "a second ledger, not 'exists'")
+        named = {r["key"] for r in json.loads(bucket.objects[out["ledger"]])["streams"] if r.get("object")}
+        self.assertIn("fleet:inbox:aya", named, "the range the retry committed is the range its ledger names")
+
+    def test_a_pending_range_whose_first_entry_was_trimmed_is_named_by_the_next_ledger(self):
+        conn = seeded()
+        bucket = Bucket(fail_on="LEDGER-r1")
+        with self.assertRaises(ConnectionError):
+            ra.run(conn, bucket.put, now=NOW, run_id="r1")
+        orphan = [n for n in bucket.objects if "conf__side" in n][0]
+        conn.data["conf:side:20261011"].pop(0)                  # trimmed by a writer's MAXLEN meanwhile
+        bucket.fail_on = None
+        out = ra.run(conn, bucket.put, now=NOW + datetime.timedelta(hours=1), run_id="r2")
+        side = [r for r in json.loads(bucket.objects[out["ledger"]])["streams"] if r["key"] == "conf:side:20261011"][0]
+        self.assertEqual(orphan, side["superseded"], "the earlier object is named, never left unnamed")
+        self.assertEqual("created", side["written"])
+        self.assertEqual({}, conn.data.get(ra.PENDING_KEY) or {})
 
     def test_an_archived_object_is_never_overwritten(self):
         bucket = Bucket()
@@ -188,6 +262,84 @@ class NeverLostNeverRewritten(unittest.TestCase):
             self.assertEqual(2, second["new"])
         finally:
             ra.MAX_PER_STREAM = original
+
+
+class CopilotOn0bda93e(unittest.TestCase):
+    def test_exactly_the_cap_is_not_more(self):
+        conn, bucket = FakeRedis(), Bucket()
+        for k in range(5):
+            conn.xadd("fleet:inbox:grok", {"text": str(k)})
+        original = ra.MAX_PER_STREAM
+        ra.MAX_PER_STREAM = 5
+        try:
+            out = ra.run(conn, bucket.put, now=NOW, run_id="r1")
+            row = json.loads(bucket.objects[out["ledger"]])["streams"][0]
+            self.assertEqual((5, False), (row["new"], row["more"]), "five of five: nothing left")
+        finally:
+            ra.MAX_PER_STREAM = original
+
+    def test_an_unread_backlog_past_the_cap_says_capped_not_a_count(self):
+        conn, bucket = FakeRedis(), Bucket()
+        conn.xadd("fleet:inbox:gemini", {"text": "first"})
+        conn.set("fleet:cursor:gemini", conn.data["fleet:inbox:gemini"][0][0])
+        for k in range(4):
+            conn.xadd("fleet:inbox:gemini", {"text": str(k)})
+        original = ra.UNREAD_CAP
+        ra.UNREAD_CAP = 3
+        try:
+            rows, app = [], []
+            out = ra.run(conn, bucket.put, append=app.append, now=NOW, run_id="r1")
+            row = json.loads(bucket.objects[out["ledger"]])["streams"][0]
+            self.assertEqual((3, True), (row["unread"], row["unread_capped"]))
+            self.assertIn("unread=gemini:3+", app[0]["payload"], "'+' on the board: at least, not exactly")
+        finally:
+            ra.UNREAD_CAP = original
+
+    def test_a_long_row_keeps_the_ledger_pointer_and_hash(self):
+        conn, bucket, app = FakeRedis(), Bucket(), []
+        for k in range(200):
+            conn.xadd("fleet:inbox:agent-with-a-long-name-%03d" % k, {"text": "x"})
+        original = ra.MAX_PER_STREAM
+        ra.MAX_PER_STREAM = 0
+        try:
+            out = ra.run(conn, bucket.put, append=app.append, now=NOW, run_id="r1")
+        finally:
+            ra.MAX_PER_STREAM = original
+        payload = app[0]["payload"]
+        self.assertLessEqual(len(payload), ra.ROW_LIMIT)
+        self.assertIn("ledger=gs://%s/%s" % (ra.DEFAULT_BUCKET, out["ledger"]), payload)
+        self.assertIn("sha256=%s" % out["sha256"], payload)
+        self.assertIn("(lists in the ledger)", payload)
+
+
+class TheEntryPoint(unittest.TestCase):
+    """main() is the scheduled job. Off (absent or anything but 'on') must touch nothing."""
+
+    def call(self, env):
+        from unittest import mock
+        import redis_dual
+        built, ran = [], []
+        with mock.patch.dict(ra.os.environ, env, clear=False), \
+                mock.patch.object(redis_dual, "client", side_effect=lambda *a, **k: built.append(1) or FakeRedis()), \
+                mock.patch.object(ra, "run", side_effect=lambda *a, **k: ran.append(k) or {"status": "ok"}), \
+                mock.patch.object(ra, "gcs_put", return_value=lambda *a: None):
+            for name in ("REDIS_ARCHIVE_ENABLED", "REDIS_ARCHIVE_DRY_RUN"):
+                if name not in env:
+                    ra.os.environ.pop(name, None)
+            code = ra.main([])
+        return code, built, ran
+
+    def test_absent_or_off_or_anything_else_does_nothing(self):
+        for env in ({}, {"REDIS_ARCHIVE_ENABLED": "off"}, {"REDIS_ARCHIVE_ENABLED": "ON"},
+                    {"REDIS_ARCHIVE_ENABLED": "1"}, {"REDIS_ARCHIVE_ENABLED": "true"}):
+            code, built, ran = self.call(env)
+            self.assertEqual((0, [], []), (code, built, ran), env)
+
+    def test_on_runs_once_and_dry_run_is_passed_through(self):
+        code, built, ran = self.call({"REDIS_ARCHIVE_ENABLED": "on", "REDIS_ARCHIVE_LEDGER_ROW": "off",
+                                      "REDIS_ARCHIVE_DRY_RUN": "1"})
+        self.assertEqual((0, 1, 1), (code, len(built), len(ran)))
+        self.assertTrue(ran[0]["dry_run"])
 
 
 class OneArchiverAtATime(unittest.TestCase):
@@ -236,6 +388,18 @@ class TheLedger(unittest.TestCase):
         rows = {s["key"]: s for s in json.loads(bucket.objects[out["ledger"]])["streams"]}
         self.assertEqual(1, rows["fleet:inbox:gemini"]["unread"])
         self.assertIsNone(rows["conf:side:20261011"]["unread"], "a room is not an inbox")
+
+    def test_a_pending_range_for_a_stream_that_expired_is_named_and_dropped(self):
+        conn = seeded()
+        bucket = Bucket(fail_on="LEDGER-r1")
+        with self.assertRaises(ConnectionError):
+            ra.run(conn, bucket.put, now=NOW, run_id="r1")
+        orphan = [n for n in bucket.objects if "conf__side" in n][0]
+        conn.delete("conf:side:20261011")                       # the day's room expired meanwhile
+        bucket.fail_on = None
+        out = ra.run(conn, bucket.put, now=NOW + datetime.timedelta(days=1), run_id="r2")
+        self.assertEqual([orphan], json.loads(bucket.objects[out["ledger"]])["superseded"])
+        self.assertNotIn("conf:side:20261011", conn.data.get(ra.PENDING_KEY) or {})
 
     def test_a_cursor_for_a_stream_that_expired_is_dropped(self):
         conn, bucket = seeded(), Bucket()

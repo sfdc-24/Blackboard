@@ -10,17 +10,22 @@ WHY THIS EXISTS
     it audits - is archived with it.
 
 WHAT ONE RUN DOES
-    1. Takes gov:archive:lock (SET NX, TTL): one archiver at a time, the PR 390 lesson.
+    1. Takes gov:archive:lock (SET NX, TTL): one archiver at a time, the PR 390 lesson. It is released with
+       a compare-and-delete, so a run that outlived its lock never frees the next holder's.
     2. For every stream it archives (ARCHIVE_PATTERNS, ARCHIVE_KEYS), reads the entries AFTER the stream's
        archive cursor (gov:archive:cursor, a hash under gov:, which no agent may write), oldest first.
-    3. Writes them as JSON lines to gs://<bucket>/<prefix>/<date>/<hour>/<key>/<first>_<last>.jsonl,
-       CREATE-ONLY (ifGenerationMatch=0). An archived hour is never rewritten.
-    4. Only then moves the cursor. A crash between the two re-writes the same range next run: the object
-       name is the range, so it already exists and the run moves on. At-least-once, never lost.
-    5. Writes the LEDGER - per stream: entries archived, newest id, length, the object and its SHA-256,
-       and for an inbox the unread count after its reader's cursor (fleet:cursor:<agent>) - as one
-       create-only JSON object, and ONE board row that names it and carries its hash. Nobody is woken:
-       the row is addressed to `ledger`, which is no agent.
+    3. Records the range in gov:archive:pending, then writes it as JSON lines to
+       gs://<bucket>/<prefix>/streams/<key>/<first>_<last>.jsonl, CREATE-ONLY (ifGenerationMatch=0). The
+       name is the stream and the range, never the hour, and a pending range is written again EXACTLY as
+       it was: a retry in any later hour finds the same object instead of writing a second copy.
+    4. Writes the run's LEDGER - per stream: entries archived, newest id, length, the object and its
+       SHA-256, and for an inbox the unread count after its reader's cursor (fleet:cursor:<agent>) - as one
+       create-only JSON object under <prefix>/<date>/<hour>/, named by the run and its own hash.
+    5. Only then moves each cursor and clears its pending range. Every object is therefore named by a
+       ledger: this run's, or - if the run died before its ledger - the next run's. At-least-once, never
+       lost, never doubled.
+    6. Posts ONE board row that names the ledger and carries its hash. Nobody is woken: the row is
+       addressed to `ledger`, which is no agent.
 
 WHAT IT NEVER DOES
     No write outside gov:archive:* in Redis; no delete, no trim; no object overwritten; no message text on
@@ -58,10 +63,18 @@ ARCHIVE_KEYS = ("gov:audit",)
 LOCK_KEY = "gov:archive:lock"
 LOCK_SECONDS = 900                       # longer than any run; a dead run frees it within 15 minutes
 CURSOR_KEY = "gov:archive:cursor"        # hash: stream key -> last archived entry id
+# hash: stream key -> "<first> <last>", the range written (or being written) and not yet committed by a ledger.
+# It is what makes a retry in ANY later hour write the SAME object instead of a second copy (Copilot on
+# 0bda93e: the name used to carry the run's hour, so a crash then the next hour duplicated the range).
+PENDING_KEY = "gov:archive:pending"
 READER_CURSOR = "fleet:cursor:%s"        # an inbox reader's own cursor (REDIS-PRIMARY 5.1); may not exist
 BATCH = 1000
 MAX_PER_STREAM = 50000                   # per run; the rest is the next hour's, and the ledger says so
 UNREAD_CAP = 1000
+# Release only our own lock, in one server-side step: GET then DELETE could delete a holder that took the
+# lock in between (Copilot on 0bda93e; the same defect and fix as bus-requests' lock in PR 390).
+DROP_LUA = ("if redis.call('get', KEYS[1]) == ARGV[1] then "
+            "return redis.call('del', KEYS[1]) else return 0 end")
 
 DEFAULT_BUCKET = "sfdc24-fleet-state"
 DEFAULT_PREFIX = "redis-archive"
@@ -76,6 +89,10 @@ class Exists(Exception):
 
 def text(value) -> str:
     return value.decode("utf-8", "replace") if isinstance(value, bytes) else ("" if value is None else str(value))
+
+
+def order(entry_id: str) -> tuple:
+    return tuple(int(p) for p in entry_id.split("-"))
 
 
 def safe_key(key: str) -> str:
@@ -113,86 +130,123 @@ def read_after(conn, key: str, cursor: str, limit: int) -> list:
 
 
 def unread(conn, key: str):
-    """For fleet:inbox:<agent>, how many entries are after the agent's own read cursor. None: no cursor."""
+    """For fleet:inbox:<agent>: (count, capped) after the agent's own read cursor, counted up to UNREAD_CAP;
+    capped=True means "at least UNREAD_CAP", never a count (Copilot on 0bda93e). None: no reader cursor."""
     if not key.startswith("fleet:inbox:"):
         return None
     cursor = text(conn.get(READER_CURSOR % key[len("fleet:inbox:"):]))
     if not re.fullmatch(r"[0-9]{1,20}-[0-9]{1,20}", cursor):
         return None
-    return len(conn.xrange(key, min="(" + cursor, max="+", count=UNREAD_CAP + 1) or [])
+    n = len(conn.xrange(key, min="(" + cursor, max="+", count=UNREAD_CAP + 1) or [])
+    return (min(n, UNREAD_CAP), n > UNREAD_CAP)
 
 
-def archive_stream(conn, key: str, put, folder: str, dry_run=False) -> dict:
+def stage_stream(conn, key: str, put, folder: str, dry_run=False) -> dict:
+    """PHASE 1 for one stream: write its new range as an object. NO cursor moves here - cursors move only
+    after the run's ledger is durable (Copilot on 0bda93e), so every object a run writes is named by a
+    ledger, this run's or the next one's."""
     cursor = text(conn.hget(CURSOR_KEY, key)) or "0-0"
-    entries = read_after(conn, key, cursor, MAX_PER_STREAM)
+    entries = read_after(conn, key, cursor, MAX_PER_STREAM + 1)       # one past the cap: the sentinel
+    more = len(entries) > MAX_PER_STREAM
+    entries = entries[:MAX_PER_STREAM]
+    pending = text(conn.hget(PENDING_KEY, key)).split()
+    if len(pending) == 2 and entries and entries[0][0] == pending[0]:
+        # A range written before and not yet committed: write EXACTLY that range again, whatever the hour.
+        pinned = [e for e in entries if order(e[0]) <= order(pending[1])]
+        more = more or len(pinned) < len(entries)
+        entries = pinned
+        pending = []
+    found = unread(conn, key)
     row = {"key": key, "new": len(entries), "after": cursor, "length": int(conn.xlen(key) or 0),
-           "unread": unread(conn, key)}
+           "unread": None if found is None else found[0],
+           "unread_capped": None if found is None else found[1], "more": more}
+    if len(pending) == 2 and order(pending[1]) > order(cursor):
+        # A range written and never committed whose first entry is gone (the stream was trimmed): its
+        # object may exist, so THIS ledger names it - no object is ever left unnamed.
+        row["superseded"] = "%s/%s/%s_%s.jsonl" % (folder, safe_key(key), pending[0], pending[1])
     if not entries:
         row["last"] = cursor
         return row
     first, last = entries[0][0], entries[-1][0]
     body = "".join(json.dumps({"id": i, "fields": f}, sort_keys=True, ensure_ascii=False) + "\n"
                    for i, f in entries).encode("utf-8")
+    # The name is the stream and the range, never the hour: the same range is the same object.
     name = "%s/%s/%s_%s.jsonl" % (folder, safe_key(key), first, last)
-    row.update(last=last, object=name, bytes=len(body), sha256=hashlib.sha256(body).hexdigest(),
-               more=len(entries) >= MAX_PER_STREAM)
+    row.update(last=last, object=name, bytes=len(body), sha256=hashlib.sha256(body).hexdigest())
     if dry_run:
         row["written"] = "dry-run"
         return row
+    conn.hset(PENDING_KEY, key, "%s %s" % (first, last))            # BEFORE the object
     try:
         put(name, body, "application/x-ndjson")
         row["written"] = "created"
     except Exists:
-        row["written"] = "exists"            # an earlier run wrote this exact range and died before the cursor
-    conn.hset(CURSOR_KEY, key, last)         # ONLY after the object is there
+        row["written"] = "exists"            # an earlier run wrote this range and died before committing it
     return row
 
 
 def ledger_row(ledger: dict, ledger_name: str, ledger_sha: str, bucket: str) -> dict:
-    """The one board row: counts, ids and the ledger's hash. Never an entry's text."""
-    inboxes = [s for s in ledger["streams"] if s["key"].startswith("fleet:inbox:")]
-    unread_text = ",".join("%s:%s" % (s["key"][len("fleet:inbox:"):], "-" if s["unread"] is None else s["unread"])
-                           for s in inboxes)
-    row_id = safe("BUS-RECONCILER-LEDGER-%s" % ledger["run"])[:120]
-    text_part = safe("hour=%s streams=%d new=%d objects=%d more=%s ledger=gs://%s/%s sha256=%s unread=%s" % (
-        ledger["hour"], len(ledger["streams"]), ledger["totals"]["new"], ledger["totals"]["objects"],
-        ",".join(s["key"] for s in ledger["streams"] if s.get("more")) or "none",
-        bucket, ledger_name, ledger_sha, unread_text or "none"))
-    payload = "BCB|v=1|id=%s|phase=LEDGER|from=%s|to=%s|evidence=MEASURED|text=%s" % (
-        row_id, WORKER_TAG, LEDGER_TARGET, text_part)
-    if len(payload) > ROW_LIMIT:              # the ledger object holds everything; the row only points at it
-        payload = payload[:ROW_LIMIT - 15] + " (see ledger)"
+    """The one board row: the ledger's pointer and hash FIRST, then counts, then the lists - and if the row
+    is too long the lists become counts, so the pointer and hash always survive (Copilot on 0bda93e).
+    Never an entry's text."""
+    rows = ledger["streams"]
+    row_id = safe("BUS-RECONCILER-LEDGER-%s-%s" % (ledger["run"], ledger_sha[:12]))[:120]
+    head = "ledger=gs://%s/%s sha256=%s hour=%s streams=%d new=%d objects=%d" % (
+        bucket, ledger_name, ledger_sha, ledger["hour"], len(rows), ledger["totals"]["new"],
+        ledger["totals"]["objects"])
+    more = [r["key"] for r in rows if r.get("more")]
+    inboxes = [r for r in rows if r["key"].startswith("fleet:inbox:")]
+    unread_text = ",".join("%s:%s%s" % (r["key"][len("fleet:inbox:"):], "-" if r["unread"] is None else r["unread"],
+                                        "+" if r.get("unread_capped") else "") for r in inboxes)
+    envelope = "BCB|v=1|id=%s|phase=LEDGER|from=%s|to=%s|evidence=MEASURED|text=%%s" % (
+        row_id, WORKER_TAG, LEDGER_TARGET)
+    full = safe("%s more=%s unread=%s" % (head, ",".join(more) or "none", unread_text or "none"))
+    payload = envelope % full
+    if len(payload) > ROW_LIMIT:
+        payload = envelope % safe("%s more=%d unread=%d (lists in the ledger)" % (head, len(more), len(inboxes)))
     return {"row_id": row_id, "source_tag": WORKER_TAG, "target_surface": LEDGER_TARGET,
             "action_type": "LEDGER", "category": "DONE", "project_tag": "Blackboard",
             "gist": safe("Redis archive %s: %d new entries in %d streams" % (
-                ledger["hour"], ledger["totals"]["new"], len(ledger["streams"]))),
+                ledger["hour"], ledger["totals"]["new"], len(rows))),
             "payload": payload}
 
 
 def run(conn, put, append=None, now=None, run_id="", dry_run=False, prefix=DEFAULT_PREFIX,
         bucket=DEFAULT_BUCKET) -> dict:
-    """One archive pass. `put(name, body, content_type)` writes create-only and raises Exists;
-    `append(spec)` posts one board row and reads it back (scripts/append.py's contract)."""
+    """One archive pass, in three phases: (1) write every stream's new range as a create-only object,
+    recording it as pending; (2) write the run's ledger, create-only; (3) only then move each cursor and
+    clear its pending range. A failure in (1) or (2) moves no cursor, and the pending ranges make the next
+    run - in any hour - rewrite the same objects and name them in its ledger.
+    `put(name, body, content_type)` writes create-only and raises Exists; `append(spec)` posts one board row
+    and reads it back (scripts/append.py's contract)."""
     now = now or datetime.datetime.now(datetime.timezone.utc)
     run_id = safe(run_id or now.strftime("%Y%m%dT%H%M%SZ")).replace(" ", "")[:64]
     if not conn.set(LOCK_KEY, run_id, nx=True, ex=LOCK_SECONDS):
         return {"status": "locked", "holder": text(conn.get(LOCK_KEY))}
     try:
-        folder = "%s/%s/%s" % (prefix, now.strftime("%Y-%m-%d"), now.strftime("%H"))
-        rows = [archive_stream(conn, key, put, folder, dry_run=dry_run) for key in streams(conn)]
-        # A cursor for a stream that no longer exists (a conf:side: day past its TTL) is dropped, so the
-        # hash does not grow forever. Its last archive object stays where it is.
+        objects_folder = "%s/streams" % prefix
+        hour_folder = "%s/%s/%s" % (prefix, now.strftime("%Y-%m-%d"), now.strftime("%H"))
+        rows = [stage_stream(conn, key, put, objects_folder, dry_run=dry_run) for key in streams(conn)]
+        # A cursor or pending range for a stream that no longer exists (a conf:side: day past its TTL) is
+        # dropped, so neither hash grows forever. A dropped pending range's object is named by this ledger.
         live = {r["key"] for r in rows}
         stale = [k for k in (text(k) for k in (conn.hkeys(CURSOR_KEY) or [])) if k not in live]
-        if stale and not dry_run:
-            conn.hdel(CURSOR_KEY, *stale)
+        gone = sorted(k for k in (text(k) for k in (conn.hkeys(PENDING_KEY) or [])) if k not in live)
+        orphans = []
+        for k in gone:
+            pair = text(conn.hget(PENDING_KEY, k)).split()
+            if len(pair) == 2:
+                orphans.append("%s/%s/%s_%s.jsonl" % (objects_folder, safe_key(k), pair[0], pair[1]))
         ledger = {"run": run_id, "hour": now.strftime("%Y-%m-%dT%HZ"), "at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                  "dry_run": bool(dry_run), "streams": rows, "dropped_cursors": stale,
+                  "dry_run": bool(dry_run), "streams": rows, "dropped_cursors": stale, "superseded": orphans,
                   "totals": {"new": sum(r["new"] for r in rows),
                              "objects": sum(1 for r in rows if r.get("object"))}}
         body = (json.dumps(ledger, indent=1, sort_keys=True) + "\n").encode("utf-8")
-        ledger_name = "%s/LEDGER-%s.json" % (folder, run_id)
         ledger_sha = hashlib.sha256(body).hexdigest()
+        # Named by the run AND its own hash: should a task ever be retried under the same execution (the job
+        # runs --max-retries 0 today), the retry writes a second, different ledger instead of finding the
+        # first and committing ranges it never named. "Exists" can then only mean these exact bytes are durable.
+        ledger_name = "%s/LEDGER-%s-%s.json" % (hour_folder, run_id, ledger_sha[:12])
         out = {"status": "dry-run" if dry_run else "ok", "ledger": ledger_name, "sha256": ledger_sha,
                "streams": len(rows), "new": ledger["totals"]["new"]}
         if dry_run:
@@ -201,6 +255,15 @@ def run(conn, put, append=None, now=None, run_id="", dry_run=False, prefix=DEFAU
             put(ledger_name, body, "application/json")
         except Exists:
             out["ledger_written"] = "exists"
+        # PHASE 3: the ledger is durable, so the ranges it names are committed, and so is every pending
+        # range it names as superseded. Nothing pending is cleared before this point.
+        for r in rows:
+            if r.get("object"):
+                conn.hset(CURSOR_KEY, r["key"], r["last"])
+        if rows or gone:
+            conn.hdel(PENDING_KEY, *([r["key"] for r in rows] + gone))
+        if stale:
+            conn.hdel(CURSOR_KEY, *stale)
         if append is not None:
             spec = ledger_row(ledger, ledger_name, ledger_sha, bucket)
             try:
@@ -210,8 +273,10 @@ def run(conn, put, append=None, now=None, run_id="", dry_run=False, prefix=DEFAU
                 out["row"] = "unconfirmed (exit %s)" % stop.code
         return out
     finally:
-        if text(conn.get(LOCK_KEY)) == run_id:
-            conn.delete(LOCK_KEY)
+        try:
+            conn.eval(DROP_LUA, 1, LOCK_KEY, run_id)
+        except Exception:                                               # noqa: BLE001 - it expires anyway
+            pass
 
 
 # ----------------------------------------------------------------------------------------------- GCS
@@ -262,7 +327,7 @@ def verify(get, ledger_name: str) -> dict:
     return {"ledger": ledger_name, "checked": checked, "mismatched": bad, "ok": not bad}
 
 
-def main(argv=None) -> int:  # pragma: no cover - the job entry point
+def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     import state_store                                                  # noqa: PLC0415
     bucket = os.environ.get("REDIS_ARCHIVE_BUCKET", DEFAULT_BUCKET)

@@ -6,7 +6,9 @@
 # A third job on the image bus-reconciler and bus-requests already run, with the same service account,
 # the same four secrets and the same private-ranges-only egress, plus ONE new grant: create and read
 # objects under gs://sfdc24-fleet-state/redis-archive/ and nowhere else in the bucket. Create-only
-# uploads (ifGenerationMatch=0) mean an archived hour is never overwritten, so no delete is granted.
+# uploads (ifGenerationMatch=0) mean an archived object is never overwritten, so no delete is granted.
+# Objects: <prefix>/streams/<key>/<first>_<last>.jsonl (the range, never the hour). Ledgers:
+# <prefix>/<date>/<hour>/LEDGER-<execution>-<hash>.json. Cursors move only after the ledger is written.
 #
 # THE ORDER, each step with its read-back
 #   bash cloud/bus-reconciler/archive.sh setup      # ticker account, its TokenCreator, the prefix grant
@@ -15,7 +17,7 @@
 #   bash cloud/bus-reconciler/archive.sh dryrun     # one execution that reads and reports, writes nothing
 #   bash cloud/bus-reconciler/archive.sh on         # the flag
 #   bash cloud/bus-reconciler/archive.sh run        # one real execution, and wait
-#   bash cloud/bus-reconciler/archive.sh verify <redis-archive/.../LEDGER-x.json>   # re-hash every object
+#   bash cloud/bus-reconciler/archive.sh verify <redis-archive/<date>/<hour>/LEDGER-....json>   # re-hash every object
 #   bash cloud/bus-reconciler/archive.sh schedule   # hourly at :05 UTC
 #   bash cloud/bus-reconciler/archive.sh readback   # what is deployed, and the last executions
 #   bash cloud/bus-reconciler/archive.sh off        # the flag; the schedule then runs it as "disabled"
@@ -99,7 +101,7 @@ verify() {
   local ledger="${1:-}"
   case "$ledger" in
     "${PREFIX}"/*/LEDGER-*.json) ;;
-    *) echo "verify <${PREFIX}/<date>/<hour>/LEDGER-<run>.json>, the path the run printed" >&2; exit 2 ;;
+    *) echo "verify <${PREFIX}/<date>/<hour>/LEDGER-<run>-<hash>.json>, the path the run printed" >&2; exit 2 ;;
   esac
   "$GCLOUD" run jobs execute "$JOB" --project "$PROJECT" --region "$REGION" --wait \
     --args="-B,redis_archive.py,verify,${ledger}"

@@ -150,13 +150,15 @@ copy we can restore ourselves.
 
 | what | where | flag | script |
 |---|---|---|---|
-| every new entry of `conf:side:*`, `fleet:inbox:*` and `gov:audit`, once an hour, create-only | job `redis-archive` on the bus-reconciler image → `gs://sfdc24-fleet-state/redis-archive/<date>/<hour>/` | `REDIS_ARCHIVE_ENABLED` | `cloud/bus-reconciler/archive.sh` |
-| the LEDGER: per stream the entries archived, newest id, object and SHA-256, and an inbox's unread count after `fleet:cursor:<agent>` | `LEDGER-<execution>.json` beside the objects, and ONE board row (`Action_Type=LEDGER`, addressed to `ledger`, which wakes nobody) | same | same |
+| every new entry of `conf:side:*`, `fleet:inbox:*` and `gov:audit`, once an hour, create-only | job `redis-archive` on the bus-reconciler image → `gs://sfdc24-fleet-state/redis-archive/streams/<key>/<first>_<last>.jsonl`, named by the range and never the hour | `REDIS_ARCHIVE_ENABLED` | `cloud/bus-reconciler/archive.sh` |
+| the LEDGER: per stream the entries archived, newest id, object and SHA-256, and an inbox's unread count after `fleet:cursor:<agent>` | `redis-archive/<date>/<hour>/LEDGER-<execution>-<hash>.json`, and ONE board row (`Action_Type=LEDGER`, addressed to `ledger`, which wakes nobody) | same | same |
 
 **Order:** `setup`, `deploy.sh build`, `deploy`, `dryrun` (writes nothing), `on`, `run`, then
 `verify <the ledger path the run printed>`, then `schedule` (hourly at :05 UTC). **Rollback** is `off`;
-nothing archived is removed. One archiver at a time (`gov:archive:lock`); a run that dies between an
-object and its cursor finds the object next hour and moves on.
+nothing archived is removed. One archiver at a time (`gov:archive:lock`, released compare-and-delete).
+A cursor moves only after the run's ledger is written; a range written and not yet committed is held in
+`gov:archive:pending`, so a run that dies before its ledger leaves every cursor where it was, and the next
+run - in any hour - writes the same range to the same object name (found, not doubled) and names it.
 
 ## The broken-telephone path (Drive → intake → worker or laptop → the doc)
 
