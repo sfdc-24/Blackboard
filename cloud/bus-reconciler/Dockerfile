@@ -65,6 +65,9 @@ COPY scripts/roster_seed.py /app/roster_seed.py
 # its permitted set before sending it. NOT named inspect.py - that shadows the standard
 # library module the redis client imports.
 COPY cloud/bus-reconciler/keyspace_view.py /app/keyspace_view.py
+# The hourly Redis archive and its LEDGER (docs/REDIS-PRIMARY.md, D5): a third job on this image, entrypoint
+# redis_archive.py. Its imports - state_store, redis_dual, serve_requests, bus - are all copied above.
+COPY cloud/bus-reconciler/redis_archive.py /app/redis_archive.py
 
 # No credential in the image. BUS_URL, BUS_SECRET and the Redis AUTH string all
 # arrive at runtime - the first two as secret-backed environment variables, the
