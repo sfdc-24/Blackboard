@@ -3,55 +3,67 @@ transcript, run as a Cloud Run JOB execution - never on a laptop, never in a bro
 
     his words -> the chair's live transcript object (GCS) -> this job -> one PATCH -> read back -> restore
 
-Approved scope (AYA-CASE-00001036-EXACT-OWNER-APPROVAL-20261012; the owner's YES of 2026-10-12
-14:35:54Z, and his typed approval in the builder's session at 15:10Z): org 00Dbm00000wK2ibEAC,
-Case 500bm000039LHSAAA4 only, field Priority only, Medium to High, verified by read-back, then
-restored. "to low" is refused as outside the approval.
+THE SCOPE IS PINNED IN SOURCE, not in configuration (Aya on 6753b44: an env var is not an approval).
+The approved org, Case and values are module constants; the environment must REPEAT the org and Case
+to confirm them, and a mismatch refuses before any network. Approval: AYA-CASE-00001036-EXACT-OWNER-
+APPROVAL-20261012 (his YES of 2026-10-12 14:35:54Z; his typed approval in the builder's session at
+15:10Z): org 00Dbm00000wK2ibEAC, Case 500bm000039LHSAAA4, Priority, Medium to High, verified by
+read-back, then restored to Medium. The Case must HOLD Medium at arming, or the arming refuses:
+Low-to-High-to-Low is nobody's approval.
 
-ONE EXECUTION IS ONE ARMING (AYA-WATCHER-DENIED-IMPLEMENTATION-HOLD-20261012: bind the exact room)
-- The job does nothing unless DEMO_ARMED is exactly "1": without it, the config is named (names,
-  never values) and the process exits 0 before any token, bucket or org is touched. Off by default.
-- The arming BINDS the exact room: DEMO_ROOM is required, and only that room's transcript is read.
-  There is no "whichever transcript appears next" mode.
-- One execution makes at most ONE change and ONE restore, then exits. A rerun is a new arming by the
-  operator who executes it; nothing re-arms itself.
-- The arming expires: DEMO_EXPIRES_MINUTES (1..45) on the monotonic clock. At expiry, at transcript
-  close, or on any error after the change, a change not yet restored IS restored before the job ends.
+ONE EXECUTION IS ONE ARMING, BOUND TO ONE ROOM, AND CONSUMED DURABLY (Aya: memory is not one-shot)
+- DEMO_ARMED=1 or the job exits at its config, naming the missing variable and never a value.
+- DEMO_ROOM is required and exact; the transcript's OWN HEADER must name that room on every read, or
+  the run refuses. There is no "whichever transcript appears next" mode.
+- Before anything is heard, the arming is CONSUMED: a create-once object (ifGenerationMatch=0) under
+  conference/devorg-demo/ keyed by the room. A Cloud Run retry or a rerun of the same arming finds
+  the object and refuses - memory-only state cannot survive a platform retry, so the bucket holds
+  the one-shot. The deploy also sets the job's maxRetries to 0; this guard assumes it did not.
+- The arming expires (DEMO_EXPIRES_MINUTES, 1..45, monotonic clock).
+
+ONE CHANGE, ONE RESTORE, AND AN UNCERTAIN WRITE IS STILL A WRITE (Aya on 6753b44)
+- At most one change and one restore per execution.
+- BEFORE the PATCH leaves, a pending-undo journal object is written durably (create-once): if this
+  process dies mid-write, the journal says what must be reconciled and to which value. The write is
+  then recorded IN FLIGHT in memory too: a lost response or a raising read-back still reconciles.
+- The restore runs at the spoken word, at expiry, at the call closing, or on any error - exactly
+  once. It claims "restored" ONLY from an actual read-back holding Medium: a restore attempt that
+  itself fails is reported as UNKNOWN (exit 1), never as done, and the journal remains for the
+  operator.
 
 WHAT A LINE MUST BE
 - An Owner line of the bound room's transcript, WRITTEN AFTER this execution first saw that
-  transcript live (lines already present are counted and skipped: a replayed call triggers nothing).
-- One sentence that begins with an instruction verb, names "demo case" and "priority", and ends
-  "to high" or "to medium": "Set the demo case priority to high." A question, a sentence holding a
-  negation, or two values in one sentence is not a request (a substring cannot carry a negation, so
-  a sentence with one is refused whole). The Owner label only says the chair heard the room's owner;
-  it authorises this one armed change and nothing wider.
-- "to high" makes the change; "to medium" restores; each request is deduplicated by a correlation id
-  made of the room, the line's place, its time and its text.
+  transcript live, and seen while the transcript still says live: a snapshot that says closed is a
+  record of a finished call, and no command is taken from it (closed is checked BEFORE new lines).
+- A negation ANYWHERE in the line refuses the whole line ("Do not do this. Set the ..." is not a
+  request; a substring cannot carry a negation, and neither can sentence order).
+- One sentence of the shape: an instruction verb, then "the demo case priority" with nothing else
+  between its words, ending "to high" or "to medium": "Set the demo case priority to high." /
+  "Put the demo case priority back to medium." A question, two values in one sentence, extra words
+  between the verb and the subject ("the OTHER demo case") or after the value ("...to high please"):
+  not a request. "to low" is out of the approved scope and refused with a receipt.
+- Each request is deduplicated by a correlation id of room, place, time and text.
 
 THE ORG, AND THE ONE WRITE
 - Identity is the org's existing integration credential (client-credentials connected app), read
   from the environment where the deploy bound the Secret Manager secrets Headless_domain /
   Headless_consumer_key / Headless_consumer_secret. No secret value and no token is ever printed.
-- The token host and the answering instance must be a developer or sandbox host
-  (develop/sandbox/scratch .my.salesforce.com); the org it answers for must be DEMO_ORG_ID
-  (15-character prefix) and a Developer Edition or sandbox - checked by query before any write.
+- The token endpoint is called before any other request is BUILT (Aya on 6753b44: the instance URL
+  does not exist until the token answer names it).
+- The token host and the answering instance must be a developer or sandbox host; the org must answer
+  as the pinned org and be a Developer Edition or sandbox, checked by query before any write.
 - The one PATCH carries "Sforce-Auto-Assign: FALSE": a bare REST update applies the org's active
-  assignment rule by default, and this org's rules reassign and email on escalation. (Checked read
-  only 2026-10-12: no workflow rule, record-triggered flow, Apex trigger, validation rule,
-  auto-response rule or notification setting acts on a Case Priority update here, and every
-  assignment/escalation entry needs the Case's Account - this Case has none.)
-- After every write the Case is read back; a read-back that does not hold the asked value is
-  reported (receipt held=false, exit 1) and never blindly retried.
+  assignment rule, and this org's rules reassign and notify on escalation.
 
 RECEIPTS
 - One JSON object per event to gs://<TRANSCRIPT_BUCKET>/conference/devorg-demo/ (the shape shared
-  with the site's demo page: correlation, kind, field, asked, before, read_back, held, at, undoes,
-  source), and one log line each. A receipt that fails to upload is said and skipped: putting the
-  value back outranks the paper trail.
+  with the site's demo page), each carrying the room, the Case and the correlation it answers, and
+  one log line each, best effort: the restore outranks the paper trail. An org error is logged as
+  its status and errorCode only - never the error body, which can carry record data.
 
-Exit: 0 done, or expired unspent; 1 a write's outcome is not the asked value; 2 config refused;
-3 token or org refused; 4 transcript refused (wrong room, never live, or already closed).
+Exit: 0 done, or expired unspent; 1 a write's outcome is not the asked value, an unexpected error
+(restored first), or a restore whose own outcome is UNKNOWN; 2 config refused; 3 token or org
+refused; 4 transcript or one-shot guard refused.
 """
 from __future__ import annotations
 
@@ -69,7 +81,12 @@ import urllib.request
 API = "v62.0"
 PREFIX = "conference/transcripts"
 RECEIPTS = "conference/devorg-demo"
-VALUES = ("High", "Medium", "Low")
+# The approved scope, pinned in source. Changing any of these is a source change for review,
+# never a configuration choice.
+APPROVED_ORG = "00Dbm00000wK2ibEAC"
+APPROVED_CASE = "500bm000039LHSAAA4"
+BEFORE_VALUE = "Medium"
+AFTER_VALUE = "High"
 MAX_MINUTES = 45
 POLL_SECONDS = 2.0
 ORG_ID = re.compile(r"^00D[A-Za-z0-9]{12}(?:[A-Za-z0-9]{3})?$")
@@ -79,9 +96,13 @@ ALLOWED_HOSTS = ("develop.my.salesforce.com", "sandbox.my.salesforce.com", "scra
 OWNER_LINE = re.compile(r"^- \*\*\[(\d{2}:\d{2}:\d{2})Z\] Owner:\*\* (.*)$")
 SENTENCE = re.compile(r"[^.?!]+[.?!]*")
 LEAD_IN = r"(?:(?:okay|ok|alright|right|now|so|and|please|yes|yeah|hey|claude|grok|codex|gemini)[,\s]+)*"
+# The subject is EXACTLY "the demo case priority": a word between the verb and the subject, between
+# its words, or after the value is not this request ("the OTHER demo case", "...to high please").
 INSTRUCTION = re.compile(
-    r"^" + LEAD_IN + r"(?:set|change|make|update|move|mark|raise|lower|bump|put|switch|restore)\b"
-    r"[^.?!]*\bdemo case\b[^.?!]*\bpriority\b[^.?!]*\bto (high|medium|low)$", re.I)
+    r"^" + LEAD_IN + r"(?:set|change|make|update|move|mark|raise|lower|bump|put|switch|restore)\s+"
+    r"(?:the\s+)?demo case(?:'s|’s)?\s+priority\s+(?:back\s+)?to (high|medium|low)$", re.I)
+# A negation ANYWHERE in the line refuses the whole line: neither a substring nor sentence order
+# can carry a negation safely.
 NEGATION = re.compile(r"\b(?:not|never|no|cannot|without|stop|wait|cancel|don)\b|n't\b|n’t\b", re.I)
 METADATA_TOKEN = "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token"
 
@@ -100,6 +121,15 @@ def now_stamp() -> str:
 
 def say(line: str) -> None:
     print("devorg-demo: %s" % line, flush=True)
+
+
+def error_code_only(body) -> str:
+    """An org error, reduced to what is safe to log: errorCode values, never messages or fields."""
+    codes = []
+    for item in body if isinstance(body, list) else []:
+        if isinstance(item, dict) and item.get("errorCode"):
+            codes.append(str(item["errorCode"]))
+    return ",".join(codes) or "(no errorCode)"
 
 
 # ---------------------------------------------------------------- the words
@@ -130,15 +160,16 @@ def owner_lines(markdown: str) -> list:
 
 
 def request(text: str):
-    """The Priority value one Owner line asks for, or None: exactly one asking sentence, or nothing."""
+    """The Priority value one Owner line asks for, or None: no negation anywhere in the line, and
+    exactly one asking sentence of the exact shape."""
+    if NEGATION.search(text):
+        return None
     asked = []
     for sentence in SENTENCE.findall(text):
         sentence = sentence.strip()
         if not sentence or sentence.endswith("?"):
             continue
         body = sentence.rstrip(".!").strip()
-        if NEGATION.search(body):
-            continue
         hit = INSTRUCTION.match(body)
         if not hit:
             continue
@@ -163,7 +194,8 @@ def _http(req: urllib.request.Request, timeout: float):
 
 
 class Store:
-    """The transcript bucket, with the job's own service-account token: reads, plus receipt writes."""
+    """The transcript bucket, with the job's own service-account token: reads, receipt writes, and
+    the two create-once guards (the consumed arming, the pending-undo journal)."""
 
     def __init__(self, bucket: str):
         self.bucket = bucket
@@ -183,8 +215,19 @@ class Store:
         return self._token
 
     def _get(self, url: str):
-        req = urllib.request.Request(url, headers={"Authorization": "Bearer " + self.token()})
+        token = self.token()
+        req = urllib.request.Request(url, headers={"Authorization": "Bearer " + token})
         return _http(req, 30)
+
+    def _put(self, name: str, entry: dict, once: bool) -> int:
+        url = ("https://storage.googleapis.com/upload/storage/v1/b/%s/o?uploadType=media&name=%s%s"
+               % (self.bucket, urllib.parse.quote(name, safe=""), "&ifGenerationMatch=0" if once else ""))
+        token = self.token()
+        req = urllib.request.Request(url, data=json.dumps(entry, sort_keys=True).encode("utf-8"),
+                                     method="POST", headers={"Authorization": "Bearer " + token,
+                                                             "Content-Type": "application/json"})
+        status, _ = _http(req, 15)
+        return status
 
     def transcript_of(self, room: str) -> str | None:
         """The bound room's one transcript object name, or None while it does not exist yet."""
@@ -209,18 +252,23 @@ class Store:
     def receipt(self, entry: dict) -> None:
         """Best effort: a receipt that cannot land is said and skipped; the restore outranks it."""
         name = "%s/%s-%s.json" % (RECEIPTS, entry["at"].replace(":", ""), entry["correlation"])
-        url = ("https://storage.googleapis.com/upload/storage/v1/b/%s/o?uploadType=media&name=%s"
-               % (self.bucket, urllib.parse.quote(name, safe="")))
-        req = urllib.request.Request(url, data=json.dumps(entry, sort_keys=True).encode("utf-8"), method="POST",
-                                     headers={"Authorization": "Bearer " + self.token(),
-                                              "Content-Type": "application/json"})
         try:
-            status, _ = _http(req, 15)
+            status = self._put(name, entry, once=False)
         except Exception as error:  # noqa: BLE001 - the restore must not die for a receipt
             status = -1
             say("receipt not written (%s)" % type(error).__name__)
         if status != 200:
             say("receipt answered HTTP %d" % status)
+
+    def create_once(self, name: str, entry: dict) -> bool:
+        """True = this call created the object; False = it already existed (412). Anything else,
+        an unknown outcome included, refuses: an unknown write under a one-shot guard is not a yes."""
+        status = self._put(name, entry, once=True)
+        if status == 200:
+            return True
+        if status == 412:
+            return False
+        raise Refused(4, "a one-shot guard write answered HTTP %d" % status)
 
 
 class Org:
@@ -254,9 +302,12 @@ class Org:
         return self._token
 
     def _call(self, method: str, path: str, payload=None, headers=()):
+        # The token comes FIRST: the instance URL does not exist until the token answer names it
+        # (Aya on 6753b44: the first query built a request against an empty endpoint).
+        token = self.token()
         data = None if payload is None else json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(self.instance + path, data=data, method=method)
-        req.add_header("Authorization", "Bearer " + self.token())
+        req.add_header("Authorization", "Bearer " + token)
         if data is not None:
             req.add_header("Content-Type", "application/json")
         for name, value in headers:
@@ -267,7 +318,7 @@ class Org:
     def query(self, soql: str) -> list:
         status, answer = self._call("GET", "/services/data/%s/query?q=%s" % (API, urllib.parse.quote(soql)))
         if status != 200:
-            raise Refused(3, "a query answered HTTP %d" % status)
+            raise Refused(3, "a query answered HTTP %d (%s)" % (status, error_code_only(answer)))
         return answer["records"]
 
     def identity(self) -> dict:
@@ -283,19 +334,20 @@ class Org:
         return rows[0]
 
     def set_priority(self, case_id: str, value: str) -> None:
-        if value not in VALUES:
-            raise Refused(3, "not one of this field's three values")
+        if value not in (BEFORE_VALUE, AFTER_VALUE):
+            raise Refused(3, "not one of the approved values")
         # Sforce-Auto-Assign FALSE: a bare REST update applies the org's active assignment rule.
         status, answer = self._call("PATCH", "/services/data/%s/sobjects/Case/%s" % (API, case_id),
                                     {"Priority": value}, headers=(("Sforce-Auto-Assign", "FALSE"),))
         if status != 204:
-            raise Refused(3, "the update answered HTTP %d: %s" % (status, str(answer)[:120]))
+            raise Refused(3, "the update answered HTTP %d (%s)" % (status, error_code_only(answer)))
 
 
 # ---------------------------------------------------------------- the arming and the run
 
 def config(environ) -> dict:
-    """The arming, from the execution's environment. Refuses by NAME; no value is ever printed."""
+    """The arming, from the execution's environment. The environment CONFIRMS the pinned scope,
+    it cannot choose one. Refuses by NAME; no value is ever printed."""
     if environ.get("DEMO_ARMED") != "1":
         raise Refused(0, "not armed (DEMO_ARMED is not 1): nothing read, nothing written")
     out = {}
@@ -304,6 +356,10 @@ def config(environ) -> dict:
         if not shape.match(value):
             raise Refused(2, "%s is missing or malformed" % name)
         out[name] = value
+    if out["DEMO_ORG_ID"][:15] != APPROVED_ORG[:15]:
+        raise Refused(2, "DEMO_ORG_ID is not the approved org")
+    if out["DEMO_CASE_ID"][:15] != APPROVED_CASE[:15]:
+        raise Refused(2, "DEMO_CASE_ID is not the approved Case")
     try:
         minutes = int(environ.get("DEMO_EXPIRES_MINUTES", "20"))
     except ValueError:
@@ -320,19 +376,25 @@ def config(environ) -> dict:
 
 
 class Demo:
-    """At most one change and one restore, whatever happens around them."""
+    """At most one change and one restore, whatever happens around them. A write whose outcome was
+    never heard counts as a write until the org says otherwise, and the journal of what to put back
+    is durable BEFORE the write leaves."""
 
-    def __init__(self, org: Org, store: Store, case_id: str, before: str):
+    def __init__(self, org: Org, store: Store, room: str):
         self.org, self.store = org, store
-        self.case_id, self.before = case_id, before
-        self.changed = None             # the correlation of the one change
+        self.room = room
+        self.changed = None             # the correlation of the one CONFIRMED change
+        self.in_flight = None           # the correlation of a write whose outcome is unknown
         self.restored = False
+        self.undo_unknown = False       # a restore attempt failed: never claimed as done
         self.held_wrong = False
         self.handled = set()            # correlations already answered, whatever they asked
 
     def receipt(self, **entry) -> dict:
         entry.setdefault("at", now_stamp())
         entry.setdefault("field", "Priority")
+        entry.setdefault("room", self.room)
+        entry.setdefault("case_id", APPROVED_CASE)
         self.store.receipt(entry)
         say("%s %s: asked %s, before %s, org holds %s" % (entry["kind"], entry["correlation"],
             entry.get("asked"), entry.get("before"), entry.get("read_back")))
@@ -342,16 +404,28 @@ class Demo:
         if source["correlation"] in self.handled:
             return                      # the same line is never run twice
         self.handled.add(source["correlation"])
-        if value == "High" and self.changed is None:
-            held = self.org.case(self.case_id)["Priority"]
-            self.org.set_priority(self.case_id, "High")
-            read_back = self.org.case(self.case_id)["Priority"]
-            self.changed = source["correlation"]
+        if value == AFTER_VALUE and self.changed is None and self.in_flight is None:
+            held = self.org.case(APPROVED_CASE)["Priority"]
+            # The journal first, durably: if this process dies between the PATCH and its read-back,
+            # the pending object says what must be reconciled and to which value.
+            created = self.store.create_once(
+                "%s/pending-%s.json" % (RECEIPTS, source["correlation"]),
+                {"kind": "pending-undo", "correlation": source["correlation"], "room": self.room,
+                 "case_id": APPROVED_CASE, "field": "Priority", "restore_to": BEFORE_VALUE,
+                 "before": held, "at": now_stamp(), "source": source})
+            if not created:
+                raise Refused(4, "this request's pending journal already exists: a rerun does not re-run it")
+            # IN FLIGHT the moment the PATCH leaves (Aya on 6753b44: a commit followed by a timeout
+            # left the change unrecorded and skipped the restore).
+            self.in_flight = source["correlation"]
+            self.org.set_priority(APPROVED_CASE, AFTER_VALUE)
+            read_back = self.org.case(APPROVED_CASE)["Priority"]
+            self.changed, self.in_flight = source["correlation"], None
             self.receipt(kind="change", correlation=source["correlation"], source=source,
-                         asked="High", before=held, read_back=read_back, held=read_back == "High")
-            if read_back != "High":
+                         asked=AFTER_VALUE, before=held, read_back=read_back, held=read_back == AFTER_VALUE)
+            if read_back != AFTER_VALUE:
                 self.held_wrong = True
-        elif value == "Medium" and self.changed and not self.restored:
+        elif value == BEFORE_VALUE and self.changed and not self.restored:
             self.restore("the spoken word")
         else:
             self.receipt(kind="refused", correlation=source["correlation"], source=source, asked=value,
@@ -359,17 +433,36 @@ class Demo:
                          why="out of the approved scope or out of order")
 
     def restore(self, why: str) -> None:
-        if not self.changed or self.restored:
+        """Put BEFORE_VALUE back - after a confirmed change, and equally after an uncertain write.
+        Restored is claimed ONLY from a read-back holding it; a failing attempt is UNKNOWN."""
+        if self.restored or self.undo_unknown or (self.changed is None and self.in_flight is None):
             return
-        held = self.org.case(self.case_id)["Priority"]
-        if held != self.before:
-            self.org.set_priority(self.case_id, self.before)
-        read_back = self.org.case(self.case_id)["Priority"]
+        base = self.changed or self.in_flight
+        if self.in_flight:
+            why = "%s, reconciling a write whose outcome was never heard" % why
+        try:
+            held = self.org.case(APPROVED_CASE)["Priority"]
+            if held != BEFORE_VALUE:
+                self.org.set_priority(APPROVED_CASE, BEFORE_VALUE)
+                read_back = self.org.case(APPROVED_CASE)["Priority"]
+            else:
+                read_back = held
+        except Exception as error:  # noqa: BLE001 - an unknown outcome is reported, never claimed
+            self.undo_unknown = True
+            self.held_wrong = True
+            say("UNDO UNKNOWN (%s): the pending journal for %s remains; reconcile by hand or rerun "
+                "a fresh arming" % (type(error).__name__, base))
+            try:
+                self.receipt(kind="undo-unknown", correlation="undo-" + base, undoes=base,
+                             asked=BEFORE_VALUE, before=None, read_back=None, held=None, why=why)
+            except Exception:  # noqa: BLE001
+                pass
+            return
         self.restored = True
-        self.receipt(kind="undo", correlation="undo-" + self.changed, undoes=self.changed,
-                     asked=self.before, before=held, read_back=read_back,
-                     held=read_back == self.before, why=why)
-        if read_back != self.before:
+        self.receipt(kind="undo", correlation="undo-" + base, undoes=base,
+                     asked=BEFORE_VALUE, before=held, read_back=read_back,
+                     held=read_back == BEFORE_VALUE, why=why)
+        if read_back != BEFORE_VALUE:
             self.held_wrong = True
 
 
@@ -383,18 +476,24 @@ def run(environ, clock=time.monotonic, sleep=time.sleep) -> int:
         store = Store(armed["bucket"])
         org = Org(armed["Headless_domain"], armed["Headless_consumer_key"], armed["Headless_consumer_secret"])
         identity = org.identity()
-        if identity["org_id"][:15] != armed["DEMO_ORG_ID"][:15]:
-            raise Refused(3, "the credential's org is not the armed org")
+        if identity["org_id"][:15] != APPROVED_ORG[:15]:
+            raise Refused(3, "the credential's org is not the approved org")
         if identity["type"] != "Developer Edition" and not identity["sandbox"]:
             raise Refused(3, "the org is neither a Developer Edition nor a sandbox")
-        case = org.case(armed["DEMO_CASE_ID"])
-        if case["Priority"] not in VALUES:
-            raise Refused(3, "the Case's Priority holds a value outside High, Medium, Low; not touching it")
+        case = org.case(APPROVED_CASE)
+        if case["Priority"] != BEFORE_VALUE:
+            raise Refused(3, "the Case does not hold %s at arming; the approved cycle starts there" % BEFORE_VALUE)
+        # The one-shot: this arming is consumed durably BEFORE anything is heard. A platform retry
+        # or a second execution bound to the same room finds the object and refuses.
+        if not store.create_once("%s/arming-%s.json" % (RECEIPTS, armed["DEMO_ROOM"]),
+                                 {"kind": "arming", "room": armed["DEMO_ROOM"], "case_id": APPROVED_CASE,
+                                  "org_id": APPROVED_ORG, "minutes": armed["minutes"], "at": now_stamp()}):
+            raise Refused(4, "this room's arming was already consumed: a rerun does not re-arm")
     except Refused as refusal:
         say(str(refusal))
         return refusal.code
     deadline = clock() + armed["minutes"] * 60
-    demo = Demo(org, store, armed["DEMO_CASE_ID"], case["Priority"])
+    demo = Demo(org, store, armed["DEMO_ROOM"])
     say("armed %d minutes: Case %s, Priority %s now, room %s"
         % (armed["minutes"], case["CaseNumber"], case["Priority"], armed["DEMO_ROOM"]))
     watched, seen, live_seen = None, 0, False
@@ -409,14 +508,21 @@ def run(environ, clock=time.monotonic, sleep=time.sleep) -> int:
                 say("found the room's transcript")
             text = store.read(watched)
             header = front_matter(text)
-            lines = owner_lines(text)
-            if not live_seen:
-                if header.get("state") == "closed":
+            if header.get("room") != armed["DEMO_ROOM"]:
+                raise Refused(4, "the transcript's own header does not name the bound room")
+            # Closed is checked BEFORE any new line: a snapshot that says closed is the record of a
+            # finished call, and no command is taken from it (Aya on 6753b44).
+            if header.get("state") == "closed":
+                if not live_seen:
                     say("that transcript is already closed; nothing to hear")
                     return 4
-                if header.get("state") != "live":
-                    sleep(POLL_SECONDS)
-                    continue
+                say("the call closed")
+                break
+            if header.get("state") != "live":
+                sleep(POLL_SECONDS)
+                continue
+            lines = owner_lines(text)
+            if not live_seen:
                 live_seen = True
                 seen = len(lines)       # his words so far are history, not requests
                 say("live: %d owner lines already there, left alone" % seen)
@@ -426,18 +532,18 @@ def run(environ, clock=time.monotonic, sleep=time.sleep) -> int:
                     continue
                 demo.act(value, {"kind": "transcript", "room": armed["DEMO_ROOM"], "line_time": at, "place": place,
                                  "correlation": correlation(armed["DEMO_ROOM"], place, at, words)})
-                if demo.restored:
+                if demo.restored or demo.undo_unknown:
                     return 1 if demo.held_wrong else 0
             seen = max(seen, len(lines))
-            if header.get("state") == "closed":
-                say("the call closed")
-                break
             sleep(POLL_SECONDS)
         else:
             say("the arming expired")
     except Refused as refusal:
         say(str(refusal))
         code = refusal.code
+    except Exception as error:  # noqa: BLE001 - reported, never retried blind; the finally reconciles
+        say("unexpected %s; restoring before exit" % type(error).__name__)
+        code = 1
     finally:
         demo.restore("the arming ended")
     if demo.held_wrong:

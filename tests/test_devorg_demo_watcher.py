@@ -1,19 +1,22 @@
 """cloud/devorg-demo/watcher.py: the armed one-shot that hears one spoken request and puts things back.
 
-What is pinned, and why it must hold:
+What is pinned, and why it must hold (the reviewer's three batches on 6753b44, one corrected head):
 
-    THE ARMING IS THE ONLY DOOR. Unarmed, the job exits at its config without touching the org or
-    the bucket. Armed, it is bound to ONE room, ONE Case, ONE org - Aya's ruling on 2026-10-12:
-    "bind the exact approved room ID AND task correlation, not whichever transcript appears next."
+    THE SCOPE IS SOURCE, NOT CONFIGURATION. The approved org, Case and values are module constants;
+    the environment can only CONFIRM them. A Case that does not hold Medium at arming refuses:
+    Low-to-High-to-Low is nobody's approval.
 
-    ONE CHANGE, ONE RESTORE. However the run ends - the spoken word, expiry, the call closing, or
-    an error after the change - the value read at arming is put back, exactly once.
+    THE ARMING IS THE ONLY DOOR, AND IT IS DURABLE. Unarmed, the job exits at its config without
+    touching anything. Armed, it consumes a create-once object first, so a platform retry or a
+    second execution against the same room refuses instead of acting twice.
 
-    A SENTENCE IS A REQUEST ONLY IN ONE SHAPE. A question, a negation anywhere in the sentence, two
-    values in one sentence, or words before the verb that are not a lead-in: refused whole.
+    AN UNCERTAIN WRITE IS STILL A WRITE. The pending-undo journal is durable BEFORE the write
+    leaves; a commit whose response is lost, or a read-back that raises, still ends in Medium. A
+    restore attempt that itself fails is UNKNOWN - said, receipted, exit 1 - never claimed as done.
 
-    NOTHING REPLAYS. Lines present when the transcript was first seen live are skipped; the same
-    line is never acted on twice (correlation dedup); a transcript that is already closed refuses.
+    A SENTENCE IS A REQUEST ONLY IN ONE SHAPE, and a negation anywhere in the line refuses the
+    whole line. Words inside the subject ("the OTHER demo case") refuse. A transcript that says
+    closed contributes no commands - closed is checked before new lines.
 
 No network: the store and the org below are the only outside things, and they record every call.
 """
@@ -27,14 +30,14 @@ watcher = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(watcher)
 
 ROOM = "conf-demo-abc123"
-ORG = "00Dbm00000wK2ibEAC"
-CASE = "500bm000039LHSAAA4"
+ORG = watcher.APPROVED_ORG
+CASE = watcher.APPROVED_CASE
 
 
-def transcript(state: str, owner_texts) -> str:
+def transcript(state: str, owner_texts, room: str = ROOM) -> str:
     lines = "\n".join("- **[13:0%d:00Z] Owner:** %s" % (i % 10, text) for i, text in enumerate(owner_texts))
     other = "- **[13:00:00Z] Grok:** Set the demo case priority to high."   # never an Owner line
-    return "---\ntype: call-transcript\nroom: %s\nstate: %s\n---\n\n%s\n%s\n" % (ROOM, state, other, lines)
+    return "---\ntype: call-transcript\nroom: %s\nstate: %s\n---\n\n%s\n%s\n" % (room, state, other, lines)
 
 
 def env(**extra) -> dict:
@@ -47,12 +50,15 @@ def env(**extra) -> dict:
 
 
 class FakeStore:
-    """The bucket as the run sees it: a list of texts, served in order (the last one repeats)."""
+    """The bucket as the run sees it: a list of texts served in order (the last repeats), a record
+    of receipts, and a real create-once ledger that survives across runs when shared."""
 
-    def __init__(self, texts, exists=True):
+    def __init__(self, texts, exists=True, events=None):
         self.texts = list(texts)
         self.exists = exists
         self.receipts = []
+        self.created = set()
+        self.events = events if events is not None else []
 
     def transcript_of(self, room):
         assert room == ROOM, "asked for a room the arming did not bind"
@@ -64,25 +70,47 @@ class FakeStore:
     def receipt(self, entry):
         self.receipts.append(entry)
 
+    def create_once(self, name, entry):
+        if name in self.created:
+            return False
+        self.created.add(name)
+        self.events.append(("created", name))
+        return True
+
 
 class FakeOrg:
-    def __init__(self, priority="Medium", org_id=ORG, kind="Developer Edition", fail_set=False):
+    def __init__(self, priority="Medium", org_id=ORG, kind="Developer Edition",
+                 fail_set=False, raise_after_commit=False, raise_readback=False,
+                 fail_reads_after_set=False, events=None):
         self.priority = priority
         self.org_id, self.kind = org_id, kind
         self.fail_set = fail_set
+        self.raise_after_commit = raise_after_commit
+        self.raise_readback = raise_readback
+        self.fail_reads_after_set = fail_reads_after_set
         self.sets = []
+        self.events = events if events is not None else []
 
     def identity(self):
         return {"org_id": self.org_id, "type": self.kind, "sandbox": False}
 
     def case(self, case_id):
-        assert case_id == CASE, "asked for a Case the arming did not bind"
+        assert case_id == CASE, "asked for a Case the scope did not pin"
+        if self.raise_readback and self.sets:
+            self.raise_readback = False                 # once: the read after the first write
+            raise TimeoutError("the read-back timed out")
+        if self.fail_reads_after_set and self.sets:
+            raise TimeoutError("the org stopped answering")
         return {"Id": case_id, "CaseNumber": "00001036", "Subject": "s", "Priority": self.priority, "IsClosed": False}
 
     def set_priority(self, case_id, value):
         self.sets.append((case_id, value))
+        self.events.append(("set", value))
         if not self.fail_set:
             self.priority = value
+        if self.raise_after_commit:
+            self.raise_after_commit = False             # once: the write landed, its answer was lost
+            raise TimeoutError("the update's response was lost")
 
 
 class UntouchableOrg:
@@ -118,6 +146,12 @@ class TheArmingIsTheOnlyDoor(unittest.TestCase):
             code = run(env(**{name: bad}), FakeStore([]), UntouchableOrg())
             self.assertEqual(2, code, (name, bad))
 
+    def test_the_scope_is_source_not_configuration(self):
+        # A well-shaped id that is not the approved one refuses before any network.
+        for name, value in (("DEMO_ORG_ID", "00D000000000001AAA"), ("DEMO_CASE_ID", "500000000000001AAA")):
+            code = run(env(**{name: value}), FakeStore([]), UntouchableOrg())
+            self.assertEqual(2, code, name)
+
     def test_the_wrong_org_refuses_before_any_write(self):
         org = FakeOrg(org_id="00D000000000001AAA")
         self.assertEqual(3, run(env(), FakeStore([transcript("live", [])]), org))
@@ -127,6 +161,27 @@ class TheArmingIsTheOnlyDoor(unittest.TestCase):
         org = FakeOrg(kind="Enterprise Edition")
         self.assertEqual(3, run(env(), FakeStore([transcript("live", [])]), org))
         self.assertEqual([], org.sets)
+
+    def test_a_case_not_holding_medium_refuses_the_arming(self):
+        # The approved cycle is Medium to High to Medium; a Low or High baseline is outside it.
+        for held in ("Low", "High"):
+            org = FakeOrg(priority=held)
+            self.assertEqual(3, run(env(), FakeStore([transcript("live", [])]), org), held)
+            self.assertEqual([], org.sets)
+
+    def test_the_arming_is_consumed_durably_so_a_rerun_refuses(self):
+        first = FakeOrg()
+        store = FakeStore([transcript("live", []),
+                           transcript("live", ["Set the demo case priority to high."]),
+                           transcript("live", ["Set the demo case priority to high.",
+                                               "Set the demo case priority to medium."])])
+        self.assertEqual(0, run(env(), store, first))
+        self.assertEqual([(CASE, "High"), (CASE, "Medium")], first.sets)
+        second = FakeOrg()
+        rerun_store = FakeStore([transcript("live", ["Set the demo case priority to high."])])
+        rerun_store.created = store.created             # the bucket survives the process
+        self.assertEqual(4, run(env(), rerun_store, second))
+        self.assertEqual([], second.sets)
 
 
 class OneChangeOneRestore(unittest.TestCase):
@@ -140,6 +195,19 @@ class OneChangeOneRestore(unittest.TestCase):
         self.assertEqual([(CASE, "High"), (CASE, "Medium")], org.sets)
         self.assertEqual(["change", "undo"], [r["kind"] for r in store.receipts])
         self.assertTrue(all(r["held"] for r in store.receipts))
+        self.assertTrue(all(r["room"] == ROOM and r["case_id"] == CASE for r in store.receipts))
+
+    def test_the_pending_journal_is_durable_before_the_write_leaves(self):
+        events = []
+        org = FakeOrg(events=events)
+        store = FakeStore([transcript("live", []),
+                           transcript("live", ["Set the demo case priority to high."])],
+                          events=events)
+        run(env(DEMO_EXPIRES_MINUTES="1"), store, org)
+        pending = [name for kind, name in events if kind == "created" and "pending-" in name]
+        self.assertEqual(1, len(pending))
+        self.assertLess(events.index(("created", pending[0])), events.index(("set", "High")),
+                        "the journal must exist before the write leaves")
 
     def test_expiry_restores_what_the_spoken_word_did_not(self):
         org = FakeOrg()
@@ -147,7 +215,7 @@ class OneChangeOneRestore(unittest.TestCase):
                            transcript("live", ["Set the demo case priority to high."])])
         self.assertEqual(0, run(env(DEMO_EXPIRES_MINUTES="1"), store, org))
         self.assertEqual([(CASE, "High"), (CASE, "Medium")], org.sets)
-        self.assertEqual("the arming ended", store.receipts[-1]["why"])
+        self.assertIn("the arming ended", store.receipts[-1]["why"])
 
     def test_the_call_closing_restores_too(self):
         org = FakeOrg()
@@ -157,12 +225,36 @@ class OneChangeOneRestore(unittest.TestCase):
         self.assertEqual(0, run(env(), store, org))
         self.assertEqual([(CASE, "High"), (CASE, "Medium")], org.sets)
 
-    def test_the_restore_target_is_the_value_read_at_arming(self):
-        org = FakeOrg(priority="Low")
+    def test_a_commit_whose_response_is_lost_is_still_restored(self):
+        # Reviewer on 6753b44: the write lands, its response times out, and the old code never knew
+        # it had changed anything - the restore was skipped and High stayed.
+        org = FakeOrg(raise_after_commit=True)
         store = FakeStore([transcript("live", []),
                            transcript("live", ["Set the demo case priority to high."])])
-        run(env(DEMO_EXPIRES_MINUTES="1"), store, org)
-        self.assertEqual([(CASE, "High"), (CASE, "Low")], org.sets)
+        self.assertEqual(1, run(env(DEMO_EXPIRES_MINUTES="1"), store, org))
+        self.assertEqual("Medium", org.priority)
+        undo = [r for r in store.receipts if r["kind"] == "undo"]
+        self.assertEqual(1, len(undo))
+        self.assertIn("never heard", undo[0]["why"])
+        self.assertTrue(undo[0]["held"])
+
+    def test_a_read_back_that_raises_is_still_restored(self):
+        org = FakeOrg(raise_readback=True)
+        store = FakeStore([transcript("live", []),
+                           transcript("live", ["Set the demo case priority to high."])])
+        self.assertEqual(1, run(env(DEMO_EXPIRES_MINUTES="1"), store, org))
+        self.assertEqual("Medium", org.priority)
+        self.assertEqual(["undo"], [r["kind"] for r in store.receipts])
+
+    def test_a_restore_that_cannot_reach_the_org_is_unknown_never_done(self):
+        org = FakeOrg(fail_reads_after_set=True)
+        store = FakeStore([transcript("live", []),
+                           transcript("live", ["Set the demo case priority to high."])])
+        self.assertEqual(1, run(env(DEMO_EXPIRES_MINUTES="1"), store, org))
+        self.assertEqual("High", org.priority)          # nothing pretended otherwise
+        kinds = [r["kind"] for r in store.receipts]
+        self.assertIn("undo-unknown", kinds)
+        self.assertNotIn("undo", kinds)
 
     def test_a_read_back_that_does_not_hold_is_exit_one(self):
         org = FakeOrg(fail_set=True)
@@ -197,6 +289,21 @@ class NothingReplays(unittest.TestCase):
         self.assertEqual(4, run(env(), store, org))
         self.assertEqual([], org.sets)
 
+    def test_a_closed_snapshot_contributes_no_commands(self):
+        # The command first appears in the snapshot that says closed: the call is over, and the
+        # sealed record is not a channel (closed is checked before new lines).
+        org = FakeOrg()
+        store = FakeStore([transcript("live", []),
+                           transcript("closed", ["Set the demo case priority to high."])])
+        self.assertEqual(0, run(env(DEMO_EXPIRES_MINUTES="1"), store, org))
+        self.assertEqual([], org.sets)
+
+    def test_a_transcript_whose_header_names_another_room_refuses(self):
+        org = FakeOrg()
+        store = FakeStore([transcript("live", [], room="conf-other-room")])
+        self.assertEqual(4, run(env(), store, org))
+        self.assertEqual([], org.sets)
+
     def test_a_missing_transcript_expires_unspent(self):
         self.assertEqual(0, run(env(DEMO_EXPIRES_MINUTES="1"), FakeStore([], exists=False), FakeOrg()))
 
@@ -214,6 +321,7 @@ class ASentenceIsARequestOnlyInOneShape(unittest.TestCase):
         for text, value in (("Set the demo case priority to high.", "High"),
                             ("Okay, please change the demo case priority to high", "High"),
                             ("Claude, update the demo case priority to high.", "High"),
+                            ("Set the demo case's priority to high.", "High"),
                             ("Put the demo case priority back to medium.", "Medium"),
                             ("Restore the demo case priority to medium.", "Medium"),
                             ("So, mark the demo case priority to low.", "Low")):
@@ -225,11 +333,20 @@ class ASentenceIsARequestOnlyInOneShape(unittest.TestCase):
                      "Don't set the demo case priority to high.",              # its contraction
                      "Never set the demo case priority to high.",
                      "Set the demo case priority from medium to high.",        # two values
+                     "Set the other demo case priority to high.",              # another subject
+                     "Set the second demo case priority to high.",
                      "Set the case priority to high.",                         # not the demo case
                      "Set the demo case priority to urgent.",                  # not a value
                      "The demo case priority moved to high.",                  # no instruction verb
-                     "I wonder whether to set the demo case priority to high altogether",
-                     "Set the demo case priority to high for an hour."):       # does not END at the value
+                     "Set the demo case priority to high for an hour.",        # does not END at the value
+                     "Set the demo case priority to high please."):
+            self.assertIsNone(watcher.request(text), text)
+
+    def test_a_negation_anywhere_in_the_line_refuses_the_whole_line(self):
+        # Sentence order cannot carry a negation either: the line is judged whole.
+        for text in ("Do not do this. Set the demo case priority to high.",
+                     "Set the demo case priority to high. Actually no.",
+                     "Wait. Set the demo case priority to high."):
             self.assertIsNone(watcher.request(text), text)
 
     def test_two_asking_sentences_in_one_line_refuse(self):
@@ -238,7 +355,7 @@ class ASentenceIsARequestOnlyInOneShape(unittest.TestCase):
 
     def test_one_asking_sentence_beside_talk_still_asks(self):
         self.assertEqual("High", watcher.request(
-            "That looks right. Set the demo case priority to high. Thanks everyone."))
+            "That looks good. Set the demo case priority to high. Thanks everyone."))
 
     def test_the_owner_line_shape_and_the_correlation(self):
         lines = watcher.owner_lines(transcript("live", ["one", "two"]))
@@ -252,6 +369,50 @@ class ASentenceIsARequestOnlyInOneShape(unittest.TestCase):
         self.assertEqual({"type": "call-transcript", "room": ROOM, "state": "live"}, header)
         self.assertEqual({}, watcher.front_matter("no header\n---\nstate: live\n"))
         self.assertEqual({}, watcher.front_matter("---\nstate: live\n"))   # never closed
+
+
+class TheOrgClientItself(unittest.TestCase):
+    """The real Org class over a stubbed wire: the startup ordering and the sanitized error."""
+
+    def serve(self, answers):
+        calls = []
+
+        def fake_http(req, timeout):
+            calls.append(req)
+            return answers[len(calls) - 1]
+        kept = watcher._http
+        watcher._http = fake_http
+        self.addCleanup(setattr, watcher, "_http", kept)
+        return calls
+
+    def test_the_first_query_acquires_the_token_before_building_its_request(self):
+        # Reviewer on 6753b44: the first query built its request while the instance was still empty.
+        token = (200, b'{"access_token": "t", "instance_url": "https://x.develop.my.salesforce.com"}')
+        rows = (200, b'{"records": [{"Id": "x"}]}')
+        calls = self.serve([token, rows])
+        org = watcher.Org("x.develop.my.salesforce.com", "k", "s")
+        org.query("SELECT Id FROM Organization")
+        self.assertEqual(2, len(calls))
+        self.assertIn("/services/oauth2/token", calls[0].full_url)
+        self.assertTrue(calls[1].full_url.startswith("https://x.develop.my.salesforce.com/services/data/"),
+                        calls[1].full_url)
+
+    def test_an_org_error_is_logged_as_its_code_and_never_its_words(self):
+        token = (200, b'{"access_token": "t", "instance_url": "https://x.develop.my.salesforce.com"}')
+        refusal = (400, b'[{"message": "Record words that must never be logged", '
+                        b'"errorCode": "FIELD_CUSTOM_VALIDATION_EXCEPTION"}]')
+        self.serve([token, refusal])
+        org = watcher.Org("x.develop.my.salesforce.com", "k", "s")
+        with self.assertRaises(watcher.Refused) as caught:
+            org.set_priority(CASE, "High")
+        self.assertIn("FIELD_CUSTOM_VALIDATION_EXCEPTION", str(caught.exception))
+        self.assertNotIn("never be logged", str(caught.exception))
+
+    def test_a_token_whose_instance_is_not_a_developer_host_refuses(self):
+        self.serve([(200, b'{"access_token": "t", "instance_url": "https://login.salesforce.com"}')])
+        org = watcher.Org("x.develop.my.salesforce.com", "k", "s")
+        with self.assertRaises(watcher.Refused):
+            org.token()
 
 
 if __name__ == "__main__":
