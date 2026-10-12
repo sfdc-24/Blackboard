@@ -494,10 +494,18 @@ def _read(conn, acl, who, raw_tag, via, op, key, count, now, after="") -> dict:
         # OLDEST FIRST from just past the cursor (exclusive "(", Redis 6.2+; redis-central is 7.0). One
         # more than asked is read so the answer can say whether a next page exists, without a second call.
         n = max(1, min(int(count or 10), MAX_RANGE))
-        entries = conn.xrange(key, min="(" + after, max="+", count=n + 1) or []
+        if tuple(int(p) for p in after.split("-")) == (U64_MAX, U64_MAX):
+            # Nothing can follow the largest id, and Redis 7.0 rejects an exclusive start there ("invalid
+            # start ID for the interval", Cursor on 2dc187a): the empty page IS the answer, with no call.
+            entries = []
+        else:
+            entries = conn.xrange(key, min="(" + after, max="+", count=n + 1) or []
         more = len(entries) > n
         entries = entries[:n]
+        # `last` - the next after= - is the raw stream id, never the rendered entry's "id": a field named
+        # `id` overwrites that key in the rendering (Cursor on 2dc187a).
         out = {"ok": True, "op": op, "key": key, "entries": len(entries), "after": after, "more": more,
+               "last": str(entries[-1][0]) if entries else after,
                "value": [{"id": str(i), **{k: preview(v) for k, v in f.items()}} for i, f in entries]}
     else:                                                                       # xrange, the newest n
         n = max(1, min(int(count or 10), MAX_RANGE))
@@ -1413,10 +1421,8 @@ def summarise(result: dict) -> str:
         # the next after= - even when that entry itself was cut (Copilot on 6b1d459: `more` was dropped).
         page = ""
         if "after" in result:
-            entries = result.get("value") or []
             page = " [after=%s more=%s last=%s]" % (
-                result["after"], "true" if result.get("more") else "false",
-                entries[-1]["id"] if entries else result["after"])
+                result["after"], "true" if result.get("more") else "false", result.get("last", result["after"]))
         return "OK %s %s%s: %s" % (result["op"], result["key"], page, body)
     return "OK %s %s%s ttl=%s old=%s new=%s (audited)" % (
         result["op"], result["key"], (" field=" + result["field"]) if result.get("field") else "",

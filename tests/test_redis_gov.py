@@ -570,7 +570,31 @@ class XrangeAfterACursor(unittest.TestCase):
             got = self.read(conn, after=bad)
             self.assertFalse(got["ok"], bad)
             self.assertIn("stream entry id", got["refused"], bad)
-        self.assertTrue(self.read(conn, after=top + "-" + top)["ok"])
+        for edge in (top + "-0", "0-" + top, str(2 ** 63) + "-1"):
+            self.assertTrue(self.read(conn, after=edge)["ok"], edge)
+
+    def test_after_the_largest_id_is_an_empty_page_without_asking_redis(self):
+        # Cursor on 2dc187a: Redis 7.0 rejects XRANGE with an exclusive start at the largest id, so the
+        # read must not send it. Nothing can follow that id: the answer is an empty page.
+        top = str(2 ** 64 - 1) + "-" + str(2 ** 64 - 1)
+
+        class RejectsTheTop(FakeRedis):
+            def xrange(self, key, min="-", max="+", count=None):
+                if min == "(" + top:
+                    raise RuntimeError("ERR invalid start ID for the interval")
+                return FakeRedis.xrange(self, key, min=min, max=max, count=count)
+        conn = RejectsTheTop()
+        self.assertTrue(run(conn, "grok", "xadd", "fleet:inbox:gemini", val="m1")["ok"])
+        got = self.read(conn, after=top)
+        self.assertEqual((True, 0, False, top), (got["ok"], got["entries"], got["more"], got["last"]))
+        self.assertIn("[after=%s more=false last=%s]" % (top, top), gov.summarise(got))
+
+    def test_last_is_the_stream_id_even_when_an_entry_has_a_field_named_id(self):
+        conn = self.stream(2)
+        conn.data["fleet:inbox:gemini"].append(("9-2", {"id": "not-a-cursor", "text": "written elsewhere"}))
+        got = self.read(conn, after="0-0")
+        self.assertEqual("9-2", got["last"])
+        self.assertIn("last=9-2]", gov.summarise(got))
 
     def test_the_board_answer_says_where_the_page_stands_before_the_entries(self):
         conn = self.stream(25)
