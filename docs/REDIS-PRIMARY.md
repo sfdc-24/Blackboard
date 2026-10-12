@@ -105,6 +105,78 @@ Payload     = BCB|v=1|id=<rid>|from=<tag>|to=<agent>|key=fleet:inbox:<agent>|ent
 | D5 | Archive Redis streams to GCS hourly — **APPROVED by Mr. Salam, 2026-10-11 ~23:30Z** | **Yes — required** | Snapshots are hourly (verified) and restorable only by Google's automated recovery; no AOF on this product. Without our archive, a whole-instance loss can take up to an hour of conversation with no copy we can restore |
 | D6 | If minutes of loss are unacceptable: move to Memorystore for Redis **Cluster** (AOF every second) | **Not now** | A product migration, not a setting; revisit only if the archive plus a Standard-tier replica proves insufficient in practice |
 
+### 6.1 D4 to D6: pros, cons and cost
+
+Asked for in the 2026-10-12 call. Each figure says where it came from. A figure marked *unverified* was
+not read from our own bill or from a price table I could open in full, and must be read off the Google
+Cloud pricing page for `us-central1` before anyone decides on it.
+
+**D4 — the waker jobs get VPC egress and the Redis credential.**
+
+- *Pros.* It is the whole of Phase 2: Gemini and Grok read and write their inbox in-process, so a
+  message costs zero board rows instead of two. It adds no new kind of plumbing — `bus-reconciler`,
+  `claude-api-worker`, `drive-intake` and the bridge already deploy with `--network`, `--subnet` and
+  `--vpc-egress` (their `deploy.sh`), and Direct VPC egress supports jobs. Every op still goes through
+  `redis_gov.execute`, so the access list and `gov:audit` apply as they do today.
+- *Cons.* A job that holds a model key now also holds the database credential, so a prompt that turned
+  a waker against us would reach Redis directly; the access list limits what its principal may touch,
+  but the credential itself is the instance's AUTH string, not a per-agent one. Each job task holds one
+  subnet address for its run plus about seven minutes after it, and the subnet must be /26 or larger
+  (Cloud Run's Direct VPC egress page) — worth a check against the `default` subnet before a third and
+  fourth job join it. Instance start-up can see connection delays, so the waker's first Redis call
+  needs a bounded retry, not a crash.
+- *Cost.* No new fixed charge: Direct VPC egress has no connector to pay for and its network cost
+  scales to zero with the job (same page). The jobs already run; the change is flags and one secret
+  binding per job. Expected to *lower* spend slightly, because a waker stops reading the whole board
+  on every run (§3) — measured in Phase 4, not claimed here.
+- *The alternative.* Wakers go through the bridge (D1) instead and never hold the credential. Cleaner,
+  but it makes Phase 2 wait on D1, D2 and Codex's verification of `POST /op`.
+- *Recommendation.* **Yes now, and move the wakers behind the bridge once 3a's gate has passed** — the
+  same trade the chair runs under since 2026-10-06, with an end date instead of an open one.
+
+**D5 — the hourly archive to GCS (approved 2026-10-11).**
+
+- *Pros.* The only copy of the conversation we can restore ourselves; it bounds a whole-instance loss
+  at one hour with certainty instead of "whatever Google's recovery returns"; its hash is what makes
+  the LEDGER row checkable by someone other than the sender.
+- *Cons.* It is hourly, so it does not shrink the loss window below the snapshot's — it makes the
+  window *ours*. Room lines and inbox text now also sit in a bucket, so the bucket's readers become
+  readers of the conversation: the archive prefix needs its own narrow access and a lifecycle rule
+  that matches the Redis TTLs (7 and 30 days), or the archive quietly outlives the retention we chose.
+  One more scheduled job that can fail silently; the LEDGER row must say when the archive did not run.
+- *Cost.* Small by construction: the instance is 1 GB, so a full hourly copy of every stream cannot
+  exceed that, and with a 30-day lifecycle the stored total is bounded. One short Cloud Run job
+  execution an hour. I expect cents to low single dollars a month; *unverified* until Phase 1 has run
+  a week and the bill shows it.
+- *Recommendation.* Stands as approved. Add the lifecycle rule and the narrow reader set to Phase 1's
+  exit tests.
+
+**D6 — move to Memorystore for Redis Cluster for per-second durability.**
+
+- *Pros.* AOF with a one-second fsync: a whole-instance loss costs about a second, not up to an hour.
+  Backups we can trigger and restore ourselves, which the current product does not offer.
+- *Cons.* It is a different product, so a migration: a new instance, a new endpoint and connection
+  mode (cluster-aware clients), a data copy, and a cutover for the chair, the worker, the bridge and
+  every waker. Cluster mode puts keys in hash slots, and a Lua script or a transaction may only touch
+  keys in one slot — `redis_gov`'s compare-and-set scripts and the roster capability script would each
+  need checking and probably hash tags in their key names. That is a change to tested, reviewed code
+  for a risk the archive already bounds.
+- *Cost.* Billed per node, not per GB. The smallest node type is listed at USD 0.0318 an hour and the
+  next at USD 0.1425 an hour (Google's Cluster pricing page, read through a search snippet, region not
+  confirmed — *unverified*). A node at the small price is about USD 23 a month, so a cluster with a
+  replica per shard is a multiple of that depending on the minimum shard count, which I could not
+  confirm, and on whether the smallest node type may be used with AOF at all. Today's instance
+  (`STANDARD_HA`, 1 GB) is put at roughly USD 50 a month by a third-party guide — *unverified*; the
+  real number is on our bill. So D6 is plausibly one to three times today's Redis cost, plus the
+  engineering time, which is the larger part.
+- *Recommendation.* **Not now.** Decide it on evidence: if Phase 4's 48 hours show a message that
+  mattered would have been lost between archive runs, shorten the archive interval first (a setting);
+  move products only if that is still not enough.
+
+**What is needed from the owner:** D4 yes or no. D5 is decided. D6 needs nothing unless per-second
+durability is wanted regardless of cost, in which case the first step is reading the three unverified
+prices off the pricing page and our bill.
+
 ## 7. Phases, each with the test that ends it
 
 Revised on Gemini's review: **the safety nets go in before any traffic moves**, so a Redis failure
