@@ -359,7 +359,16 @@ class TheWriteItselfIsGated(unittest.TestCase):
             if name in store.created:
                 return {"kind": "resolved"}
             raise watcher.Refused(4, "there is no such journal object")
+
+        def read_json_if_absent_is_known(name):
+            if store.marker_unreadable:
+                raise watcher.Refused(4, "the guard object answered HTTP 403, which is not absence")
+            if name in store.created:
+                return {"kind": "resolved"}
+            return None
+        store.marker_unreadable = False
         store.read_json = read_json
+        store.read_json_if_absent_is_known = read_json_if_absent_is_known
         return store
 
     def test_recovery_restores_the_journalled_operation_once(self):
@@ -400,6 +409,15 @@ class TheWriteItselfIsGated(unittest.TestCase):
         bad = self.recovery_env()
         bad["DEMO_RECOVER_CORRELATION"] = "not-hex"
         self.assertEqual(2, run(bad, FakeStore([]), UntouchableOrg()))
+
+    def test_an_unreadable_spent_guard_refuses_and_never_bypasses(self):
+        # Only an explicit 404 means absent: a 403, a 5xx or a timeout on the marker read must
+        # refuse the recovery, not run it (the reviewer on b811296).
+        org = FakeOrg(priority="High")
+        store = self.journal_store()
+        store.marker_unreadable = True
+        self.assertEqual(4, run(self.recovery_env(), store, org))
+        self.assertEqual([], org.sets)
 
     def test_a_failed_recovery_keeps_the_journal_pending_for_a_retry(self):
         # The resolved marker is committed only AFTER an authoritative Medium read-back: a marker

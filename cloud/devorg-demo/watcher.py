@@ -269,6 +269,17 @@ class Store:
             raise Refused(4, "reading the journal answered HTTP %d" % status)
         return json.loads(body.decode("utf-8"))
 
+    def read_json_if_absent_is_known(self, name: str):
+        """The object, or None ONLY on an explicit 404. A 403, a 5xx or a timeout is not absence:
+        under a spent guard, an unreadable state refuses rather than bypasses (Aya on b811296)."""
+        status, body = self._get("https://storage.googleapis.com/storage/v1/b/%s/o/%s?alt=media"
+                                 % (self.bucket, urllib.parse.quote(name, safe="")))
+        if status == 404:
+            return None
+        if status != 200:
+            raise Refused(4, "the guard object answered HTTP %d, which is not absence" % status)
+        return json.loads(body.decode("utf-8"))
+
     def receipt(self, entry: dict) -> None:
         """Best effort: a receipt that cannot land is said and skipped; the restore outranks it."""
         name = "%s/%s-%s.json" % (RECEIPTS, entry["at"].replace(":", ""), entry["correlation"])
@@ -545,11 +556,10 @@ def recover(store: Store, org: Org, correlation_id: str) -> int:
     if not ROOM.match(room):
         raise Refused(4, "that journal does not name a room")
     marker = "%s/resolved-%s.json" % (RECEIPTS, correlation_id)
-    try:
-        store.read_json(marker)
-    except Refused:
-        pass                            # not recovered yet: proceed
-    else:
+    # Only an explicit 404 means "not recovered yet": any other answer is an unreadable guard, and
+    # an unreadable guard refuses instead of bypassing (Aya on b811296: a 403 or a timeout here
+    # must never spend the operation twice).
+    if store.read_json_if_absent_is_known(marker) is not None:
         raise Refused(4, "that operation was already recovered")
     demo = Demo(org, store, room)
 
