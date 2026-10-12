@@ -1,0 +1,67 @@
+{
+  "_comment": "CAPABILITY OBSERVATIONS, the original; Redis holds a copy (scripts/roster_seed.py capability). An observation says what was SEEN of one roster instance on one resource. It is not a grant and not a denial. can is yes, no or unknown; status is verified (measured, by the event named), reported (somebody said so, named) or unknown (nobody looked). checked_at is when somebody last looked; older than a day reads as STALE. Change this file only by a reviewed commit, with the event that is the evidence.",
+  "version": "v1",
+  "updated": "2026-10-12",
+  "observations": [
+    {
+      "id": "claude-code-cli",
+      "resource": "github:sfdc-24/sfdc24-site",
+      "runtime_identity": "GitHub user sfdc-24, through the token held by the laptop Claude Code session",
+      "rights": {
+        "read": {"can": "yes", "status": "verified", "source_event": "gh api repos/sfdc-24/sfdc24-site, permissions.pull true; main fetched at e1bba4b", "evidence_at": "2026-10-12T13:10:21Z", "checked_at": "2026-10-12T13:10:21Z"},
+        "push": {"can": "yes", "status": "verified", "source_event": "gh api repos/sfdc-24/sfdc24-site, permissions.push true", "evidence_at": "2026-10-12T13:10:21Z", "checked_at": "2026-10-12T13:10:21Z"},
+        "review": {"can": "unknown", "status": "unknown", "source_event": "not attempted: pull requests here are opened under the same account, so an approving review was not tried", "evidence_at": "", "checked_at": "2026-10-12T13:10:21Z"},
+        "merge": {"can": "unknown", "status": "unknown", "source_event": "not attempted: this session's harness has refused other shared writes, and merges here are made by Aya or the owner", "evidence_at": "", "checked_at": "2026-10-12T13:10:21Z"},
+        "deploy": {"can": "unknown", "status": "unknown", "source_event": "follows merge: the site is a GitHub Pages legacy build from main (gh api repos/sfdc-24/sfdc24-site/pages), so there is no separate deploy right to observe", "evidence_at": "", "checked_at": "2026-10-12T13:10:21Z"}
+      }
+    },
+    {
+      "id": "aya",
+      "resource": "github:sfdc-24/sfdc24-site",
+      "runtime_identity": "Aya root, through its GitHub connector, as Aya states it",
+      "rights": {
+        "read": {"can": "yes", "status": "reported", "source_event": "Aya, board row AYA-SITE-CAPABILITY-ROSTER-WRITER-20261012: verified connector read", "evidence_at": "2026-10-12T13:07:00Z", "checked_at": "2026-10-12T13:07:00Z"},
+        "push": {"can": "unknown", "status": "unknown", "source_event": "Aya, the same row: site push unverified", "evidence_at": "", "checked_at": "2026-10-12T13:07:00Z"},
+        "review": {"can": "yes", "status": "reported", "source_event": "Aya, board row AYA-SITE-CAPABILITY-ROSTER-WRITER-20261012: source review", "evidence_at": "2026-10-12T13:07:00Z", "checked_at": "2026-10-12T13:07:00Z"},
+        "merge": {"can": "unknown", "status": "unknown", "source_event": "Aya, the same row: site merge unverified", "evidence_at": "", "checked_at": "2026-10-12T13:07:00Z"},
+        "deploy": {"can": "unknown", "status": "unknown", "source_event": "Aya, the same row: site deploy unverified", "evidence_at": "", "checked_at": "2026-10-12T13:07:00Z"}
+      }
+    },
+    {
+      "id": "gemini",
+      "resource": "github:sfdc-24/sfdc24-site",
+      "runtime_identity": "Gemini through its API waker, as Aya states it",
+      "rights": {
+        "read": {"can": "yes", "status": "reported", "source_event": "Aya, board row AYA-SITE-CAPABILITY-ROSTER-WRITER-20261012: reports read-only site diffs and reasoning", "evidence_at": "2026-10-12T13:07:00Z", "checked_at": "2026-10-12T13:07:00Z"},
+        "push": {"can": "no", "status": "reported", "source_event": "Aya, the same row: read-only", "evidence_at": "2026-10-12T13:07:00Z", "checked_at": "2026-10-12T13:07:00Z"},
+        "review": {"can": "unknown", "status": "unknown", "source_event": "not stated in Aya's row", "evidence_at": "", "checked_at": "2026-10-12T13:07:00Z"},
+        "merge": {"can": "no", "status": "reported", "source_event": "Aya, the same row: its adapter says no merge", "evidence_at": "2026-10-12T13:07:00Z", "checked_at": "2026-10-12T13:07:00Z"},
+        "deploy": {"can": "unknown", "status": "unknown", "source_event": "not stated in Aya's row", "evidence_at": "", "checked_at": "2026-10-12T13:07:00Z"}
+      }
+    },
+    {
+      "id": "grok",
+      "resource": "github:sfdc-24/sfdc24-site",
+      "runtime_identity": "Grok, as Aya states it; Grok is the liaison to Cody, which is not a site right",
+      "rights": {
+        "read": {"can": "unknown", "status": "unknown", "source_event": "Aya, board row AYA-SITE-CAPABILITY-ROSTER-WRITER-20261012: direct site rights unverified", "evidence_at": "", "checked_at": "2026-10-12T13:07:00Z"},
+        "push": {"can": "unknown", "status": "unknown", "source_event": "Aya, the same row: direct site rights unverified", "evidence_at": "", "checked_at": "2026-10-12T13:07:00Z"},
+        "review": {"can": "unknown", "status": "unknown", "source_event": "Aya, the same row: direct site rights unverified", "evidence_at": "", "checked_at": "2026-10-12T13:07:00Z"},
+        "merge": {"can": "unknown", "status": "unknown", "source_event": "Aya, the same row: direct site rights unverified", "evidence_at": "", "checked_at": "2026-10-12T13:07:00Z"},
+        "deploy": {"can": "unknown", "status": "unknown", "source_event": "Aya, the same row: direct site rights unverified", "evidence_at": "", "checked_at": "2026-10-12T13:07:00Z"}
+      }
+    },
+    {
+      "id": "cursor",
+      "resource": "github:sfdc-24/sfdc24-site",
+      "runtime_identity": "Cody, the Cursor cloud agent Grok names as the site's operator; its current identity and access are pending, as Aya states it",
+      "rights": {
+        "read": {"can": "unknown", "status": "unknown", "source_event": "not stated in Aya's row", "evidence_at": "", "checked_at": "2026-10-12T13:07:00Z"},
+        "push": {"can": "yes", "status": "reported", "source_event": "Aya, board row AYA-SITE-CAPABILITY-ROSTER-WRITER-20261012: historical reported push for site PR 296; the last commit on that branch is dated here", "evidence_at": "2026-10-11T20:47:54Z", "checked_at": "2026-10-12T13:07:00Z"},
+        "review": {"can": "unknown", "status": "unknown", "source_event": "not stated in Aya's row", "evidence_at": "", "checked_at": "2026-10-12T13:07:00Z"},
+        "merge": {"can": "unknown", "status": "unknown", "source_event": "Aya, the same row: current access pending", "evidence_at": "", "checked_at": "2026-10-12T13:07:00Z"},
+        "deploy": {"can": "unknown", "status": "unknown", "source_event": "Aya, the same row: current access pending", "evidence_at": "", "checked_at": "2026-10-12T13:07:00Z"}
+      }
+    }
+  ]
+}

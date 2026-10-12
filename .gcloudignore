@@ -44,6 +44,7 @@
 !/scripts/roster_seed.py
 !/scripts/signature.py
 !/scripts/agent_roster.json
+!/scripts/agent_capabilities.json
 !/scripts/append.py
 !/scripts/board_say.py
 !/scripts/state_store.py
