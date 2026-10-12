@@ -14,7 +14,8 @@
 #   bash cloud/bus-reconciler/archive.sh setup      # ticker account, its TokenCreator, the prefix grant
 #   IMAGE=<registry>/bus-reconciler:git-<sha7> bash cloud/bus-reconciler/deploy.sh build   # a NEW tag; :v1 untouched
 #   IMAGE=<that tag or its @sha256 digest> bash cloud/bus-reconciler/archive.sh deploy     # flag OFF
-#   bash cloud/bus-reconciler/archive.sh dryrun     # one execution that reads and reports, writes nothing
+#   bash cloud/bus-reconciler/archive.sh dryrun     # one execution that reads and reports: no object, ledger or row;
+#                                                   # it takes and releases gov:archive:lock, so it is not zero-write
 #   bash cloud/bus-reconciler/archive.sh on         # the flag
 #   bash cloud/bus-reconciler/archive.sh run        # one real execution, and wait
 #   bash cloud/bus-reconciler/archive.sh verify <redis-archive/<date>/<hour>/LEDGER-....json>   # re-hash every object
@@ -95,7 +96,7 @@ dryrun() {
   # An execution-level override: the job's own flag is untouched.
   "$GCLOUD" run jobs execute "$JOB" --project "$PROJECT" --region "$REGION" --wait \
     --update-env-vars "REDIS_ARCHIVE_ENABLED=on,REDIS_ARCHIVE_DRY_RUN=1"
-  echo "dry run done: its log has one JSON line - streams, entries it WOULD archive, nothing written"
+  echo "dry run done: its log has one JSON line - streams, entries it WOULD archive. No object, ledger or row was written; gov:archive:lock was taken and released"
 }
 
 run_once() {

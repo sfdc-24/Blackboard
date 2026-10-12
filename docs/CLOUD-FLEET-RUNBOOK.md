@@ -155,8 +155,10 @@ copy we can restore ourselves.
 
 **Order:** `setup`; `IMAGE=<registry>/bus-reconciler:git-<sha7> deploy.sh build` (a new tag from a clean
 checkout of `main`: the shared `:v1` is never rebuilt for this, so no other job moves); `IMAGE=<that tag or
-its digest> archive.sh deploy` (it refuses without one); `dryrun` (writes nothing), `on`, `run`, then
-`verify <the ledger path the run printed>`, then `schedule` (hourly at :05 UTC). **Rollback** is `off`;
+its digest> archive.sh deploy` (it refuses without one); `dryrun` (no object, ledger, cursor or row - but it takes and releases `gov:archive:lock`, so it is not
+zero-write), `on`, `run`, then
+`verify <the ledger path the run printed>` (it re-hashes every object the ledger names with a hash; a
+`superseded` object has none and is not checked; it is not a restore test), then `schedule` (hourly at :05 UTC). **Rollback** is `off`;
 nothing archived is removed. One archiver at a time (`gov:archive:lock`, released compare-and-delete).
 A cursor moves only after the run's ledger is written; a range written and not yet committed is held in
 `gov:archive:pending`, so a run that dies before its ledger leaves every cursor where it was, and the next

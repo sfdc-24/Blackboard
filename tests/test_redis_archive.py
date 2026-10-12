@@ -4,6 +4,7 @@ What must hold: every entry reaches an object, and that object a durable ledger,
 an archived range is never rewritten; a crash anywhere before the ledger re-finds the same object in any
 later hour instead of losing or doubling it; every object is named by some ledger; one archiver at a time;
 the ledger hashes what it names; the board row carries no entry's text."""
+import copy
 import datetime
 import hashlib
 import json
@@ -500,14 +501,18 @@ class TheBoardRow(unittest.TestCase):
 
 
 class DryRun(unittest.TestCase):
-    def test_a_dry_run_writes_nothing_anywhere(self):
+    def test_a_dry_run_writes_no_object_row_or_cursor_and_releases_its_lock(self):
+        # Not zero-write (Aya, 2026-10-12): it takes gov:archive:lock so it never overlaps a real run. That
+        # lock is its ONLY Redis write, and it is gone when the dry run returns.
         conn, bucket, rows = seeded(), Bucket(), []
+        before = copy.deepcopy(conn.data)
         out = ra.run(conn, bucket.put, append=rows.append, now=NOW, run_id="r1", dry_run=True)
         self.assertEqual("dry-run", out["status"])
         self.assertEqual(6, out["new"])
         self.assertEqual({}, bucket.objects)
         self.assertEqual([], rows)
         self.assertIsNone(conn.hget(ra.CURSOR_KEY, "conf:side:20261011"))
+        self.assertEqual(before, conn.data, "the lock is released and nothing else in Redis changed")
 
 
 class TheDeployScriptsPinTheImage(unittest.TestCase):
