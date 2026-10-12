@@ -32,7 +32,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DOCKERFILE = ROOT / "cloud" / "bus-reconciler" / "Dockerfile"
 
 # Everything the image is expected to be able to import, entrypoints first.
-MODULES = ("serve_requests", "main", "probe", "keyspace_view", "roster_seed",
+MODULES = ("serve_requests", "main", "probe", "keyspace_view", "roster_seed", "roster_capability",
            "bus_request", "bus_reconcile", "append", "signature", "redis_dual", "bus",
            "git_requests", "milestones_sync")
 

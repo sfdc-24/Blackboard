@@ -191,30 +191,44 @@ class TheFileIsTheOriginal(unittest.TestCase):
         self.assertEqual([], rs.check(data))
 
 
-# --- capability observations: one cap: field beside the fifteen, by a path of its own -----------
+# --- capability observations: scripts/roster_capability.py, an entrypoint of its own -------------
 #
 # The owner asked on 2026-10-12 for a map of who can do what, for routing. Aya's conditions for
-# putting it in the roster: every existing field, identity, entry and index preserved; an
-# observation never a grant; verified, reported and unknown told apart, with the identity, the
-# event and both times; stale evidence visible; a narrow write that cannot put a stale roster
-# back; exact read-back. Each class below is one of those, written as the failure it prevents.
+# putting it beside the roster, and the four holes her review of be4a776 found, are each a class
+# below, written as the failure it prevents:
+#   1. `roster_seed.py seed capability` ran the destructive seed: the path has its own file now,
+#      with exactly one argument, and that file cannot seed.
+#   2. An unconditional HSET could overwrite newer evidence or create a missing hash: the write is a
+#      compare-and-set on a complete hash, after a decision that refuses stale and conflicting evidence.
+#   3. An access list is not an ability: verified requires basis executed.
+#   4. There was no read-only verify, and a time was a shape, not a time: there is one, and a day
+#      that does not exist or has not happened yet is refused.
+
+import roster_capability as rc                                           # noqa: E402
 
 STAMP = "2026-10-12T13:10:21Z"
+LATER = "2026-10-12T14:10:21Z"
+EARLIER = "2026-10-12T12:10:21Z"
+NOW = datetime.datetime(2026, 10, 12, 15, 0, 0, tzinfo=datetime.timezone.utc)
 SITE = "github:example/site"
 
 
-def right(can="yes", status="verified", source="gh api: permissions.push true", evidence=STAMP, checked=STAMP):
-    return {"can": can, "status": status, "source_event": source, "evidence_at": evidence, "checked_at": checked}
+def right(can="yes", status="verified", basis="executed", source="this runtime pushed commit abc1234", evidence=STAMP, checked=STAMP):
+    return {"can": can, "status": status, "basis": basis, "source_event": source, "evidence_at": evidence, "checked_at": checked}
+
+
+def said(can="yes", source="stated on the board", evidence=STAMP, checked=STAMP, basis="stated"):
+    return right(can=can, status="reported", basis=basis, source=source, evidence=evidence, checked=checked)
 
 
 def unknown(checked=STAMP, source="nobody looked"):
-    return {"can": "unknown", "status": "unknown", "source_event": source, "evidence_at": "", "checked_at": checked}
+    return {"can": "unknown", "status": "unknown", "basis": "none", "source_event": source, "evidence_at": "", "checked_at": checked}
 
 
-def observation(rid="alpha", resource=SITE, **rights):
-    states = {name: unknown() for name in rs.RIGHTS}
+def observation(rid="alpha", resource=SITE, identity="login example-bot", **rights):
+    states = {name: unknown() for name in rc.RIGHTS}
     states.update(rights)
-    return {"id": rid, "resource": resource, "runtime_identity": "login example-bot", "rights": states}
+    return {"id": rid, "resource": resource, "runtime_identity": identity, "rights": states}
 
 
 def capfile(*observations):
@@ -222,19 +236,40 @@ def capfile(*observations):
 
 
 class NarrowRedis(FakeRedis):
-    """A seeded copy that RECORDS every write and REFUSES the commands the capability path must never
-    send. A fake that merely allowed them would let a delete slip in behind a passing test."""
+    """A seeded copy that RECORDS every write and REFUSES every command the capability path must
+    never send. Its eval is the compare-and-set as the server runs it, for THAT script and no other;
+    TheLuaItself checks this double against the script's own text where an interpreter is installed."""
 
     def __init__(self, data=None):
         super().__init__()
         seeded = FakeRedis()
         rs.seed(seeded, data or roster())
         self.hashes, self.sets = copy.deepcopy(seeded.hashes), copy.deepcopy(seeded.sets)
-        self.writes = []
+        self.writes, self.reads = [], []
+
+    def smembers(self, key):
+        self.reads.append(("smembers", key))
+        return super().smembers(key)
+
+    def hgetall(self, key):
+        self.reads.append(("hgetall", key))
+        return super().hgetall(key)
+
+    def eval(self, script, numkeys, *args):
+        assert script == rc.CAS_LUA and numkeys == 2, "a script this path does not own"
+        key, members, rid, field, held, value = args[:6]
+        if rid not in self.sets.get(members, set()):
+            return "not-a-member"
+        if any(name not in self.hashes.get(key, {}) for name in args[6:]):
+            return "incomplete"
+        if self.hashes[key].get(field, "") != held:
+            return "changed"
+        self.hashes[key][field] = value
+        self.writes.append((key, field))
+        return "written"
 
     def hset(self, key, mapping=None):
-        self.writes.append((key, tuple(sorted(mapping or {}))))
-        super().hset(key, mapping=mapping)
+        raise AssertionError("a bare HSET sent by the capability path: %s" % key)
 
     def delete(self, key):
         raise AssertionError("DEL %s sent by the capability path" % key)
@@ -249,105 +284,230 @@ class NarrowRedis(FakeRedis):
         raise AssertionError("SREM %s sent by the capability path" % key)
 
 
-class TheCapabilityPathIsNarrow(unittest.TestCase):
-    def test_one_field_is_written_and_everything_else_is_byte_for_byte_the_same(self):
+def run(argv, caps=None, conn="none", now=None):
+    """rc.main with a capability file of our own and a connection of our own. Returns its exit code."""
+    with tempfile.TemporaryDirectory() as folder:
+        path = Path(folder) / "agent_capabilities.json"
+        if caps is not None:
+            path.write_text(json.dumps(caps), encoding="utf-8")
+        client = mock.Mock(side_effect=AssertionError("connected")) if conn == "none" else mock.Mock(return_value=conn)
+        with mock.patch.object(rc, "CAPABILITIES", path), \
+                mock.patch.object(rc.redis_dual, "Settings", return_value=object()), \
+                mock.patch.object(rc.redis_dual, "client", client):
+            return rc.main(argv)
+
+
+class OneEntrypointThatCannotSeed(unittest.TestCase):
+    """Hole 1. `roster_seed.py seed capability` took its first word and seeded."""
+
+    def test_anything_but_exactly_one_known_verb_is_refused_before_a_file_or_a_connection(self):
+        for argv in ([], ["seed"], ["seed", "capability"], ["capability"], ["write", "now"], ["check", "--force"],
+                     ["verify", "write"], ["WRITE"], ["table"], ["capability-check"], [""], ["write", ""]):
+            with mock.patch.object(rc, "load", side_effect=AssertionError("the file was read")):
+                self.assertEqual(2, run(argv), argv)              # run() raises if a connection is made
+
+    def test_the_file_holds_no_seed_and_does_not_import_the_seeder(self):
+        source = Path(rc.__file__).read_text(encoding="utf-8")
+        for never in ("import roster_seed", "from roster_seed", "seed(", ".delete(", ".hdel(", ".sadd(", ".srem(", ".hset("):
+            self.assertNotIn(never, source, never)
+        self.assertEqual(("check", "verify", "write"), rc.VERBS)
+
+    def test_its_names_for_the_roster_are_the_seeders_own(self):
+        self.assertEqual((rs.AGENT_KEY, rs.ROSTER_SET, rs.FIELDS, rs.CAP_PREFIX),
+                         (rc.AGENT_KEY, rc.ROSTER_SET, rc.CANONICAL_FIELDS, rc.CAP_PREFIX))
+        self.assertEqual(15, len(rc.CANONICAL_FIELDS))
+
+    def test_the_seeder_itself_gained_no_capability_verb(self):
+        source = Path(rs.__file__).read_text(encoding="utf-8")
+        self.assertNotIn('"capability"', source)
+        self.assertNotIn("put_capabilities", source)
+
+    def test_check_reads_the_file_alone_and_a_bad_file_stops_write_before_any_connection(self):
+        good = capfile(observation("alpha", read=right()))
+        self.assertEqual(0, run(["check"], good))
+        bad = capfile(observation("alpha", read=right(can="granted")))
+        for verb in rc.VERBS:
+            self.assertEqual(1, run([verb], bad), verb)
+
+    def test_no_connection_is_unknown_and_never_success(self):
+        good = capfile(observation("alpha", read=right()))
+        for verb in ("write", "verify"):
+            self.assertEqual(3, run([verb], good, conn=None), verb)
+
+
+class TheWriteIsGuardedAndAtomic(unittest.TestCase):
+    """Hole 2. An unconditional HSET overwrote whatever was there and created whatever was not."""
+
+    def test_one_field_is_set_and_everything_else_is_byte_for_byte_the_same(self):
         conn = NarrowRedis()
         before_hashes, before_sets = copy.deepcopy(conn.hashes), copy.deepcopy(conn.sets)
-        obs = observation("alpha", read=right(), push=right(can="no", status="reported", source="its adapter says so"))
-        out = rs.put_capabilities(conn, capfile(obs))
-        self.assertEqual({"written": 1, "refused": [], "changed_elsewhere": [], "not_read_back": []}, out)
-        key, field = rs.AGENT_KEY % "alpha", rs.CAP_PREFIX + SITE
-        self.assertEqual([(key, (field,))], conn.writes, "one HSET, of one field, on one existing key")
-        self.assertEqual(rs.cap_value(obs), conn.hashes[key][field])
+        obs = observation("alpha", read=right(), push=said(can="no"))
+        out = rc.write(conn, capfile(obs))
+        key, field = rc.AGENT_KEY % "alpha", rc.CAP_PREFIX + SITE
+        self.assertEqual(["%s %s" % (key, field)], out["written"])
+        self.assertEqual(([], [], [], [], []), (out["same"], out["refused"], out["lost"], out["changed_elsewhere"], out["not_read_back"]))
+        self.assertEqual([(key, field)], conn.writes, "one compare-and-set, of one field, on one existing key")
+        self.assertEqual(rc.cap_value(obs), conn.hashes[key][field])
         after = copy.deepcopy(conn.hashes)
         del after[key][field]
         self.assertEqual(before_hashes, after, "the fifteen fields, the family, canon and seeded are untouched")
-        self.assertEqual(before_sets, conn.sets, "the membership set is untouched")
-        self.assertEqual(15, len(rs.FIELDS))
-        self.assertEqual(set(rs.FIELDS), set(before_hashes[key]), "and all fifteen are still there")
+        self.assertEqual(before_sets, conn.sets)
 
-    def test_an_id_that_is_not_in_the_roster_in_redis_means_nothing_at_all_is_written(self):
+    def test_an_id_that_is_not_a_member_means_nothing_is_written_for_anyone(self):
         conn = NarrowRedis()
         before = copy.deepcopy(conn.hashes)
-        out = rs.put_capabilities(conn, capfile(observation("alpha", read=right()), observation("ghost", read=right())))
-        self.assertEqual((0, ["ghost"]), (out["written"], out["refused"]))
-        self.assertEqual([], conn.writes, "not even the observation whose id is fine")
-        self.assertEqual(before, conn.hashes)
-        self.assertNotIn(rs.AGENT_KEY % "ghost", conn.hashes, "this path creates no instance")
+        out = rc.write(conn, capfile(observation("alpha", read=right()), observation("ghost", read=right())))
+        self.assertEqual(([], 1), (out["written"], len(out["refused"])))
+        self.assertIn("creates no instance", out["refused"][0])
+        self.assertEqual(([], before), (conn.writes, conn.hashes))
+        self.assertNotIn(rc.AGENT_KEY % "ghost", conn.hashes)
 
-    def test_a_second_write_replaces_its_own_field_and_another_resource_adds_its_own(self):
+    def test_a_missing_hash_is_refused_and_never_created(self):
         conn = NarrowRedis()
-        rs.put_capabilities(conn, capfile(observation("alpha", read=right())))
-        newer = observation("alpha", read=right(can="no", status="reported", source="said on the board"))
-        other = observation("alpha", resource="gcp:run/roster-seed", deploy=right())
-        out = rs.put_capabilities(conn, capfile(newer, other))
-        self.assertEqual((2, [], []), (out["written"], out["changed_elsewhere"], out["not_read_back"]))
-        stored = conn.hashes[rs.AGENT_KEY % "alpha"]
-        self.assertEqual(rs.cap_value(newer), stored[rs.CAP_PREFIX + SITE])
-        self.assertEqual(rs.cap_value(other), stored[rs.CAP_PREFIX + "gcp:run/roster-seed"])
-        self.assertEqual(15 + 2, len(stored))
+        del conn.hashes[rc.AGENT_KEY % "alpha"]                   # still a member of the set: a half-written copy
+        out = rc.write(conn, capfile(observation("alpha", read=right())))
+        self.assertIn("missing or incomplete (15 of 15", out["refused"][0])
+        self.assertEqual([], conn.writes)
+        self.assertNotIn(rc.AGENT_KEY % "alpha", conn.hashes, "the old HSET would have made a hash of one field here")
 
-    def test_a_field_that_does_not_read_back_as_written_is_a_failure(self):
+    def test_an_incomplete_hash_is_refused_and_not_completed(self):
+        conn = NarrowRedis()
+        del conn.hashes[rc.AGENT_KEY % "alpha"]["wake"]
+        out = rc.write(conn, capfile(observation("alpha", read=right()), observation("beta", read=right())))
+        self.assertIn("missing or incomplete (1 of 15", out["refused"][0])
+        self.assertEqual([], conn.writes, "and beta, whose hash is whole, is not written either")
+
+    def test_an_identical_observation_is_a_retry_and_writes_nothing(self):
+        conn, caps = NarrowRedis(), capfile(observation("alpha", read=right()))
+        rc.write(conn, caps)
+        conn.writes.clear()
+        out = rc.write(conn, caps)
+        self.assertEqual(([], 1, []), (out["written"], len(out["same"]), out["refused"]))
+        self.assertEqual([], conn.writes)
+
+    def test_older_evidence_never_overwrites_newer(self):
+        conn = NarrowRedis()
+        newer = observation("alpha", read=right(checked=LATER), push=said(checked=LATER))
+        rc.write(conn, capfile(newer))
+        conn.writes.clear()
+        for stale in (observation("alpha", read=right(checked=STAMP), push=said(checked=LATER)),      # one right older
+                      observation("alpha", read=right(can="no", checked=EARLIER, evidence=EARLIER), push=said(checked=LATER))):
+            out = rc.write(conn, capfile(stale))
+            self.assertIn("stale: read was checked at %s in Redis" % LATER, out["refused"][0])
+        self.assertEqual([], conn.writes)
+        self.assertEqual(rc.cap_value(newer), conn.hashes[rc.AGENT_KEY % "alpha"][rc.CAP_PREFIX + SITE])
+
+    def test_the_same_check_time_with_a_different_claim_is_a_conflict_not_a_win_for_the_later_writer(self):
+        conn = NarrowRedis()
+        first = observation("alpha", read=right())
+        rc.write(conn, capfile(first))
+        conn.writes.clear()
+        out = rc.write(conn, capfile(observation("alpha", read=right(can="no"))))
+        self.assertIn("conflict: read has the same check time", out["refused"][0])
+        out = rc.write(conn, capfile(observation("alpha", identity="login another-bot", read=right())))
+        self.assertIn("conflict: no check here is newer", out["refused"][0], "a different identity at the same moment")
+        self.assertEqual([], conn.writes)
+        self.assertEqual(rc.cap_value(first), conn.hashes[rc.AGENT_KEY % "alpha"][rc.CAP_PREFIX + SITE])
+
+    def test_a_newer_check_replaces_the_stored_one(self):
+        conn = NarrowRedis()
+        rc.write(conn, capfile(observation("alpha", read=right())))
+        newer = observation("alpha", read=right(can="no", evidence=LATER, checked=LATER))
+        out = rc.write(conn, capfile(newer))
+        self.assertEqual(1, len(out["written"]))
+        self.assertEqual(rc.cap_value(newer), conn.hashes[rc.AGENT_KEY % "alpha"][rc.CAP_PREFIX + SITE])
+
+    def test_a_stored_value_this_path_cannot_read_is_not_overwritten(self):
+        for junk in ("{}", "not json", '{"rights": {"read": {"checked_at": "soon"}}}', '["a list"]'):
+            conn = NarrowRedis()
+            conn.hashes[rc.AGENT_KEY % "alpha"][rc.CAP_PREFIX + SITE] = junk
+            out = rc.write(conn, capfile(observation("alpha", read=right())))
+            self.assertIn("is not one this path can read", out["refused"][0], junk)
+            self.assertEqual(junk, conn.hashes[rc.AGENT_KEY % "alpha"][rc.CAP_PREFIX + SITE])
+
+    def test_a_value_that_moved_between_the_read_and_the_write_is_not_overwritten(self):
+        class Raced(NarrowRedis):
+            def eval(self, script, numkeys, *args):
+                self.hashes[args[0]][args[3]] = "written by somebody else in between"
+                return super().eval(script, numkeys, *args)
+        conn = Raced()
+        out = rc.write(conn, capfile(observation("alpha", read=right())))
+        self.assertEqual(([], 1), (out["written"], len(out["lost"])))
+        self.assertIn(": changed", out["lost"][0])
+        self.assertEqual("written by somebody else in between", conn.hashes[rc.AGENT_KEY % "alpha"][rc.CAP_PREFIX + SITE])
+        self.assertEqual([], out["not_read_back"], "a field this run did not set is not called a failed read-back")
+
+    def test_a_hash_deleted_or_a_member_removed_between_the_read_and_the_write_is_not_recreated(self):
+        class Vanished(NarrowRedis):
+            def eval(self, script, numkeys, *args):
+                del self.hashes[args[0]]
+                return super().eval(script, numkeys, *args)
+        conn = Vanished()
+        out = rc.write(conn, capfile(observation("alpha", read=right())))
+        self.assertIn(": incomplete", out["lost"][0])
+        self.assertNotIn(rc.AGENT_KEY % "alpha", conn.hashes)
+
+        class Removed(NarrowRedis):
+            def eval(self, script, numkeys, *args):
+                self.sets[args[1]].discard(args[2])
+                return super().eval(script, numkeys, *args)
+        out = rc.write(Removed(), capfile(observation("alpha", read=right())))
+        self.assertIn(": not-a-member", out["lost"][0])
+
+    def test_a_field_that_does_not_read_back_and_a_field_that_moved_elsewhere_are_both_failures(self):
         class Lossy(NarrowRedis):
-            def hset(self, key, mapping=None):
-                super().hset(key, mapping={name: "{}" for name in (mapping or {})})
-        out = rs.put_capabilities(Lossy(), capfile(observation("alpha", read=right())))
-        self.assertEqual(["%s: field %s%s" % (rs.AGENT_KEY % "alpha", rs.CAP_PREFIX, SITE)], out["not_read_back"])
+            def eval(self, script, numkeys, *args):
+                answer = super().eval(script, numkeys, *args)
+                self.hashes[args[0]][args[3]] = "{}"
+                self.hashes[args[0]]["state"] = "changed by somebody else"
+                return answer
+        out = rc.write(Lossy(), capfile(observation("alpha", read=right())))
+        self.assertEqual(1, len(out["not_read_back"]))
+        self.assertEqual(["%s: field state" % (rc.AGENT_KEY % "alpha")], out["changed_elsewhere"])
+        self.assertEqual(1, run(["write"], capfile(observation("alpha", read=right())), conn=Lossy()))
 
-    def test_any_other_field_that_moved_during_the_write_is_reported(self):
-        class Meddled(NarrowRedis):
-            def hset(self, key, mapping=None):
-                super().hset(key, mapping=mapping)
-                self.hashes[key]["state"] = "changed by somebody else"
-        out = rs.put_capabilities(Meddled(), capfile(observation("alpha", read=right())))
-        self.assertEqual(["%s: field state" % (rs.AGENT_KEY % "alpha")], out["changed_elsewhere"])
-
-    def test_the_verbs_never_load_the_roster_file_and_never_seed(self):
-        """A roster baked into an old image is an old roster. Asking for a capability must not put it back."""
+    def test_the_verbs_never_load_the_roster_file(self):
         conn = NarrowRedis()
-        with tempfile.TemporaryDirectory() as folder:
-            caps = Path(folder) / "agent_capabilities.json"
-            caps.write_text(json.dumps(capfile(observation("alpha", read=right()))), encoding="utf-8")
-            with mock.patch.object(rs, "CAPABILITIES", caps), \
-                    mock.patch.object(rs, "load", side_effect=AssertionError("the roster file was read")), \
-                    mock.patch.object(rs, "seed", side_effect=AssertionError("a seed was run")), \
-                    mock.patch.object(rs.redis_dual, "Settings", return_value=object()), \
-                    mock.patch.object(rs.redis_dual, "client", return_value=conn):
-                self.assertEqual(0, rs.main(["capability-check"]))
-                self.assertEqual([], conn.writes, "the check is the file alone")
-                self.assertEqual(0, rs.main(["capability"]))
+        with mock.patch.object(rs, "load", side_effect=AssertionError("the roster file was read")), \
+                mock.patch.object(rs, "seed", side_effect=AssertionError("a seed was run")):
+            self.assertEqual(0, run(["write"], capfile(observation("alpha", read=right())), conn=conn))
         self.assertEqual(1, len(conn.writes))
-
-    def test_no_connection_is_unknown_and_a_refused_id_or_a_bad_read_back_is_not_success(self):
-        with tempfile.TemporaryDirectory() as folder:
-            caps = Path(folder) / "agent_capabilities.json"
-            caps.write_text(json.dumps(capfile(observation("ghost", read=right()))), encoding="utf-8")
-            with mock.patch.object(rs, "CAPABILITIES", caps), \
-                    mock.patch.object(rs.redis_dual, "Settings", return_value=object()):
-                with mock.patch.object(rs.redis_dual, "client", return_value=None):
-                    self.assertEqual(2, rs.main(["capability"]))
-                with mock.patch.object(rs.redis_dual, "client", return_value=NarrowRedis()):
-                    self.assertEqual(1, rs.main(["capability"]), "an id Redis does not hold")
-            caps.write_text(json.dumps(capfile(observation("alpha", read=right(can="granted")))), encoding="utf-8")
-            with mock.patch.object(rs, "CAPABILITIES", caps), \
-                    mock.patch.object(rs.redis_dual, "client", side_effect=AssertionError("connected for a bad file")):
-                self.assertEqual(1, rs.main(["capability"]), "a bad file is refused before any connection")
+        self.assertEqual(1, run(["write"], capfile(observation("ghost", read=right())), conn=NarrowRedis()))
 
 
-class AnObservationIsNeverAGrant(unittest.TestCase):
-    def test_a_well_formed_file_passes_and_the_real_one_does(self):
-        self.assertEqual([], rs.check_capabilities(capfile(observation("alpha", read=right(), merge=right(can="no")))))
-        real = rs.load_capabilities()
-        self.assertEqual([], rs.check_capabilities(real))
+class AnAccessListIsNotAnAbility(unittest.TestCase):
+    """Hole 3. permissions.push true was recorded as a verified push; a source review as an approval right."""
+
+    def test_verified_requires_that_the_runtime_did_it(self):
+        ok = capfile(observation("alpha", read=right(), push=said(basis="acl"), merge=said(can="no")))
+        self.assertEqual([], rc.check(ok, NOW))
+        for state, says in ((right(basis="acl"), "verified needs basis executed"),
+                            (right(basis="stated"), "verified needs basis executed"),
+                            (said(basis="executed"), "reported needs basis acl or stated"),
+                            (dict(unknown(), basis="acl"), "unknown needs basis none"),
+                            (right(basis="none"), "verified needs basis executed"),
+                            (right(basis="inferred"), "never a grant or a denial")):
+            problems = rc.check(capfile(observation("alpha", push=state)), NOW)
+            self.assertTrue(any(says in problem for problem in problems), (says, problems))
+
+    def test_the_real_file_calls_nothing_verified_on_an_access_list_or_a_statement(self):
+        real = rc.load()
+        self.assertEqual([], rc.check(real))
         known = {row["id"] for row in rs.instances(rs.load())}
         for obs in real["observations"]:
             self.assertIn(obs["id"], known, "the real file names an instance the real roster does not have")
+            for name, state in obs["rights"].items():
+                if state["status"] == "verified":
+                    self.assertEqual("executed", state["basis"], (obs["id"], name))
+                    self.assertNotIn("permissions.", state["source_event"], "an access-list reading is not an execution")
+        aya = next(obs for obs in real["observations"] if obs["id"] == "aya")
+        self.assertEqual("unknown", aya["rights"]["review"]["can"], "a source review is not a GitHub approval right")
 
-    def test_every_shape_that_is_not_an_observation_is_refused(self):
+    def test_every_other_shape_that_is_not_an_observation_is_refused(self):
         def broken(change):
             obs = observation("alpha", read=right())
             change(obs)
-            return rs.check_capabilities(capfile(obs))
+            return rc.check(capfile(obs), NOW)
 
         def state(**over):
             return lambda obs: obs["rights"].__setitem__("read", dict(right(), **over))
@@ -355,105 +515,190 @@ class AnObservationIsNeverAGrant(unittest.TestCase):
             (state(can="granted"), "never a grant or a denial"),
             (state(can="denied"), "never a grant or a denial"),
             (state(status="approved"), "never a grant or a denial"),
-            (state(can="yes", status="unknown"), "unknown is unknown in both"),
-            (state(can="unknown", status="verified"), "unknown is unknown in both"),
-            (state(checked_at="yesterday"), "checked_at must be"),
-            (state(checked_at=""), "checked_at must be"),
-            (state(evidence_at="2026-10-12"), "evidence_at must be"),
-            (state(evidence_at="2026-10-13T00:00:00Z"), "dated after its own check"),
+            (state(can="yes", status="unknown", basis="none"), "unknown is unknown in both"),
+            (state(can="unknown"), "unknown is unknown in both"),
             (state(source_event=""), "needs its source_event"),
             (state(source_event="a\nb"), "needs its source_event"),
             (lambda obs: obs["rights"].__setitem__("read", dict(unknown(), evidence_at=STAMP)), "unknown has no evidence time"),
             (lambda obs: obs["rights"].__setitem__("read", dict(right(), note="extra")), "a state is exactly"),
+            (lambda obs: obs["rights"].__setitem__("read", {k: v for k, v in right().items() if k != "basis"}), "a state is exactly"),
             (lambda obs: obs["rights"].__setitem__("read", "yes"), "a state is exactly"),
             (lambda obs: obs["rights"].pop("deploy"), "rights must be exactly"),
             (lambda obs: obs["rights"].__setitem__("admin", right()), "rights must be exactly"),
             (lambda obs: obs.__setitem__("granted", True), "nothing else"),
             (lambda obs: obs.__setitem__("runtime_identity", ""), "no runtime_identity"),
+            (lambda obs: obs.__setitem__("runtime_identity", "x" * 201), "no runtime_identity"),
             (lambda obs: obs.__setitem__("id", "not an id"), "is not an instance id"),
             (lambda obs: obs.__setitem__("resource", "github sfdc"), "must be <kind>:<name>"),
             (lambda obs: obs.__setitem__("resource", "github:a|b"), "must be <kind>:<name>"),
             (lambda obs: obs.__setitem__("resource", "site"), "must be <kind>:<name>"),
-            (lambda obs: obs.__setitem__("runtime_identity", "x" * 201), "no runtime_identity"),
         )
         for change, says in cases:
             problems = broken(change)
             self.assertTrue(any(says in problem for problem in problems), (says, problems))
         twice = capfile(observation("alpha", read=right()), observation("ALPHA", read=right()))
-        self.assertTrue(any("appears twice" in p for p in rs.check_capabilities(twice)))
-        self.assertEqual(["the file needs an observations list"], rs.check_capabilities({"version": "v1"}))
-        self.assertTrue(rs.check_capabilities({"observations": [observation()]}), "no version, no date")
-        self.assertTrue(any("is not an object" in p for p in rs.check_capabilities(capfile("alpha"))))
+        self.assertTrue(any("appears twice" in p for p in rc.check(twice, NOW)))
+        self.assertEqual(["the file needs an observations list"], rc.check({"version": "v1"}, NOW))
+        self.assertTrue(rc.check({"observations": [observation()]}, NOW), "no version, no date")
+        self.assertTrue(any("is not an object" in p for p in rc.check(capfile("alpha"), NOW)))
 
     def test_the_stored_value_is_the_observation_and_nothing_that_reads_as_a_permission(self):
-        value = json.loads(rs.cap_value(observation("alpha", read=right(), merge=right(can="no", status="reported"))))
+        value = json.loads(rc.cap_value(observation("alpha", read=right(), merge=said(can="no"))))
         self.assertEqual({"runtime_identity", "rights"}, set(value))
-        self.assertEqual(set(rs.RIGHTS), set(value["rights"]), "five rights, each its own state")
-        self.assertEqual(("yes", "verified"), (value["rights"]["read"]["can"], value["rights"]["read"]["status"]))
-        self.assertEqual(("unknown", "unknown"), (value["rights"]["push"]["can"], value["rights"]["push"]["status"]))
-        for word in rs.CAN + rs.STATUS:
+        self.assertEqual(set(rc.RIGHTS), set(value["rights"]), "five rights, each its own state")
+        self.assertEqual(("yes", "verified", "executed"), tuple(value["rights"]["read"][k] for k in ("can", "status", "basis")))
+        self.assertEqual(("unknown", "unknown", "none"), tuple(value["rights"]["push"][k] for k in ("can", "status", "basis")))
+        for word in rc.CAN + rc.STATUS + rc.BASIS:
             self.assertNotIn(word, ("granted", "denied", "allowed", "forbidden"))
-        self.assertFalse(any(name.startswith(rs.CAP_PREFIX) for name in rs.FIELDS), "a cap field is never one of the fifteen")
+        self.assertFalse(any(name.startswith(rc.CAP_PREFIX) for name in rc.CANONICAL_FIELDS))
 
 
-class StaleEvidenceIsTold(unittest.TestCase):
-    NOW = datetime.datetime(2026, 10, 12, 13, 10, 21, tzinfo=datetime.timezone.utc)
+class ATimeIsARealTimeAndNotTomorrow(unittest.TestCase):
+    """Hole 4, second half. A time was checked for its shape only, and could be next week."""
 
-    def test_it_is_judged_from_when_somebody_last_looked(self):
+    def test_a_day_that_does_not_exist_is_refused_not_crashed_on(self):
+        for field in ("checked_at", "evidence_at"):
+            for stamp in ("2026-02-30T00:00:00Z", "2026-13-01T00:00:00Z", "2026-10-12T25:00:00Z", "2026-10-12 13:10:21",
+                          "2026-10-12T13:10:21+00:00", "yesterday", "", None, 1791810621):
+                problems = rc.check(capfile(observation("alpha", read=dict(right(), **{field: stamp}))), NOW)
+                self.assertTrue(any("%s must be a real time" % field in p for p in problems), (field, stamp, problems))
+
+    def test_a_time_in_the_future_is_refused_and_a_small_clock_skew_is_not(self):
+        def at(seconds):
+            return (NOW + datetime.timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        edge, past = at(rc.FUTURE_SKEW_SECONDS), at(rc.FUTURE_SKEW_SECONDS + 1)
+        self.assertEqual([], rc.check(capfile(observation("alpha", read=right(evidence=edge, checked=edge))), NOW))
+        problems = rc.check(capfile(observation("alpha", read=right(evidence=STAMP, checked=past))), NOW)
+        self.assertTrue(any("checked_at is in the future" in p for p in problems), problems)
+        problems = rc.check(capfile(observation("alpha", read=right(evidence=past, checked=past))), NOW)
+        self.assertTrue(any("evidence_at is in the future" in p for p in problems), problems)
+        problems = rc.check(capfile(observation("alpha", read=dict(unknown(), checked_at=at(86400)))), NOW)
+        self.assertTrue(any("checked_at is in the future" in p for p in problems), "an unknown checked tomorrow, too")
+        problems = rc.check(capfile(observation("alpha", read=right(evidence=LATER, checked=STAMP))), NOW)
+        self.assertTrue(any("dated after its own check" in p for p in problems), problems)
+
+    def test_stale_is_judged_from_when_somebody_last_looked(self):
+        base = datetime.datetime(2026, 10, 12, 13, 10, 21, tzinfo=datetime.timezone.utc)
         hour = datetime.timedelta(hours=1)
-        self.assertEqual("fresh", rs.staleness(right(), self.NOW + hour))
-        self.assertEqual("fresh", rs.staleness(right(), self.NOW + 24 * hour))
-        self.assertEqual("STALE", rs.staleness(right(), self.NOW + 24 * hour + datetime.timedelta(seconds=1)))
-        # An old fact checked now is fresh; a fact nobody has checked since is not, however new it was.
-        self.assertEqual("fresh", rs.staleness(right(evidence="2026-10-02T00:00:00Z"), self.NOW))
-        self.assertEqual("unknown", rs.staleness(unknown(), self.NOW + 99 * hour))
-
-    def test_the_table_shows_the_state_how_it_is_known_and_whether_it_is_stale(self):
-        text = rs.capability_table(capfile(observation("alpha", read=right(), merge=right(can="no", status="reported"))),
-                                   self.NOW + datetime.timedelta(days=2))
-        self.assertIn("alpha on %s, observed for: login example-bot" % SITE, text)
-        self.assertRegex(text, r"read\s+yes\s+verified\s+STALE")
-        self.assertRegex(text, r"merge\s+no\s+reported\s+STALE")
-        self.assertRegex(text, r"deploy\s+unknown\s+unknown\s+unknown")
+        self.assertEqual("fresh", rc.staleness(right(), base + 24 * hour))
+        self.assertEqual("STALE", rc.staleness(right(), base + 24 * hour + datetime.timedelta(seconds=1)))
+        self.assertEqual("fresh", rc.staleness(right(evidence="2026-10-02T00:00:00Z"), base), "an old fact checked now")
+        self.assertEqual("unknown", rc.staleness(unknown(), base + 99 * hour))
+        text = rc.table(capfile(observation("alpha", read=right(), merge=said(can="no", basis="acl"))), base + 48 * hour)
+        self.assertRegex(text, r"read\s+yes\s+verified\s+executed\s+STALE")
+        self.assertRegex(text, r"merge\s+no\s+reported\s+acl\s+STALE")
+        self.assertRegex(text, r"deploy\s+unknown\s+unknown\s+none\s+unknown")
 
 
-class TheTwoVerifiesEachKeepTheirOwn(unittest.TestCase):
-    def test_a_capability_field_is_not_roster_drift_and_matches_its_own_file(self):
+class VerifyReadsAndNeverWrites(unittest.TestCase):
+    """Hole 4, first half. There was no way to ask Redis what it holds without the write path."""
+
+    class ReadOnly(NarrowRedis):
+        def eval(self, script, numkeys, *args):
+            raise AssertionError("EVAL sent by verify")
+
+    def test_the_verify_verb_sends_only_reads_and_says_no_three_ways(self):
+        caps = capfile(observation("alpha", read=right()))
+        key, field = rc.AGENT_KEY % "alpha", rc.CAP_PREFIX + SITE
+        conn = self.ReadOnly()
+        self.assertEqual(["%s: %s is in the file and not in Redis" % (key, field)], rc.verify(conn, caps))
+        self.assertEqual(1, run(["verify"], caps, conn=conn))
+        conn.hashes[key][field] = "{}"
+        self.assertEqual(["%s: %s differs" % (key, field)], rc.verify(conn, caps))
+        conn.hashes[key][field] = rc.cap_value(caps["observations"][0])
+        self.assertEqual([], rc.verify(conn, caps))
+        self.assertEqual(0, run(["verify"], caps, conn=conn))
+        conn.hashes[rc.AGENT_KEY % "beta"]["cap:gcp:run/x"] = "{}"
+        self.assertEqual(["%s: cap:gcp:run/x is in Redis and not in the file" % (rc.AGENT_KEY % "beta")], rc.verify(conn, caps))
+        self.assertEqual({"smembers", "hgetall"}, {name for name, _ in conn.reads})
+        self.assertEqual([], conn.writes)
+
+    def test_it_reports_an_instance_redis_does_not_hold_and_a_hash_that_is_not_whole(self):
+        conn = self.ReadOnly()
+        drift = rc.verify(conn, capfile(observation("ghost", read=right())))
+        self.assertTrue(any("ghost is not in" in line for line in drift), drift)
+        del conn.hashes[rc.AGENT_KEY % "alpha"]["wake"]
+        drift = rc.verify(conn, capfile(observation("alpha", read=right())))
+        self.assertIn("%s: the hash is missing or incomplete" % (rc.AGENT_KEY % "alpha"), drift)
+
+    def test_the_rosters_verify_and_this_one_each_keep_their_own(self):
         data, caps = roster(), capfile(observation("alpha", read=right()))
         conn = NarrowRedis(data)
-        rs.put_capabilities(conn, caps)
-        self.assertEqual([], rs.verify(conn, data), "the roster's verify leaves cap: fields alone")
-        self.assertEqual([], rs.verify_capabilities(conn, caps))
-        conn.hashes[rs.AGENT_KEY % "alpha"]["stray"] = "x"
-        self.assertEqual(["%s: field stray is in Redis and not in the file" % (rs.AGENT_KEY % "alpha")], rs.verify(conn, data))
+        rc.write(conn, caps)
+        self.assertEqual(([], []), (rs.verify(conn, data), rc.verify(conn, caps)))
+        conn.hashes[rc.AGENT_KEY % "alpha"]["stray"] = "x"
+        self.assertEqual(["%s: field stray is in Redis and not in the file" % (rc.AGENT_KEY % "alpha")], rs.verify(conn, data))
         conn.hashes[rs.FAMILY_KEY % "claude"]["cap:x"] = "y"
         self.assertTrue(any("cap:x" in line for line in rs.verify(conn, data)), "only an INSTANCE hash may hold one")
 
-    def test_the_capability_verify_can_say_no_three_ways(self):
-        caps = capfile(observation("alpha", read=right()))
-        conn = NarrowRedis()
-        key, field = rs.AGENT_KEY % "alpha", rs.CAP_PREFIX + SITE
-        self.assertEqual(["%s: %s is in the file and not in Redis" % (key, field)], rs.verify_capabilities(conn, caps))
-        rs.put_capabilities(conn, caps)
-        conn.hashes[key][field] = "{}"
-        self.assertEqual(["%s: %s differs" % (key, field)], rs.verify_capabilities(conn, caps))
-        rs.put_capabilities(conn, caps)
-        conn.hashes[rs.AGENT_KEY % "beta"]["cap:gcp:run/x"] = "{}"
-        self.assertEqual(["%s: cap:gcp:run/x is in Redis and not in the file" % (rs.AGENT_KEY % "beta")],
-                         rs.verify_capabilities(conn, caps))
-
     def test_a_seed_replaces_the_hash_so_the_capability_goes_until_it_is_written_again(self):
         """Said, not hidden: seed() replaces each instance hash on purpose. The capability's original is
-        its own file, so nothing is lost, and the capability verify reports it missing."""
+        its own file, so nothing is lost, and this verify reports it missing."""
         data, caps = roster(), capfile(observation("alpha", read=right()))
-        conn = FakeRedis()
-        rs.seed(conn, data)
-        rs.put_capabilities(conn, caps)
-        rs.seed(conn, data)
-        self.assertNotIn(rs.CAP_PREFIX + SITE, conn.hashes[rs.AGENT_KEY % "alpha"])
-        self.assertEqual(1, len(rs.verify_capabilities(conn, caps)))
-        rs.put_capabilities(conn, caps)
-        self.assertEqual(([], []), (rs.verify(conn, data), rs.verify_capabilities(conn, caps)))
+        conn = NarrowRedis(data)
+        rc.write(conn, caps)
+        plain = FakeRedis()
+        plain.hashes, plain.sets = conn.hashes, conn.sets
+        rs.seed(plain, data)
+        self.assertNotIn(rc.CAP_PREFIX + SITE, plain.hashes[rc.AGENT_KEY % "alpha"])
+        self.assertEqual(1, len(rc.verify(plain, caps)))
+
+
+try:
+    import fakeredis                                                     # noqa: E402
+    import lupa                                                          # noqa: E402,F401
+except ImportError:                                                      # CI's suite has neither
+    fakeredis = None
+
+
+@unittest.skipUnless(fakeredis, "fakeredis with lupa is not installed: the Lua text is not run here")
+class TheLuaItself(unittest.TestCase):
+    """CAS_LUA's own text, run by a Lua interpreter against an in-memory server, with the same cases the
+    Python double above is used for. A double that answers in the shape its author assumed proves
+    nothing about the script; this is where the two are held to the same answers."""
+
+    def server(self):
+        conn = fakeredis.FakeStrictRedis(decode_responses=True)
+        rs.seed(conn, roster())
+        return conn
+
+    def test_the_script_and_the_double_give_the_same_answers(self):
+        key, field = rc.AGENT_KEY % "alpha", rc.CAP_PREFIX + SITE
+        cases = (
+            ("alpha", "", "written"),                 # nothing held, nothing expected
+            ("alpha", "something else", "changed"),   # the caller read a value that is no longer there
+            ("ghost", "", "not-a-member"),
+        )
+        for rid, held, want in cases:
+            real, double = self.server(), NarrowRedis()
+            args = (rc.AGENT_KEY % rid if rid == "ghost" else key, rc.ROSTER_SET, rid, field, held, "NEW") + rc.CANONICAL_FIELDS
+            self.assertEqual(want, real.eval(rc.CAS_LUA, 2, *args), (rid, held))
+            self.assertEqual(want, double.eval(rc.CAS_LUA, 2, *args), (rid, held))
+        real, double = self.server(), NarrowRedis()
+        real.hdel(key, "wake")
+        del double.hashes[key]["wake"]
+        args = (key, rc.ROSTER_SET, "alpha", field, "", "NEW") + rc.CANONICAL_FIELDS
+        self.assertEqual(("incomplete", "incomplete"), (real.eval(rc.CAS_LUA, 2, *args), double.eval(rc.CAS_LUA, 2, *args)))
+        self.assertIsNone(real.hget(key, field), "nothing was set on an incomplete hash")
+        real = self.server()
+        real.delete(key)
+        self.assertEqual("incomplete", real.eval(rc.CAS_LUA, 2, *args))
+        self.assertFalse(real.exists(key), "and a missing hash was not created")
+
+    def test_the_whole_write_runs_against_the_interpreter_and_sets_one_field(self):
+        conn = self.server()
+        before = {key: conn.hgetall(key) for key in conn.keys("*") if conn.type(key) == "hash"}
+        caps = capfile(observation("alpha", read=right()))
+        out = rc.write(conn, caps)
+        key, field = rc.AGENT_KEY % "alpha", rc.CAP_PREFIX + SITE
+        self.assertEqual((1, [], [], []), (len(out["written"]), out["lost"], out["changed_elsewhere"], out["not_read_back"]))
+        after = {k: conn.hgetall(k) for k in conn.keys("*") if conn.type(k) == "hash"}
+        self.assertEqual(rc.cap_value(caps["observations"][0]), after[key].pop(field))
+        self.assertEqual(before, after)
+        self.assertEqual([], rc.verify(conn, caps))
+        self.assertEqual(1, len(rc.write(conn, caps)["same"]), "and a second run is a retry")
+        stale = capfile(observation("alpha", read=right(checked=EARLIER, evidence=EARLIER)))
+        self.assertIn("stale", rc.write(conn, stale)["refused"][0])
 
 
 if __name__ == "__main__":

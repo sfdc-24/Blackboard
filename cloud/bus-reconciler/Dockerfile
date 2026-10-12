@@ -59,10 +59,11 @@ COPY cloud/bus-reconciler/serve_requests.py /app/serve_requests.py
 # the copy against the original from inside the VPC, which is the only place either is reachable.
 COPY scripts/agent_roster.json /app/agent_roster.json
 COPY scripts/roster_seed.py /app/roster_seed.py
-# The capability observations: the ORIGINAL of the cap: fields that `roster_seed.py capability`
-# writes beside the roster. It travels for the same reason the roster does: the copy is checked
-# against it from inside the VPC.
+# Capability observations beside the roster: their ORIGINAL, and the one entrypoint that may copy
+# them into Redis. That entrypoint is its own file because it must not be able to seed: the
+# seeder dispatches on its first word, and `roster_seed.py seed capability` ran the seed.
 COPY scripts/agent_capabilities.json /app/agent_capabilities.json
+COPY scripts/roster_capability.py /app/roster_capability.py
 # The keyspace viewer. redis-central has a private address and the Cloud console shows the
 # instance but never its contents, so the only way a person sees what is in there is a job
 # inside the VPC that prints it. Read-only by construction: it refuses any command outside
