@@ -484,8 +484,10 @@ def backend_receipt_accepts(receipt) -> bool:
 def entry_view(entry_id, fields) -> dict:
     """One stream entry as an answer shows it. "id" is ALWAYS the stream id. A field that is itself named
     `id` is shown as "field:id": it used to overwrite the stream id, so a reader that keeps a cursor by the
-    shown id could be moved past messages it never read (Cursor on PR 397)."""
-    view = {("field:id" if k == "id" else k): preview(v) for k, v in (fields or {}).items()}
+    shown id could be moved past messages it never read (Cursor on PR 397). A field already named
+    "field:..." gains one more prefix, so no two fields can land on one name (Copilot on PR 397)."""
+    view = {("field:" + k if k == "id" or k.startswith("field:") else k): preview(v)
+            for k, v in (fields or {}).items()}
     view["id"] = str(entry_id)
     return view
 

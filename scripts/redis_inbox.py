@@ -250,9 +250,11 @@ def seen() -> dict:
         return {}
 
 
-def remember(last_id: str) -> None:
+def remember(last_id: str, synced: bool = False) -> None:
+    """The local cursor, and whether fleet:cursor:<me> in Redis is CONFIRMED to hold it. A bookmark with
+    synced=False is retried on the next read even when nothing new arrives (Copilot on PR 397)."""
     with open(BOOKMARK, "w", encoding="utf-8", newline="") as fh:
-        json.dump({"last_id": last_id, "at": stamp()}, fh)
+        json.dump({"last_id": last_id, "at": stamp(), "synced": bool(synced)}, fh)
 
 
 def entries_of(payload: str) -> list:
@@ -346,7 +348,11 @@ def cmd_read(args) -> int:
     page (the local bookmark) and once at the end in Redis (fleet:cursor:<me>, which the archive's
     unread count reads). A page that was cut or not understood moves nothing."""
     key = KEY % ME
-    start = (args.after or seen().get("last_id") or "0-0").strip()
+    book = seen()
+    start = (args.after or book.get("last_id") or "0-0").strip()
+    # The Redis copy is owed when this read moves the cursor, or when an earlier read moved it and the
+    # Redis write was never confirmed (no "synced": a bookmark from before this, or a failed set).
+    owed = not args.after and bool(book.get("last_id")) and book.get("synced") is not True
     if stream_id(start) is None:
         raise SystemExit("the read cursor is not a stream id: %r (fix %s or pass --after)" % (start, BOOKMARK))
     cursor, count, shown, code = start, max(1, min(int(args.count), 20)), 0, 0
@@ -383,12 +389,16 @@ def cmd_read(args) -> int:
             break
     else:
         print("more is waiting after %s: read again (each page is one row)" % cursor)
-    if cursor != start:
+    if cursor != start or owed:
         rid = post(request_row("set", CURSOR_KEY % ME, value=cursor))
         saved = answer(rid, args.wait, since=args.since or stamp())
         ok = bool(saved) and saved.get("from") == WORKER and "|text=OK" in saved["payload"]
+        if ok:
+            remember(cursor, synced=True)
+        else:
+            code = code or 4
         print("cursor %s -> %s (local); in Redis: %s" % (start, cursor, "saved" if ok else
-                                                          "NOT confirmed, the local one stands"))
+                                                          "NOT confirmed, the local one stands; retried next read"))
     print("%d shown from %s, cursor %s" % (shown, key, cursor))
     return code
 

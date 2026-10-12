@@ -142,12 +142,29 @@ class Reading(unittest.TestCase):
         self.assertEqual(2, code)
         self.assertIsNone(self.saved())
 
-    def test_an_unconfirmed_redis_cursor_leaves_the_local_one_standing(self):
+    def test_an_unconfirmed_redis_cursor_leaves_the_local_one_standing_and_is_retried(self):
+        # Copilot on f873482: the failed set was never retried while nothing new arrived, so
+        # fleet:cursor:<me> (the archive's unread count) could stay stale for as long as the inbox was quiet.
         worker = Worker(stream(["a", "b"]))
         worker.drop.add("set")
         code, out = self.read(worker)
-        self.assertEqual("2-0", self.saved())
+        self.assertEqual((4, "2-0"), (code, self.saved()), "unconfirmed is not a success")
         self.assertIn("NOT confirmed, the local one stands", out)
+        worker.drop.discard("set")
+        code, out = self.read(worker)                                    # nothing new arrives
+        self.assertEqual(0, code, out)
+        self.assertEqual("2-0", worker.conn.data.get("fleet:cursor:claude-code-cli"), "retried, now confirmed")
+        sets = len([p for p in worker.asked if "op=set" in p])
+        self.read(worker)                                                # confirmed: no third set
+        self.assertEqual(sets, len([p for p in worker.asked if "op=set" in p]))
+
+    def test_a_bookmark_from_the_old_reader_is_copied_to_redis_once(self):
+        with open(self.bookmark, "w", encoding="utf-8") as fh:
+            json.dump({"last_id": "2-0", "at": "t"}, fh)                 # no "synced": never written to Redis
+        worker = Worker(stream(["a", "b"]))
+        code, out = self.read(worker)
+        self.assertEqual(0, code, out)
+        self.assertEqual("2-0", worker.conn.data.get("fleet:cursor:claude-code-cli"))
 
     def test_the_default_page_of_four_fits_one_row_at_the_preview_bound(self):
         # The default is sized so the worst case still fits: four values at the full 200-character preview.

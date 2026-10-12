@@ -598,6 +598,12 @@ class XrangeAfterACursor(unittest.TestCase):
             shown = got["value"][-1]
             self.assertEqual(("9-2", "100-0", "written elsewhere"), (shown["id"], shown["field:id"], shown["text"]))
 
+    def test_the_field_renaming_never_lands_two_fields_on_one_name(self):
+        # Copilot on PR 397: a field already named "field:id" collided with the renamed `id`.
+        shown = gov.entry_view("3-0", {"id": "a", "field:id": "b", "field:field:id": "c", "text": "t"})
+        self.assertEqual({"id": "3-0", "field:id": "a", "field:field:id": "b", "field:field:field:id": "c",
+                          "text": "t"}, shown)
+
     def test_last_is_the_stream_id_even_when_an_entry_has_a_field_named_id(self):
         conn = self.stream(2)
         conn.data["fleet:inbox:gemini"].append(("9-2", {"id": "not-a-cursor", "text": "written elsewhere"}))
