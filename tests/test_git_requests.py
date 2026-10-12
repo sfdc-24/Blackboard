@@ -24,6 +24,16 @@ CURSOR_ID = 206951365
 BOTS = {str(CURSOR_ID): "cursor"}
 
 
+def _result_row(spec):
+    """A RESULT row as the board would show the one just appended (only the cells handle() reads)."""
+    req = ""
+    for part in str(spec.get("payload", "")).split("|"):
+        if part.startswith("answers="):
+            req = part[len("answers="):]
+    return [spec.get("row_id", "R"), "2026-10-08T14:29:30Z", "bus-reconciler", "cursor", "AYA_RESULT",
+            spec.get("payload") or "BCB|v=1|answers=%s" % req, "", "", "", ""]
+
+
 def comment(body, cid=9001, uid=CURSOR_ID, utype="Bot", login="cursor[bot]", at="2026-10-08T14:25:00Z"):
     return {"id": cid, "body": body, "created_at": at, "updated_at": at,
             "html_url": "https://github.com/sfdc-24/Blackboard/pull/342#issuecomment-%d" % cid,
@@ -127,13 +137,18 @@ class ItRunsThroughTheSameGovernance(unittest.TestCase):
         # The run marker is what stops it; the board RESULT alone is a claim anyone can append and
         # must not (Cursor on 237562f - see test_a_forged_result_row_cannot_stop_a_git_request).
         conn.set(br.run_marker(br.parse_request(rows[0])), "earlier run")
-        out = br.handle([done] + rows, conn, now=NOW, append=[].append)
+        posted = []
+        out = br.handle([done] + rows, conn, now=NOW, append=posted.append)
         self.assertEqual([], out["answered"])
+        self.assertEqual([], posted, "no row on top of the answer (Cursor on 2d9a669: [].append hid one)")
         self.assertIsNone(conn.get("conf:2026-10-08:git:cursor"))
 
-    def test_a_lost_result_row_does_not_run_the_write_again(self):
+    def test_a_lost_result_row_does_not_run_the_write_again_or_answer_twice(self):
         # aya on 4d13e97: the op ran, its RESULT append failed, and the next run - seeing no RESULT -
         # applied it again. The second run must find the Redis marker and leave the value alone.
+        # Copilot on 6dc6f86: and it must not append under the same Row_ID either, however old the claim:
+        # the failed append may have landed. Before 6dc6f86 this test expected a NOT RUN AGAIN row here;
+        # that row is the 2026-10-11 duplicate whenever the first row did land.
         conn = FakeRedis()
         rows = gr.rows_from_comments("Blackboard", [comment(SET)], BOTS)
 
@@ -144,10 +159,14 @@ class ItRunsThroughTheSameGovernance(unittest.TestCase):
         self.assertEqual("from git", conn.get("conf:2026-10-08:git:cursor"))
         conn.set("conf:2026-10-08:git:cursor", "changed since by someone else")
         posted = []
-        out = br.handle(rows, conn, now=NOW, append=posted.append)
+        # Past the grace window: a younger claim is presumed in flight and says nothing yet.
+        later = NOW.timestamp() + br.CLAIM_GRACE_SECONDS + 600
+        out = br.handle(rows, conn, now=NOW + datetime.timedelta(seconds=600), append=posted.append,
+                        clock=lambda: later)
         self.assertEqual([], out["answered"])
         self.assertEqual("changed since by someone else", conn.get("conf:2026-10-08:git:cursor"))
-        self.assertIn("NOT RUN AGAIN", posted[0]["payload"])
+        self.assertEqual([], posted, "an attempted append is never followed by another under its Row_ID")
+        self.assertIn("never appended twice", json.dumps(out["refused"]))
 
     def test_a_claim_without_an_operation_is_reported_as_unknown_not_as_run(self):
         # aya on ce941b6: the worker died after claiming the marker and before the op. Nothing ran,
@@ -155,9 +174,12 @@ class ItRunsThroughTheSameGovernance(unittest.TestCase):
         conn = FakeRedis()
         rows = gr.rows_from_comments("Blackboard", [comment(SET)], BOTS)
         req_id = br.parse_request(rows[0])["req_id"]
-        conn.set(br.run_marker(br.parse_request(rows[0])), "x")
+        # A bare claim in the current format, past its grace. (A legacy claim, "x", is silent now: the
+        # previous image cannot say whether it answered - Cursor on 2d9a669.)
+        conn.set(br.run_marker(br.parse_request(rows[0])), "x|%d" % int(NOW.timestamp()))
         posted = []
-        br.handle(rows, conn, now=NOW, append=posted.append)
+        br.handle(rows, conn, now=NOW, append=posted.append,
+                  clock=lambda: NOW.timestamp() + br.CLAIM_GRACE_SECONDS + 1)
         self.assertIsNone(conn.get("conf:2026-10-08:git:cursor"))
         self.assertIn("UNKNOWN", posted[0]["payload"])
         self.assertNotIn("already run once", posted[0]["payload"])
@@ -171,6 +193,203 @@ class ItRunsThroughTheSameGovernance(unittest.TestCase):
         self.assertEqual([], second["answered"])
         writes = [e for e in conn.audit() if "conf:2026-10-08:git:cursor" in json.dumps(e)]
         self.assertEqual(1, len(writes), "one set in the audit, not two")
+
+    def test_an_answered_request_seen_again_in_a_stale_snapshot_gets_no_second_row(self):
+        # GEMINI-REDIS-20261011T221508Z-8f6635 on 2026-10-11: the live loop's next pass read a board taken
+        # before its own RESULT landed, found the marker, and appended "NOT RUN AGAIN ... UNKNOWN" under a
+        # request that had run and been answered. One request, one answer.
+        conn = FakeRedis()
+        rows = gr.rows_from_comments("Blackboard", [comment(SET)], BOTS)
+        posted = []
+        first = br.handle(rows, conn, now=NOW, append=posted.append)
+        second = br.handle(rows, conn, now=NOW, append=posted.append)    # no RESULT row in this snapshot
+        self.assertEqual(["OK"], [a["status"] for a in first["answered"]])
+        self.assertEqual([], second["answered"])
+        self.assertEqual(1, len(posted), "one RESULT row, not an OK and then an UNKNOWN")
+        self.assertNotIn("UNKNOWN", posted[0]["payload"])
+        self.assertIn("already answered", json.dumps(second["refused"]))
+
+    def test_a_second_worker_over_the_same_snapshot_stays_silent_while_the_first_is_in_flight(self):
+        # The same request, two executions, 112 ms apart: the second finds the first's fresh claim before
+        # its answer is out. It must neither run the op nor publish UNKNOWN.
+        conn = FakeRedis()
+        rows = gr.rows_from_comments("Blackboard", [comment(SET)], BOTS)
+        conn.set(br.run_marker(br.parse_request(rows[0])), "row-1|%d" % int(NOW.timestamp()))
+        posted = []
+        out = br.handle(rows, conn, now=NOW + datetime.timedelta(seconds=1), append=posted.append,
+                        clock=lambda: NOW.timestamp() + 1)
+        self.assertEqual([], out["answered"])
+        self.assertEqual([], posted)
+        self.assertIsNone(conn.get("conf:2026-10-08:git:cursor"))
+        self.assertIn("in flight", json.dumps(out["refused"]))
+
+    # --- Cursor and Copilot on 6dc6f86: every remaining way to a second row under one Row_ID ---
+
+    def test_a_lost_answered_write_then_a_stale_snapshot_after_the_grace_is_silent(self):
+        conn = FakeRedis()
+        rows = gr.rows_from_comments("Blackboard", [comment(SET)], BOTS)
+        marker = br.run_marker(br.parse_request(rows[0]))
+        real_set = conn.set
+
+        def lose_answered(key, value, **kw):
+            if key == marker and str(value).startswith(br.ANSWERED_MARK):
+                raise ConnectionError("lost")
+            return real_set(key, value, **kw)
+        conn.set = lose_answered
+        posted = []
+        br.handle(rows, conn, now=NOW, append=posted.append, clock=lambda: NOW.timestamp())
+        conn.set = real_set
+        br.handle(rows, conn, now=NOW + datetime.timedelta(seconds=10), append=posted.append,
+                  clock=lambda: NOW.timestamp() + br.CLAIM_GRACE_SECONDS + 1)
+        self.assertEqual(1, len(posted), "the OK, and nothing after it")
+        self.assertNotIn("UNKNOWN", posted[0]["payload"])
+
+    def test_an_unreadable_marker_neither_runs_nor_answers_and_is_retried(self):
+        conn = FakeRedis()
+        rows = gr.rows_from_comments("Blackboard", [comment(SET)], BOTS)
+        conn.set(br.run_marker(br.parse_request(rows[0])), "row-1|%d" % int(NOW.timestamp()))
+        real_get = conn.get
+        conn.get = lambda key: (_ for _ in ()).throw(ConnectionError("blip"))
+        posted = []
+        out = br.handle(rows, conn, now=NOW, append=posted.append, clock=lambda: NOW.timestamp() + 999)
+        conn.get = real_get
+        self.assertEqual([], posted)
+        self.assertEqual([], out["answered"])
+        self.assertIn("could not be read", json.dumps(out["refused"]))
+        again = br.handle(rows, conn, now=NOW, append=posted.append, clock=lambda: NOW.timestamp() + 999)
+        self.assertEqual(1, len(posted), "the next pass, able to read it, gives the one notice")
+        self.assertEqual([], again["answered"])
+
+    def test_the_claim_is_stamped_when_it_is_made_not_when_the_pass_began(self):
+        conn = FakeRedis()
+        rows = gr.rows_from_comments("Blackboard", [comment(SET)], BOTS)
+        claimed_at = NOW.timestamp() + 300             # a board read that took five minutes
+        stamps = []
+        real_set = conn.set
+
+        def watch(key, value, **kw):
+            stamps.append(str(value))
+            return real_set(key, value, **kw)
+        conn.set = watch
+        br.handle(rows, conn, now=NOW, append=[].append, clock=lambda: claimed_at)
+        claim = [v for v in stamps if v.endswith("|%d" % int(claimed_at))]
+        self.assertTrue(claim, "the claim carries the clock at the SET, not the pass start: %r" % stamps)
+
+    def test_a_request_claimed_near_the_end_of_its_window_is_never_answered_refused(self):
+        conn = FakeRedis()
+        rows = gr.rows_from_comments("Blackboard", [comment(SET)], BOTS)
+        req = br.parse_request(rows[0])
+        late = req["at"] + datetime.timedelta(minutes=31)          # stale by refusals()
+        # (a) the claimant died after the claim: one UNKNOWN notice, not REFUSED, and the op is not run
+        conn.set(br.run_marker(req), "row-1|%d" % int(late.timestamp() - 200))
+        posted = []
+        br.handle(rows, conn, now=late, append=posted.append, clock=lambda: late.timestamp())
+        self.assertEqual(1, len(posted))
+        self.assertIn("NOT RUN AGAIN", posted[0]["payload"])
+        self.assertNotIn("REFUSED", posted[0]["payload"])
+        self.assertIsNone(conn.get("conf:2026-10-08:git:cursor"))
+        # (b) an answer was attempted: nothing at all
+        conn2 = FakeRedis()
+        conn2.set(br.run_marker(req), br.ANSWERING_MARK + "row-1")
+        posted2 = []
+        br.handle(rows, conn2, now=late, append=posted2.append, clock=lambda: late.timestamp())
+        self.assertEqual([], posted2)
+
+    def test_a_refusal_is_published_once_however_stale_the_next_snapshot(self):
+        conn = FakeRedis()
+        rows = gr.rows_from_comments("Blackboard", [comment(SET)], BOTS)
+        req = br.parse_request(rows[0])
+        stale = req["at"] + datetime.timedelta(minutes=45)
+        posted = []
+        br.handle(rows, conn, now=stale, append=posted.append, clock=lambda: stale.timestamp())
+        br.handle(rows, conn, now=stale, append=posted.append, clock=lambda: stale.timestamp() + 999)
+        self.assertEqual(1, len(posted))
+        self.assertIn("REFUSED", posted[0]["payload"])
+
+    def test_an_unconfirmed_refusal_is_not_published_again(self):
+        conn = FakeRedis()
+        rows = gr.rows_from_comments("Blackboard", [comment(SET)], BOTS)
+        stale = br.parse_request(rows[0])["at"] + datetime.timedelta(minutes=45)
+
+        def unconfirmed(spec):
+            raise SystemExit(2)
+        with self.assertRaises(SystemExit):
+            br.handle(rows, conn, now=stale, append=unconfirmed, clock=lambda: stale.timestamp())
+        posted = []
+        br.handle(rows, conn, now=stale, append=posted.append, clock=lambda: stale.timestamp() + 999)
+        self.assertEqual([], posted, "the refusal may have landed; its Row_ID is not appended again")
+
+    def test_the_unknown_notice_is_given_once_however_many_stale_snapshots_follow(self):
+        conn = FakeRedis()
+        rows = gr.rows_from_comments("Blackboard", [comment(SET)], BOTS)
+        conn.set(br.run_marker(br.parse_request(rows[0])), "row-1|%d" % int(NOW.timestamp()))
+        posted = []
+        for k in range(4):                         # the claimant died; four passes, none sees the notice
+            br.handle(rows, conn, now=NOW, append=posted.append,
+                      clock=lambda k=k: NOW.timestamp() + br.CLAIM_GRACE_SECONDS + 10 + 60 * k)
+        self.assertEqual(1, len(posted))
+        self.assertIn("NOT RUN AGAIN", posted[0]["payload"])
+
+    def test_a_withheld_haudit_is_answered_once_on_the_board_and_on_git(self):
+        board = ["ROW-REQ-HAUD01", "2026-10-08T14:29:00Z", "cursor", "bus-reconciler", "AYA_REQ",
+                 "BCB|v=1|id=REQ-HAUD01|req=REQ-HAUD01|do=redis-op|op=haudit|key=proj:x", "", "", "", ""]
+        git = gr.rows_from_comments("Blackboard", [comment(
+            "BCB|v=1|do=redis-op|op=haudit|key=proj:x", cid=9002)], BOTS)
+        for rows in ([board], git):
+            conn, posted = FakeRedis(), []
+            br.handle(rows, conn, now=NOW, append=posted.append, clock=lambda: NOW.timestamp())
+            self.assertEqual(1, len(posted))
+            # On the board the worker answers only the public side stream (#367), so a board haudit is
+            # refused with its one key-free sentence; the Git channel keeps the governor's withheld.
+            self.assertIn("withheld" if rows is git else br.redis_keys.BOARD_REDIS_REFUSAL, posted[0]["payload"])
+            # The second pass sees the first answer in its snapshot (git: not a stop by itself) or not.
+            br.handle(rows + [_result_row(posted[0])], conn, now=NOW, append=posted.append,
+                      clock=lambda: NOW.timestamp() + 999)
+            br.handle(rows, conn, now=NOW, append=posted.append, clock=lambda: NOW.timestamp() + 999)
+            self.assertEqual(1, len(posted), "withheld once, on %s" % ("git" if rows is git else "board"))
+
+    def test_an_unconfirmed_withheld_haudit_is_not_appended_again(self):
+        board = ["ROW-REQ-HAUD02", "2026-10-08T14:29:00Z", "cursor", "bus-reconciler", "AYA_REQ",
+                 "BCB|v=1|id=REQ-HAUD02|req=REQ-HAUD02|do=redis-op|op=haudit|key=proj:x", "", "", "", ""]
+        conn = FakeRedis()
+
+        def unconfirmed(spec):
+            raise SystemExit(2)
+        with self.assertRaises(SystemExit):
+            br.handle([board], conn, now=NOW, append=unconfirmed, clock=lambda: NOW.timestamp())
+        posted = []
+        br.handle([board], conn, now=NOW, append=posted.append, clock=lambda: NOW.timestamp() + 999)
+        self.assertEqual([], posted, "the first may have landed; its Row_ID is not appended again")
+
+    def test_a_legacy_marker_is_silent_whether_or_not_the_snapshot_shows_the_answer(self):
+        rows = gr.rows_from_comments("Blackboard", [comment(SET)], BOTS)
+        rid = br.parse_request(rows[0])["req_id"]
+        answered = {"payload": "BCB|v=1|answers=%s|text=OK set" % rid, "row_id": "BUS-RECONCILER-RESULT-%s" % rid}
+        for snapshot in (rows, [_result_row(answered)] + rows):
+            conn, posted = FakeRedis(), []
+            conn.set(br.run_marker(br.parse_request(rows[0])), "BUS-ROW-FROM-THE-OLD-IMAGE")
+            out = br.handle(snapshot, conn, now=NOW, append=posted.append,
+                            clock=lambda: NOW.timestamp() + 99999)
+            self.assertEqual([], posted)
+            self.assertEqual([], out["answered"])
+            self.assertIsNone(conn.get("conf:2026-10-08:git:cursor"), "and the op is not run")
+
+    def test_no_answering_mark_no_append(self):
+        conn = FakeRedis()
+        rows = gr.rows_from_comments("Blackboard", [comment(SET)], BOTS)
+        marker = br.run_marker(br.parse_request(rows[0]))
+        real_set = conn.set
+
+        def refuse_answering(key, value, **kw):
+            if key == marker and str(value).startswith(br.ANSWERING_MARK):
+                raise ConnectionError("lost")
+            return real_set(key, value, **kw)
+        conn.set = refuse_answering
+        posted = []
+        out = br.handle(rows, conn, now=NOW, append=posted.append, clock=lambda: NOW.timestamp())
+        self.assertEqual([], posted, "an append that could not be marked is not made")
+        self.assertEqual("from git", conn.get("conf:2026-10-08:git:cursor"), "the op itself ran once")
+        self.assertIn(br.parse_request(rows[0])["req_id"], out["errors"])
 
     def test_a_repeated_field_is_refused_not_read_first_value_wins(self):
         conn = FakeRedis()

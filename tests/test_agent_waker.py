@@ -628,6 +628,8 @@ class RedisRequests(unittest.TestCase):
         return fake
 
     def test_a_well_formed_line_is_the_request_and_leaves_the_body(self):
+        req, _ = aw.redis_request("REDIS-OP|op=xrange|key=fleet:inbox:gemini|count=5|after=1791756204281-0")
+        self.assertEqual(("xrange", "1791756204281-0", "5"), (req["op"], req["after"], req["count"]))
         req, body = aw.redis_request("Short answer.\nREDIS-OP|op=xadd|key=conf:side:20261011|val=the lease holds\nMore.")
         self.assertEqual({"op": "xadd", "key": "conf:side:20261011", "val": "the lease holds",
                           "field": None, "count": None}, req)
@@ -1096,6 +1098,22 @@ class RedisRequests(unittest.TestCase):
                                                               model_cut=cut, verbose=False)
                 self.assertIn(state, ("refused", "cut"))
         self.assertEqual([], taken, "the claim is taken only for a request that will be sent")
+
+    def test_xrange_takes_after_and_only_a_stream_entry_id(self):
+        # main #392 added after= to xrange; the strict line takes it with or without count, and
+        # anywhere else, or as anything but <ms>-<seq>, the line is malformed and never sent.
+        for line in ("REDIS-OP|op=xrange|key=conf:side:20261011|after=1-0",
+                     "REDIS-OP|op=xrange|key=conf:side:20261011|count=5|after=1712-3"):
+            req, _ = aw.redis_request(line)
+            self.assertIsNotNone(req, line)
+        self.assertEqual("1-0", aw.redis_request("REDIS-OP|op=xrange|key=conf:side:20261011|after=1-0")[0]["after"])
+        for line in ("REDIS-OP|op=xadd|key=conf:side:20261011|val=v|after=1-0",
+                     "REDIS-OP|op=xrange|key=conf:side:20261011|after=1",
+                     "REDIS-OP|op=xrange|key=conf:side:20261011|after=%d-0" % 2 ** 64):
+            report = {}
+            req, body = aw.redis_request(line, report)
+            self.assertIsNone(req, line)
+            self.assertEqual(1, report["dropped"], line)
 
     def test_each_op_takes_exactly_its_fields(self):
         for text in ("REDIS-OP|op=get|key=proj:x|val=1",            # a read with a value

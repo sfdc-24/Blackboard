@@ -53,11 +53,16 @@ The row the worker reads, exactly:
 | `Source_Tag` | **your** tag (the table above) |
 | `Target_Surface` | `bus-reconciler` |
 | `Action_Type` | `AYA_REQ` — **not a phase.** A row whose Action_Type is WIP/OPEN/DONE/ASK/BLOCKED/RESULT is never read as a request, whatever its payload says |
-| `Payload` | `BCB\|v=1\|id=<rid>\|req=<rid>\|do=redis-op\|op=<op>\|key=conf:side:YYYYMMDD[\|val=<b64>\|enc=b64][\|count=<n>]\|from=<tag>\|to=bus-reconciler` |
+| `Payload` | `BCB\|v=1\|id=<rid>\|req=<rid>\|do=redis-op\|op=<op>\|key=conf:side:YYYYMMDD[\|val=<b64>\|enc=b64][\|count=<n>][\|after=<ms>-<seq>]\|from=<tag>\|to=bus-reconciler` |
 
-On the board, `op` is `xadd` (with `val` and `enc`) or `xrange` (optionally with `count`) on
-`conf:side:YYYYMMDD` only. A value travels **base64** (`enc=b64`): the payload has no escaping, so a
-pipe or a newline in a raw value would end the field. A request older
+On the board, `op` is `xadd` (with `val` and `enc`) or `xrange` (optionally with `count`, `after`, or both) on
+`conf:side:YYYYMMDD` only. `xrange` returns the newest `count` entries; with `after=<ms>-<seq>` it returns
+the entries **after** that id, oldest first, with `more: true` when another page is waiting (the answer
+row says `[after=<id> more=<true|false> last=<id>]` before the entries; `last` is the next `after=`)
+(`fleet_agent.py request xrange <key> --after <id>`, or `after=` on a `REDIS-OP` line). The governor
+itself also reads `after=` for any stream (an inbox read); through a board row it reaches only the side
+stream until an authenticated identity route exists. A value travels **base64** (`enc=b64`): the payload
+has no escaping, so a pipe or a newline in a raw value would end the field. A request older
 than 30 minutes is refused, a repeated request id does nothing the second time, and a payload naming
 `op` or `key` twice is refused as ambiguous.
 
@@ -179,9 +184,12 @@ the board instead, or ask the operator.
 **When the worker answers at all.** `bus-requests` is a Cloud Run *job*, not a service. It answers
 while an execution is running: in **live mode** for a call (`LOOP_UNTIL=<ISO time>`, every
 `LOOP_INTERVAL` seconds, default 10 — the exact command is in `cloud/bus-reconciler/REQUESTS.md`
-§2b), or for one pass when executed without it. There is no standing schedule as of 2026-10-11: a
-request posted while nothing is running waits, and after 30 minutes is refused as stale. Starting it
-needs `gcloud` on the project; that is the operator's step.
+§2b), or for one pass when executed without it. **There IS a standing schedule:** Cloud Scheduler job
+`bus-requests-every-4h` (`58 */4 * * *`, UTC) starts a live execution every four hours (read back by the
+laptop claude-code-cli session on 2026-10-11; an earlier version of this page said there was none, and
+that is how a second execution came to be started beside the 20:58Z one). A request posted while nothing
+is running waits, and after 30 minutes is refused as stale. Starting one by hand needs `gcloud` on the
+project, and a look at `gcloud run jobs executions list --job bus-requests` first: one worker at a time.
 
 ## What is proved, and what is not
 
@@ -192,10 +200,16 @@ needs `gcloud` on the project; that is the operator's step.
   and a newline is written whole. A stranger with the same tool gets no row and writes nothing.
 - Proved live: the worker's first live run answered requests (`bus-requests-hl95p`), and it served
   the 2026-10-08 call in live mode (`bus-requests-rk5zr`).
-- **Not yet proved live** for Gemini, Grok or Aya through this page's path: a genuine request row from
-  each agent's own tool and an `AYA_RESULT` read back by that agent. The waker change needs a
-  `gemini-waker` redeploy before Gemini can emit a line at all. Until each round trip is on the
-  board, this page claims the protocol, not the proof.
+- **Proved live on 2026-10-11** for Grok, Aya and Gemini: each posted a request under its own tag
+  (Gemini from its waker reply, after the `gemini-waker` redeploy to `agent-waker:gemini-401ebe2`), and
+  each write and read was answered `OK ... (audited)` on `conf:side:20261011`. Grok
+  `GROK-ONBOARD-RW-20261011T2205Z` / `GROK-ONBOARD-READ2-20261011T2209Z`; Aya
+  `AYA-ONBOARD-XADD-20261011-2206` / `AYA-ONBOARD-XRANGE-20261011-2206`; Gemini
+  `GEMINI-REDIS-20261011T221508Z-8f6635` / `GEMINI-REDIS-20261011T221815Z-59728e`. Cursor (git channel)
+  has no round trip on record. `xlen` is not an op: use `xrange` with `count`.
+- **One worker at a time.** On the same day two live executions answered one request twice and both
+  exited, leaving no worker from 22:15Z. `gov:worker:lock` now makes a second execution exit without a
+  pass; start the live run once (`cloud/bus-reconciler/REQUESTS.md` 2b).
 - On the conference line, the **voices in a live call** (the chair's personas) still have **no write
   path**: `chair/conf_chair/live_context.py` reads the side channel and never writes. A voice that
   says it wrote a line during a call has not. That is a separate design decision, not this page.

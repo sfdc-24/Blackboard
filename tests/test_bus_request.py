@@ -49,6 +49,13 @@ class FakeRedis:
             raise RuntimeError("boom")
         return self.store.get(key)
 
+    def set(self, key, value, nx=False, ex=None):
+        """The run markers (gov:req:*). Separate from the probe's setex, which `fail` targets."""
+        if nx and key in self.store:
+            return None
+        self.store[key] = value
+        return True
+
     def ttl(self, key):
         return self.ttls.get(key, -1)
 
@@ -85,7 +92,48 @@ class TheHappyPath(unittest.TestCase):
     def test_the_probe_cleans_up_after_itself(self):
         fake = FakeRedis()
         br.handle([row()], fake, now=NOW, append=Appender())
-        self.assertEqual({}, fake.store)
+        # The probe's own key is gone. What remains is the request's run marker (gov:req:*), which is
+        # how a second pass over a stale snapshot knows not to run the probe again (Cursor on ec758c7).
+        self.assertEqual([br.run_marker(br.parse_request(row()))], list(fake.store))
+        self.assertTrue(fake.store[br.run_marker(br.parse_request(row()))].startswith(br.ANSWERED_MARK))
+
+
+class EveryAnswerOnce(unittest.TestCase):
+    """Cursor on ec758c7: the probe and a refused unknown action published twice under one Row_ID over a
+    stale snapshot. Every action now claims and marks like a redis-op."""
+
+    def rows_of(self, appender):
+        return [r["row_id"] for r in appender.rows]
+
+    def test_two_passes_over_one_snapshot_run_the_probe_once_and_append_two_rows(self):
+        fake, app = FakeRedis(), Appender()
+        br.handle([row()], fake, now=NOW, append=app)
+        br.handle([row()], fake, now=NOW, append=app)
+        ids = self.rows_of(app)
+        self.assertEqual(2, len(ids), ids)
+        self.assertEqual(len(set(ids)), len(ids), "no Row_ID twice")
+        self.assertEqual(1, sum(1 for k in fake.keys_seen), "the probe wrote its key once")
+
+    def test_a_half_snapshot_showing_only_the_receipt_appends_nothing_more(self):
+        fake, app = FakeRedis(), Appender()
+        br.handle([row()], fake, now=NOW, append=app)
+        receipt = [r for r in app.rows if r["action_type"] == br.RECEIPT_ACTION][0]
+        half = [row(), [receipt["row_id"], "2026-10-06T13:56:00Z", "bus-reconciler", "aya", br.RECEIPT_ACTION,
+                        receipt["payload"], "", "", "", ""]]
+        before = len(app.rows)
+        br.handle(half, fake, now=NOW, append=app)
+        br.handle(half, fake, now=NOW, append=app)
+        self.assertEqual(before, len(app.rows))
+
+    def test_a_stale_probe_and_an_unknown_action_are_refused_once(self):
+        stale = row(at="2026-10-06T12:00:00Z", req="REQ-PROBE02")
+        bad = row(do="drop-table", req="REQ-BAD0001")
+        fake, app = FakeRedis(), Appender()
+        for _ in range(3):
+            br.handle([stale, bad], fake, now=NOW, append=app)
+        ids = self.rows_of(app)
+        self.assertEqual(2, len(ids), ids)
+        self.assertEqual(len(set(ids)), len(ids))
 
 
 class WhatAForgedRequestCanDo(unittest.TestCase):

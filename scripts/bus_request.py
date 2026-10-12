@@ -89,6 +89,51 @@ PROBE_TTL_SECONDS = 10
 # staleness bound, so a request is unrunnable by staleness long before its marker can expire.
 DONE_PREFIX = "gov:req:"
 DONE_TTL_SECONDS = 6 * 3600
+# THE MARKER'S STATES, and the one rule they serve: a request's RESULT Row_ID is appended AT MOST ONCE.
+#   <row id>|<epoch>     CLAIMED: the op may be running; nothing has been appended
+#   ANSWERING|<row id>   an append under this request's Row_ID has been ATTEMPTED; whether it landed is
+#                        not known here (append.py read it back, or it did not)
+#   ANSWERED|<row id>    append.py read the row back: it is on the board
+# The 2026-10-11 duplicate (GEMINI-REDIS-20261011T221508Z-8f6635: an OK and then an UNKNOWN under one
+# Row_ID, 112 ms apart; append.py exited 2 in both workers) and every way Cursor and Copilot found to
+# re-open it on 6dc6f86 - a lost ANSWERED write, an ambiguous append, a slow pass, an unreadable marker -
+# end at the same place: a later pass that decides by ELAPSED TIME whether a row exists. So time decides
+# nothing about rows any more. ANSWERING is written BEFORE the append; from then on every later pass is
+# silent under that request, whatever its snapshot says. Time only ages a bare CLAIM (no append ever
+# attempted), which is the crash between claim and answer and gets the one UNKNOWN notice.
+ANSWERED_MARK = "ANSWERED|"
+ANSWERING_MARK = "ANSWERING|"
+# A bare claim younger than this is another worker's op still in flight: say nothing yet.
+CLAIM_GRACE_SECONDS = 120
+
+
+def claim_age(held, now_seconds: float) -> float | None:
+    """Seconds since a claim written as `<row id>|<epoch>`; None for a marker that carries no time."""
+    head, _, stamp = str(held or "").rpartition("|")
+    if not head or not stamp.isdigit():
+        return None
+    return now_seconds - int(stamp)
+
+
+def marker_state(conn, marker: str, clock) -> tuple:
+    """(state, age) for a run marker: none, answered, answering, claimed (with its age), legacy (a claim
+    from before claims carried a time), or unreadable. A GET that fails is UNREADABLE, never 'none': an
+    unreadable marker is not proof that nothing was claimed (Copilot on 6dc6f86)."""
+    try:
+        held = conn.get(marker)
+    except Exception:                                                   # noqa: BLE001
+        return "unreadable", None
+    if isinstance(held, bytes):
+        held = held.decode("utf-8", "replace")
+    if held is None:
+        return "none", None
+    held = str(held)
+    if held.startswith(ANSWERED_MARK):
+        return "answered", None
+    if held.startswith(ANSWERING_MARK):
+        return "answering", None
+    age = claim_age(held, clock())
+    return ("claimed", age) if age is not None else ("legacy", None)
 
 
 def field(payload: str, name: str) -> str:
@@ -153,6 +198,7 @@ def parse_request(row):
         "val": field(payload, "val"),
         "enc": field(payload, "enc"),
         "count": field(payload, "count"),
+        "after": field(payload, "after"),
         # haudit only. Ignored by every other op. The manifest in val is digests and lengths;
         # redis_gov refuses anything else and never copies a stored string into the result.
         "gen": field(payload, "gen"),
@@ -210,7 +256,8 @@ def board_shared_request(req) -> bool:
               % (req["req_id"], req["req_id"], op, key))
     if op == "xadd":
         value = req.get("val") or ""
-        if req.get("field") or req.get("count") or req.get("enc") != "b64" or not value:
+        if (req.get("field") or req.get("count") or req.get("after") or req.get("enc") != "b64"
+                or not value):
             return False
         try:
             decoded = base64.b64decode(value, validate=True)
@@ -229,6 +276,12 @@ def board_shared_request(req) -> bool:
                     or str(int(count)) != count or not 1 <= int(count) <= redis_gov.MAX_RANGE):
                 return False
             prefix += "|count=%s" % count
+        after = req.get("after") or ""
+        if after:
+            if (not re.fullmatch(r"[0-9]{1,20}-[0-9]{1,20}", after)
+                    or any(int(p) > 2 ** 64 - 1 for p in after.split("-"))):
+                return False
+            prefix += "|after=%s" % after
     else:
         return False
     return req.get("payload") == prefix + "|from=%s|to=%s" % (req["claimed_sender"], WORKER_TAG)
@@ -416,11 +469,74 @@ def row_for(kind, req, text, gist) -> dict:
     }
 
 
-def handle(rows, conn, now=None, append=None, max_per_run=MAX_PER_RUN) -> dict:
+def _mark_answering(conn, req, nx=False) -> bool:
+    """Record that an append under this request's Row_ID is about to be attempted. False: not recorded,
+    so do not append. nx: only if no marker exists (a refusal, which has no claim before it)."""
+    try:
+        return bool(conn.set(run_marker(req), ANSWERING_MARK + (safe(req["row_id"])[:100] or "-"),
+                             nx=nx, ex=DONE_TTL_SECONDS))
+    except Exception:                                                   # noqa: BLE001
+        return False
+
+
+def _mark_answered(conn, req) -> None:
+    """append.py read the row back. Best effort: ANSWERING already keeps every later pass silent."""
+    try:
+        conn.set(run_marker(req), ANSWERED_MARK + (safe(req["row_id"])[:100] or "-"), ex=DONE_TTL_SECONDS)
+    except Exception:                                                   # noqa: BLE001
+        pass
+
+
+def _claimed(req, state, age, conn, append, already, out, budget, acl, clock) -> int:
+    """A request that already has a marker. Never runs the op. Appends at most the one UNKNOWN notice, and
+    only for a bare claim (no append ever attempted) past its grace. Returns the budget left."""
+    rid = req["req_id"]
+    # A LEGACY marker (written by the image before 6dc6f86: the row id alone, no time, never updated after
+    # the answer) cannot tell "died before answering" from "answered, and this snapshot is stale". The old
+    # image appended its OK right after the op, so a legacy marker is far more often an answered request:
+    # it is SILENT, never the UNKNOWN notice (Cursor on 2d9a669: the notice landed on top of an OK).
+    if (state in ("answered", "answering", "unreadable", "legacy")
+            or (state == "claimed" and age < CLAIM_GRACE_SECONDS)):
+        why = {"answered": "already answered: its RESULT row is on the board",
+               "answering": "an answer was attempted (append unconfirmed); never appended twice under one Row_ID",
+               "unreadable": "the run marker could not be read; not run and not answered, retried next pass",
+               "legacy": "claimed by the previous image, which cannot say whether it answered; silent, not run",
+               }.get(state) or "in flight: another run claimed it %ds ago" % max(0, int(age))
+        out["refused"].append({"req_id": rid, "why": [why]})
+        return budget
+    # A bare claim past its grace: the claimant died between the claim and any answer. One notice, under
+    # the same ANSWERING rule as every other row.
+    out["refused"].append({"req_id": rid, "why": ["already claimed: Redis holds this request's run marker"]})
+    already.add(rid)
+    if not (append and recognised(req, acl)):
+        return budget
+    if budget <= 0:
+        out["capped"] += 1
+        return budget
+    if not _mark_answering(conn, req):
+        out["errors"].append(rid)
+        return budget
+    # CLAIMED, NOT "RAN" (aya on ce941b6). The marker is set BEFORE the op, so a worker that died between
+    # the two left a marker and no operation. What is known is the claim; whether the op happened is only
+    # in gov:audit, and this row says so.
+    append(row_for(RESULT_ACTION, req,
+                   "NOT RUN AGAIN. An earlier run CLAIMED this request (Redis holds its run marker). Whether "
+                   "that run completed is UNKNOWN here: a gov:audit entry naming this request id means it "
+                   "ran; none means it did not.",
+                   "Already claimed: " + rid[:60]))
+    _mark_answered(conn, req)
+    return budget - 1
+
+
+def handle(rows, conn, now=None, append=None, max_per_run=MAX_PER_RUN, clock=time.time) -> dict:
     """Answer the request rows in `rows`. Returns what was done, in counts and ids.
 
     `append` takes a row spec dict and is expected to read its own write back - that is append.py's
-    contract and the only thing that closes an ambiguous append on this gateway."""
+    contract and the only thing that closes an ambiguous append on this gateway.
+
+    `now` is the pass's clock for staleness; `clock` is read at the moment a marker is written or aged.
+    They differ on purpose: a pass can spend minutes reading the board before it claims anything, and a
+    claim stamped with the pass's start looks old the moment it is made (Cursor on 6dc6f86)."""
     now = now or datetime.datetime.now(datetime.timezone.utc)
     already = answered(rows)
     seen_receipts = receipts(rows)
@@ -441,6 +557,20 @@ def handle(rows, conn, now=None, append=None, max_per_run=MAX_PER_RUN) -> dict:
     out = {"seen": len(requests), "answered": [], "refused": [], "capped": 0, "errors": [],
            "receipts_reused": [], "acl": acl.get("digest", "")}
     for req in requests:
+        # A CLAIMED REQUEST IS JUDGED BY ITS MARKER, NEVER BY refusals() AGAIN. Only this worker writes
+        # gov:req:*, and only for a request it accepted, so a marker is proof of an earlier acceptance.
+        # Judging it again let a request claimed at 29:00 be answered "REFUSED ... older than 30 minutes"
+        # after its op had run (Cursor on 6dc6f86) - under the same Row_ID as the answer it may have had.
+        # EVERY request with a usable id is judged by its marker first - every action, not only redis-op
+        # (Cursor on ec758c7: the probe and a refused unknown action published twice under one Row_ID).
+        # RESULT row on the board or not: a git request is not stopped by a RESULT row (anyone can append
+        # one), so skipping the marker there let a git haudit be answered twice (Cursor on 2d9a669).
+        is_op = bool(_REQ_ID.match(req["req_id"] or ""))
+        if is_op:
+            state, age = marker_state(conn, run_marker(req), clock)
+            if state != "none":
+                budget = _claimed(req, state, age, conn, append, already, out, budget, acl, clock)
+                continue
         why = refusals(req, now, already, acl)
         if why:
             out["refused"].append({"req_id": req["req_id"], "why": why,
@@ -462,8 +592,16 @@ def handle(rows, conn, now=None, append=None, max_per_run=MAX_PER_RUN) -> dict:
             if publishable:
                 budget -= 1
                 already.add(req["req_id"])
+                # A refusal is an answer under the same RESULT Row_ID, so it takes the same marker: a stale
+                # snapshot must not publish it twice, whatever the action. Never before the sender was
+                # recognised above, so a forged flood cannot make us write markers.
+                if is_op and not _mark_answering(conn, req, nx=True):
+                    out["refused"][-1]["why"] = why + ["the run marker could not be set; no refusal row"]
+                    continue
                 append(row_for(RESULT_ACTION, req, "REFUSED. " + "; ".join(why),
                                "Refused: " + why[0][:80]))
+                if is_op:
+                    _mark_answered(conn, req)
             continue
         if budget <= 0:
             out["capped"] += 1
@@ -473,10 +611,18 @@ def handle(rows, conn, now=None, append=None, max_per_run=MAX_PER_RUN) -> dict:
         if req["action"] == "redis-op" and (req.get("op") or "").strip().lower() == redis_gov.VERIFY_OP:
             # The public Sheet is not the haudit route. Do not run the manifest and do not publish
             # a receipt. Counts and digests stay with the in-process caller. C11.
+            # The withheld notice is an answer under the RESULT Row_ID like any other: it takes the mark
+            # first (Cursor on 2d9a669: it did not, and a second pass appended it again).
             if append:
-                append(row_for(RESULT_ACTION, req,
-                               "HAUDIT withheld. Request and receipt stay off the board.",
-                               "HAUDIT withheld"))
+                if _mark_answering(conn, req, nx=True):
+                    append(row_for(RESULT_ACTION, req,
+                                   "HAUDIT withheld. Request and receipt stay off the board.",
+                                   "HAUDIT withheld"))
+                    _mark_answered(conn, req)
+                else:
+                    out["refused"].append({"req_id": req["req_id"],
+                                           "why": ["the run marker could not be set; no withheld row"]})
+                    continue
             already.add(req["req_id"])
             out["answered"].append({"req_id": req["req_id"], "status": "REFUSED",
                                     "op": req.get("op"), "key": "",
@@ -499,7 +645,8 @@ def handle(rows, conn, now=None, append=None, max_per_run=MAX_PER_RUN) -> dict:
             # and says so - it never applies one twice.
             marker = run_marker(req)
             try:
-                claimed = conn.set(marker, safe(req["row_id"])[:120] or "-", nx=True, ex=DONE_TTL_SECONDS)
+                claimed = conn.set(marker, "%s|%d" % (safe(req["row_id"])[:100] or "-", int(clock())),
+                                   nx=True, ex=DONE_TTL_SECONDS)
             except Exception as error:
                 out["errors"].append(req["req_id"])
                 out["refused"].append({"req_id": req["req_id"],
@@ -507,30 +654,28 @@ def handle(rows, conn, now=None, append=None, max_per_run=MAX_PER_RUN) -> dict:
                                                % type(error).__name__]})
                 continue
             if not claimed:
-                noticed = req["req_id"] in already
-                already.add(req["req_id"])
-                out["refused"].append({"req_id": req["req_id"],
-                                       "why": ["already claimed: Redis holds this request's run marker"]})
-                if append and not noticed:
-                    # CLAIMED, NOT "RAN" (aya on ce941b6). The marker is set BEFORE the op, so a worker
-                    # that died between the two left a marker and no operation. What is known is the
-                    # claim; whether the op happened is only in gov:audit, and this row says so.
-                    append(row_for(RESULT_ACTION, req,
-                                   "NOT RUN AGAIN. An earlier run CLAIMED this request (Redis holds its "
-                                   "run marker). Whether that run completed is UNKNOWN here: a gov:audit "
-                                   "entry naming this request id means it ran; none means it did not.",
-                                   "Already claimed: " + req["req_id"][:60]))
+                # Another worker claimed it between our read of the marker and our SET NX.
+                state, age = marker_state(conn, marker, clock)
+                budget = _claimed(req, state, age, conn, append, already, out, budget, acl, clock)
                 continue
             result = redis_gov.execute(conn, acl, req["claimed_sender"],
                                        "%s/%s" % (req["req_id"], req["row_id"]),
                                        req.get("op"), req.get("key"), field=req.get("field") or "",
                                        raw_value=req.get("val") or "", enc=req.get("enc") or "",
                                        count=count, now=now, generation=req.get("gen") or "",
+                                       after=req.get("after") or "",
                                        correlation=req.get("cid") or "", head=req.get("head") or "")
             if append:
-                append(row_for(RESULT_ACTION, req, redis_gov.summarise(result),
-                               ("%s %s %s" % ("OK" if result.get("ok") else "NOT DONE",
-                                              req.get("op") or "?", req.get("key") or "?"))[:100]))
+                # ANSWERING BEFORE THE APPEND, or no append. If it cannot be recorded, the marker stays a bare
+                # claim and a later pass gives the one UNKNOWN notice; appending without it is what let a
+                # stale pass add a second row under this Row_ID.
+                if _mark_answering(conn, req):
+                    append(row_for(RESULT_ACTION, req, redis_gov.summarise(result),
+                                   ("%s %s %s" % ("OK" if result.get("ok") else "NOT DONE",
+                                                  req.get("op") or "?", req.get("key") or "?"))[:100]))
+                    _mark_answered(conn, req)
+                else:
+                    out["errors"].append(req["req_id"])
             already.add(req["req_id"])
             # A finished haudit that did not match is FAILED, not ERROR: ERROR is a crash, and the
             # entrypoint counts those. The row itself says missing, extra, changed, moved or partial.
@@ -551,6 +696,22 @@ def handle(rows, conn, now=None, append=None, max_per_run=MAX_PER_RUN) -> dict:
                                     "latency_ms": int((time.time() - started) * 1000)})
             continue
 
+        # THE PROBE CLAIMS ITS RUN like a redis-op does, before its receipt: a second pass over a snapshot
+        # that does not yet show the RESULT found no marker, ran the probe again and appended both rows
+        # again (Cursor on ec758c7). Its RESULT takes ANSWERING before the append, like every answer.
+        marker = run_marker(req)
+        try:
+            claimed = conn.set(marker, "%s|%d" % (safe(req["row_id"])[:100] or "-", int(clock())),
+                               nx=True, ex=DONE_TTL_SECONDS)
+        except Exception as error:                                       # noqa: BLE001
+            out["errors"].append(req["req_id"])
+            out["refused"].append({"req_id": req["req_id"],
+                                   "why": ["could not claim the run marker (%s); not run" % type(error).__name__]})
+            continue
+        if not claimed:
+            state, age = marker_state(conn, marker, clock)
+            budget = _claimed(req, state, age, conn, append, already, out, budget, acl, clock)
+            continue
         if append:
             # REUSE AN EXISTING RECEIPT RATHER THAN REPLAY IT. A receipt that landed while the
             # result did not leaves the request pending and its receipt Row_ID taken; appending it
@@ -583,8 +744,12 @@ def handle(rows, conn, now=None, append=None, max_per_run=MAX_PER_RUN) -> dict:
             text += " failed_with=" + receipt["failed_with"]
             out["errors"].append(req["req_id"])
         if append:
-            append(row_for(RESULT_ACTION, req, text,
-                           "%s for %s" % (receipt["status"], req["req_id"][:50])))
+            if _mark_answering(conn, req):
+                append(row_for(RESULT_ACTION, req, text,
+                               "%s for %s" % (receipt["status"], req["req_id"][:50])))
+                _mark_answered(conn, req)
+            else:
+                out["errors"].append(req["req_id"])
         already.add(req["req_id"])
         out["answered"].append({"req_id": req["req_id"], "status": receipt["status"],
                                 "latency_ms": receipt["latency_ms"]})
