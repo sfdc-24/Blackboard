@@ -38,6 +38,36 @@ class TheRepoCopyIsCheckedBeforeAnythingIsWritten(unittest.TestCase):
             self.skipTest("the durable copy is on main (PR 344), not on this branch")
         self.assertEqual(10, len(ms.parse(raw)))
 
+    def test_every_shipped_milestone_has_a_target_and_an_actual_and_neither_is_made_up(self):
+        """The owner, 2026-10-13: milestones "each with target date and actual date (plan vs actual)". A date
+        that was never recorded stays empty: a done item whose date was only ever a plan has no actual."""
+        path = ROOT / "docs" / "milestones" / "milestones-v1.json"
+        if not path.exists():
+            self.skipTest("the durable copy is on main (PR 344), not on this branch")
+        hashes = ms.parse(path.read_bytes())
+        items = [i for fields in hashes.values() if "milestones" in fields for i in json.loads(fields["milestones"])]
+        self.assertEqual(int(hashes[ms.META]["milestones_total"]), len(items))
+        for item in items:
+            self.assertEqual({"actual", "change", "date", "date_kind", "id", "owner", "status", "target", "title"},
+                             set(item), item.get("id"))
+            want = {"actual": ("", item["date"]), "prop": (item["date"], ""), "agreed": (item["date"], ""),
+                    "": ("", "")}[item["date_kind"]]
+            self.assertEqual(want, (item["target"], item["actual"]), item["id"])
+            if item["actual"]:
+                self.assertEqual("done", item["status"], "%s has an actual date and is not done" % item["id"])
+        self.assertIn("never filled in from the other one", hashes[ms.META]["item_dates"])
+        self.assertEqual(("2026-10-08", 2), ms.version_of(hashes[ms.META]["version"]))
+
+    def test_the_shipped_copy_is_written_whole_through_the_governor_so_every_hash_fits_its_cap(self):
+        path = ROOT / "docs" / "milestones" / "milestones-v1.json"
+        if not path.exists():
+            self.skipTest("the durable copy is on main (PR 344), not on this branch")
+        conn = FakeRedis()
+        out = ms.sync(conn, ACL, ms.parse(path.read_bytes()), "0" * 40)
+        self.assertEqual(("write", [], 10), (out["decision"], out["failed"], len(out["written"])))
+        self.assertEqual(out["written"][-1], ms.META, "meta is written last")
+        self.assertIn('"target"', conn.data["proj:milestones:v1:redis"]["milestones"])
+
     def test_a_source_that_does_not_match_its_sha_refuses_the_whole_file(self):
         with self.assertRaises(ms.BadSource):
             ms.parse(repo_file(sha="0" * 64))
