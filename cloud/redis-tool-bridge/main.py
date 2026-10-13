@@ -38,15 +38,20 @@ THE FOUR DEFECTS FROM MY OWN 2026-10-06 REVIEW, AND HOW EACH IS CLOSED HERE
      process. Both secrets are read from FILE MOUNTS, which is also what the running service already
      does, so this file does not regress what is deployed.
 
-WHAT THIS SERVICE DELIBERATELY CANNOT DO
-The only endpoint that touches Redis is a synthetic probe (locked decision 3: "first endpoint:
-test-only synthetic-probe yes"). The caller selects NO key, NO command, NO namespace and NO TTL -
-the server chooses all four. That is the same bound as scripts/bus_request.py and for the same
-reason, with one difference that matters: here the caller is actually AUTHENTICATED, which is
-precisely why the board-row worker was not widened tonight.
+WHAT THIS FILE DELIBERATELY CANNOT DO
+The only Redis calls THIS FILE makes are the synthetic probe's (locked decision 3: "first endpoint:
+test-only synthetic-probe yes"). On /probe the caller selects NO key, NO command, NO namespace and
+NO TTL - the server chooses all four.
 
-There is no action for GET, SET, HSET, XADD, KEYS, SCAN, FLUSHDB, FLUSHALL or DEL. Not refused -
+There is no code here for GET, SET, HSET, XADD, KEYS, SCAN, FLUSHDB, FLUSHALL or DEL. Not refused -
 ABSENT. A refusal is a line of code that can be got wrong.
+
+POST /op (2026-10-13, docs/REDIS-PRIMARY.md decision D1 - SOURCE FOR REVIEW, NOT YET APPROVED)
+The second endpoint is in op.py, on purpose, so that the paragraph above stays true of this file.
+This file does three things for it and no more: it reads the body, bounded; it runs the SAME
+verify_caller as the probe; and it hands the verified email and the bytes to op.handle. What a
+caller may read or write is decided by scripts/redis_gov.execute - the access list, the protected
+namespaces and the audit that the board route already uses - never by code in this directory.
 
 TWO DEFECTS IN THE FIRST VERSION OF THIS FILE, found by aya and Codex in PR 341 and fixed there:
   - plain `google-auth` does not install `requests`, so `google.auth.transport.requests` failed to
@@ -73,6 +78,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 PROBE_NAMESPACE = "probe:bridge:"
 PROBE_TTL_SECONDS = 60
 MAX_BODY_BYTES = 4096
+# /op's own bound. Kept equal to op.MAX_BODY_BYTES by tests/test_redis_tool_bridge.py; restated here
+# so the size check runs before op (and redis_gov behind it) is imported at all.
+OP_MAX_BODY_BYTES = 16384
 
 # Required configuration. EVERY ONE OF THESE IS FAIL-CLOSED: unset means the service refuses, never
 # that the check is skipped. Defect 1 shipped because an absent audience meant "verify nothing".
@@ -210,12 +218,20 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
         try:
-            length = min(int(self.headers.get("Content-Length") or 0), MAX_BODY_BYTES)
+            declared = int(self.headers.get("Content-Length") or 0)
         except ValueError:
-            length = 0
-        if length:
-            self.rfile.read(length)          # read and DISCARD: no endpoint takes input
-        if path != "/probe":
+            declared = 0
+        raw = b""
+        if path == "/op":
+            # THE ONE ENDPOINT THAT TAKES INPUT. Bounded BEFORE the read: a body over the bound is
+            # refused whole, never truncated into a different request.
+            if declared > OP_MAX_BODY_BYTES:
+                return self._send(413, {"error": "body too large"})
+            if declared > 0:
+                raw = self.rfile.read(declared)
+        elif declared > 0:
+            self.rfile.read(min(declared, MAX_BODY_BYTES))   # read and DISCARD: /probe takes no input
+        if path not in ("/probe", "/op"):
             return self._send(404, {"error": "no such endpoint"})
 
         principal, why = verify_caller(bearer(self.headers.get("Authorization", "")),
@@ -229,6 +245,15 @@ class Handler(BaseHTTPRequestHandler):
                 sys.stderr.write("%s REFUSING EVERY REQUEST: %s\n" % (stamp(), why))
                 return self._send(503, {"error": UNAVAILABLE})
             return self._send(code, {"error": why})
+
+        if path == "/op":
+            # Imported here, not at the top: the probe must keep working in an image or a test
+            # that has no redis_gov beside it, and a missing module must fail THIS endpoint loudly
+            # rather than every request.
+            import op
+            code, body = op.handle(principal, raw, connect,
+                                   lambda line: sys.stderr.write("%s %s\n" % (stamp(), line)))
+            return self._send(code, dict(body, at=stamp()))
 
         result = synthetic_probe(connect())
         sys.stderr.write("%s probe by %s: %s\n" % (stamp(), principal, result["status"]))

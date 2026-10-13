@@ -73,6 +73,39 @@ There is **no** action for `GET`, `SET`, `HSET`, `XADD`, `KEYS`, `SCAN`, `FLUSHD
 Redis calls to exactly `setex`, `get`, `ttl`, `delete`, so a fifth is a test change and therefore a
 review.
 
+### `POST /op` — source for review, not approved, not deployed (2026-10-13)
+
+Everything above describes what is **deployed** and what `main.py` itself does. This PR adds a second
+endpoint as source, for decision D1 of `docs/REDIS-PRIMARY.md` ("extend the bridge from probe-only to
+governed ops, after the source is verified"). **D1 has not been given. Nothing here deploys it, and
+`deploy.sh` still says not to run it.**
+
+- It lives in `op.py`, so the paragraph above stays true of `main.py`: its own Redis calls are still
+  exactly `setex`, `get`, `ttl`, `delete`, and the same test still pins them.
+- `op.py` makes **no** Redis call of its own. It hands one request to `scripts/redis_gov.execute`, the
+  function the board route already calls, so the access list, the protected namespaces, the server-set
+  TTL, the value cap and the audit are one tested implementation, not two.
+- The caller is whoever `verify_caller` verified (signature, audience, allowlist), mapped to a principal
+  by `callers.json`. The body cannot name who it acts as. `gov:audit` records `via = bridge:<email>`.
+- A message through it costs no board row.
+
+| status | meaning |
+|---|---|
+| 401 `unauthenticated` | no token, bad signature, wrong audience, unverified email |
+| 403 `not authorised` | a verified identity that is not on `BRIDGE_CALLERS` |
+| 400 `bad request` | the body is not the small JSON object `op.py` describes |
+| 413 `body too large` | over 16 KB; refused before it is read |
+| 403 `refused` | `redis_gov` refused it; `reason` is its own, and the refusal is audited |
+| 502 `failed` | the operation raised inside Redis; the error type only |
+| 503 `redis unreachable` | no connection, or it failed mid-operation |
+| 503 `service unavailable` | the bridge is misconfigured, including a caller on the allowlist with no principal |
+| 200 | `redis_gov`'s result |
+
+**Not built here** (the rest of Phase 3a and all of 3b): the hourly canary, the negative controls
+against a deployed bridge, the client (`scripts/redis_inbox.py` sending through the bridge with its
+breaker), and any second caller. Adding a caller is one line in `callers.json` after its service
+account exists and the owner has approved it (D2).
+
 ## Caller identity, per surface
 
 The GO asks for this explicitly: *federation possible or not, and why.*
