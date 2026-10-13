@@ -39,11 +39,18 @@ WHO DECIDES WHAT: THE STORE, NOT THIS TOOL
     - THE LIST CANNOT LIE. A list line is taken only when it says what the record's log says.
     - The description is written once, by its verified requester. Neither it nor the log is given an
       expiry or can be deleted through the governed path.
+    - A LOG BELONGS TO ITS DESCRIPTION. The store admits a record's first entry only if its
+      description exists, has its whole schema, and names that entry's verified actor as requester;
+      it reads the description under the same WATCH as the entry. So nobody begins a record another
+      agent described, and no log exists without a description. If a create is cut off between the
+      two writes, `resume` lets the SAME requester finish it: the description is not written again,
+      and nobody else can.
     This tool applies the same function before it sends, to say why a move would be refused without
     spending a call. That is a courtesy. The store's answer is the authority.
 
 THE MOVES, AND WHO MAY MAKE THEM
     create                    anyone verified        -> requested      (names the owner)
+    resume   --owner          the requester          finishes a create cut off after its description
     accept   --next           the owner              requested -> accepted (a lease, and a next step)
     start                     the owner              accepted -> working
     block    --blocker        the owner              accepted|working -> blocked
@@ -104,14 +111,14 @@ import redis_inbox as inbox  # noqa: E402   the board route's post, answer and p
 NS = "proj:work:v1:"
 INDEX, REC, LOG = NS + "index:%s", NS + "rec:%s", NS + "log:%s"
 ID = re.compile(r"^W-([0-9]{8})-[0-9a-f]{6}$")
-KINDS = ("task", "issue")
+KINDS = redis_gov.WORK_KINDS
 STATES, OPEN, MOVES = redis_gov.WORK_STATES, redis_gov.WORK_OPEN, redis_gov.WORK_MOVES
 allowed = redis_gov.work_allowed          # THE rules: the store's, used here only to explain a refusal early
 ISSUE_LINK = re.compile(r"^https://github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/issues/[0-9]+$")
 GITHUB_LINK = re.compile(r"^https://github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/(issues|pull)/[0-9]+$")
 PROJECT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,29}$")
 CAPS = {"title": 100, "source": 150, "done-when": 160, "link": 150}
-INDEX_TITLE = 30
+INDEX_TITLE = redis_gov.WORK_LIST_TITLE   # a list line must equal what the store derives; the store refuses any other
 EVENT_MAX = redis_gov.PREVIEW_CHARS      # a log entry a governed read shows whole
 REC_MAX = 900                            # a description one board row carries whole
 BOARD_BODY = 1000                        # what one board row carries of a day's list
@@ -441,6 +448,37 @@ def cmd_create(who: str, args) -> int:
     return code
 
 
+def cmd_resume(who: str, args) -> int:
+    """Finish a create whose description landed and whose first entry did not. NOTHING IS REWRITTEN: the
+    description stays exactly as it was written, and only the agent it names may begin the record. The
+    tool checks that to say so early; the store is what refuses anyone else."""
+    switched_on()
+    rid = args.id
+    index_key(rid)
+    record = describe_of(who, rid, args)
+    why = redis_gov.work_described(record, redis_gov.load_acl())
+    if why:
+        raise Stop(2, "nothing to resume: %s has no description this tool wrote (%s)" % (rid, why))
+    if record["requested_by"] != who:
+        raise Stop(2, "only %s, who described %s, may begin it; this is %s" % (record["requested_by"], rid, who))
+    page = govern(who, "xrange", LOG % rid, count=1, after="0-0", wait=args.wait, since=args.since)["page"]
+    if page["status"] != "ok":
+        raise Stop(3, "%s NOT READ: %s. Nothing is resumed on a log that was not read." % (rid, page["why"]))
+    if page["entries"]:
+        raise Stop(2, "%s is already begun: its first entry is there. Nothing to resume. If the list lacks it: "
+                      "reindex %s" % (rid, rid))
+    ev = {"rev": 1, "action": "create", "state": "requested", "owner": agent(args.owner),
+          "reviewer": agent(args.reviewer) if args.reviewer else "-", "requester": who, "lease": "-",
+          "req": secrets.token_hex(4), "words": "", "by": who}
+    why_not = allowed(None, ev)
+    if why_not:
+        raise Stop(2, "not resumed: %s" % why_not)
+    code = append(who, rid, ev, record["kind"], record["title"], args)
+    print("%s resumed (req=%s): its description is as it was written; %s for %s, state requested."
+          % (rid, ev["req"], record["kind"], ev["owner"]))
+    return code
+
+
 def cmd_move(who: str, args) -> int:
     switched_on()
     action, rid = args.what, args.id
@@ -636,7 +674,7 @@ def cmd_selftest(_who: str, _args) -> int:
     row = request_row("grok", "xrange", LOG % "W-20261013-a1b2c3", count=4, after="0-0")
     assert "|op=xrange|key=proj:work:v1:log:W-20261013-a1b2c3|count=4|after=0-0" in row["payload"], row
     assert row["source_tag"] == "grok" and row["action_type"] == inbox.REQUEST_ACTION, row
-    assert set(MOVES) <= set(__doc__.split()), "every move is in the docstring"
+    assert set(MOVES) | {"resume"} <= set(__doc__.split()), "every move is in the docstring"
     assert (REC % "", LOG % "", INDEX % "") == (redis_gov.WRITE_ONCE[0], redis_gov.SEQUENCED[0], redis_gov.REV_FORWARD[0])
     assert ID.match("W-20261013-a1b2c3") and not ID.match("W-20261013-A1B2C3") and not ID.match("W-2026-a1b2c3")
     assert redis_gov._KEY.match(REC % "W-20261013-a1b2c3") and redis_gov._FIELD.match("W-20261013-a1b2c3")
@@ -653,7 +691,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="the agent acting (default: $%s, else claude-code-cli); a write still needs the "
                              "bridge to have verified it" % ENV_AGENT)
     sub = parser.add_subparsers(dest="what", required=True)
-    for name in ["create", "note", "show", "list", "history", "reindex", "preflight", "selftest"] + sorted(MOVES):
+    for name in ["create", "resume", "note", "show", "list", "history", "reindex", "preflight", "selftest"] + sorted(MOVES):
         p = sub.add_parser(name)
         p.add_argument("--wait", type=float, default=180.0, help="seconds to wait for the worker, per operation")
         p.add_argument("--since", default="", help="board timestamp to read answers from")
@@ -674,6 +712,9 @@ def build_parser() -> argparse.ArgumentParser:
             p.add_argument("--all", action="store_true", help="also the done and the cancelled")
         elif name not in ("selftest", "preflight"):
             p.add_argument("id")
+        if name == "resume":
+            p.add_argument("--owner", required=True)
+            p.add_argument("--reviewer", default="")
         if name == "preflight":
             p.add_argument("--allow-stray-entry", action="store_true",
                            help="agreed: a governor without the rules will write one stray entry")
@@ -699,8 +740,8 @@ def main(argv=()) -> int:
             return cmd_move(who, args)
         if args.what == "preflight":
             return cmd_preflight(who, args)
-        return {"create": cmd_create, "show": cmd_show, "list": cmd_list, "history": cmd_history,
-                "reindex": cmd_reindex}[args.what](who, args)
+        return {"create": cmd_create, "resume": cmd_resume, "show": cmd_show, "list": cmd_list,
+                "history": cmd_history, "reindex": cmd_reindex}[args.what](who, args)
     except Stop as why:
         print(str(why))
         return why.code

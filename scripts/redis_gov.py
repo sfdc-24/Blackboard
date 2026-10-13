@@ -65,17 +65,23 @@ raw-write bypass.")
                                   (execute(verified=True): the bridge, after OIDC verification and
                                   the caller binding). A board row's sender tag is a claim, so the
                                   board worker's writes here are refused, whatever the tag says.
-        rec:<id>     WRITE_ONCE   hput, only when the key does not exist, and its requested_by must be
-                                  the verified caller. What was asked is not rewritten or forged.
-        log:<id>     SEQUENCED    xadd of ONE MOVE. The whole log is replayed first: if any entry in
-                                  it is not a legal move the record is disputed and takes nothing.
-                                  Then the new entry must be the NEXT revision, name only agents in
-                                  the access list, be a move its actor - the verified caller - may
-                                  make from the state and owner the log is in, and carry the evidence
-                                  that move requires (work_allowed). Two callers who both read r4
-                                  cannot both write r5; an unauthorized done never reaches the stream.
-        index:<day>  REV_FORWARD  hset, and the line must say what that record's log says now
-                                  (revision, state, owner, lease). A list cannot lie or go back.
+        rec:<id>     WRITE_ONCE   hput, only when the key does not exist; exactly the fields of
+                                  WORK_FIELDS; and its requested_by must be the verified caller. What
+                                  was asked is not rewritten or forged.
+        log:<id>     SEQUENCED    xadd of ONE MOVE. The record's DESCRIPTION is read under the same
+                                  WATCH: it must exist, have its schema, and name the entry's requester.
+                                  So a log cannot begin without its description (no orphan log), and B
+                                  cannot begin A's record in the gap after A described it (no takeover).
+                                  The whole log is then replayed: if any entry in it is not a legal
+                                  move the record is disputed and takes nothing. Then the new entry
+                                  must be the NEXT revision, name only agents in the access list, be a
+                                  move its actor - the verified caller - may make from the state and
+                                  owner the log is in, and carry the evidence that move requires
+                                  (work_allowed). Two callers who both read r4 cannot both write r5;
+                                  an unauthorized done never reaches the stream.
+        index:<day>  REV_FORWARD  hset, and the line must be exactly what that record's log and
+                                  description say now (revision, state, owner, lease, kind, title).
+                                  A list cannot lie or go back.
     Nothing else may be done to those keys through this path: no del, no set, no rewrite. rec and log
     are given NO expiry here whatever the access list's ttl says: they are the record, not a cache.
     The rules are narrow and they are the whole of it: WORK_MOVES and work_allowed below.
@@ -126,6 +132,9 @@ WORK_MOVES = {
     "reopen":  (("done", "cancelled"), "requested", "requester", "note"),
 }
 _WORK_REV = re.compile(r"r[1-9][0-9]{0,3}")           # r1..r9999: a log never reaches the stream's trim bound
+WORK_KINDS = ("task", "issue")
+WORK_FIELDS = ("created", "done_when", "kind", "link", "project", "requested_by", "source", "title")
+WORK_LIST_TITLE = 30                                   # how much of a title a list line carries
 
 OPS_READ = ("get", "hgetall", "xrange")
 # hput: REPLACE a whole hash from one b64 JSON object {field: string}, in one transaction with one
@@ -262,6 +271,37 @@ def work_allowed(prev, ev: dict) -> str:
     if end in ("done", "cancelled"):
         return "" if ev["lease"] == "-" else "a closed record holds no lease"
     return "" if same["lease"] else "%s does not change the lease" % action
+
+
+def work_described(mapping, acl) -> str:
+    """Why `mapping` is NOT a work record's description ("" when it is): exactly WORK_FIELDS, each a
+    non-empty string a governed read shows whole, a kind, and a requester who is an agent."""
+    if not isinstance(mapping, dict) or sorted(mapping) != list(WORK_FIELDS):
+        return "a description has exactly these fields: %s" % ", ".join(WORK_FIELDS)
+    for name in WORK_FIELDS:
+        value = mapping[name]
+        if not isinstance(value, str) or not value or value != preview(value):
+            return "%s is empty, or longer than a read shows whole" % name
+    if mapping["kind"] not in WORK_KINDS:
+        return "kind is task or issue"
+    if principal(acl, mapping["requested_by"]) != mapping["requested_by"]:
+        return "requested_by is an agent in the access list"
+    return ""
+
+
+def _work_record(pipe, acl, log_key: str) -> dict:
+    """The description a log belongs to, read UNDER THE WATCH of the write that is being decided (the
+    description's key is watched here, so if it changes before EXEC nothing applies). Raises Refused
+    when there is none, or it is not one."""
+    rec_key = WRITE_ONCE[0] + log_key[len(SEQUENCED[0]):]
+    pipe.watch(rec_key)
+    if _text(pipe.type(rec_key)) != "hash":
+        raise Refused("this record has no description: a log begins only after its description is written")
+    record = {_text(k): _text(v) for k, v in (pipe.hgetall(rec_key) or {}).items()}
+    why = work_described(record, acl)
+    if why:
+        raise Refused("this record's description is not one (%s); a person must look" % why)
+    return record
 
 
 def _stream_field(fields, name: str) -> str:
@@ -1503,7 +1543,10 @@ def _write(conn, acl, who, raw_tag, via, op, key, field, value, now, verified=Fa
         if key.startswith(WRITE_ONCE):
             if kind != "none":
                 raise Refused("this work record is already described; a description is written once")
-            if not isinstance(value, dict) or value.get("requested_by") != who:
+            why = work_described(value, acl)
+            if why:
+                raise Refused("not a description: %s" % why)
+            if value["requested_by"] != who:
                 raise Refused("a description names its verified writer as requested_by")
         if key.startswith(SEQUENCED):
             prev = work_chain(pipe.xrange(key, min="-", max="+"))        # disputed: nothing is added
@@ -1514,6 +1557,10 @@ def _write(conn, acl, who, raw_tag, via, op, key, field, value, now, verified=Fa
             held = prev["rev"] if prev else 0
             if ev["rev"] != held + 1:
                 raise Refused("revision conflict: the record is at r%d" % held)
+            # EXISTENCE, SCHEMA AND CREATOR, under this same WATCH: no orphan log, and nobody begins or
+            # extends a record whose description names another requester.
+            if _work_record(pipe, acl, key)["requested_by"] != ev["requester"]:
+                raise Refused("this record's description names another requester")
             for name in sorted({ev["owner"], ev["requester"], ev["reviewer"]} - {"-"}):
                 if principal(acl, name) != name:
                     raise Refused("an owner, a reviewer and a requester are agents in the access list")
@@ -1540,9 +1587,11 @@ def _write(conn, acl, who, raw_tag, via, op, key, field, value, now, verified=Fa
                       if _text(pipe.type(log_key)) == "stream" else None)
                 if ev is None:
                     raise Refused("a list line is written only for a record whose log exists")
-                if not value.startswith("%d %s %s %s " % (ev["rev"], ev["state"], ev["owner"], ev["lease"])):
-                    raise Refused("a list line says what the record's log says: it is at r%d %s"
-                                  % (ev["rev"], ev["state"]))
+                record = _work_record(pipe, acl, log_key)
+                if value != "%d %s %s %s %s %s" % (ev["rev"], ev["state"], ev["owner"], ev["lease"],
+                                                   record["kind"], record["title"][:WORK_LIST_TITLE]):
+                    raise Refused("a list line says what the record's log and description say: it is at "
+                                  "r%d %s" % (ev["rev"], ev["state"]))
         elif op == "hput":
             found = pipe.hgetall(key) or {}
             old = canonical({_text(k): _text(v) for k, v in found.items()}) if found else None

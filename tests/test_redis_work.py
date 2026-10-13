@@ -46,6 +46,12 @@ def canon(agent):
     return redis_gov.principal(redis_gov.load_acl(), agent) or agent
 
 
+def work_description(**change):
+    """A description with exactly the store's fields."""
+    return dict({"created": "2026-10-13T05:00:00Z", "done_when": "d", "kind": "task", "link": "-",
+                 "project": "Blackboard", "requested_by": ME, "source": "s", "title": "x"}, **change)
+
+
 def account(agent):
     """The service account this test binds to one agent. A real account id is 6 to 30 characters."""
     return "wk-%s@sfdc24.iam.gserviceaccount.com" % canon(agent)
@@ -271,21 +277,98 @@ class Records(unittest.TestCase):
         self.assertEqual("0", self.conn.audit()[-1]["ok"], "and the refusal is audited")
         self.assertEqual(0, self.cmd("cursor", "show", rid)[0], "the record is whole and undisputed")
 
-    def test_REGRESSION_a_forged_requester_or_description_is_refused_by_the_store(self):
+    def test_REGRESSION_takeover_in_the_gap_between_the_description_and_the_first_entry(self):
+        """Aya on 647b0d9: "Authenticated B can append r1 under A's record ID between description write and
+        first log." Here B tries exactly then: after A's description has landed, before A's first entry."""
+        tried = {}
+
+        def b_moves_in_the_gap(sim, request):
+            if request["op"] == "xadd" and not tried:
+                rid = request["key"][len(work.LOG % ""):]
+                for name, text in (("as itself", work_entry(1, "create", "requested", owner="gemini", requester="gemini")),
+                                   ("as A", work_entry(1, "create", "requested", owner="gemini", requester=ME))):
+                    try:
+                        self.sim("gemini").execute({"op": "xadd", "key": request["key"], "expect": "gemini", "val": text})
+                        tried[name] = "ADMITTED"
+                    except bc.Refused as why:
+                        tried[name] = why.reason
+                tried["stream then"] = (work.LOG % rid) in self.conn.data
+            return sim.execute(request)
+
+        racing = BridgeSim(self.conn, principal=ME, account=account(ME), fault=b_moves_in_the_gap)
+        rid = self.create(owner="grok", bridge=racing)
+        self.assertIn("this record's description names another requester", tried["as itself"])
+        self.assertIn("by its requester", tried["as A"], "B began A's record in A's name")
+        self.assertFalse(tried["stream then"], "B's refused entry created the stream")
+        self.assertEqual([(ME, "create")], [(by, text.split()[1]) for by, text in self.log(rid)],
+                         "the record was begun by its describer and by nobody else")
+        self.assertEqual((ME, "grok"), (self.state(rid)["requester"], self.state(rid)["owner"]))
+
+    def test_REGRESSION_orphan_a_log_or_a_list_line_never_exists_without_its_description(self):
         rid = "W-20261013-0f0f0f"
-        forged = work_entry(1, "create", "requested", owner="grok", requester="cursor")     # "cursor asked"
-        with self.assertRaises(bc.Refused) as raised:
-            self.sim("gemini").execute({"op": "xadd", "key": work.LOG % rid, "expect": "gemini", "val": forged})
-        self.assertIn("by its requester", raised.exception.reason)
-        self.assertNotIn(work.LOG % rid, self.conn.data)
+        for who, text in (("gemini", work_entry(1, "create", "requested", owner="grok", requester="gemini")),
+                          ("gemini", work_entry(1, "create", "requested", owner="grok", requester="cursor"))):
+            with self.assertRaises(bc.Refused) as raised:
+                self.sim(who).execute({"op": "xadd", "key": work.LOG % rid, "expect": who, "val": text})
+            self.assertIn("this record has no description", raised.exception.reason)
+        with self.assertRaises(bc.Refused):
+            self.sim("gemini").execute({"op": "hset", "key": INDEX, "field": rid, "expect": "gemini",
+                                        "val": "1 requested grok - task x"})
         import base64
         import json
-        body = base64.b64encode(json.dumps({"title": "x", "requested_by": "cursor"}).encode()).decode()
+        forged = dict(work_description(), requested_by="cursor")                  # "cursor asked for this"
         with self.assertRaises(bc.Refused) as raised:
-            self.sim("gemini").execute({"op": "hput", "key": work.REC % rid, "expect": "gemini", "val": body,
-                                        "enc": "b64"})
+            self.sim("gemini").execute({"op": "hput", "key": work.REC % rid, "expect": "gemini", "enc": "b64",
+                                        "val": base64.b64encode(json.dumps(forged).encode()).decode()})
         self.assertIn("names its verified writer as requested_by", raised.exception.reason)
-        self.assertEqual({}, self.snapshot())
+        self.assertEqual({}, self.snapshot(), "an orphan log, list line or forged description was written")
+
+    def half_made(self, lose):
+        """A create cut off at its first entry. Returns the id; the description is there."""
+        cut = BridgeSim(self.conn, principal=ME, account=account(ME), fault=lambda sim, request: sim.execute(
+            request, lose=lose if request["op"] == "xadd" else None))
+        code, out = self.cmd(ME, "create", "--title", "Half made", "--owner", "grok", *BASE, bridge=cut)
+        self.assertEqual(work.UNKNOWN_EXIT, code, out)
+        (rec_key,) = [k for k in self.conn.data if k.startswith(work.NS + "rec:")]
+        return rec_key[len(work.REC % ""):]
+
+    def test_REGRESSION_the_requester_completes_a_partial_create_and_nobody_else_can(self):
+        """Aya: "legitimate A completion after partial create. Keep valid recovery without overwrite/
+        identity substitution." The description landed; the first entry never did."""
+        rid = self.half_made("before")
+        described = dict(self.conn.data[work.REC % rid])
+        self.assertEqual((2, "no record %s: its log is empty" % rid), self.cmd("grok", "show", rid))
+        self.assertNotIn(INDEX, self.conn.data, "a record that was never begun is listed")
+        self.refused("grok", "accept", rid, "--next", "x", says="its log is empty")
+        # nobody else: not with the tool, and not without it
+        self.refused("gemini", "resume", rid, "--owner", "gemini",
+                     says="only claude-code-cli, who described %s, may begin it; this is gemini" % rid)
+        for requester in ("gemini", ME):
+            with self.assertRaises(bc.Refused):
+                self.sim("gemini").execute({"op": "xadd", "key": work.LOG % rid, "expect": "gemini",
+                                            "val": work_entry(1, "create", "requested", owner="gemini",
+                                                              requester=requester)})
+        self.assertNotIn(work.LOG % rid, self.conn.data)
+        # the requester: finishes it, and the description is exactly what it was
+        self.ops()
+        code, out = self.cmd(ME, "resume", rid, "--owner", "grok")
+        self.assertEqual(0, code, out)
+        self.assertNotIn("hput", self.ops(), "the description was written again")
+        self.assertEqual(described, self.conn.data[work.REC % rid], "the description was overwritten")
+        self.assertEqual([(ME, "create")], [(by, text.split()[1]) for by, text in self.log(rid)])
+        self.assertEqual(("requested", "grok", "Half made"),
+                         (self.listed(rid)["state"], self.listed(rid)["owner"], self.listed(rid)["title"]))
+        self.assertEqual(0, self.cmd("grok", "accept", rid, "--next", "x")[0], "and it is an ordinary record now")
+        self.refused(ME, "resume", rid, "--owner", "grok", says="is already begun")
+
+    def test_a_create_whose_first_entry_landed_unanswered_is_not_begun_twice(self):
+        rid = self.half_made("after")                                 # the entry landed; its answer was lost
+        self.assertEqual(1, len(self.conn.data[work.LOG % rid]))
+        self.refused(ME, "resume", rid, "--owner", "cursor", says="is already begun")
+        self.assertEqual("grok", self.state(rid)["owner"], "a second first entry changed the owner")
+        self.assertEqual(0, self.cmd(ME, "reindex", rid)[0])
+        self.assertEqual("requested", self.listed(rid)["state"])
+        self.refused(ME, "resume", "W-20261013-0f0f0f", "--owner", "grok", says="has no description this tool wrote")
 
     def test_REGRESSION_a_move_without_the_evidence_it_requires_is_refused_by_the_tool_and_by_the_store(self):
         rid = self.create(owner="grok")
