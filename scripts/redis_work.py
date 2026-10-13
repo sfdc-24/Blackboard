@@ -13,7 +13,10 @@ WHY THIS EXISTS
 
 A RECORD IS ITS LOG (namespace proj:work:v1:, beside proj:pr-board:v1:, which this never touches)
     proj:work:v1:rec:<id>           HASH    What was asked: kind, title, project, link, source,
-                                            done_when, requested_by, created. Written ONCE.
+                                            done_when, requested_by, created, due (the planned date
+                                            or -), milestone (its id or -). Written ONCE. The ACTUAL
+                                            date is not a field: it is the store's stamp on the entry
+                                            that closes the record. `show` prints plan against actual.
     proj:work:v1:log:<id>           STREAM  One entry per move. THE LAST ENTRY IS THE RECORD'S STATE:
                                               r<N> <action> <state> <owner> <reviewer> <requester> <lease> <req> <words>
                                             The governor adds who (`by`) and when (`at`). <req> is this
@@ -398,6 +401,13 @@ def cmd_create(who: str, args) -> int:
     title = text_ok("title", args.title, CAPS["title"])
     source = text_ok("source", args.source, CAPS["source"])
     done_when = text_ok("done-when", args.done_when, CAPS["done-when"])
+    due, milestone = args.due or "-", args.milestone or "-"
+    if not redis_gov.work_due(due):
+        raise Stop(2, "--due is the planned date as YYYY-MM-DD, a day that exists. Leave it out when no "
+                      "date was planned; the actual date is never given, the store stamps it.")
+    if milestone != "-" and not redis_gov.WORK_MILESTONE.match(milestone):
+        raise Stop(2, "--milestone is one milestone id, for example RED-M3: at most 30 letters, digits, "
+                      "dot, dash or underscore")
     link = text_ok("link", args.link, CAPS["link"])
     for label, value in (("title", title), ("source", source), ("done-when", done_when)):
         if not value:
@@ -415,7 +425,8 @@ def cmd_create(who: str, args) -> int:
     moment = now()
     rid = new_id(moment)
     record = {"kind": kind, "title": title, "project": args.project, "link": link or "-", "source": source,
-              "done_when": done_when, "requested_by": who, "created": moment.strftime("%Y-%m-%dT%H:%M:%SZ")}
+              "done_when": done_when, "requested_by": who, "created": moment.strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "due": due, "milestone": milestone}
     described = json.dumps(record, sort_keys=True, ensure_ascii=False)
     if len(json.dumps({k: redis_gov.preview(v) for k, v in record.items()}, sort_keys=True)) > REC_MAX:
         raise Stop(2, "this description would not fit one board row (%d characters; at most %d). Shorten "
@@ -541,6 +552,35 @@ def print_entry(shown: dict, bad: dict) -> None:
              ev["req"], ("  " + ev["words"]) if ev["words"] else "", mark))
 
 
+def plan_line(record: dict, shown: list, last, moment: datetime.datetime) -> str:
+    """Plan against actual, in one line. The plan is the description's `due`. The actual date is the
+    time the STORE stamped on the entry that closed the record, and only while the record is still
+    closed: a reopened record has no actual date."""
+    due, milestone = record.get("due", "-"), record.get("milestone", "-")
+    head = "milestone %s; " % milestone if milestone != "-" else ""
+    planned = None
+    if redis_gov.work_due(due) and due != "-":
+        planned = datetime.date(int(due[:4]), int(due[5:7]), int(due[8:]))
+    actual = None
+    if last is not None and last["state"] == "done" and shown:
+        stamp = str(shown[-1].get("at", ""))
+        if redis_gov.WORK_DUE.match(stamp[:10]):
+            actual = datetime.date(int(stamp[:4]), int(stamp[5:7]), int(stamp[8:10]))
+    plan = "planned %s" % due if planned else "no planned date"
+    if actual is None:
+        if last is not None and last["state"] == "cancelled":
+            return "%s%s; cancelled, no actual date" % (head, plan)
+        late = (moment.date() - planned).days if planned else 0
+        return "%s%s; not done%s" % (head, plan, " (%d day%s past the plan)" % (late, "" if late == 1 else "s")
+                                     if late > 0 else "")
+    if not planned:
+        return "%s%s; done %s" % (head, plan, actual.isoformat())
+    gap = (actual - planned).days
+    word = "on the day" if gap == 0 else "%d day%s %s" % (abs(gap), "" if abs(gap) == 1 else "s",
+                                                          "late" if gap > 0 else "early")
+    return "%s%s; done %s (%s)" % (head, plan, actual.isoformat(), word)
+
+
 def cmd_show(who: str, args) -> int:
     """The record: its state from the WHOLE chain, what was asked, and its newest entries."""
     rid = args.id
@@ -551,6 +591,7 @@ def cmd_show(who: str, args) -> int:
     print("project %s; link %s; source: %s" % (record.get("project", "?"), record.get("link", "-"),
                                                record.get("source", "?")))
     print("done when: %s" % record.get("done_when", "?"))
+    print(plan_line(record, shown, last, now()))
     print("requested by %s at %s" % (last["requester"] if last else "?", record.get("created", "?")))
     for entry in shown[-PAGE:]:
         print_entry(entry, dict(bad))
@@ -703,6 +744,8 @@ def build_parser() -> argparse.ArgumentParser:
             p.add_argument("--source", required=True, help="where the ask came from: a board row id, a doc, a call")
             p.add_argument("--done-when", dest="done_when", required=True, help="what done means")
             p.add_argument("--link", default="", help="the GitHub pull request or issue; required for an issue")
+            p.add_argument("--due", default="", help="the planned date, YYYY-MM-DD; the actual date is stamped by the store")
+            p.add_argument("--milestone", default="", help="the milestone id this counts toward, for example RED-M3")
             p.add_argument("--reviewer", default="", help="who closes it; it then cannot be closed unreviewed")
             p.add_argument("--past-board-list", action="store_true",
                            help="create it although the day's list will no longer fit one board row")
