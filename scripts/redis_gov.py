@@ -481,6 +481,17 @@ def backend_receipt_accepts(receipt) -> bool:
     return True
 
 
+def entry_view(entry_id, fields) -> dict:
+    """One stream entry as an answer shows it. "id" is ALWAYS the stream id. A field that is itself named
+    `id` is shown as "field:id": it used to overwrite the stream id, so a reader that keeps a cursor by the
+    shown id could be moved past messages it never read (Cursor on PR 397). A field already named
+    "field:..." gains one more prefix, so no two fields can land on one name (Copilot on PR 397)."""
+    view = {("field:" + k if k == "id" or k.startswith("field:") else k): preview(v)
+            for k, v in (fields or {}).items()}
+    view["id"] = str(entry_id)
+    return view
+
+
 def _read(conn, acl, who, raw_tag, via, op, key, count, now, after="") -> dict:
     if op == "get":
         value = conn.get(key)
@@ -502,17 +513,15 @@ def _read(conn, acl, who, raw_tag, via, op, key, count, now, after="") -> dict:
             entries = conn.xrange(key, min="(" + after, max="+", count=n + 1) or []
         more = len(entries) > n
         entries = entries[:n]
-        # `last` - the next after= - is the raw stream id, never the rendered entry's "id": a field named
-        # `id` overwrites that key in the rendering (Cursor on 2dc187a).
+        # `last` - the next after= - is the raw stream id of the last entry returned (Cursor on 2dc187a).
         out = {"ok": True, "op": op, "key": key, "entries": len(entries), "after": after, "more": more,
                "last": str(entries[-1][0]) if entries else after,
-               "value": [{"id": str(i), **{k: preview(v) for k, v in f.items()}} for i, f in entries]}
+               "value": [entry_view(i, f) for i, f in entries]}
     else:                                                                       # xrange, the newest n
         n = max(1, min(int(count or 10), MAX_RANGE))
         entries = conn.xrevrange(key, count=n) or []
         out = {"ok": True, "op": op, "key": key, "entries": len(entries),
-               "value": [{"id": str(i), **{k: preview(v) for k, v in f.items()}}
-                         for i, f in reversed(entries)]}
+               "value": [entry_view(i, f) for i, f in reversed(entries)]}
     # A read is audited too - "who looked at what" is half of governance - but cheaply: no value.
     _audit_alone(conn, audit_fields(acl, who, raw_tag, via, op, key, "", True, "", now=now))
     out["audit"] = "ok"
