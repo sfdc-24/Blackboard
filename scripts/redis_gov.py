@@ -55,22 +55,30 @@ WHAT ONLY MOVES FORWARD
     one is refused whenever it arrives. `del` still removes the key: moving a cursor back on purpose is
     a deletion first, audited as one.
 
-A WORK RECORD IS A LEDGER (scripts/redis_work.py; Aya, 2026-10-13: "revision/state/owner transitions
-must be atomic compare-and-set" and "do not delete the only audit record")
-    Three prefixes, in code like the two lists above, each decided under the same WATCH as its write:
-        proj:work:v1:rec:<id>     WRITE_ONCE   hput, and only when the key does not exist. What was
-                                               asked for, and what done means, are not rewritten.
-        proj:work:v1:log:<id>     SEQUENCED    xadd, and only as the NEXT revision: the text starts
-                                               "r<N> " and N is one more than the last entry's. Two
-                                               writers who both read r4 cannot both write r5; one is
-                                               refused and must read again. An r5 whose answer was lost
-                                               and that arrives after someone else's r5 is refused too.
-        proj:work:v1:index:<day>  REV_FORWARD  hset, and never to a lower revision: the value starts
-                                               "<N> ". It is a list for reading, rebuilt from the log.
-    Nothing else may be done to those keys through this path: no del, no set, no rewrite. The first two
+A WORK RECORD IS ADMITTED HERE, NOT TRUSTED (scripts/redis_work.py; Aya, 2026-10-13, on PR 403 at da4488a:
+"derive actor from authenticated transport, validate expected revision/state/owner and required
+transition evidence inside the SAME governed WATCH/transaction before append/audit. Prevent generic
+raw-write bypass.")
+    Namespace proj:work:v1:, three prefixes, in code like the lists above. Every rule is decided under
+    the same WATCH as its write, before the write and its audit entry are queued:
+        ANY WRITE                 only from a caller whose identity was VERIFIED by its transport
+                                  (execute(verified=True): the bridge, after OIDC verification and
+                                  the caller binding). A board row's sender tag is a claim, so the
+                                  board worker's writes here are refused, whatever the tag says.
+        rec:<id>     WRITE_ONCE   hput, only when the key does not exist, and its requested_by must be
+                                  the verified caller. What was asked is not rewritten or forged.
+        log:<id>     SEQUENCED    xadd of ONE MOVE. The whole log is replayed first: if any entry in
+                                  it is not a legal move the record is disputed and takes nothing.
+                                  Then the new entry must be the NEXT revision, name only agents in
+                                  the access list, be a move its actor - the verified caller - may
+                                  make from the state and owner the log is in, and carry the evidence
+                                  that move requires (work_allowed). Two callers who both read r4
+                                  cannot both write r5; an unauthorized done never reaches the stream.
+        index:<day>  REV_FORWARD  hset, and the line must say what that record's log says now
+                                  (revision, state, owner, lease). A list cannot lie or go back.
+    Nothing else may be done to those keys through this path: no del, no set, no rewrite. rec and log
     are given NO expiry here whatever the access list's ttl says: they are the record, not a cache.
-    This is not a state machine. Who may make which move is redis_work's rule, checked by every reader
-    against the `by` this module writes; here it is only "once", "in order" and "not backwards".
+    The rules are narrow and they are the whole of it: WORK_MOVES and work_allowed below.
 
 IDENTITY, STATED HONESTLY
     The actor is the row's Source_Tag. Appending a row needs the board secret, so the writer is a
@@ -101,7 +109,23 @@ WRITE_ONCE = ("proj:work:v1:rec:",)
 SEQUENCED = ("proj:work:v1:log:",)
 REV_FORWARD = ("proj:work:v1:index:",)
 _LEDGER_OP = {WRITE_ONCE: "hput", SEQUENCED: "xadd", REV_FORWARD: "hset"}
-_REVISION = re.compile(r"(r?)([1-9][0-9]{0,3}) ")     # 1..9999: a log never reaches the stream's trim bound
+WORK_STATES = ("requested", "accepted", "working", "blocked", "review", "done", "cancelled")
+WORK_OPEN = WORK_STATES[:5]
+# action: (states it may start from, the state it ends in or None to keep it, who may, the evidence it carries)
+WORK_MOVES = {
+    "accept":  (("requested",), "accepted", "owner", "next"),
+    "start":   (("accepted",), "working", "owner", ""),
+    "block":   (("accepted", "working"), "blocked", "owner", "blocker"),
+    "unblock": (("blocked",), "working", "owner", ""),
+    "review":  (("accepted", "working"), "review", "owner", ""),
+    "return":  (("review",), "working", "reviewer", "note"),
+    "done":    (("accepted", "working", "review"), "done", "closer", "evidence"),
+    "cancel":  (WORK_OPEN, "cancelled", "owner-or-requester", "note"),
+    "handoff": (WORK_OPEN, "requested", "owner-or-requester", ""),
+    "renew":   (("accepted", "working"), None, "owner", ""),
+    "reopen":  (("done", "cancelled"), "requested", "requester", "note"),
+}
+_WORK_REV = re.compile(r"r[1-9][0-9]{0,3}")           # r1..r9999: a log never reaches the stream's trim bound
 
 OPS_READ = ("get", "hgetall", "xrange")
 # hput: REPLACE a whole hash from one b64 JSON object {field: string}, in one transaction with one
@@ -158,10 +182,105 @@ STREAM_ID = re.compile(r"[0-9]{1,20}-[0-9]{1,20}")
 U64_MAX = 2 ** 64 - 1
 
 
-def _revision(text, mark: str):
-    """The revision a ledger value starts with - "r<N> " in a log, "<N> " in an index - or None."""
-    m = _REVISION.match(text if isinstance(text, str) else "")
-    return int(m[2]) if m and m[1] == mark else None
+def work_event(text, by: str = "", at: str = "", entry_id: str = ""):
+    """One entry of a work record's log, as a dict, or None when it is not one:
+        r<N> <action> <state> <owner> <reviewer> <requester> <lease> <req> [words]
+    `by` is the actor: for an entry being written, the verified caller; for a stored one, the `by`
+    this module wrote beside it."""
+    parts = text.split(" ", 8) if isinstance(text, str) else []
+    if len(parts) < 8 or not all(parts[:8]) or not _WORK_REV.fullmatch(parts[0]) or parts[2] not in WORK_STATES:
+        return None
+    if parts[1] not in WORK_MOVES and parts[1] not in ("create", "note"):
+        return None
+    return {"rev": int(parts[0][1:]), "action": parts[1], "state": parts[2], "owner": parts[3],
+            "reviewer": parts[4], "requester": parts[5], "lease": parts[6], "req": parts[7],
+            "words": parts[8] if len(parts) > 8 else "", "by": str(by or ""), "at": str(at or ""),
+            "id": str(entry_id or "")}
+
+
+def work_lease(lease: str):
+    """A lease stamp as an aware datetime, or None."""
+    try:
+        return datetime.datetime.strptime(lease, "%Y%m%dT%H%MZ").replace(tzinfo=datetime.timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def work_allowed(prev, ev: dict) -> str:
+    """Why `ev` is NOT a move the rules allow after `prev` ("" when it is). `prev` is None for the first
+    entry. ONE function: _write admits an entry with it, and every reader checks a stored log with it."""
+    by, action = ev["by"], ev["action"]
+    if prev is None:
+        if ev["rev"] != 1 or action != "create":
+            return "a record's first entry is r1 create"
+        if (ev["state"], ev["lease"]) != ("requested", "-") or ev["requester"] != by:
+            return "a record is created requested, with no lease, by its requester"
+        return "" if ev["reviewer"] != ev["owner"] else "the reviewer cannot be the owner"
+    if ev["rev"] != prev["rev"] + 1:
+        return "r%d does not follow r%d" % (ev["rev"], prev["rev"])
+    if ev["requester"] != prev["requester"]:
+        return "the requester of a record never changes"
+    same = {k: ev[k] == prev[k] for k in ("state", "owner", "reviewer", "lease")}
+    if action == "note":
+        if not all(same.values()):
+            return "a note moves nothing"
+        return "" if ev["words"] else "a note says something"
+    if action not in WORK_MOVES:
+        return "%s is not a move" % action
+    starts, end, actor, needs = WORK_MOVES[action]
+    if prev["state"] not in starts:
+        return "%s starts from %s, not from %s" % (action, " or ".join(starts), prev["state"])
+    may = {"owner": (prev["owner"],), "reviewer": (prev["reviewer"],), "requester": (prev["requester"],),
+           "owner-or-requester": (prev["owner"], prev["requester"]),
+           "closer": (prev["reviewer"],) if prev["state"] == "review" else
+                     (prev["owner"],) if prev["reviewer"] == "-" else ()}[actor]
+    if by not in may:
+        if actor == "closer" and not may:
+            return "a reviewer (%s) is named: it goes to review, and the reviewer closes it" % prev["reviewer"]
+        return "only %s may %s it, and this is %s" % (" or ".join(may), action, by or "(nobody)")
+    if needs and not re.search(r"(?:^| )%s=\S" % needs, ev["words"]):
+        return "%s must carry %s=" % (action, needs)
+    if ev["state"] != (end or prev["state"]):
+        return "%s ends in %s" % (action, end or prev["state"])
+    if action == "handoff":
+        if ev["owner"] == prev["owner"] or (ev["reviewer"], ev["lease"]) != ("-", "-"):
+            return "a handoff names a new owner and clears the reviewer and the lease"
+        return ""
+    if not same["owner"]:
+        return "only a handoff changes the owner"
+    if action == "review":
+        if ev["reviewer"] in ("-", ev["owner"]):
+            return "a review names a reviewer who is not the owner"
+        return "" if prev["reviewer"] in ("-", ev["reviewer"]) and same["lease"] else \
+            "a review keeps the lease, and the reviewer already named"
+    if action == "reopen":
+        return "" if (ev["reviewer"], ev["lease"]) == ("-", "-") else "a reopened record has no reviewer and no lease"
+    if not same["reviewer"]:
+        return "only a review, a handoff or a reopen changes the reviewer"
+    if action in ("accept", "renew"):
+        return "" if work_lease(ev["lease"]) else "%s sets a lease" % action
+    if end in ("done", "cancelled"):
+        return "" if ev["lease"] == "-" else "a closed record holds no lease"
+    return "" if same["lease"] else "%s does not change the lease" % action
+
+
+def _stream_field(fields, name: str) -> str:
+    fields = fields or {}
+    return _text(fields.get(name, fields.get(name.encode("ascii"), "")))
+
+
+def work_chain(entries):
+    """Replay a stored log from its first entry. Returns its last entry (None for an empty log).
+    Raises Refused naming the first entry that is not a legal move: the record is disputed."""
+    prev = None
+    for entry_id, fields in entries or ():
+        ev = work_event(_stream_field(fields, "text"), _stream_field(fields, "by"))
+        why = "it is not a work-record entry" if ev is None else work_allowed(prev, ev)
+        if why:
+            raise Refused("this record is disputed at entry %s (%s); nothing is added until a person "
+                          "has looked" % (_text(entry_id), why))
+        prev = ev
+    return prev
 
 
 def _id_pair(value: str) -> tuple:
@@ -362,8 +481,12 @@ def _audit_alone(conn, fields) -> None:
 
 def execute(conn, acl: dict, raw_tag: str, via: str, op: str, key: str, field: str = "",
             raw_value: str = "", enc: str = "", count: int = 10, now=None, generation: str = "",
-            correlation: str = "", head: str = "", after: str = "") -> dict:
+            correlation: str = "", head: str = "", after: str = "", verified: bool = False) -> dict:
     """Do one governed operation. Always returns a result dict; never raises into the caller.
+
+    verified says the CALLER'S IDENTITY WAS VERIFIED BY ITS TRANSPORT, so `raw_tag` is who it is and
+    not who it says it is. Only the bridge passes True (OIDC, then the caller binding). The board
+    worker never does: a row's sender tag is a claim. It is read by the work-record rules alone.
 
     Every outcome - refused, read, written, or failed - leaves exactly one gov:audit entry, and a
     write's entry is committed in the SAME transaction as the write.
@@ -397,7 +520,7 @@ def execute(conn, acl: dict, raw_tag: str, via: str, op: str, key: str, field: s
                                      echoed_generation, echoed_correlation, (head or "").strip(), now)
         if op in OPS_READ:
             return _read(conn, acl, who, raw_tag, via, op, key, count, now, after)
-        return _write(conn, acl, who, raw_tag, via, op, key, field, value, now)
+        return _write(conn, acl, who, raw_tag, via, op, key, field, value, now, verified is True)
     except Refused as why:
         try:
             _audit_alone(conn, audit_fields(acl, who, raw_tag, via, op, key, field, False, str(why),
@@ -1354,7 +1477,7 @@ def _finish_audit(conn, acl, who, raw_tag, via, key, entries, generation, correl
     return result
 
 
-def _write(conn, acl, who, raw_tag, via, op, key, field, value, now) -> dict:
+def _write(conn, acl, who, raw_tag, via, op, key, field, value, now, verified=False) -> dict:
     """WATCH, check the type, read the old value, then MULTI the write AND its audit entry together.
 
     Every Refused raised in here is audited by the caller. Every EXEC result is inspected: a success
@@ -1368,26 +1491,35 @@ def _write(conn, acl, who, raw_tag, via, op, key, field, value, now) -> dict:
         for prefixes, only in _LEDGER_OP.items():
             if key.startswith(prefixes) and op != only:
                 raise Refused("a work record is a ledger: this key takes %s and nothing else" % only)
+        if key.startswith(WRITE_ONCE + SEQUENCED + REV_FORWARD) and not verified:
+            # BEFORE anything is read or queued. Whatever tag a board row carries, it is a claim.
+            raise Refused("a work record is written only by an authenticated caller; a board row's "
+                          "sender tag is a claim, not an identity")
         allowed = WRITABLE_TYPES.get(op)
         if allowed and kind not in allowed:
             raise Refused("the key holds a %s; %s writes a %s" % (kind, op, allowed[1]))
-        # Each of the three is decided here, under the WATCH: if the key changes after the comparison,
-        # EXEC applies nothing.
-        if key.startswith(WRITE_ONCE) and kind != "none":
-            raise Refused("this work record is already described; a description is written once")
+        # Each rule below is decided here, under the WATCH: if the key changes after the comparison,
+        # EXEC applies nothing - neither the write nor its audit entry.
+        if key.startswith(WRITE_ONCE):
+            if kind != "none":
+                raise Refused("this work record is already described; a description is written once")
+            if not isinstance(value, dict) or value.get("requested_by") != who:
+                raise Refused("a description names its verified writer as requested_by")
         if key.startswith(SEQUENCED):
-            want = _revision(value, "r")
-            if want is None:
-                raise Refused("an entry in a work record's log starts with its revision, r<N>")
-            last = pipe.xrevrange(key, count=1)
-            held = 0
-            if last:
-                fields = last[0][1] or {}
-                held = _revision(_text(fields.get("text", fields.get(b"text", ""))), "r")
-                if held is None:
-                    raise Refused("the log's last entry carries no revision; a person must look")
-            if want != held + 1:
+            prev = work_chain(pipe.xrange(key, min="-", max="+"))        # disputed: nothing is added
+            ev = work_event(value, who)
+            if ev is None:
+                raise Refused("not a work-record entry: r<N> <action> <state> <owner> <reviewer> "
+                              "<requester> <lease> <req> [words]")
+            held = prev["rev"] if prev else 0
+            if ev["rev"] != held + 1:
                 raise Refused("revision conflict: the record is at r%d" % held)
+            for name in sorted({ev["owner"], ev["requester"], ev["reviewer"]} - {"-"}):
+                if principal(acl, name) != name:
+                    raise Refused("an owner, a reviewer and a requester are agents in the access list")
+            why = work_allowed(prev, ev)
+            if why:
+                raise Refused("not a legal move: %s" % why)
         # The OLD value, read under the WATCH, so the audit says exactly what this replaced.
         if op in ("set", "del"):
             old = pipe.get(key) if kind in ("none", "string") else "(%s)" % kind
@@ -1401,12 +1533,16 @@ def _write(conn, acl, who, raw_tag, via, op, key, field, value, now) -> dict:
         elif op == "hset":
             old = pipe.hget(key, field)
             if key.startswith(REV_FORWARD):
-                want = _revision(value, "")
-                if want is None:
-                    raise Refused("a line in a work list starts with its revision")
-                held = _revision(_text(old), "") if old is not None else None
-                if held is not None and want < held:
-                    raise Refused("the list holds a later revision of this record")
+                log_key = SEQUENCED[0] + field
+                pipe.watch(log_key)                      # the line and the log it mirrors, together
+                # The WHOLE log is replayed, as for a move: a list never follows a disputed record.
+                ev = (work_chain(pipe.xrange(log_key, min="-", max="+"))
+                      if _text(pipe.type(log_key)) == "stream" else None)
+                if ev is None:
+                    raise Refused("a list line is written only for a record whose log exists")
+                if not value.startswith("%d %s %s %s " % (ev["rev"], ev["state"], ev["owner"], ev["lease"])):
+                    raise Refused("a list line says what the record's log says: it is at r%d %s"
+                                  % (ev["rev"], ev["state"]))
         elif op == "hput":
             found = pipe.hgetall(key) or {}
             old = canonical({_text(k): _text(v) for k, v in found.items()}) if found else None

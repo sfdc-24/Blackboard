@@ -153,7 +153,10 @@ def handle(caller: str, raw: bytes, connect, log, callers=None, gov=None, acl=No
     result = gov.execute(conn, gov.load_acl() if acl is None else acl, who,
                          ("bridge:%s" % caller)[:120], request["op"], request["key"],
                          field=request["field"], raw_value=request["val"], enc=request["enc"],
-                         count=request["count"], after=request["after"])
+                         count=request["count"], after=request["after"],
+                         # THE one place a caller's identity is verified: OIDC in main.verify_caller,
+                         # then the binding in callers.json. redis_gov admits a work-record move on it.
+                         verified=True)
     op = request["op"].strip().lower()[:16]
     if result.get("ok"):
         log("op by %s as %s: %s ok" % (caller, who, op))

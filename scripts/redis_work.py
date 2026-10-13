@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Work records on Redis: a task or an issue any agent can create, read, move, hand off and close.
+"""Work records on Redis: a task or an issue an agent can create, read, move, hand off and close.
 Stdlib only.
 
 WHY THIS EXISTS
@@ -7,7 +7,9 @@ WHY THIS EXISTS
     PR's is still not operational. This needs to be operational asap." Aya's Stage 1 exit check 4:
     "minimum task/issue/communication records support usable create/read/update/close and traced
     handoff on the declared canonical store, not empty dashboards/specifications."
-    This is the minimum, built to her conditions (AYA-STAGE1-WORK-RECORDS-SOURCE-DESIGN-20261013).
+    Built to her conditions (AYA-STAGE1-WORK-RECORDS-SOURCE-DESIGN-20261013) and to her review of the
+    first version (AYA-PR403-ACTOR-ADMISSION-ADDENDUM-20261013): that version DETECTED a forbidden
+    move after the fact. This one does not let it be written.
 
 A RECORD IS ITS LOG (namespace proj:work:v1:, beside proj:pr-board:v1:, which this never touches)
     proj:work:v1:rec:<id>           HASH    What was asked: kind, title, project, link, source,
@@ -15,24 +17,33 @@ A RECORD IS ITS LOG (namespace proj:work:v1:, beside proj:pr-board:v1:, which th
     proj:work:v1:log:<id>           STREAM  One entry per move. THE LAST ENTRY IS THE RECORD'S STATE:
                                               r<N> <action> <state> <owner> <reviewer> <requester> <lease> <req> <words>
                                             The governor adds who (`by`) and when (`at`). <req> is this
-                                            command's request id. Revision N follows N-1 and nothing else.
+                                            command's request id.
     proj:work:v1:index:<YYYYMMDD>   HASH    A LIST for finding records, one line per id:
                                               <rev> <state> <owner> <lease> <kind> <title>
-                                            Rebuilt from the log (`reindex`). Never the authority.
     An id is W-<YYYYMMDD>-<6 hex>.
 
-A MOVE IS ONE ATOMIC COMPARE-AND-SET
-    A move is ONE write: the next log entry. The store takes r<N> only when the log is at r<N-1>
-    (redis_gov.SEQUENCED, decided under the write's own WATCH). Two agents who both read r4 cannot
-    both write r5: one is refused, nothing of its move is written, and it must read again. A move
-    whose answer was lost and that arrives after someone else's is refused the same way. The
-    description is write-once and the log is append-only (redis_gov.WRITE_ONCE); neither is given an
-    expiry or can be deleted through the governed path: the log is the audit record.
-    The list is written after the move and can only lag, never go back (redis_gov.REV_FORWARD). If
-    that second write fails the command says so, and `reindex` repairs it.
+WHO DECIDES WHAT: THE STORE, NOT THIS TOOL
+    The rules live in scripts/redis_gov.py (WORK_MOVES, work_allowed) and are applied INSIDE the
+    governed write, under its one WATCH, before the entry and its audit are queued:
+    - THE ACTOR IS THE VERIFIED CALLER. A work record is written only by a caller whose identity its
+      transport verified: the bridge, after OIDC verification and the caller binding. A board row's
+      sender tag is a claim, so the board route can READ a record and can never write one. `--as`
+      chooses which agent this command is; it cannot make it someone the bridge did not verify.
+    - A MOVE IS ONE COMPARE-AND-SET. The store replays the whole log, then takes the entry only if it
+      is the next revision, a move that actor may make from that state and owner, and carries the
+      evidence the move requires. Two agents who both read r4 cannot both write r5. An unauthorized
+      done, a theft by handoff, a forged requester: refused before the stream changes.
+    - A TAINTED RECORD TAKES NOTHING. If any entry in a log is not a legal move, the store adds
+      nothing to it, and neither does this tool: `show`, a move and `reindex` all replay the whole
+      chain first, never just the last pair. The history stays readable for a person to reconcile.
+    - THE LIST CANNOT LIE. A list line is taken only when it says what the record's log says.
+    - The description is written once, by its verified requester. Neither it nor the log is given an
+      expiry or can be deleted through the governed path.
+    This tool applies the same function before it sends, to say why a move would be refused without
+    spending a call. That is a courtesy. The store's answer is the authority.
 
 THE MOVES, AND WHO MAY MAKE THEM
-    create                    anyone                 -> requested      (names the owner)
+    create                    anyone verified        -> requested      (names the owner)
     accept   --next           the owner              requested -> accepted (a lease, and a next step)
     start                     the owner              accepted -> working
     block    --blocker        the owner              accepted|working -> blocked
@@ -45,32 +56,25 @@ THE MOVES, AND WHO MAY MAKE THEM
     handoff  --to             the owner or the requester               -> requested, for the new owner
     renew                     the owner              a new lease; nothing else moves
     reopen   --note           the requester          done|cancelled -> requested
-    note     --note           anyone                 an entry; nothing moves
+    note     --note           anyone verified        an entry; nothing moves
     A handoff returns the record to `requested`: a write naming you is not you accepting it.
     A lease that has run out is SHOWN as expired and gives nobody anything. It is not completion.
 
-WHAT IS ENFORCED WHERE (said here so nobody has to find out)
-    - ORDER is the store's: no entry out of sequence, by anyone, by any route.
-    - WHO MAY MAKE WHICH MOVE is this tool's, checked twice with one function (`allowed`): before a
-      move is written, and by EVERY READER against the `by` the governor wrote. An entry that no
-      rule allows makes the record DISPUTED: it is shown as such, nothing is built on it, and
-      `history` checks every entry from the first. A writer that goes around this tool is therefore
-      caught, not prevented; preventing it would put a state machine in the governor.
-    - On the board route an actor is the row's sender tag, a claim. Through the bridge it is the
-      verified account's bound principal. The log's `by` is the governor's, either way.
+WHAT ELSE IS TRUE (said here so nobody has to find out)
     - A move whose outcome is UNKNOWN (no answer, or a lost one) is never sent again by this tool.
       `show` settles it by reading: if r<N> carries this command's <req>, it landed; if r<N> carries
       another, it never can.
     - NOTHING IS CUT SHORT. A text too long to read back whole, a description too long for one row,
       a day's list that is full: each is refused before anything is written, with the number.
-    - One board row carries about a thousand characters of a read, so by the board route a day's
-      list holds about nine records and `create` refuses the next one. The bridge's bound is fifty.
+    - The list is written after the move and can only lag. If that write fails the command says
+      so, and `reindex` repairs it.
+    - Reading by the board route costs rows: a record of N entries is about N/4 request rows.
 
 IT IS OFF UNTIL THE GOVERNOR IS PROVEN (REDIS_WORK=on)
-    Everything above rests on a governor that has the three rules. An older one would take any write.
-    So every write here is refused unless REDIS_WORK=on is set for this agent, and that is set only
-    after `preflight` has passed on each route the agent can write by: it sends one entry that a
-    correct governor must refuse, and says which it met. Reading needs no switch.
+    All of it rests on a governor that has these rules. An older one would take any write. So every
+    write here is refused unless REDIS_WORK=on is set for this agent, and that is set only after
+    `preflight` has passed on each route: it sends one entry a correct governor must refuse, and says
+    which governor it met. Reading needs no switch.
 
     python scripts/redis_work.py create --title "..." --owner grok --project Blackboard \\
            --source "board row AYA-..." --done-when "the suite is green on main"
@@ -78,7 +82,6 @@ IT IS OFF UNTIL THE GOVERNOR IS PROVEN (REDIS_WORK=on)
     python scripts/redis_work.py done   W-20261013-a1b2c3 --evidence https://github.com/...
     python scripts/redis_work.py show   W-20261013-a1b2c3
     python scripts/redis_work.py list [--days 2]
-    python scripts/redis_work.py --as cursor handoff W-20261013-a1b2c3 --to grok
 """
 from __future__ import annotations
 
@@ -102,8 +105,8 @@ NS = "proj:work:v1:"
 INDEX, REC, LOG = NS + "index:%s", NS + "rec:%s", NS + "log:%s"
 ID = re.compile(r"^W-([0-9]{8})-[0-9a-f]{6}$")
 KINDS = ("task", "issue")
-STATES = ("requested", "accepted", "working", "blocked", "review", "done", "cancelled")
-OPEN = STATES[:5]
+STATES, OPEN, MOVES = redis_gov.WORK_STATES, redis_gov.WORK_OPEN, redis_gov.WORK_MOVES
+allowed = redis_gov.work_allowed          # THE rules: the store's, used here only to explain a refusal early
 ISSUE_LINK = re.compile(r"^https://github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/issues/[0-9]+$")
 GITHUB_LINK = re.compile(r"^https://github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/(issues|pull)/[0-9]+$")
 PROJECT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,29}$")
@@ -114,24 +117,10 @@ REC_MAX = 900                            # a description one board row carries w
 BOARD_BODY = 1000                        # what one board row carries of a day's list
 INDEX_MAX = redis_gov.MAX_HASH_FIELDS    # what one read shows of a hash, by any route
 LEASE_MINUTES = 240
-SHOWN_LOG = 4                            # log entries one board row carries at the preview bound
+PAGE = 4                                 # log entries one board row carries at the preview bound
+PAGES_MAX = 2500                         # 9999 revisions at four a page
 REFUSED_EXIT, DENIED_EXIT, UNKNOWN_EXIT, CONFLICT_EXIT, DISPUTED_EXIT = 5, 6, 7, 9, 10
 ENV_AGENT, ENV_SWITCH = "FLEET_AGENT", "REDIS_WORK"
-
-# action: (states it may start from, the state it ends in or None to keep it, who, the text it needs)
-MOVES = {
-    "accept":  (("requested",), "accepted", "owner", "next"),
-    "start":   (("accepted",), "working", "owner", ""),
-    "block":   (("accepted", "working"), "blocked", "owner", "blocker"),
-    "unblock": (("blocked",), "working", "owner", ""),
-    "review":  (("accepted", "working"), "review", "owner", ""),
-    "return":  (("review",), "working", "reviewer", "note"),
-    "done":    (("accepted", "working", "review"), "done", "closer", "evidence"),
-    "cancel":  (OPEN, "cancelled", "owner-or-requester", "note"),
-    "handoff": (OPEN, "requested", "owner-or-requester", ""),
-    "renew":   (("accepted", "working"), None, "owner", ""),
-    "reopen":  (("done", "cancelled"), "requested", "requester", "note"),
-}
 
 
 class Stop(Exception):
@@ -176,19 +165,10 @@ def lease_stamp(moment: datetime.datetime) -> str:
     return moment.strftime("%Y%m%dT%H%MZ")
 
 
-def lease_until(lease: str):
-    try:
-        return datetime.datetime.strptime(lease, "%Y%m%dT%H%MZ").replace(tzinfo=datetime.timezone.utc)
-    except ValueError:
-        return None
-
-
 def lease_over(lease: str, moment: datetime.datetime) -> bool:
-    until = lease_until(lease)
+    until = redis_gov.work_lease(lease)
     return until is not None and moment > until
 
-
-# ---------------------------------------------------------------------------- an entry, and the rules
 
 def event_text(ev: dict) -> str:
     """One log entry. Stop when it would not read back whole: nothing is ever cut."""
@@ -203,71 +183,9 @@ def event_text(ev: dict) -> str:
 
 
 def parse_event(shown: dict):
-    """A log entry as a read showed it, as a dict - or None when it is not one this tool wrote."""
-    parts = str((shown or {}).get("text", "")).split(" ", 8)
-    if len(parts) < 8 or not re.fullmatch(r"r[1-9][0-9]{0,3}", parts[0]) or parts[2] not in STATES:
-        return None
-    if parts[1] not in MOVES and parts[1] not in ("create", "note"):
-        return None
-    return {"rev": int(parts[0][1:]), "action": parts[1], "state": parts[2], "owner": parts[3],
-            "reviewer": parts[4], "requester": parts[5], "lease": parts[6], "req": parts[7],
-            "words": parts[8] if len(parts) > 8 else "", "by": str(shown.get("by", "")),
-            "at": str(shown.get("at", "")), "id": str(shown.get("id", ""))}
-
-
-def allowed(prev, ev: dict) -> str:
-    """Why `ev` is NOT a move the rules allow after `prev` ("" when it is). `prev` is None for the first
-    entry. ONE function: it refuses a move before it is written, and it is what every reader checks
-    each entry against, with the `by` the governor wrote."""
-    by, action = ev["by"], ev["action"]
-    if prev is None:
-        if ev["rev"] != 1 or action != "create":
-            return "a record's first entry is r1 create"
-        if (ev["state"], ev["lease"]) != ("requested", "-") or ev["requester"] != by:
-            return "a record is created requested, with no lease, by its requester"
-        return "" if ev["reviewer"] != ev["owner"] else "the reviewer cannot be the owner"
-    if ev["rev"] != prev["rev"] + 1:
-        return "r%d does not follow r%d" % (ev["rev"], prev["rev"])
-    if ev["requester"] != prev["requester"]:
-        return "the requester of a record never changes"
-    same = {k: ev[k] == prev[k] for k in ("state", "owner", "reviewer", "lease")}
-    if action == "note":
-        return "" if all(same.values()) else "a note moves nothing"
-    if action not in MOVES:
-        return "%s is not a move" % action
-    starts, end, actor, _needs = MOVES[action]
-    if prev["state"] not in starts:
-        return "%s starts from %s, not from %s" % (action, " or ".join(starts), prev["state"])
-    may = {"owner": (prev["owner"],), "reviewer": (prev["reviewer"],), "requester": (prev["requester"],),
-           "owner-or-requester": (prev["owner"], prev["requester"]),
-           "closer": (prev["reviewer"],) if prev["state"] == "review" else
-                     (prev["owner"],) if prev["reviewer"] == "-" else ()}[actor]
-    if by not in may:
-        if actor == "closer" and not may:
-            return "a reviewer (%s) is named: it goes to review, and the reviewer closes it" % prev["reviewer"]
-        return "only %s may %s it, and this is %s" % (" or ".join(may), action, by or "(nobody)")
-    if ev["state"] != (end or prev["state"]):
-        return "%s ends in %s" % (action, end or prev["state"])
-    if action == "handoff":
-        if ev["owner"] == prev["owner"] or (ev["reviewer"], ev["lease"]) != ("-", "-"):
-            return "a handoff names a new owner and clears the reviewer and the lease"
-        return ""
-    if not same["owner"]:
-        return "only a handoff changes the owner"
-    if action == "review":
-        if ev["reviewer"] in ("-", ev["owner"]):
-            return "a review names a reviewer who is not the owner"
-        return "" if prev["reviewer"] in ("-", ev["reviewer"]) and same["lease"] else \
-            "a review keeps the lease, and the reviewer already named"
-    if action == "reopen":
-        return "" if (ev["reviewer"], ev["lease"]) == ("-", "-") else "a reopened record has no reviewer and no lease"
-    if not same["reviewer"]:
-        return "only a review, a handoff or a reopen changes the reviewer"
-    if action in ("accept", "renew"):
-        return "" if lease_until(ev["lease"]) else "%s sets a lease" % action
-    if end in ("done", "cancelled"):
-        return "" if ev["lease"] == "-" else "a closed record holds no lease"
-    return "" if same["lease"] else "%s does not change the lease" % action
+    """A log entry as a read showed it, as redis_gov reads it - or None when it is not one."""
+    shown = shown or {}
+    return redis_gov.work_event(shown.get("text", ""), shown.get("by", ""), shown.get("at", ""), shown.get("id", ""))
 
 
 def index_line(ev: dict, kind: str, title: str) -> str:
@@ -285,7 +203,9 @@ def read_index_line(line: str):
 # ------------------------------------------------------------------------------------- one governed op
 
 _OK = re.compile(r"OK (?P<op>[a-z]+) (?P<key>\S+)(?: \[[^\]]*\])?: (?P<body>.*)", re.S)
-_WROTE = re.compile(r"OK (?P<op>[a-z]+) (?P<key>\S+)(?: field=\S+)? ttl=\S+ old=\S+ new=\S+ \(audited\)")
+NO_BOARD_WRITE = ("NOT WRITTEN. A work record is written only through the bridge, by a caller it has "
+                  "verified. The bridge was not used for this agent (the line above says why), and nothing "
+                  "is sent by the board route: there a sender is a claim, and the store refuses it.")
 
 
 def request_row(who: str, op: str, key: str, field=None, value=None, count=None, after=None) -> dict:
@@ -307,13 +227,18 @@ def request_row(who: str, op: str, key: str, field=None, value=None, count=None,
 
 
 def govern(who: str, op: str, key: str, *, field=None, value=None, count=None, after=None, wait=180.0,
-           since="") -> dict:
-    """One governed operation as `who`, by the bridge when it is on for this agent, else by the board.
+           since="", unverified_write=False) -> dict:
+    """One governed operation as `who`.
+
+    A WRITE goes by the bridge or not at all: the board route carries a claimed identity, which the
+    store refuses for this namespace, so no row is spent on it. (`unverified_write` is for `preflight`
+    alone, whose whole purpose is to see that refusal.) A READ goes by the bridge when it is on for
+    this agent, else by the board.
 
     {"value": what a read showed, "truncated": a hash had more fields than a read shows,
      "route": "bridge" | "board"}; a paged read (after=) returns {"page": redis_inbox's judgement}.
-    Raises Stop for everything that is not a success. A WRITE that Stops with UNKNOWN_EXIT, or with 2
-    (no answer yet), MAY HAVE HAPPENED and is not sent again by this tool."""
+    Raises Stop for everything that is not a success. A WRITE that Stops with UNKNOWN_EXIT MAY HAVE
+    HAPPENED and is not sent again by this tool."""
     write = op not in redis_gov.OPS_READ
     try:
         result = bridge_client.attempt(op, key, me=who, field=field, value=value, count=count, after=after)
@@ -330,6 +255,8 @@ def govern(who: str, op: str, key: str, *, field=None, value=None, count=None, a
         if result.get("op") != op or result.get("key") != key:
             raise Stop(3, "the bridge answered another operation; nothing here is trusted", "bridge")
         return {"value": result.get("value"), "truncated": bool(result.get("truncated")), "route": "bridge"}
+    if write and not unverified_write:
+        raise Stop(2, NO_BOARD_WRITE, "board")
     rid = inbox.post(request_row(who, op, key, field=field, value=value, count=count, after=after))
     got = inbox.answer(rid, wait, since=since or inbox.stamp())
     if not got:
@@ -350,11 +277,8 @@ def govern(who: str, op: str, key: str, *, field=None, value=None, count=None, a
         raise Stop(UNKNOWN_EXIT if write else 3, "%s%s" % (text[:200], ". It MAY HAVE HAPPENED and is not "
                                                            "sent again." if write else ""), "board")
     if write:
-        m = _WROTE.fullmatch(text)
-        if not m or m["op"] != op or m["key"] != key:
-            raise Stop(UNKNOWN_EXIT, "the worker's answer to %s %s is not one this tool can read. It MAY "
-                                     "HAVE HAPPENED and is not sent again." % (op, key), "board")
-        return {"value": None, "truncated": False, "route": "board"}
+        # Only `preflight` sends a write here, and it expects the refusal above. An OK is the finding.
+        raise Stop(UNKNOWN_EXIT, "%s  <- an unverified write was NOT refused" % text[:200], "board")
     if re.search(r"(^|\|)(truncated=1|full=)", head + "|" + text):
         raise Stop(4, "the answer to %s %s is longer than one board row" % (op, key), "board")
     m = _OK.fullmatch(text)
@@ -372,8 +296,8 @@ def govern(who: str, op: str, key: str, *, field=None, value=None, count=None, a
 def switched_on() -> None:
     if (os.environ.get(ENV_SWITCH) or "").strip().lower() != "on":
         raise Stop(2, "work records are OFF for this agent: nothing is written. They rest on a governor "
-                      "that takes a log entry only in sequence; set %s=on only after `preflight` has passed "
-                      "on every route this agent writes by. Reading needs no switch." % ENV_SWITCH)
+                      "that admits a move itself; set %s=on only after `preflight` has passed on every "
+                      "route this agent uses. Reading needs no switch." % ENV_SWITCH)
 
 
 # --------------------------------------------------------------------------------------------- records
@@ -385,32 +309,54 @@ def index_key(rid: str) -> str:
     return INDEX % m[1]
 
 
-def current(who: str, rid: str, args) -> tuple:
-    """(the record's state, the newest entries read, why it is DISPUTED or ""). The state IS the last
-    log entry. The last entry is checked against the one before it with `allowed`."""
+def chain(who: str, rid: str, args) -> tuple:
+    """THE WHOLE LOG, read from its first entry and replayed with the store's own rules.
+    (every entry as shown, the last entry parsed, [(entry id, why)] for every entry that is not a legal
+    move). A record with anything in that list is DISPUTED, however legal its last entries look."""
     index_key(rid)
-    shown = govern(who, "xrange", LOG % rid, count=SHOWN_LOG, wait=args.wait, since=args.since)["value"]
-    if not isinstance(shown, list) or not shown:
+    key, cursor, count, shown = LOG % rid, "0-0", PAGE, []
+    for _page in range(PAGES_MAX):
+        page = govern(who, "xrange", key, count=count, after=cursor, wait=args.wait, since=args.since)["page"]
+        if page["status"] == "cut" and count > 1:
+            count = max(1, count // 2)
+            continue
+        if page["status"] != "ok":
+            raise Stop(3, "%s NOT READ after %s: %s. Nothing is built on a record that was not read whole."
+                          % (rid, cursor, page["why"]))
+        shown += page["entries"]
+        cursor = page["last"]
+        if not page["more"]:
+            break
+    else:
+        raise Stop(3, "%s has more entries than this reads; nothing is built on it" % rid)
+    if not shown:
         raise Stop(2, "no record %s: its log is empty" % rid)
-    events = [parse_event(e) for e in shown]
-    if events[-1] is None:
-        raise Stop(3, "the last entry of %s is not one this tool wrote; nothing is built on it" % rid)
-    last = events[-1]
-    prev = events[-2] if len(events) > 1 else None
-    if last["rev"] > 1 and prev is None:
-        return last, shown, "r%d has no readable entry before it" % last["rev"]
-    return last, shown, allowed(prev, last)
+    prev, bad = None, []
+    for entry in shown:
+        ev = parse_event(entry)
+        why = "it is not a work-record entry" if ev is None else allowed(prev, ev)
+        if why:
+            bad.append((str(entry.get("id", "?")), why))
+        prev = ev if ev is not None else prev
+    return shown, prev, bad
 
 
-def must_be_sound(rid: str, last: dict, disputed: str) -> None:
-    if disputed:
-        raise Stop(DISPUTED_EXIT, "%s is DISPUTED: r%d %s by %s is not a move the rules allow (%s). Nothing "
-                                  "is built on it until its requester (%s) has looked."
-                   % (rid, last["rev"], last["action"], last["by"], disputed, last["requester"]))
+def disputed_line(rid: str, bad: list) -> str:
+    return ("%s is DISPUTED: %d of its entries %s not a legal move (first: %s, %s). Nothing is built on it. "
+            "Its history is kept for a person to reconcile: history %s"
+            % (rid, len(bad), "is" if len(bad) == 1 else "are", bad[0][0], bad[0][1], rid))
+
+
+def sound(who: str, rid: str, args) -> dict:
+    """The record's state, from a WHOLE chain with nothing wrong in it - or Stop."""
+    _shown, last, bad = chain(who, rid, args)
+    if bad or last is None:
+        raise Stop(DISPUTED_EXIT, disputed_line(rid, bad or [("?", "no readable entry")]))
+    return last
 
 
 def append(who: str, rid: str, ev: dict, kind: str, title: str, args) -> int:
-    """THE MOVE: one log entry, taken only as the next revision. Then the list, which can only lag.
+    """THE MOVE: one log entry, admitted by the store or not. Then the list, which can only lag.
     Returns 0, or 3 when the move landed and the list was not updated."""
     line = event_text(ev)
     try:
@@ -419,7 +365,7 @@ def append(who: str, rid: str, ev: dict, kind: str, title: str, args) -> int:
         if why.code == REFUSED_EXIT and "revision conflict" in str(why):
             raise Stop(CONFLICT_EXIT, "CONFLICT: someone moved %s first (%s). NOTHING of this move was "
                                       "written. Read it again: show %s" % (rid, str(why)[9:], rid)) from None
-        if why.code in (UNKNOWN_EXIT, 2):
+        if why.code == UNKNOWN_EXIT:
             raise Stop(why.code, "%s\nRead it with `show %s`: if r%d carries req=%s this move landed; if r%d "
                                  "carries another req, this one never can." % (why, rid, ev["rev"], ev["req"],
                                                                                ev["rev"])) from None
@@ -479,16 +425,16 @@ def cmd_create(who: str, args) -> int:
     except Stop as why:
         if why.code != 4:
             raise
-        raise Stop(2, "not created: today's list no longer fits one board row. Create it through the "
-                      "bridge, or tomorrow. Nothing was written.") from None
+        raise Stop(2, "not created: today's list no longer fits one board row. Nothing was written.") from None
     lines = listed["value"] if isinstance(listed["value"], dict) else {}
     after = json.dumps(dict(lines, **{rid: index_line(ev, kind, title)}), sort_keys=True, ensure_ascii=False)
     if listed["truncated"] or len(lines) >= INDEX_MAX:
         raise Stop(2, "not created: today's list is full (%d records). Create it tomorrow. Nothing was "
                       "written." % len(lines))
-    if listed["route"] == "board" and len(after) > BOARD_BODY:
-        raise Stop(2, "not created: with one more record today's list (%d) would not fit one board row. "
-                      "Create it through the bridge, or tomorrow. Nothing was written." % len(lines))
+    if len(after) > BOARD_BODY and not args.past_board_list:
+        raise Stop(2, "not created: with one more record today's list (%d) would no longer fit one board "
+                      "row, and an agent that reads by the board could not list the day. Create it tomorrow, "
+                      "or say --past-board-list to accept that. Nothing was written." % len(lines))
     govern(who, "hput", REC % rid, value=described, wait=args.wait, since=args.since)
     code = append(who, rid, ev, kind, title, args)
     print("%s created (req=%s): %s for %s, state requested. %s must accept it." % (rid, ev["req"], kind, owner, owner))
@@ -503,8 +449,7 @@ def cmd_move(who: str, args) -> int:
     if needs and not text:
         raise Stop(2, "%s needs --%s" % (action, needs))
     note = text_ok("note", getattr(args, "note", "")) if needs != "note" else ""
-    last, _shown, disputed = current(who, rid, args)
-    must_be_sound(rid, last, disputed)
+    last = sound(who, rid, args)                     # the WHOLE chain, or nothing is built on it
     moment = now()
     ev = dict(last, rev=last["rev"] + 1, action=action, req=secrets.token_hex(4), by=who)
     said = [("%s=%s" % (needs, text)) if text and action != "note" else text, ("note=" + note) if note else ""]
@@ -524,10 +469,10 @@ def cmd_move(who: str, args) -> int:
     if ev["state"] in ("done", "cancelled"):
         ev["lease"] = "-"
     ev["words"] = " ".join(s for s in said if s)
-    why_not = allowed(last, ev)                      # the same rules every reader will hold this entry to
+    why_not = allowed(last, ev)                      # the store's rule, asked early to save the call
     if why_not:
         raise Stop(2, "not moved: %s (%s is %s, held by %s)" % (why_not, rid, last["state"], last["owner"]))
-    event_text(ev)                                   # too long is refused before anything is read or written
+    event_text(ev)                                   # too long is refused before anything is written
     described = describe_of(who, rid, args)          # the list's line carries the kind and the title
     kind = described.get("kind") if described.get("kind") in KINDS else "task"
     code = append(who, rid, ev, kind, str(described.get("title", "")), args)
@@ -546,32 +491,47 @@ def state_line(rid: str, ev: dict, kind: str, title: str, moment: datetime.datet
         ("  reviewer " + ev["reviewer"]) if ev.get("reviewer", "-") != "-" else "", title)
 
 
-def print_entry(shown: dict) -> None:
+def print_entry(shown: dict, bad: dict) -> None:
     ev = parse_event(shown)
+    mark = ("  <- NOT ALLOWED: " + bad[str(shown.get("id"))]) if str(shown.get("id")) in bad else ""
     if ev is None:
-        print("  %s  %s  by %s: (not an entry this tool wrote) %s" % (shown.get("id", "?"), shown.get("at", "?"),
-                                                                     shown.get("by", "?"), shown.get("text", "")))
+        print("  %s  %s  by %s: %s%s" % (shown.get("id", "?"), shown.get("at", "?"), shown.get("by", "?"),
+                                         shown.get("text", ""), mark))
         return
-    print("  %s  %s  by %s  r%d>r%d %s -> %s owner=%s req=%s result=applied%s"
+    print("  %s  %s  by %s  r%d>r%d %s -> %s owner=%s req=%s result=applied%s%s"
           % (ev["id"], ev["at"], ev["by"], ev["rev"] - 1, ev["rev"], ev["action"], ev["state"], ev["owner"],
-             ev["req"], ("  " + ev["words"]) if ev["words"] else ""))
+             ev["req"], ("  " + ev["words"]) if ev["words"] else "", mark))
 
 
 def cmd_show(who: str, args) -> int:
+    """The record: its state from the WHOLE chain, what was asked, and its newest entries."""
     rid = args.id
-    last, shown, disputed = current(who, rid, args)
+    shown, last, bad = chain(who, rid, args)
     record = describe_of(who, rid, args)
-    print(state_line(rid, last, record.get("kind", "?"), record.get("title", "(no description was written)"), now()))
+    if last is not None:
+        print(state_line(rid, last, record.get("kind", "?"), record.get("title", "(no description was written)"), now()))
     print("project %s; link %s; source: %s" % (record.get("project", "?"), record.get("link", "-"),
                                                record.get("source", "?")))
     print("done when: %s" % record.get("done_when", "?"))
-    print("requested by %s at %s" % (last["requester"], record.get("created", "?")))
-    for entry in shown:
-        print_entry(entry)
-    if disputed:
-        print("DISPUTED: r%d %s by %s is not a move the rules allow (%s). Nothing is built on it until its "
-              "requester (%s) has looked." % (last["rev"], last["action"], last["by"], disputed, last["requester"]))
+    print("requested by %s at %s" % (last["requester"] if last else "?", record.get("created", "?")))
+    for entry in shown[-PAGE:]:
+        print_entry(entry, dict(bad))
+    if bad:
+        print(disputed_line(rid, bad))
         return DISPUTED_EXIT
+    print("%d entries, each a move its actor was allowed to make" % len(shown))
+    return 0
+
+
+def cmd_history(who: str, args) -> int:
+    """Every entry, oldest first, each marked when it is not a legal move. Kept whole for reconciliation."""
+    shown, _last, bad = chain(who, args.id, args)
+    for entry in shown:
+        print_entry(entry, dict(bad))
+    if bad:
+        print(disputed_line(args.id, bad))
+        return DISPUTED_EXIT
+    print("%d entries of %s. VERIFIED: every one is a move its actor was allowed to make." % (len(shown), args.id))
     return 0
 
 
@@ -606,45 +566,10 @@ def cmd_list(who: str, args) -> int:
     return code
 
 
-def cmd_history(who: str, args) -> int:
-    """Every entry, oldest first, and EVERY ONE checked against the rules from the first."""
-    key, cursor, count, prev, bad, seen = LOG % args.id, "0-0", SHOWN_LOG, None, [], 0
-    index_key(args.id)
-    for _page in range(max(1, int(args.pages))):
-        page = govern(who, "xrange", key, count=count, after=cursor, wait=args.wait, since=args.since)["page"]
-        if page["status"] == "cut" and count > 1:
-            count = max(1, count // 2)
-            continue
-        if page["status"] != "ok":
-            raise Stop(3, "NOT READ after %s: %s" % (cursor, page["why"]))
-        for shown in page["entries"]:
-            print_entry(shown)
-            ev = parse_event(shown)
-            why_not = "not an entry this tool wrote" if ev is None else allowed(prev, ev)
-            if why_not:
-                bad.append("%s: NOT ALLOWED: %s" % (shown.get("id", "?"), why_not))
-            prev, seen = ev or prev, seen + 1
-        cursor = page["last"]
-        if not page["more"]:
-            break
-    else:
-        print("more follows %s: run it again with --pages. NOT VERIFIED: the history was not read to its end."
-              % cursor)
-        return 4
-    for line in bad:
-        print(line)
-    if not seen:
-        raise Stop(2, "no record %s: its log is empty" % args.id)
-    print("%d entries of %s. %s" % (seen, args.id, "DISPUTED: %d not allowed" % len(bad) if bad else
-                                   "VERIFIED: every one is a move its actor was allowed to make."))
-    return DISPUTED_EXIT if bad else 0
-
-
 def cmd_reindex(who: str, args) -> int:
-    """Write the list's line for one record again, from its log. It can only bring the list forward."""
+    """Write the list's line for one record again, from its log. The store takes it only if it is true."""
     switched_on()
-    last, _shown, disputed = current(who, args.id, args)
-    must_be_sound(args.id, last, disputed)
+    last = sound(who, args.id, args)
     described = describe_of(who, args.id, args)
     kind = described.get("kind") if described.get("kind") in KINDS else "task"
     govern(who, "hset", index_key(args.id), field=args.id, value=index_line(last, kind, str(described.get("title", ""))),
@@ -654,25 +579,37 @@ def cmd_reindex(who: str, args) -> int:
 
 
 def cmd_preflight(who: str, args) -> int:
-    """Prove the governor on this route takes a log entry only in sequence, by sending one it must
-    refuse: r2 to a log that has no r1. A governor without the rule WRITES it, and this says so."""
+    """Prove the governor on this route admits a work-record move itself, by sending one it must
+    refuse: r2 to a log that has no r1. Through the bridge a correct governor answers "revision
+    conflict". By the board a correct governor refuses the claimed identity before it looks at anything.
+    A governor without the rules WRITES the entry, and this says so."""
     if not args.allow_stray_entry:
         raise Stop(2, "preflight sends one entry that a correct governor REFUSES and a governor without the "
-                      "rule WRITES. Run it only when that one stray entry has been agreed, and say so: "
+                      "rules WRITES. Run it only when that one stray entry has been agreed, and say so: "
                       "--allow-stray-entry")
     key = LOG % ("preflight-" + who)
     try:
-        got = govern(who, "xadd", key, value="r2 note requested - - - - %s preflight" % secrets.token_hex(4),
-                     wait=args.wait, since=args.since)
+        got = govern(who, "xadd", key, value="r2 note requested %s - %s - %s preflight" % (who, who, secrets.token_hex(4)),
+                     wait=args.wait, since=args.since, unverified_write=True)
     except Stop as why:
-        if why.code == REFUSED_EXIT and "revision conflict" in str(why):
-            print("PASS by the %s route: the governor refused an entry out of sequence (%s). Nothing was "
-                  "written." % (why.route, str(why)[:120]))
+        reason = str(why)
+        if why.code == REFUSED_EXIT and why.route == "bridge" and "revision conflict" in reason:
+            print("PASS by the bridge route: the governor admitted this caller as verified and refused an "
+                  "entry out of sequence (%s). Nothing was written." % reason[:120])
             return 0
+        if why.code == REFUSED_EXIT and why.route == "board" and "authenticated caller" in reason:
+            print("PASS by the board route: the governor refused a work-record write from a claimed "
+                  "identity (%s). Nothing was written. This route can read records; it cannot move them."
+                  % reason[:120])
+            return 0
+        if why.code == UNKNOWN_EXIT and "NOT refused" in reason:
+            print("FAIL by the board route: THIS GOVERNOR TOOK A WORK-RECORD WRITE IT MUST REFUSE. It does "
+                  "not have the rules. Do not set %s=on. One stray entry is now in %s." % (ENV_SWITCH, key))
+            return 1
         raise
-    print("FAIL by the %s route: THIS GOVERNOR TOOK AN ENTRY OUT OF SEQUENCE. It does not have the rule, so "
-          "a move here would not be a compare-and-set. Do not set %s=on for this route. One stray entry is "
-          "now in %s." % (got["route"], ENV_SWITCH, key))
+    print("FAIL by the %s route: THIS GOVERNOR TOOK AN ENTRY OUT OF SEQUENCE. It does not have the rules, so "
+          "a move here would not be admitted by the store. Do not set %s=on. One stray entry is now in %s."
+          % (got["route"], ENV_SWITCH, key))
     return 1
 
 
@@ -682,9 +619,7 @@ def cmd_selftest(_who: str, _args) -> int:
           "requester": "claude-code-cli", "lease": "20261013T0830Z", "req": "0a1b2c3d", "words": ""}
     line = event_text(ev)
     back = parse_event({"text": line, "by": "grok", "at": "t", "id": "3-0"})
-    assert {k: back[k] for k in ev} == ev, back
-    assert redis_gov._revision(line, "r") == 3, "the governor reads the same revision this writes"
-    assert redis_gov._revision(index_line(ev, "task", "a title"), "") == 3
+    assert {k: back[k] for k in ev} == ev and back["by"] == "grok", back
     worst = dict(ev, rev=9999, action="handoff", state="requested", owner="chatgpt-codex-desktop",
                  reviewer="chatgpt-codex-desktop", requester="chatgpt-codex-desktop")
     room = EVENT_MAX - len(event_text(worst))
@@ -697,22 +632,16 @@ def cmd_selftest(_who: str, _args) -> int:
         raise AssertionError("an entry longer than a read shows was accepted")
     assert len(index_line(worst, "issue", "t" * 200)) <= redis_gov.PREVIEW_CHARS
     assert parse_event({"text": "not an entry"}) is None and parse_event({"text": "r1 dance requested a b c - x"}) is None
-    one = {"rev": 1, "action": "create", "state": "requested", "owner": "grok", "reviewer": "-",
-           "requester": "cursor", "lease": "-", "req": "x", "words": "", "by": "cursor"}
-    assert allowed(None, one) == "" and allowed(None, dict(one, by="grok")), "only its requester creates it"
-    two = dict(one, rev=2, action="accept", state="accepted", lease="20261013T0830Z", by="grok")
-    assert allowed(one, two) == "" and allowed(one, dict(two, by="cursor")), "only the owner accepts"
-    assert allowed(one, dict(two, rev=3)) and allowed(one, dict(two, requester="grok"))
-    row = request_row("grok", "xadd", LOG % "W-20261013-a1b2c3", value=line)
-    assert "|op=xadd|key=proj:work:v1:log:W-20261013-a1b2c3|val=" in row["payload"], row
+    assert allowed is redis_gov.work_allowed and MOVES is redis_gov.WORK_MOVES, "one set of rules, the store's"
+    row = request_row("grok", "xrange", LOG % "W-20261013-a1b2c3", count=4, after="0-0")
+    assert "|op=xrange|key=proj:work:v1:log:W-20261013-a1b2c3|count=4|after=0-0" in row["payload"], row
     assert row["source_tag"] == "grok" and row["action_type"] == inbox.REQUEST_ACTION, row
     assert set(MOVES) <= set(__doc__.split()), "every move is in the docstring"
-    assert all(end is None or end in STATES for _, end, _, _ in MOVES.values())
     assert (REC % "", LOG % "", INDEX % "") == (redis_gov.WRITE_ONCE[0], redis_gov.SEQUENCED[0], redis_gov.REV_FORWARD[0])
     assert ID.match("W-20261013-a1b2c3") and not ID.match("W-20261013-A1B2C3") and not ID.match("W-2026-a1b2c3")
     assert redis_gov._KEY.match(REC % "W-20261013-a1b2c3") and redis_gov._FIELD.match("W-20261013-a1b2c3")
-    print("selftest OK: an entry reads back whole and carries the revision the governor checks; the keys "
-          "are proj:work:v1:rec:<id>, log:<id> and index:<day>")
+    print("selftest OK: an entry reads back whole in the grammar the governor admits; the keys are "
+          "proj:work:v1:rec:<id>, log:<id> and index:<day>")
     return 0
 
 
@@ -721,7 +650,8 @@ def cmd_selftest(_who: str, _args) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--as", dest="who", default=os.environ.get(ENV_AGENT, "claude-code-cli"),
-                        help="the agent acting (default: $%s, else claude-code-cli)" % ENV_AGENT)
+                        help="the agent acting (default: $%s, else claude-code-cli); a write still needs the "
+                             "bridge to have verified it" % ENV_AGENT)
     sub = parser.add_subparsers(dest="what", required=True)
     for name in ["create", "note", "show", "list", "history", "reindex", "preflight", "selftest"] + sorted(MOVES):
         p = sub.add_parser(name)
@@ -736,17 +666,17 @@ def build_parser() -> argparse.ArgumentParser:
             p.add_argument("--done-when", dest="done_when", required=True, help="what done means")
             p.add_argument("--link", default="", help="the GitHub pull request or issue; required for an issue")
             p.add_argument("--reviewer", default="", help="who closes it; it then cannot be closed unreviewed")
+            p.add_argument("--past-board-list", action="store_true",
+                           help="create it although the day's list will no longer fit one board row")
         elif name == "list":
             p.add_argument("--day", action="append", help="YYYYMMDD; may repeat (default: the last --days)")
             p.add_argument("--days", type=int, default=2)
             p.add_argument("--all", action="store_true", help="also the done and the cancelled")
         elif name not in ("selftest", "preflight"):
             p.add_argument("id")
-        if name == "history":
-            p.add_argument("--pages", type=int, default=10)
         if name == "preflight":
             p.add_argument("--allow-stray-entry", action="store_true",
-                           help="agreed: a governor without the rule will write one stray entry")
+                           help="agreed: a governor without the rules will write one stray entry")
         if name in MOVES or name == "note":
             for flag in sorted({"note", MOVES.get(name, ("", "", "", ""))[3] or "note"}):
                 p.add_argument("--" + flag, default="")
