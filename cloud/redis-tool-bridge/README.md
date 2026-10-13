@@ -87,6 +87,13 @@ governed ops, after the source is verified"). **D1 has not been given. Nothing h
   TTL, the value cap and the audit are one tested implementation, not two.
 - The caller is whoever `verify_caller` verified (signature, audience, allowlist), mapped to a principal
   by `callers.json`. The body cannot name who it acts as. `gov:audit` records `via = bridge:<email>`.
+- **The conference chair is the one caller that acts for someone else**, and it must say for whom. Its line in
+  `callers.json` is `"for": "chair"`. It states `author` (the persona) and `request` (its request id) on every
+  op, or gets a 400; both go into the audit entry as `claimed_author` and `request_id`, beside the verified
+  `actor`, and both come back in the answer. They are claims and are named as claims: nothing reads either as an
+  identity. Its ops are the three reads and `set`, and a `set` goes only to `conf:persona:<yyyymmdd>:<author>`.
+  Its principal, `conference-chair`, may read `conf:` and write `conf:persona:` and nothing else. A fleet agent
+  that states either member gets a 400. (Conference `docs/PERSONA-WRITE-CONFIRMATION-A1.md`.)
 - A message through it costs no board row.
 
 | status | meaning |
@@ -114,8 +121,10 @@ principal; it can only make the bridge refuse, before anything runs, when the ca
 different one. That is what stops a client configured with another agent's account from writing under
 that agent's name.
 
-**Not built here** (the rest of Phase 3a): the hourly canary, the negative controls against a deployed
-bridge, and any second caller. **Built as source, deployed nowhere and off by default** (Phase 3b):
+**Not built here** (the rest of Phase 3a): the hourly canary and the negative controls against a deployed
+bridge. **A second caller's line is in `callers.json` as source: the conference chair's. It admits nobody by
+itself.** The deploy's `BRIDGE_CALLERS` does not name it and it holds no `run.invoker`; both are the owner's
+(D2), and neither is in this repository's power to give. **Built as source, deployed nowhere and off by default** (Phase 3b):
 the client, `scripts/bridge_client.py`, which `scripts/redis_inbox.py` sends through, with its breaker
 and its journal of writes whose outcome is unknown. Adding a caller is one line in `callers.json` after its service
 account exists and the owner has approved it (D2).

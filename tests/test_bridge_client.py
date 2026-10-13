@@ -492,6 +492,22 @@ class Outcomes(unittest.TestCase):
         with self.assertRaises(bc.Unknown):
             self.go("xadd", {"ok": True})
 
+    def test_the_client_and_the_service_read_every_kind_of_line_the_same(self):
+        """A line became an object when the chair was added. Two readers of one file that disagree is how an
+        agent comes to use an account the service will not map, or the reverse."""
+        lines = {
+            "old@x": "grok", "agent@x": {"principal": "Grok", "for": "fleet-agent"},
+            " Chair@X ": {"principal": "conference-chair", "for": "chair"},
+            "other@x": {"principal": "grok", "for": "admin"}, "more@x": {"principal": "grok", "for": "chair", "n": 1},
+            "none@x": {"for": "chair"}, "blank@x": {"principal": " ", "for": "chair"}, "num@x": {"principal": 7, "for": "chair"},
+            "list@x": ["grok"], "nul@x": None, "int@x": 7, "forlist@x": {"principal": "grok", "for": ["chair"]}, " ": "grok",
+        }
+        path = os.path.join(self.tmp.name, "lines.json")
+        pathlib.Path(path).write_text(json.dumps({"callers": lines}), encoding="utf-8")
+        self.assertEqual({"old@x": "grok", "agent@x": "grok", "chair@x": "conference-chair"}, bc.load_callers(path))
+        self.assertEqual(bridge_op.load_callers(path), bc.load_callers(path))
+        self.assertEqual(bridge_op.load_callers(), bc.load_callers(), "and the committed file")
+
     def test_the_missing_callers_file_maps_nobody(self):
         self.assertEqual({}, bc.load_callers(os.path.join(self.tmp.name, "absent.json")))
         bad = os.path.join(self.tmp.name, "bad.json")

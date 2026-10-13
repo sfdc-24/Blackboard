@@ -1,7 +1,14 @@
 {
-  "why": "Who a VERIFIED bridge caller acts as. The key is the email of the OIDC token main.verify_caller accepted; the value is a principal in scripts/redis_acl.json. A caller must ALSO be on the service's BRIDGE_CALLERS allowlist and hold run.invoker on the service: three independent gates, and this is the one that decides whose name goes in gov:audit.",
-  "how_to_change": "Add one line, in a reviewed PR, AFTER the service account exists and the owner has approved it (docs/REDIS-PRIMARY.md, D2). tests/test_redis_tool_bridge.py refuses a caller whose principal cannot write fleet: and conf:, and refuses a deploy allowlist that names a caller missing from here.",
+  "why": "Who a VERIFIED bridge caller acts as, and what it is FOR. The key is the email of the OIDC token main.verify_caller accepted. `principal` is a principal in scripts/redis_acl.json; `for` is fleet-agent or chair and decides what op.py lets that caller say (a fleet agent may not state an author; the chair must, on every op). A caller must ALSO be on the service's BRIDGE_CALLERS allowlist and hold run.invoker on the service: three independent gates, and this is the one that decides whose name goes in gov:audit.",
+  "how_to_change": "Add one line, in a reviewed PR, AFTER the service account exists and the owner has approved it (docs/REDIS-PRIMARY.md, D2). tests/test_redis_tool_bridge.py holds each line to LEAST PRIVILEGE: a fleet agent's principal must be able to write fleet: and conf:; the chair's must be able to read conf: and write conf:persona: and must NOT be able to write fleet:, any other conf: key, proj: or a protected namespace. It also refuses a deploy allowlist that names a caller missing from here.",
   "callers": {
-    "aya-runtime@sfdc24.iam.gserviceaccount.com": "chatgpt-codex-desktop"
+    "aya-runtime@sfdc24.iam.gserviceaccount.com": {
+      "principal": "chatgpt-codex-desktop",
+      "for": "fleet-agent"
+    },
+    "conference-chair@sfdc24.iam.gserviceaccount.com": {
+      "principal": "conference-chair",
+      "for": "chair"
+    }
   }
 }

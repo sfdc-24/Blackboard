@@ -131,6 +131,10 @@ _VERIFY_ON = {"1", "true", "on", "yes"}
 KEY_ENCODING = "owner:name"
 _KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _FIELD = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
+# The two things a caller may ASK to have recorded beside its own name (said()): who it says it acts for, and
+# its request's id. Shapes only; neither is ever a principal.
+_CLAIMED_AUTHOR = re.compile(r"[a-z][a-z0-9-]{1,31}")
+_REQUEST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,119}")
 
 PREVIEW_CHARS = 200          # how much of a value an audit entry or a RESULT row may quote
 MAX_HASH_FIELDS = 50
@@ -316,10 +320,31 @@ def decode_value(raw: str, enc: str, acl: dict, key: str = "") -> str:
 
 # --------------------------------------------------------------------------------------- the audit
 
-def audit_fields(acl, who, raw_tag, via, op, key, field, ok, reason, old=None, new=None, now=None):
+def said(claimed_author="", request_id="") -> dict:
+    """The fields an audit entry gains when a caller states who it acts for and under which request id.
+
+    BOTH ARE CLAIMS AND ARE NAMED AS CLAIMS. The actor of an entry is always `actor`, the principal the
+    transport verified; `claimed_author` is what that actor SAID, and nothing reads it as an identity. The
+    conference chair uses them: it writes under its own identity for a persona, and its request id ties the
+    entry to the owner's confirmation it holds (conference docs/PERSONA-WRITE-CONFIRMATION-A1.md).
+    Absent, an entry is exactly what it always was: no field is added. A value of the wrong shape is a
+    Refused, raised before anything runs, and is NOT recorded."""
+    out = {}
+    if claimed_author:
+        if not isinstance(claimed_author, str) or not _CLAIMED_AUTHOR.fullmatch(claimed_author):
+            raise Refused("claimed_author is not a name (lower-case letters, digits, hyphen; 2 to 32)")
+        out["claimed_author"] = claimed_author
+    if request_id:
+        if not isinstance(request_id, str) or not _REQUEST_ID.fullmatch(request_id):
+            raise Refused("request_id is not an id (letters, digits, . _ : - only, at most 120)")
+        out["request_id"] = request_id
+    return out
+
+
+def audit_fields(acl, who, raw_tag, via, op, key, field, ok, reason, old=None, new=None, now=None, stated=None):
     """One audit entry. EVERY VALUE A STRING - redis-py refuses bools and None, and an audit write
-    that raised would take its operation down with it."""
-    return {
+    that raised would take its operation down with it. `stated` is said()'s: two more fields, or none."""
+    return dict(stated or {}, **{
         "at": stamp(now), "actor": who or "(unknown)", "raw_tag": str(raw_tag or "")[:64],
         "via": str(via or "")[:120], "op": op or "", "key": key or "", "field": field or "",
         "ok": "1" if ok else "0", "reason": reason or "",
@@ -328,7 +353,7 @@ def audit_fields(acl, who, raw_tag, via, op, key, field, ok, reason, old=None, n
         "new_sha": sha8(new), "new_len": str(len(str(new))) if new is not None else "",
         "new": preview(new),
         "acl": acl.get("digest", ""),
-    }
+    })
 
 
 def _audit_alone(conn, fields) -> None:
@@ -339,15 +364,18 @@ def _audit_alone(conn, fields) -> None:
 
 def execute(conn, acl: dict, raw_tag: str, via: str, op: str, key: str, field: str = "",
             raw_value: str = "", enc: str = "", count: int = 10, now=None, generation: str = "",
-            correlation: str = "", head: str = "", after: str = "") -> dict:
+            correlation: str = "", head: str = "", after: str = "", claimed_author: str = "",
+            request_id: str = "") -> dict:
     """Do one governed operation. Always returns a result dict; never raises into the caller.
 
     Every outcome - refused, read, written, or failed - leaves exactly one gov:audit entry, and a
     write's entry is committed in the SAME transaction as the write.
 
     generation, correlation and head are read only by haudit. Other ops ignore them.
-    after is read only by xrange; on any other op it is refused, so a caller cannot believe it paged."""
+    after is read only by xrange; on any other op it is refused, so a caller cannot believe it paged.
+    claimed_author and request_id are recorded in the audit entry and change nothing else (said())."""
     who = principal(acl, raw_tag)
+    stated = {}                             # what said() allows; empty until it has, so a bad one is not recorded
     op = (op or "").strip().lower()
     key = (key or "").strip()
     field = (field or "").strip()
@@ -356,6 +384,7 @@ def execute(conn, acl: dict, raw_tag: str, via: str, op: str, key: str, field: s
     try:
         if op == VERIFY_OP and not verifier_enabled():
             raise Refused("the verifier is off")
+        stated = said(claimed_author, request_id)
         check(acl, who, op, key, field)
         after = (after or "").strip()
         if after and op != "xrange":
@@ -373,12 +402,12 @@ def execute(conn, acl: dict, raw_tag: str, via: str, op: str, key: str, field: s
             return _audit_generation(conn, acl, who, raw_tag, via, key, field, raw_value, enc,
                                      echoed_generation, echoed_correlation, (head or "").strip(), now)
         if op in OPS_READ:
-            return _read(conn, acl, who, raw_tag, via, op, key, count, now, after)
-        return _write(conn, acl, who, raw_tag, via, op, key, field, value, now)
+            return _read(conn, acl, who, raw_tag, via, op, key, count, now, after, stated)
+        return _write(conn, acl, who, raw_tag, via, op, key, field, value, now, stated)
     except Refused as why:
         try:
             _audit_alone(conn, audit_fields(acl, who, raw_tag, via, op, key, field, False, str(why),
-                                            now=now))
+                                            now=now, stated=stated))
         except Exception as error:
             result = {"ok": False, "refused": str(why), "audit": "FAILED:" + type(error).__name__}
         else:
@@ -389,7 +418,7 @@ def execute(conn, acl: dict, raw_tag: str, via: str, op: str, key: str, field: s
         reason = "failed:" + type(error).__name__
         try:
             _audit_alone(conn, audit_fields(acl, who, raw_tag, via, op, key, field, False, reason,
-                                            now=now))
+                                            now=now, stated=stated))
         except Exception:
             pass
         result = {"ok": False, "error": type(error).__name__}
@@ -514,7 +543,7 @@ def entry_view(entry_id, fields) -> dict:
     return view
 
 
-def _read(conn, acl, who, raw_tag, via, op, key, count, now, after="") -> dict:
+def _read(conn, acl, who, raw_tag, via, op, key, count, now, after="", stated=None) -> dict:
     if op == "get":
         value = conn.get(key)
         out = {"ok": True, "op": op, "key": key, "found": value is not None, "value": preview(value)}
@@ -545,7 +574,7 @@ def _read(conn, acl, who, raw_tag, via, op, key, count, now, after="") -> dict:
         out = {"ok": True, "op": op, "key": key, "entries": len(entries),
                "value": [entry_view(i, f) for i, f in reversed(entries)]}
     # A read is audited too - "who looked at what" is half of governance - but cheaply: no value.
-    _audit_alone(conn, audit_fields(acl, who, raw_tag, via, op, key, "", True, "", now=now))
+    _audit_alone(conn, audit_fields(acl, who, raw_tag, via, op, key, "", True, "", now=now, stated=stated))
     out["audit"] = "ok"
     return out
 
@@ -1331,7 +1360,7 @@ def _finish_audit(conn, acl, who, raw_tag, via, key, entries, generation, correl
     return result
 
 
-def _write(conn, acl, who, raw_tag, via, op, key, field, value, now) -> dict:
+def _write(conn, acl, who, raw_tag, via, op, key, field, value, now, stated=None) -> dict:
     """WATCH, check the type, read the old value, then MULTI the write AND its audit entry together.
 
     Every Refused raised in here is audited by the caller. Every EXEC result is inspected: a success
@@ -1364,7 +1393,7 @@ def _write(conn, acl, who, raw_tag, via, op, key, field, value, now) -> dict:
             old = None                               # xadd appends; nothing is replaced
         entry = audit_fields(acl, who, raw_tag, via, op, key, field, True, "", old=old,
                              new=(None if op == "del" else
-                                  canonical(value) if op == "hput" else value), now=now)
+                                  canonical(value) if op == "hput" else value), now=now, stated=stated)
         pipe.multi()
         if op == "set":
             if ttl:

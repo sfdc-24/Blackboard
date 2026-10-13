@@ -207,16 +207,32 @@ def config(environ=None):
 
 def load_callers(path=None) -> dict:
     """{service-account email: principal} from the bridge's own callers.json. A missing or malformed
-    file maps NOBODY, so the bridge is not used: stricter, never looser."""
+    file maps NOBODY, so the bridge is not used: stricter, never looser.
+
+    A line is {"principal": ..., "for": "fleet-agent" | "chair"}, or a bare principal for a fleet agent,
+    read by the SAME rule as the service (cloud/redis-tool-bridge/op.py, _lines): a line the service would
+    not map, this does not map either. tests/test_bridge_client.py holds the two readers equal."""
     try:
         with open(path or CALLERS_FILE, encoding="utf-8") as fh:
             callers = json.load(fh)["callers"]
         if not isinstance(callers, dict):
             return {}
-        return {str(k).strip().lower(): str(v).strip().lower() for k, v in callers.items()
-                if str(k).strip() and str(v).strip()}
     except (OSError, ValueError, KeyError, TypeError):
         return {}
+    out = {}
+    for email, line in callers.items():
+        if isinstance(line, str):
+            who, purpose = line, "fleet-agent"
+        elif isinstance(line, dict) and set(line) == {"principal", "for"}:
+            who, purpose = line["principal"], line["for"]
+        else:
+            continue
+        if not isinstance(who, str) or not isinstance(purpose, str) or purpose not in ("fleet-agent", "chair"):
+            continue
+        email, who = str(email).strip().lower(), who.strip().lower()
+        if email and who:
+            out[email] = who
+    return out
 
 
 def mint(url: str, account: str, run=subprocess.run, which=shutil.which) -> str:
