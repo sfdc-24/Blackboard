@@ -741,7 +741,7 @@ def cmd_reconcile(args) -> int:
                 print("CANDIDATE     %s: %d entr%s by this agent show%s the same text (%s). That may be this "
                       "write or another message alike in its first %d characters. Not sent again."
                       % (what, len(seen), "y" if len(seen) == 1 else "ies", "s" if len(seen) == 1 else "",
-                         ", ".join(seen[:5]), PREVIEW_CHARS))
+                         ", ".join(seen), PREVIEW_CHARS))      # all of them: --pages bounds the list
             else:
                 print("NOT OBSERVED  %s: no entry like it from %d s before to %d s after. That is not proof "
                       "it did not commit: it may still land. Not sent again." % (what, SETTLE_BEFORE, SETTLE_AFTER))

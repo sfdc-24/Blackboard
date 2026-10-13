@@ -62,8 +62,17 @@ THE JOURNAL IS WRITTEN FIRST, AND IT FAILS CLOSED (Aya on 506b98a, defect 3)
     - If the process dies between the send and the answer, the line is still there: UNKNOWN.
     - If the closing line cannot be written, the write stays listed as UNKNOWN: a hold that is not
       needed, never a release that is not earned.
-    - A journal that cannot be read whole - unreadable, or holding a line that is not a JSON object -
-      is UNCERTAIN: journal() raises, and everything that asks "is anything unsettled?" answers yes.
+    - A journal that cannot be read whole is UNCERTAIN: journal() raises, and everything that asks
+      "is anything unsettled?" answers yes. "Whole" is strict (Aya on 98a3e90: a line holding only
+      {"resolves": <id>} closed an UNKNOWN write with no outcome, no detail and no time). Every line
+      must be EXACTLY one of the three lines this module writes - the UNKNOWN line, the line that
+      closes one, the note about one - with those fields and no others, each of the right type and
+      form; a closing line must name an outcome from the closed list SETTLED, a time, and a write
+      that an EARLIER line opened and that no line has closed already. Anything else - a missing
+      field, an extra one, a field named twice, an outcome nobody writes, a closing line for an id
+      nobody opened - is not skipped and is not read generously: the journal is UNCERTAIN, the
+      write it might have closed stays UNKNOWN, and every later save is held until a person repairs
+      the file.
     Nothing here ever sends an operation again, and nothing here settles an UNKNOWN on its own:
     `redis_inbox.py reconcile` reads and reports what it sees as EVIDENCE, and a person settles.
 
@@ -121,6 +130,20 @@ _JWT = re.compile(r"^[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}$")
 # Anything shaped like a credential: three dotted base64url runs (a JWT), or one long unbroken run.
 _SECRETISH = re.compile(r"[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}|[A-Za-z0-9_+/=-]{24,}")
 _PLAIN = re.compile(r"[^A-Za-z0-9 .,:;=()'_/<>-]")
+
+# The journal's three lines, and nothing else (Aya on 98a3e90). A line is one of these EXACTLY.
+OPEN = "UNKNOWN"
+SETTLED_BY_ANSWER = ("DONE", "REFUSED", "DENIED", "NOT_EXECUTED")       # the bridge's answer settled it
+SETTLED_BY_HAND = ("COMMITTED_BY_HAND", "NOT_COMMITTED_BY_HAND")        # a person did, and said why
+SETTLED = SETTLED_BY_ANSWER + SETTLED_BY_HAND
+_UNKNOWN_FIELDS = frozenset(("id", "at", "epoch", "op", "key", "value_sha256", "shown_sha256",
+                             "value_chars", "outcome", "why"))
+_CLOSING_FIELDS = frozenset(("resolves", "outcome", "detail", "at"))
+_NOTE_FIELDS = frozenset(("about", "why"))
+_ID = re.compile(r"[0-9a-f]{16}")
+_AT = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
+_HASH = re.compile(r"[0-9a-f]{64}")
+_OP = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")      # any op that is not a read is a write, known or new
 
 
 class BridgeProblem(Exception):
@@ -315,50 +338,130 @@ def journal_unknown(op: str, key: str, value, label: str, now: float, path=None)
     """One line for a write whose outcome is not (yet) known: what, where, when, and hashes of the
     value - never the value. attempt() writes it BEFORE the write is sent. Returns the record."""
     text = "" if value is None else str(value)
-    record = {"id": secrets.token_hex(8), "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
-              "epoch": int(now), "op": op, "key": key, "value_sha256": _sha(text),
-              "shown_sha256": _sha(shown(text)), "value_chars": len(text), "outcome": "UNKNOWN", "why": label}
+    record = {"id": secrets.token_hex(8), "at": _at(int(now)), "epoch": int(now), "op": op, "key": key,
+              "value_sha256": _sha(text), "shown_sha256": _sha(shown(text)), "value_chars": len(text),
+              "outcome": OPEN, "why": str(label)}
+    if _line_kind(record) != "unknown":
+        # A line journal() would refuse must not be the only record of a write. OSError: the caller
+        # already treats "the journal cannot be written" as "do not send by this route".
+        raise OSError("the UNKNOWN line for this write is not one the journal holds")
     _append(record, path)
     return record
 
 
+def _at(moment: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(moment))
+
+
+def _is(value, form) -> bool:
+    """A string, and the whole of it is of this form. Not a number, a list or a bool that prints alike."""
+    return isinstance(value, str) and form.fullmatch(value) is not None
+
+
+def _count(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _same_moment(at, epoch) -> bool:
+    """The line's two clocks agree. A number no calendar holds is not a moment."""
+    try:
+        return at == _at(epoch)
+    except (OverflowError, OSError, ValueError):
+        return False
+
+
+def _unique(pairs) -> dict:
+    """json's object hook: a field named twice is not an object this module wrote, so it is no object."""
+    found = dict(pairs)
+    if len(found) != len(pairs):
+        raise ValueError("a field is named twice")
+    return found
+
+
+def _line_kind(record) -> str:
+    """Which of the three journal lines this object is - "unknown", "closing", "note" - or "" when it
+    is none of them. Exact fields, exact types, exact forms: a line that is nearly one is none."""
+    if not isinstance(record, dict):
+        return ""
+    fields = frozenset(record)
+    if fields == _UNKNOWN_FIELDS:
+        good = (_is(record["id"], _ID) and _count(record["epoch"]) and _same_moment(record["at"], record["epoch"])
+                and _is(record["op"], _OP) and record["op"] not in READS
+                and isinstance(record["key"], str) and record["key"] != ""
+                and _is(record["value_sha256"], _HASH) and _is(record["shown_sha256"], _HASH)
+                and _count(record["value_chars"]) and record["outcome"] == OPEN
+                and isinstance(record["why"], str))
+        return "unknown" if good else ""
+    if fields == _CLOSING_FIELDS:
+        good = (_is(record["resolves"], _ID) and _is(record["at"], _AT)
+                and isinstance(record["outcome"], str) and record["outcome"] in SETTLED
+                and isinstance(record["detail"], str)
+                and (record["outcome"] not in SETTLED_BY_HAND or record["detail"].strip() != ""))
+        return "closing" if good else ""
+    if fields == _NOTE_FIELDS:
+        return "note" if _is(record["about"], _ID) and isinstance(record["why"], str) else ""
+    return ""
+
+
 def journal(path=None) -> list:
     """Every line of the journal, in order. No file is no lines. A file that cannot be read, or that
-    holds a line that is not a JSON object, raises JournalUncertain: a damaged line is not skipped,
-    because it may be the one that says a write is unsettled."""
+    holds ANY line that is not exactly one this module writes, raises JournalUncertain. A line is not
+    skipped and is not read generously, because it may be the one that says a write is unsettled -
+    or one that pretends to say a write is settled. What is checked is in _line_kind(); and across
+    lines: an id is opened once, and a write is closed, or noted, only after the line that opened it,
+    and closed once. The reason given names a line number and a closed phrase, never a field's value."""
     target = path or JOURNAL
     if not os.path.exists(target):
         return []
-    out = []
+    name = os.path.basename(target)
+    out, opened, closed = [], set(), set()
     try:
         with open(target, encoding="utf-8") as fh:
             for number, line in enumerate(fh, 1):
                 if not line.strip():
                     continue
                 try:
-                    record = json.loads(line)
+                    record = json.loads(line, object_pairs_hook=_unique)
                 except ValueError:
                     record = None
-                if not isinstance(record, dict):
-                    raise JournalUncertain("line %d of %s is damaged" % (number, os.path.basename(target)))
+                kind = _line_kind(record)
+                if kind == "unknown":
+                    wrong = "opens an id that an earlier line opened" if record["id"] in opened else ""
+                    opened.add(record["id"])
+                elif kind == "closing":
+                    wrong = ("closes a write that no earlier line opened" if record["resolves"] not in opened
+                             else "closes a write that is closed already" if record["resolves"] in closed
+                             else "")
+                    closed.add(record["resolves"])
+                elif kind == "note":
+                    wrong = "" if record["about"] in opened else "is about a write that no earlier line opened"
+                else:
+                    wrong = "is damaged, or is not a line this journal holds"
+                if wrong:
+                    raise JournalUncertain("line %d of %s %s" % (number, name, wrong))
                 out.append(record)
     except (OSError, UnicodeDecodeError) as error:
-        raise JournalUncertain("%s cannot be read (%s)" % (os.path.basename(target),
-                                                           type(error).__name__)) from None
+        raise JournalUncertain("%s cannot be read (%s)" % (name, type(error).__name__)) from None
     return out
 
 
 def pending(path=None) -> list:
-    """The UNKNOWN writes that no later line has closed. Raises JournalUncertain with journal()."""
+    """The UNKNOWN writes that no later line has closed. Raises JournalUncertain with journal(), so a
+    line that only looks like a closing one closes nothing: it makes the whole journal uncertain."""
     lines = journal(path)
-    settled = {str(r.get("resolves")) for r in lines if r.get("resolves")}
-    return [r for r in lines if r.get("outcome") == "UNKNOWN" and r.get("id") and r["id"] not in settled]
+    closed = {record["resolves"] for record in lines if "resolves" in record}
+    return [record for record in lines if "id" in record and record["id"] not in closed]
 
 
 def settle(entry: dict, outcome: str, detail: str, now: float, path=None) -> None:
-    """Append the line that closes an UNKNOWN one. Append-only: the line it names is never rewritten."""
-    _append({"resolves": entry["id"], "outcome": outcome, "detail": detail,
-             "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))}, path)
+    """Append the line that closes an UNKNOWN one. Append-only: the line it names is never rewritten.
+    It writes only a line journal() will accept: anything else raises ValueError and appends nothing."""
+    record = {"resolves": entry.get("id") if isinstance(entry, dict) else None, "outcome": outcome,
+              "detail": detail, "at": _at(now)}
+    if _line_kind(record) != "closing":
+        raise ValueError("not a closing line this journal holds: an id, an outcome from SETTLED, a "
+                         "detail (not empty when a person settles), a time")
+    _append(record, path)
 
 
 def _close(intent, outcome: str, now: float, path, say) -> None:

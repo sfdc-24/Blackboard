@@ -30,6 +30,24 @@ from test_redis_gov import ACL, FakeRedis, run                       # noqa: E40
 NOW = datetime.datetime(2026, 10, 12, 2, 0, tzinfo=datetime.timezone.utc)
 KEY = "fleet:inbox:claude-code-cli"
 
+# Before it saves a cursor the reader asks bridge_client whether an earlier save is unsettled, and that
+# is read from a file in the checkout. These tests are about the board route: they must give the same
+# answer on a machine whose own journal holds an unsettled write, or a damaged line, as on a clean one.
+_scratch = tempfile.TemporaryDirectory()
+_own_journal = None
+
+
+def setUpModule():
+    global _own_journal
+    import bridge_client
+    _own_journal = mock.patch.object(bridge_client, "JOURNAL", os.path.join(_scratch.name, "unknown.jsonl"))
+    _own_journal.start()
+
+
+def tearDownModule():
+    _own_journal.stop()
+    _scratch.cleanup()
+
 
 class Worker:
     """The board between the reader and Redis: a request row in, the RESULT row the worker appends out."""
