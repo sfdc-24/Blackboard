@@ -273,6 +273,36 @@ class SilentStore(RefusingStore):
         return "1"
 
 
+class KeepingStore(RefusingStore):
+    """A store whose write LANDS. What the read-back then does is the subclass's business."""
+
+    def __init__(self):
+        self.kept = {}
+
+    def save(self, name, state, token):
+        self.kept[name] = dict(state)
+        return "1"
+
+
+class ReadRefusedStore(KeepingStore):
+    """The upload succeeds and the read-back is a 403: create without get."""
+
+    def load(self, name):
+        raise PermissionError("HTTP Error 403: Forbidden")
+
+
+class ReadTimesOutStore(KeepingStore):
+    def load(self, name):
+        raise TimeoutError("timed out")
+
+
+class CorruptedReadStore(KeepingStore):
+    """The read-back answers, with bytes that are not this row's text."""
+
+    def load(self, name):
+        return {"row_id": "ORDER-9", "chars": 8, "sha256": "0" * 64, "text": "tampered"}, "1"
+
+
 class AMissingSpillIsNeverVerified(unittest.TestCase):
     """2026-10-12 23:15Z: two Gemini replies were posted with full= pointers to objects that did
     not exist. The poster printed VERIFIED and exited 0, and the waker, which captures that output,
@@ -292,10 +322,15 @@ class AMissingSpillIsNeverVerified(unittest.TestCase):
         rc, said, board = self.post_long(store)
         self.assertEqual(3, rc, said)
         self.assertNotIn("VERIFIED on the board", said)
-        self.assertIn(fleet_agent.SPILL_MISSING_MARK, said)
+        self.assertIn(fleet_agent.FULLTEXT_UNCONFIRMED_MARK, said)
         self.assertIn("SPILL_UNCONFIRMED", said)
         self.assertEqual(1, len(board.rows), "the row must land once and never be posted again")
         self.assertIn("full=gs://fake-bucket/wakers/", board.rows[0][5])
+        # Unconfirmed is the whole claim. The object may be there (Aya on ddd3275), so the words
+        # that say it is not must never be printed.
+        for wrong in ("NOT STORED", "not stored", "does not resolve"):
+            self.assertNotIn(wrong, said)
+        return said
 
     def test_a_store_that_refuses_the_write_is_exit_3_not_verified(self):
         self.check(RefusingStore())
@@ -303,6 +338,23 @@ class AMissingSpillIsNeverVerified(unittest.TestCase):
     def test_a_write_that_returns_but_stores_nothing_is_exit_3_not_verified(self):
         """The save call coming back is not the proof; the read-back is."""
         self.check(SilentStore())
+
+    def test_an_upload_that_landed_with_a_refused_read_back_is_unconfirmed_not_missing(self):
+        store = ReadRefusedStore()
+        said = self.check(store)
+        self.assertEqual(1, len(store.kept), "the write did land: the object is in the store")
+        self.assertIn("403", said)
+        self.assertIn("may or may not resolve", said)
+
+    def test_a_read_back_that_times_out_is_unconfirmed(self):
+        store = ReadTimesOutStore()
+        said = self.check(store)
+        self.assertEqual(1, len(store.kept))
+        self.assertIn("TimeoutError", said)
+
+    def test_a_corrupted_read_back_is_unconfirmed(self):
+        said = self.check(CorruptedReadStore())
+        self.assertIn("does not hold this row's text", said)
 
     def test_commit_refuses_a_spill_it_cannot_read_back(self):
         def blind(key, full):
@@ -315,20 +367,20 @@ class AMissingSpillIsNeverVerified(unittest.TestCase):
         rc, said, board = self.post_long(state_store.open_store(tempfile.mkdtemp()))
         self.assertEqual(0, rc, said)
         self.assertIn("VERIFIED on the board", said)
-        self.assertNotIn(fleet_agent.SPILL_MISSING_MARK, said)
+        self.assertNotIn(fleet_agent.FULLTEXT_UNCONFIRMED_MARK, said)
         self.assertTrue(board_row.resolve(board.rows[0][5]).endswith("END-OF-REPLY."))
 
     def test_the_waker_says_it_on_its_own_log_and_does_not_post_or_ask_again(self):
         import contextlib
         import io
         import agent_waker as aw
-        self.assertEqual(fleet_agent.SPILL_MISSING_MARK, aw.SPILL_MISSING_MARK)
+        self.assertEqual(fleet_agent.FULLTEXT_UNCONFIRMED_MARK, aw.FULLTEXT_UNCONFIRMED_MARK)
         calls, out = [], io.StringIO()
 
         def run(args, **kw):
             calls.append(args)
             return mock.Mock(stdout="  SPILL_UNCONFIRMED: PermissionError: HTTP Error 403: Forbidden\n"
-                                    "  %s: Row_ID=R is on the board" % fleet_agent.SPILL_MISSING_MARK,
+                                    "  %s: Row_ID=R is on the board" % fleet_agent.FULLTEXT_UNCONFIRMED_MARK,
                              stderr="")
 
         with mock.patch.object(aw.subprocess, "run", side_effect=run), contextlib.redirect_stdout(out):
@@ -336,7 +388,8 @@ class AMissingSpillIsNeverVerified(unittest.TestCase):
         self.assertTrue(posted, "the row landed: the watermark must move, or the next pass re-asks")
         self.assertEqual(1, len(calls), "one post, never a second")
         said = out.getvalue()
-        self.assertIn("SPILL_UNCONFIRMED for reply", said)
+        self.assertIn("FULLTEXT_UNCONFIRMED for reply", said)
+        self.assertIn("not recovered", said, "the log must not read as if a later pass repairs it")
         self.assertIn("403", said, "the store's own reason must reach the waker's log")
 
     def test_a_post_with_neither_word_is_still_not_confirmed(self):

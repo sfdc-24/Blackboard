@@ -243,6 +243,9 @@ def commit(info: dict, spill) -> str | None:
     Returning means CONFIRMED, not "the write call came back": the object is read back and held to
     the row's own length and sha256 before this returns. A store that cannot be read back cannot be
     confirmed, and that is a raise too, so a caller never reports stored text it has not seen.
+
+    A raise means UNCONFIRMED, not "not stored": the write may have landed and the read-back been
+    refused, timed out or returned other bytes. The caller must say unconfirmed and claim neither.
     """
     if not info.get("deferred"):
         return info.get("pointer")

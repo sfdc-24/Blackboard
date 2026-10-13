@@ -747,9 +747,9 @@ def reply_phase(row) -> str:
     return "RESULT" if m and m.group(1).upper() in RESULT_FOR else "DONE"
 
 
-# fleet_agent.SPILL_MISSING_MARK, restated: the poster runs as a subprocess and its output is all
-# this file sees of it. tests/test_board_row.py fails if the two strings ever differ.
-SPILL_MISSING_MARK = "POSTED, FULL TEXT NOT STORED"
+# fleet_agent.FULLTEXT_UNCONFIRMED_MARK, restated: the poster runs as a subprocess and its output
+# is all this file sees of it. tests/test_board_row.py fails if the two strings ever differ.
+FULLTEXT_UNCONFIRMED_MARK = "POSTED, FULLTEXT_UNCONFIRMED"
 
 
 def _unlink_quietly(path: str) -> None:
@@ -800,15 +800,19 @@ def post_reply(me: str, cfg: dict, text: str, to: str, answers: str, verbose: bo
         return False
     _unlink_quietly(text_path)
     out = (res.stdout or "") + (res.stderr or "")
-    if SPILL_MISSING_MARK in out:
-        # The row IS on the board; only its long text is missing from the store. Said here, on the
-        # waker's own log, every time: this output is captured, and until 2026-10-13 the poster's
-        # SPILL_UNCONFIRMED line was dropped whenever the row itself verified, so a store that
-        # refused every write left no trace anywhere (gemini-waker-7nhvc, 2026-10-12 23:15Z).
-        # True, not False: the row landed, so it must not be posted again and the model must not be
-        # asked again; holding the watermark would invite both on the next pass.
-        print("    SPILL_UNCONFIRMED for reply %s: the row is posted, its full text is NOT stored, "
-              "and its full= pointer does not resolve. Not posted again." % rid)
+    if FULLTEXT_UNCONFIRMED_MARK in out:
+        # The row IS on the board; its long text could not be confirmed in the store. Said here, on
+        # the waker's own log, every time: this output is captured, and until 2026-10-13 the
+        # poster's SPILL_UNCONFIRMED line was dropped whenever the row itself verified, so a store
+        # that refused every write left no trace anywhere (gemini-waker-7nhvc, 2026-10-12 23:15Z).
+        #
+        # True means ROW POSTED, and only that. The caller records the source id in answered_ids,
+        # which is deduplication of posted rows: it stops a second post and a second inference. It
+        # is not proof the full text was delivered, and nothing here recovers it: the reply's
+        # temporary file is already deleted and no later pass writes the spill again.
+        print("    FULLTEXT_UNCONFIRMED for reply %s: the row is posted; its full text could not be "
+              "confirmed in the store and may be unreadable. Not posted again, not asked again, "
+              "not recovered." % rid)
         print("    " + out.strip()[-600:].replace("\n", "\n    "))
         return True
     ok = "VERIFIED on the board" in out
