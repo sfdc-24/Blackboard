@@ -54,6 +54,11 @@ WHAT ONLY MOVES FORWARD
     Without this, that old `set` could land AFTER a newer one and move the cursor back. With it, the old
     one is refused whenever it arrives. `del` still removes the key: moving a cursor back on purpose is
     a deletion first, audited as one.
+    "Whenever it arrives" needs the key to still be there (Copilot on 98a3e90): the rule compares
+    against the value the key HOLDS, so a cursor that expired would let a delayed older save in with
+    nothing to refuse it and nothing audited as removed. So a `set` of a cursor is written with NO
+    expiry, whatever ttl_seconds says for fleet:, and it clears an expiry an older governor left.
+    One small string per reader; only `del` removes it.
 
 IDENTITY, STATED HONESTLY
     The actor is the row's Source_Tag. Appending a row needs the board secret, so the writer is a
@@ -1331,7 +1336,8 @@ def _write(conn, acl, who, raw_tag, via, op, key, field, value, now) -> dict:
 
     Every Refused raised in here is audited by the caller. Every EXEC result is inspected: a success
     is reported only when both the write and its audit entry succeeded."""
-    ttl = ttl_for(acl, key)
+    # A saved read cursor never expires: FORWARD_ONLY compares against what the key holds.
+    ttl = None if (op == "set" and key.startswith(FORWARD_ONLY)) else ttl_for(acl, key)
     pipe = conn.pipeline(transaction=True)
     try:
         pipe.watch(key)                              # immediate mode until multi()

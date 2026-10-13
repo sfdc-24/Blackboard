@@ -57,6 +57,8 @@ class FakeRedis:
         self._bump(key)
         if ex:
             self.ttls[key] = ex
+        else:
+            self.ttls.pop(key, None)        # Redis: SET without KEEPTTL discards the key's expiry
         return True
 
     def delete(self, key):
@@ -550,6 +552,25 @@ class AReadCursorOnlyMovesForward(unittest.TestCase):
         conn = FakeRedis()
         conn.set(self.KEY, "left by an older writer")
         self.assertTrue(run(conn, "grok", "set", self.KEY, val="7-0")["ok"])
+
+    def test_REGRESSION_a_saved_cursor_never_expires_so_the_value_compared_against_cannot_lapse(self):
+        """Copilot on 98a3e90: the cursor "still inherits the ACL's 30-day fleet: TTL. Once the newer
+        cursor expires, a delayed older SET sees no held value and is accepted." """
+        conn = FakeRedis()
+        self.assertIn("fleet:", ACL["ttl_seconds"], "this test needs an expiry it would otherwise inherit")
+        self.assertTrue(run(conn, "grok", "set", self.KEY, val="20-0")["ok"])
+        self.assertNotIn(self.KEY, conn.ttls, "the newer cursor can expire, and the old save then lands")
+        conn.ttls[self.KEY] = ACL["ttl_seconds"]["fleet:"]          # as an older governor left it
+        self.assertTrue(run(conn, "grok", "set", self.KEY, val="21-0")["ok"])
+        self.assertNotIn(self.KEY, conn.ttls, "an expiry left by an older governor outlived the next save")
+        self.assertIn("only moves forward", run(conn, "grok", "set", self.KEY, val="12-0")["refused"])
+        self.assertNotIn(self.KEY, conn.ttls, "a refused save changed the key")
+        # and nothing else lost its expiry: the same op beside it, and the same key by another op
+        self.assertTrue(run(conn, "grok", "set", "fleet:y", val="1-0")["ok"])
+        self.assertEqual(ACL["ttl_seconds"]["fleet:"], conn.ttls["fleet:y"])
+        self.assertTrue(run(conn, "grok", "xadd", "fleet:cursor:astream", val="x")["ok"])
+        self.assertEqual(ACL["ttl_seconds"]["fleet:"], conn.ttls["fleet:cursor:astream"],
+                         "only a SAVED cursor is kept: a stream someone put under that name still expires")
 
     def test_del_still_removes_it_so_moving_back_is_a_deletion_first(self):
         conn = FakeRedis()

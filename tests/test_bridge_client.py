@@ -49,6 +49,32 @@ from test_redis_tool_bridge import Verifier  # noqa: E402   the stand-in for Goo
 
 REAL_CALL = bc.call      # the harness puts a BridgeSim where bc.call is; this is the function it wraps
 
+# No test here may touch this checkout's own journal or breaker. Until 2026-10-13 one did: it called
+# attempt() with no journal path, and every run appended sixteen lines to the repository's real
+# .redis_bridge_unknown.jsonl - on a machine with the bridge switched on, that is the file a real
+# unsettled write is remembered in. The module is checked as a whole, so the next one is caught too.
+_OWN_FILES = (bc.JOURNAL, bc.STATE)
+_before = {}
+
+
+def _fingerprint(path):
+    if not os.path.exists(path):
+        return None
+    found = os.stat(path)
+    return found.st_size, found.st_mtime_ns
+
+
+def setUpModule():
+    for path in _OWN_FILES:
+        _before[path] = _fingerprint(path)
+
+
+def tearDownModule():
+    touched = [os.path.basename(path) for path in _OWN_FILES if _fingerprint(path) != _before[path]]
+    if touched:
+        raise AssertionError("a test wrote this checkout's own %s: give it a path of its own"
+                             % " and ".join(touched))
+
 
 class Worker(BoardWorker):
     """PR 397's board, plus the one thing it never had to carry: a row that is not a request. The
@@ -371,7 +397,8 @@ class Blocker2_ADeniedCallerIsNeverDowngraded(unittest.TestCase):
                 for _ in range(4):
                     with self.assertRaises(bc.Denied):
                         bc.attempt(op, "fleet:inbox:grok", me=ME, value="v", environ=ON, callers=MINE,
-                                   state_path=state, say=lambda line: None, minter=lambda u, a: TOKEN,
+                                   state_path=state, journal_path=os.path.join(tmp, "unknown.jsonl"),
+                                   say=lambda line: None, minter=lambda u, a: TOKEN,
                                    caller=mock.Mock(side_effect=bc.Denied("HTTP 401 unauthenticated")))
             self.assertEqual({"failures": 0, "open_until": 0.0}, bc.load_state(state),
                              "a denial proves the bridge is answering")
@@ -1117,6 +1144,18 @@ class Reconciling(Harness, unittest.TestCase):
         code, out = self.reconcile(worker, BridgeSim(conn))
         self.assertIn("3 entries by this agent show the same text (1-0, 2-0, 3-0)", out)
 
+    def test_REGRESSION_every_candidate_is_named_not_the_first_five(self):
+        """Copilot on 98a3e90: "this slice prints only the first five IDs. With six or more lookalikes,
+        the person asked to settle the UNKNOWN does not receive all of the evidence." """
+        conn = FakeRedis()
+        worker = Worker(conn)
+        for _ in range(6):
+            self.send(worker, BridgeSim(conn), text="ack", clock=self.SENT_AT)
+        self.unknown_send(conn, worker, lost_after_commit, text="ack")
+        code, out = self.reconcile(worker, BridgeSim(conn))
+        self.assertEqual(inbox.UNSETTLED_EXIT, code, out)
+        self.assertIn("7 entries by this agent show the same text (1-0, 2-0, 3-0, 4-0, 5-0, 6-0, 7-0)", out)
+
     def test_the_same_words_from_another_agent_are_not_even_a_candidate(self):
         conn = FakeRedis()
         worker = Worker(conn)
@@ -1434,6 +1473,206 @@ class Reconciling(Harness, unittest.TestCase):
                 bc.pending(self.journal)
         os.unlink(self.journal)                                      # no file at all is no unknown writes
         self.assertEqual([], bc.pending(self.journal))
+
+    # --------------------------------- Aya on 98a3e90: a line that only LOOKS like one closes nothing
+    AN_ID = "abcdef0123456789"
+    OTHER_ID = "0123456789abcdef"
+    A_TIME = "1970-01-01T00:13:20Z"
+
+    def one_unknown(self, op="set", key=CURSOR, value="5-0"):
+        """A journal holding one valid UNKNOWN line with a known id. Returns (the record, its text)."""
+        if os.path.exists(self.journal):
+            os.unlink(self.journal)
+        with mock.patch.object(bc.secrets, "token_hex", return_value=self.AN_ID):
+            record = bc.journal_unknown(op, key, value, "sent; no answer recorded", float(self.SENT_AT),
+                                        self.journal)
+        return record, self.raw()
+
+    def closing(self, **changed):
+        line = {"resolves": self.AN_ID, "outcome": "DONE", "detail": "", "at": self.A_TIME}
+        line.update(changed)
+        return {k: v for k, v in line.items() if v is not ...}
+
+    def assert_uncertain(self, text, name, line=None):
+        pathlib.Path(self.journal).write_text(text, encoding="utf-8", newline="")
+        with self.assertRaises(bc.JournalUncertain, msg=name) as caught:
+            bc.pending(self.journal)
+        said = str(caught.exception)
+        if line is not None:
+            self.assertIn("line %d of " % line, said, name)
+        for value in (self.AN_ID, self.OTHER_ID, self.CURSOR):
+            self.assertNotIn(value, said, "%s: the reason repeats what the line holds" % name)
+
+    def test_REGRESSION_a_bare_resolves_line_closes_nothing_and_holds_every_later_save(self):
+        """Aya, withdrawing the source GO on 98a3e90: "a valid UNKNOWN record abc followed only by
+        {"resolves":"abc"} removes pending state without outcome, detail or time." End to end: the save
+        whose answer was lost stays UNKNOWN, nothing is saved past it by either route, and nothing but a
+        person's own verdict - after the file is repaired - closes it."""
+        conn = stream(["m1"])
+        worker = Worker(conn)
+        self.read(worker, BridgeSim(conn, fault=save_lost("before")), clock=self.SENT_AT)
+        (entry,) = self.pending()
+        whole = self.raw()
+        with open(self.journal, "a", encoding="utf-8", newline="") as fh:
+            fh.write(json.dumps({"resolves": entry["id"]}) + "\n")
+        with self.assertRaises(bc.JournalUncertain) as caught:
+            bc.pending(self.journal)
+        self.assertIn("line %d of " % (len(whole.splitlines()) + 1), str(caught.exception))
+        self.assertNotIn(entry["id"], str(caught.exception))
+        assert run(conn, "grok", "xadd", KEY, val="m2")["ok"]
+        bridge = BridgeSim(conn)
+        code, out = self.read(worker, bridge, clock=self.SENT_AT + 4000)
+        self.assertEqual(inbox.UNKNOWN_EXIT, code, out)
+        self.assertIn("in Redis: HELD. The journal of unknown writes cannot be trusted", out)
+        self.assertNotIn("set", [r["op"] for r in bridge.requests], "a save left by the bridge")
+        self.assertFalse([a for a in worker.asked if "op=set" in a], "a save left by the board")
+        self.assertNotIn(self.CURSOR, conn.data)
+        code, out = self.reconcile(worker, bridge)
+        self.assertEqual(inbox.UNSETTLED_EXIT, code, out)
+        self.assertIn("THE JOURNAL CANNOT BE TRUSTED", out)
+        code, out = self.settle(entry["id"], "--outcome", "committed", "--why", "trying to settle around it")
+        self.assertEqual(2, code, out)
+        # a person sets the bad line aside: the write is UNKNOWN again, exactly as it was, and still held
+        pathlib.Path(self.journal).write_text(whole, encoding="utf-8", newline="")
+        self.assertEqual([entry], self.pending(), "the write the bare line named is no longer UNKNOWN")
+        code, out = self.read(worker, BridgeSim(conn), clock=self.SENT_AT + 4100)
+        self.assertEqual(inbox.UNKNOWN_EXIT, code, out)
+        self.assertIn("in Redis: HELD", out)
+
+    def test_REGRESSION_a_closing_line_is_exactly_a_closing_line_or_the_journal_is_uncertain(self):
+        record, unknown = self.one_unknown()
+        gone = ...
+        malformed = {
+            "only resolves": {"resolves": self.AN_ID},
+            "no outcome": self.closing(outcome=gone),
+            "no detail": self.closing(detail=gone),
+            "no time": self.closing(at=gone),
+            "a field this journal does not write": self.closing(note="looks official"),
+            "the outcome is UNKNOWN": self.closing(outcome="UNKNOWN"),
+            "an outcome nobody writes": self.closing(outcome="SETTLED"),
+            "an outcome in another case": self.closing(outcome="done"),
+            "an outcome with a space after it": self.closing(outcome="DONE "),
+            "an empty outcome": self.closing(outcome=""),
+            "no outcome at all": self.closing(outcome=None),
+            "an outcome that is a list": self.closing(outcome=["DONE"]),
+            "a detail that is nothing": self.closing(detail=None),
+            "a detail that is a number": self.closing(detail=0),
+            "an empty time": self.closing(at=""),
+            "a time that is not one": self.closing(at="yesterday"),
+            "a time with words after it": self.closing(at=self.A_TIME + " or so"),
+            "a time that is a number": self.closing(at=800),
+            "an id that is a list": self.closing(resolves=[self.AN_ID]),
+            "an id that is true": self.closing(resolves=True),
+            "an id that is a number": self.closing(resolves=1),
+            "an id in another case": self.closing(resolves=self.AN_ID.upper()),
+            "an id with a space after it": self.closing(resolves=self.AN_ID + " "),
+            "an id no line opened": self.closing(resolves=self.OTHER_ID),
+            "a person's verdict with no reason": self.closing(outcome="COMMITTED_BY_HAND"),
+            "a person's verdict with a blank reason": self.closing(outcome="NOT_COMMITTED_BY_HAND", detail="   "),
+        }
+        for name, line in malformed.items():
+            self.assert_uncertain(unknown + json.dumps(line) + "\n", name, line=2)
+        good = json.dumps(self.closing()) + "\n"
+        twice = '{"resolves": "%s", "outcome": "UNKNOWN", "outcome": "DONE", "detail": "", "at": "%s"}\n' % (
+            self.AN_ID, self.A_TIME)
+        self.assert_uncertain(unknown + twice, "a field named twice", line=2)
+        self.assert_uncertain(unknown + good + good, "closed twice", line=3)
+        self.assert_uncertain(good + unknown, "closed before it was opened", line=1)
+        self.assert_uncertain(unknown + "[" + good.strip() + "]\n", "a closing line inside a list", line=2)
+        # and the lines that ARE closing lines close it: every outcome in the closed list, and no other
+        self.assertEqual(set(bc.SETTLED), set(bc.SETTLED_BY_ANSWER) | set(inbox.OUTCOMES.values()))
+        self.assertNotIn(bc.OPEN, bc.SETTLED)
+        for outcome in bc.SETTLED:
+            detail = "by hand: read entry 1-0" if outcome in bc.SETTLED_BY_HAND else ""
+            pathlib.Path(self.journal).write_text(
+                unknown + json.dumps(self.closing(outcome=outcome, detail=detail)) + "\n",
+                encoding="utf-8", newline="")
+            self.assertEqual([], self.pending(), outcome)
+        pathlib.Path(self.journal).write_text(unknown, encoding="utf-8", newline="")
+        self.assertEqual([record], self.pending(), "with no closing line it is UNKNOWN")
+
+    def test_REGRESSION_an_unknown_line_and_a_note_are_held_to_the_same_strictness(self):
+        record, unknown = self.one_unknown()
+
+        def changed(**fields):
+            line = dict(record)
+            line.update(fields)
+            return json.dumps({k: v for k, v in line.items() if v is not ...}) + "\n"
+
+        gone = ...
+        bad_unknown = {
+            "no hash of the value as shown": changed(shown_sha256=gone),
+            "no time": changed(at=gone),
+            "an outcome that is not UNKNOWN": changed(outcome="DONE"),
+            "no outcome": changed(outcome=gone),
+            "a second that is text": changed(epoch=str(self.SENT_AT)),
+            "a second that is true": changed(epoch=True),
+            "a second before the clock began": changed(epoch=-1),
+            "a second no calendar holds": changed(epoch=10 ** 30),
+            "a time that is not that second": changed(at=self.A_TIME),
+            "a short id": changed(id=self.AN_ID[:15]),
+            "an id that is a number": changed(id=5),
+            "an id that is sixteen digits, but a number": changed(id=1234567890123456),
+            "a read, which is never journalled": changed(op="get"),
+            "an op that is a list": changed(op=["set"]),
+            "an empty key": changed(key=""),
+            "a key that is a number": changed(key=7),
+            "a count below nothing": changed(value_chars=-1),
+            "a count that is text": changed(value_chars="3"),
+            "a count that is true": changed(value_chars=True),
+            "a hash of the wrong length": changed(value_sha256="ab" * 31),
+            "a hash that is not hex": changed(shown_sha256="z" * 64),
+            "a reason that is not text": changed(why=None),
+            "a field this journal does not write": changed(value="5-0"),
+        }
+        for name, line in bad_unknown.items():
+            self.assert_uncertain(line, name, line=1)
+        self.assert_uncertain(unknown + unknown, "one id opened twice", line=2)
+        note = {"about": self.AN_ID, "why": "no answer (TimeoutError)"}
+        bad_note = {
+            "about a write no line opened": dict(note, about=self.OTHER_ID),
+            "no reason": {"about": self.AN_ID},
+            "a reason that is a number": dict(note, why=5),
+            "an id that is a list": dict(note, about=[self.AN_ID]),
+            "a field this journal does not write": dict(note, outcome="DONE"),
+            "an empty object": {},
+        }
+        for name, line in bad_note.items():
+            self.assert_uncertain(unknown + json.dumps(line) + "\n", name, line=2)
+        self.assert_uncertain(json.dumps(note) + "\n" + unknown, "a note before the write it is about", line=1)
+        # a note that is a note closes nothing and damages nothing
+        pathlib.Path(self.journal).write_text(unknown + json.dumps(note) + "\n", encoding="utf-8", newline="")
+        self.assertEqual([record], self.pending())
+
+    def test_REGRESSION_this_module_cannot_write_a_line_it_would_not_read(self):
+        record, unknown = self.one_unknown()
+        for outcome, detail in (("UNKNOWN", ""), ("", ""), ("done", ""), (None, ""), ("DONE", None),
+                                ("COMMITTED_BY_HAND", ""), ("NOT_COMMITTED_BY_HAND", " ")):
+            with self.assertRaises(ValueError, msg=repr((outcome, detail))):
+                bc.settle(record, outcome, detail, 800.0, self.journal)
+        for entry in ({}, {"id": None}, {"id": "abc"}, {"id": [self.AN_ID]}, None, "abcdef0123456789"):
+            with self.assertRaises(ValueError, msg=repr(entry)):
+                bc.settle(entry, "DONE", "", 800.0, self.journal)
+        self.assertEqual(unknown, self.raw(), "a refused closing line was written anyway")
+        self.assertEqual([record], self.pending())
+        for op in ("get", "xrange", "hgetall", "", "SET", "set now"):
+            with self.assertRaises(OSError, msg=op):
+                bc.journal_unknown(op, self.CURSOR, "5-0", "x", 300.0, self.journal)
+        with self.assertRaises(OSError):
+            bc.journal_unknown("set", "", "5-0", "x", 300.0, self.journal)
+        self.assertEqual(unknown, self.raw(), "a refused UNKNOWN line was written anyway")
+        # every line the real flow writes is one journal() reads: an answer, a refusal, a lost answer
+        os.unlink(self.journal)
+        conn = stream(["m1"])
+        worker = Worker(conn)
+        self.send(worker, BridgeSim(conn))
+        self.send(worker, BridgeSim(conn, fault=lambda s, r: s.execute(dict(r, key="gov:audit"))))
+        self.read(worker, BridgeSim(conn, fault=save_lost("after")), clock=self.SENT_AT)
+        kinds = [bc._line_kind(line) for line in bc.journal(self.journal)]
+        self.assertEqual(["unknown", "closing", "unknown", "closing", "unknown", "note"], kinds)
+        (still,) = self.pending()
+        bc.settle(still, "COMMITTED_BY_HAND", "by hand: the cursor key was read", 900.0, self.journal)
+        self.assertEqual([], self.pending())
 
     def test_two_identical_writes_in_one_second_are_two_journal_lines(self):
         first = bc.journal_unknown("xadd", "fleet:inbox:grok", "ack", "x", 300.0, self.journal)

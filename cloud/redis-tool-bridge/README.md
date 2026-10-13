@@ -114,9 +114,10 @@ principal; it can only make the bridge refuse, before anything runs, when the ca
 different one. That is what stops a client configured with another agent's account from writing under
 that agent's name.
 
-**Not built here** (the rest of Phase 3a and all of 3b): the hourly canary, the negative controls
-against a deployed bridge, the client (`scripts/redis_inbox.py` sending through the bridge with its
-breaker), and any second caller. Adding a caller is one line in `callers.json` after its service
+**Not built here** (the rest of Phase 3a): the hourly canary, the negative controls against a deployed
+bridge, and any second caller. **Built as source, deployed nowhere and off by default** (Phase 3b):
+the client, `scripts/bridge_client.py`, which `scripts/redis_inbox.py` sends through, with its breaker
+and its journal of writes whose outcome is unknown. Adding a caller is one line in `callers.json` after its service
 account exists and the owner has approved it (D2).
 
 ## Caller identity, per surface
