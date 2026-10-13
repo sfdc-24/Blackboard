@@ -652,6 +652,15 @@ class TheOpEndpoint(unittest.TestCase):
         self.assertEqual(400, code)
         self.assertEqual([], self.conn.audit(), "a malformed request reached Redis")
 
+    def test_the_body_grammar_is_exactly_these_eight_members(self):
+        """Pinned whole. A ninth member that is accepted and ignored is how a caller comes to believe
+        it passed something (a hand mutant adding one survived until this existed)."""
+        self.assertEqual(("op", "key", "field", "val", "enc", "count", "after", "expect"),
+                         bridge_op.MEMBERS)
+        for extra in ("as", "ttl", "via", "who"):
+            code, out = self.post({"op": "get", "key": "fleet:x", extra: "x"})
+            self.assertEqual((400, "bad request"), (code, out["error"]), extra)
+
     # --- 401 and 403 from the HTTP surface: the same gate as the probe, on the new endpoint
     def test_no_token_is_401_and_nothing_is_touched(self):
         code, out = self.post({"op": "get", "key": "fleet:x"}, token="")
