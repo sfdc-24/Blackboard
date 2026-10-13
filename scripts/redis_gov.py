@@ -55,6 +55,23 @@ WHAT ONLY MOVES FORWARD
     one is refused whenever it arrives. `del` still removes the key: moving a cursor back on purpose is
     a deletion first, audited as one.
 
+A WORK RECORD IS A LEDGER (scripts/redis_work.py; Aya, 2026-10-13: "revision/state/owner transitions
+must be atomic compare-and-set" and "do not delete the only audit record")
+    Three prefixes, in code like the two lists above, each decided under the same WATCH as its write:
+        proj:work:v1:rec:<id>     WRITE_ONCE   hput, and only when the key does not exist. What was
+                                               asked for, and what done means, are not rewritten.
+        proj:work:v1:log:<id>     SEQUENCED    xadd, and only as the NEXT revision: the text starts
+                                               "r<N> " and N is one more than the last entry's. Two
+                                               writers who both read r4 cannot both write r5; one is
+                                               refused and must read again. An r5 whose answer was lost
+                                               and that arrives after someone else's r5 is refused too.
+        proj:work:v1:index:<day>  REV_FORWARD  hset, and never to a lower revision: the value starts
+                                               "<N> ". It is a list for reading, rebuilt from the log.
+    Nothing else may be done to those keys through this path: no del, no set, no rewrite. The first two
+    are given NO expiry here whatever the access list's ttl says: they are the record, not a cache.
+    This is not a state machine. Who may make which move is redis_work's rule, checked by every reader
+    against the `by` this module writes; here it is only "once", "in order" and "not backwards".
+
 IDENTITY, STATED HONESTLY
     The actor is the row's Source_Tag. Appending a row needs the board secret, so the writer is a
     fleet member - but WHICH fleet member is a claim, not a proof. This does not pretend otherwise:
@@ -80,6 +97,11 @@ AUDIT_MAXLEN = 200000
 
 PROTECTED = ("v1:bus:", "v1:agent:", "v1:conf:", "v1:synth:", "probe:", "gov:")
 FORWARD_ONLY = ("fleet:cursor:",)
+WRITE_ONCE = ("proj:work:v1:rec:",)
+SEQUENCED = ("proj:work:v1:log:",)
+REV_FORWARD = ("proj:work:v1:index:",)
+_LEDGER_OP = {WRITE_ONCE: "hput", SEQUENCED: "xadd", REV_FORWARD: "hset"}
+_REVISION = re.compile(r"(r?)([1-9][0-9]{0,3}) ")     # 1..9999: a log never reaches the stream's trim bound
 
 OPS_READ = ("get", "hgetall", "xrange")
 # hput: REPLACE a whole hash from one b64 JSON object {field: string}, in one transaction with one
@@ -134,6 +156,12 @@ MAX_RANGE = 20
 # entry it read, so a burst of more than MAX_RANGE messages is paged, never silently cut to the newest.
 STREAM_ID = re.compile(r"[0-9]{1,20}-[0-9]{1,20}")
 U64_MAX = 2 ** 64 - 1
+
+
+def _revision(text, mark: str):
+    """The revision a ledger value starts with - "r<N> " in a log, "<N> " in an index - or None."""
+    m = _REVISION.match(text if isinstance(text, str) else "")
+    return int(m[2]) if m and m[1] == mark else None
 
 
 def _id_pair(value: str) -> tuple:
@@ -1331,14 +1359,35 @@ def _write(conn, acl, who, raw_tag, via, op, key, field, value, now) -> dict:
 
     Every Refused raised in here is audited by the caller. Every EXEC result is inspected: a success
     is reported only when both the write and its audit entry succeeded."""
-    ttl = ttl_for(acl, key)
+    # The record itself is never given an expiry here; its list is a cache and takes the access list's.
+    ttl = None if key.startswith(WRITE_ONCE + SEQUENCED) else ttl_for(acl, key)
     pipe = conn.pipeline(transaction=True)
     try:
         pipe.watch(key)                              # immediate mode until multi()
         kind = _text(pipe.type(key))
+        for prefixes, only in _LEDGER_OP.items():
+            if key.startswith(prefixes) and op != only:
+                raise Refused("a work record is a ledger: this key takes %s and nothing else" % only)
         allowed = WRITABLE_TYPES.get(op)
         if allowed and kind not in allowed:
             raise Refused("the key holds a %s; %s writes a %s" % (kind, op, allowed[1]))
+        # Each of the three is decided here, under the WATCH: if the key changes after the comparison,
+        # EXEC applies nothing.
+        if key.startswith(WRITE_ONCE) and kind != "none":
+            raise Refused("this work record is already described; a description is written once")
+        if key.startswith(SEQUENCED):
+            want = _revision(value, "r")
+            if want is None:
+                raise Refused("an entry in a work record's log starts with its revision, r<N>")
+            last = pipe.xrevrange(key, count=1)
+            held = 0
+            if last:
+                fields = last[0][1] or {}
+                held = _revision(_text(fields.get("text", fields.get(b"text", ""))), "r")
+                if held is None:
+                    raise Refused("the log's last entry carries no revision; a person must look")
+            if want != held + 1:
+                raise Refused("revision conflict: the record is at r%d" % held)
         # The OLD value, read under the WATCH, so the audit says exactly what this replaced.
         if op in ("set", "del"):
             old = pipe.get(key) if kind in ("none", "string") else "(%s)" % kind
@@ -1351,6 +1400,13 @@ def _write(conn, acl, who, raw_tag, via, op, key, field, value, now) -> dict:
                     raise Refused("a read cursor only moves forward; the key holds a later one")
         elif op == "hset":
             old = pipe.hget(key, field)
+            if key.startswith(REV_FORWARD):
+                want = _revision(value, "")
+                if want is None:
+                    raise Refused("a line in a work list starts with its revision")
+                held = _revision(_text(old), "") if old is not None else None
+                if held is not None and want < held:
+                    raise Refused("the list holds a later revision of this record")
         elif op == "hput":
             found = pipe.hgetall(key) or {}
             old = canonical({_text(k): _text(v) for k, v in found.items()}) if found else None

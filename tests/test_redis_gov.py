@@ -575,6 +575,164 @@ class AReadCursorOnlyMovesForward(unittest.TestCase):
             self.assertIn("refused", run(conn, "grok", "set", self.KEY, val="3-0", acl=acl))
 
 
+class AWorkRecordIsALedger(unittest.TestCase):
+    """proj:work:v1: (Aya, 2026-10-13): a move is an atomic compare-and-set, and the only audit record is
+    not deleted. Written once, appended in order, never backwards - each under the write's own WATCH."""
+
+    REC, LOG, INDEX = "proj:work:v1:rec:W-20261013-a1b2c3", "proj:work:v1:log:W-20261013-a1b2c3", \
+        "proj:work:v1:index:20261013"
+    DESCRIPTION = json.dumps({"title": "Wire the reader", "done_when": "the suite is green"})
+
+    def put(self, conn, who="grok", val=None):
+        return run(conn, who, "hput", self.REC, val=base64.b64encode((val or self.DESCRIPTION).encode()).decode(),
+                   enc="b64")
+
+    def add(self, conn, text, who="grok", via="REQ-1"):
+        return run(conn, who, "xadd", self.LOG, val=text, via=via)
+
+    # ------------------------------------------------------------------------ described once
+    def test_a_description_is_written_once_and_never_rewritten_or_removed(self):
+        conn = FakeRedis()
+        self.assertTrue(self.put(conn)["ok"])
+        again = self.put(conn, who="cursor", val=json.dumps({"title": "something easier"}))
+        self.assertIn("written once", again["refused"])
+        self.assertEqual("Wire the reader", conn.data[self.REC]["title"])
+        for op, kw in (("hset", {"field": "title", "val": "x"}), ("del", {}), ("set", {"val": "x"}),
+                       ("xadd", {"val": "r1 x"})):
+            out = run(conn, "grok", op, self.REC, **kw)
+            self.assertIn("this key takes hput and nothing else", out.get("refused", ""), op)
+        self.assertEqual("Wire the reader", conn.data[self.REC]["title"])
+        self.assertEqual("0", conn.audit()[-1]["ok"], "each refusal is audited")
+
+    # ------------------------------------------------------------------- moved in order: the CAS
+    def test_a_log_takes_only_the_next_revision(self):
+        conn = FakeRedis()
+        for bad in ("r2 accept", "r0 create", "create", "1 create", "r01 create", "r10000 create", "R1 create",
+                    "r1", "r-1 create", " r1 create", "r١ create"):
+            self.assertIn("refused", self.add(conn, bad), bad)
+        self.assertNotIn(self.LOG, conn.data, "a refused first entry created the stream")
+        self.assertTrue(self.add(conn, "r1 create requested")["ok"])
+        self.assertTrue(self.add(conn, "r2 accept accepted")["ok"])
+        for bad, why in (("r2 accept again", "the record is at r2"), ("r4 skips one", "the record is at r2"),
+                         ("r1 create again", "the record is at r2"), ("no revision", "starts with its revision")):
+            out = self.add(conn, bad)
+            self.assertIn(why, out["refused"], bad)
+        self.assertEqual(["r1 create requested", "r2 accept accepted"], [f["text"] for _, f in conn.data[self.LOG]])
+
+    def test_two_writers_who_read_the_same_revision_cannot_both_move_it(self):
+        """THE compare-and-set. Both read r1. One r2 lands; the other is refused and must read again."""
+        conn = FakeRedis()
+        self.add(conn, "r1 create requested grok")
+        first = self.add(conn, "r2 accept accepted grok", who="grok")
+        second = self.add(conn, "r2 cancel cancelled grok", who="cursor")
+        self.assertTrue(first["ok"])
+        self.assertEqual("revision conflict: the record is at r2", second["refused"])
+        self.assertEqual("r2 accept accepted grok", conn.data[self.LOG][-1][1]["text"])
+        self.assertEqual(("0", "cursor"), (conn.audit()[-1]["ok"], conn.audit()[-1]["actor"]), "the loser is audited")
+
+    def test_it_is_decided_under_the_watch_not_before_it(self):
+        """A rival r2 that lands between this write's comparison and its EXEC: nothing of this one applies."""
+        conn = FakeRedis()
+        self.add(conn, "r1 create requested")
+        real = conn.pipeline
+
+        def racing_pipeline(transaction=True):
+            pipe = real(transaction)
+            original_multi = pipe.multi
+
+            def multi():
+                conn.xadd(self.LOG, {"text": "r2 the rival", "by": "cursor", "at": "x"})    # after the look
+                original_multi()
+            pipe.multi = multi
+            return pipe
+        conn.pipeline = racing_pipeline
+        out = self.add(conn, "r2 mine")
+        self.assertFalse(out["ok"])
+        self.assertEqual(["r1 create requested", "r2 the rival"], [f["text"] for _, f in conn.data[self.LOG]])
+
+    def test_a_move_whose_answer_was_lost_cannot_land_after_someone_elses(self):
+        conn = FakeRedis()
+        self.add(conn, "r1 create requested")
+        self.assertTrue(self.add(conn, "r2 handoff requested cursor", via="bridge:later")["ok"])
+        late = self.add(conn, "r2 accept accepted grok", via="bridge:earlier")          # it arrives now
+        self.assertIn("revision conflict", late["refused"])
+        self.assertEqual(2, len(conn.data[self.LOG]))
+
+    def test_a_log_whose_last_entry_has_no_revision_takes_nothing_more(self):
+        conn = FakeRedis()
+        conn.xadd(self.LOG, {"text": "written around the governor", "by": "x", "at": "x"})
+        self.assertIn("a person must look", self.add(conn, "r1 create")["refused"])
+        self.assertIn("a person must look", self.add(conn, "r2 next")["refused"])
+
+    def test_a_log_is_append_only(self):
+        conn = FakeRedis()
+        self.add(conn, "r1 create requested")
+        for op, kw in (("del", {}), ("set", {"val": "x"}), ("hset", {"field": "a", "val": "x"})):
+            out = run(conn, "grok", op, self.LOG, **kw)
+            self.assertIn("this key takes xadd and nothing else", out.get("refused", ""), op)
+        self.assertEqual(1, len(conn.data[self.LOG]))
+        fresh = FakeRedis()                                  # nor may a key be squatted before its log exists
+        self.assertIn("refused", run(fresh, "grok", "set", self.LOG, val="x"))
+        self.assertNotIn(self.LOG, fresh.data)
+
+    def test_the_record_is_given_no_expiry_and_its_list_is(self):
+        conn = FakeRedis()
+        self.put(conn)
+        self.add(conn, "r1 create requested")
+        run(conn, "grok", "hset", self.INDEX, field="W-20261013-a1b2c3", val="1 requested grok")
+        self.assertNotIn(self.REC, conn.ttls, "the description was given an expiry")
+        self.assertNotIn(self.LOG, conn.ttls, "the only audit record was given an expiry")
+        self.assertEqual(ACL["ttl_seconds"]["proj:"], conn.ttls[self.INDEX], "the list is a cache")
+        self.assertTrue(gov.ttl_for(ACL, self.LOG), "the access list would have expired it; the code does not")
+
+    # ------------------------------------------------------------------- the list: never backwards
+    def test_a_list_line_never_goes_to_a_lower_revision(self):
+        conn = FakeRedis()
+        field = "W-20261013-a1b2c3"
+
+        def line(text):
+            return run(conn, "grok", "hset", self.INDEX, field=field, val=text)
+
+        self.assertTrue(line("1 requested grok")["ok"])
+        self.assertTrue(line("3 working grok")["ok"])
+        self.assertIn("holds a later revision", line("2 accepted grok")["refused"])
+        self.assertTrue(line("3 working grok")["ok"], "writing the same line again is a repair, not a step back")
+        self.assertTrue(line("10 done grok")["ok"], '"10" sorts before "3" as text')
+        self.assertIn("refused", line("9 review grok"))
+        for bad in ("working grok", "r4 working", "0 x", " 4 x", "4"):
+            self.assertIn("starts with its revision", line(bad)["refused"], bad)
+        self.assertEqual("10 done grok", conn.data[self.INDEX][field])
+        self.assertTrue(run(conn, "grok", "hset", self.INDEX, field="W-20261013-ffffff", val="1 requested x")["ok"],
+                        "another record's line is its own")
+        for op, kw in (("del", {}), ("hput", {"val": base64.b64encode(b'{"a": "1 x"}').decode(), "enc": "b64"})):
+            self.assertIn("this key takes hset and nothing else", run(conn, "grok", op, self.INDEX, **kw)["refused"])
+
+    def test_a_line_nobody_can_read_may_be_repaired(self):
+        conn = FakeRedis()
+        conn.hset(self.INDEX, "W-20261013-a1b2c3", "left by something else")
+        self.assertTrue(run(conn, "grok", "hset", self.INDEX, field="W-20261013-a1b2c3", val="2 accepted grok")["ok"])
+
+    # ------------------------------------------------------------------------------- the edges
+    def test_only_these_three_prefixes_and_no_access_list_can_change_them(self):
+        self.assertEqual((("proj:work:v1:rec:",), ("proj:work:v1:log:",), ("proj:work:v1:index:",)),
+                         (gov.WRITE_ONCE, gov.SEQUENCED, gov.REV_FORWARD))
+        conn = FakeRedis()
+        for key in ("proj:work:v2:log:x", "proj:pr-board:v1:log:x", "proj:worklog:x", "fleet:inbox:grok"):
+            self.assertTrue(run(conn, "grok", "xadd", key, val="no revision here")["ok"], key)
+            self.assertTrue(conn.ttls.get(key), key)
+        self.assertTrue(run(conn, "grok", "hset", "proj:pr-board:v1:index:20261013", field="a", val="anything")["ok"])
+        loose = dict(ACL, WRITE_ONCE=[], SEQUENCED=[], REV_FORWARD=[], ledger=False)
+        self.add(conn, "r1 create")
+        self.assertIn("refused", run(conn, "grok", "xadd", self.LOG, val="r5 jump", acl=loose))
+        self.assertIn("refused", run(conn, "grok", "del", self.LOG, acl=loose))
+
+    def test_it_is_not_a_state_machine_and_the_protected_keys_stay_protected(self):
+        conn = FakeRedis()
+        self.assertTrue(self.add(conn, "r1 anything at all can follow the revision")["ok"])
+        self.assertIn("refused", run(conn, "grok", "xadd", "gov:audit", val="r1 x"))
+        self.assertIn("refused", run(conn, "nobody", "xadd", self.LOG, val="r2 x"), "the access list still decides who")
+
+
 class TheServerSetsTheTTL(unittest.TestCase):
     def test_longest_prefix_wins(self):
         conn = FakeRedis()

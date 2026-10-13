@@ -142,6 +142,8 @@ on:
       - "tests/test_redis_inbox.py"
       - "scripts/bridge_client.py"
       - "tests/test_bridge_client.py"
+      - "scripts/redis_work.py"
+      - "tests/test_redis_work.py"
       - "cloud/redis-tool-bridge/callers.json"
       - "scripts/sf360.py"
       - "tests/test_org_publish.py"
@@ -245,6 +247,8 @@ on:
       - "tests/test_redis_inbox.py"
       - "scripts/bridge_client.py"
       - "tests/test_bridge_client.py"
+      - "scripts/redis_work.py"
+      - "tests/test_redis_work.py"
       - "cloud/redis-tool-bridge/callers.json"
       - "scripts/roster_seed.py"
       - "tests/test_roster_seed.py"
@@ -1077,6 +1081,7 @@ jobs:
       # Its combined tests drive the REAL service in process: bridge_client.call -> main.Handler.do_POST
       # -> op.handle -> redis_gov.execute (Aya on 0baa197). Only the socket, Google's verifier and Redis
       # are stood in, so this suite also fails on a change to cloud/redis-tool-bridge/ or redis_gov.py.
+      # test_redis_work (2026-10-13): task and issue records over both routes, on the same fakes.
       - name: "redis gov, git requests, live mode, archive, inbox, bridge client: the governed path and its worker (no network)"
         run: |
           set -euo pipefail
@@ -1089,7 +1094,8 @@ jobs:
                       "test_live_mode:cloud/bus-reconciler/serve_requests.py" \
                       "test_redis_archive:cloud/bus-reconciler/redis_archive.py" \
                       "test_redis_inbox:scripts/redis_inbox.py" \
-                      "test_bridge_client:scripts/bridge_client.py"; do
+                      "test_bridge_client:scripts/bridge_client.py" \
+                      "test_redis_work:scripts/redis_work.py"; do
             suite="${pair%%:*}"; code="${pair#*:}"
             if [ -f "tests/${suite}.py" ]; then
               sudo unshare -n -- "$python_bin" -B -m unittest "tests.${suite}" -v
