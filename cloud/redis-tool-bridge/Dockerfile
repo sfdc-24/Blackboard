@@ -19,6 +19,13 @@ RUN pip install --no-cache-dir -r /app/requirements.txt \
 # The connection, the off-switch and the TLS rules - borrowed, never reimplemented.
 COPY scripts/redis_dual.py /app/redis_dual.py
 COPY scripts/redis_dual.settings.json /app/redis_dual.settings.json
+# /op: the governed module and its access list are the ONE copy the board worker also runs
+# (cloud/bus-reconciler/Dockerfile copies the same two files), so the bridge cannot disagree with
+# the board about who may write what.
+COPY scripts/redis_gov.py /app/redis_gov.py
+COPY scripts/redis_acl.json /app/redis_acl.json
+COPY cloud/redis-tool-bridge/callers.json /app/callers.json
+COPY cloud/redis-tool-bridge/op.py /app/op.py
 COPY cloud/redis-tool-bridge/main.py /app/main.py
 
 ENV PYTHONUNBUFFERED=1

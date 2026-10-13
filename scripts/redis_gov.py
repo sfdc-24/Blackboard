@@ -46,6 +46,20 @@ WHAT NOBODY MAY WRITE THROUGH THIS, WHATEVER THE ACL SAYS
     Reads of all of these are allowed - including gov:audit, because governance that cannot be
     inspected is not governance.
 
+WHAT ONLY MOVES FORWARD
+    FORWARD_ONLY below, also in code and not configurable by the ACL: a reader's cursor,
+    fleet:cursor:<agent>. A `set` there must be a stream entry id and may not be LOWER than the one the
+    key holds. It is decided under the same WATCH as the write, so it is a compare-and-set, not a
+    look-then-write. Why (Aya, 2026-10-13): a checkpoint whose answer was lost may still be on its way.
+    Without this, that old `set` could land AFTER a newer one and move the cursor back. With it, the old
+    one is refused whenever it arrives. `del` still removes the key: moving a cursor back on purpose is
+    a deletion first, audited as one.
+    "Whenever it arrives" needs the key to still be there (Copilot on 98a3e90): the rule compares
+    against the value the key HOLDS, so a cursor that expired would let a delayed older save in with
+    nothing to refuse it and nothing audited as removed. So a `set` of a cursor is written with NO
+    expiry, whatever ttl_seconds says for fleet:, and it clears an expiry an older governor left.
+    One small string per reader; only `del` removes it.
+
 IDENTITY, STATED HONESTLY
     The actor is the row's Source_Tag. Appending a row needs the board secret, so the writer is a
     fleet member - but WHICH fleet member is a claim, not a proof. This does not pretend otherwise:
@@ -70,6 +84,7 @@ AUDIT_STREAM = "gov:audit"
 AUDIT_MAXLEN = 200000
 
 PROTECTED = ("v1:bus:", "v1:agent:", "v1:conf:", "v1:synth:", "probe:", "gov:")
+FORWARD_ONLY = ("fleet:cursor:",)
 
 OPS_READ = ("get", "hgetall", "xrange")
 # hput: REPLACE a whole hash from one b64 JSON object {field: string}, in one transaction with one
@@ -124,6 +139,13 @@ MAX_RANGE = 20
 # entry it read, so a burst of more than MAX_RANGE messages is paged, never silently cut to the newest.
 STREAM_ID = re.compile(r"[0-9]{1,20}-[0-9]{1,20}")
 U64_MAX = 2 ** 64 - 1
+
+
+def _id_pair(value: str) -> tuple:
+    """A stream id that stream_id_ok has passed, as two integers: ids compare as numbers, never as text
+    ("9-0" sorts after "10-0" as a string)."""
+    ms, seq = value.split("-")
+    return int(ms), int(seq)
 
 
 def stream_id_ok(value: str) -> bool:
@@ -481,6 +503,17 @@ def backend_receipt_accepts(receipt) -> bool:
     return True
 
 
+def entry_view(entry_id, fields) -> dict:
+    """One stream entry as an answer shows it. "id" is ALWAYS the stream id. A field that is itself named
+    `id` is shown as "field:id": it used to overwrite the stream id, so a reader that keeps a cursor by the
+    shown id could be moved past messages it never read (Cursor on PR 397). A field already named
+    "field:..." gains one more prefix, so no two fields can land on one name (Copilot on PR 397)."""
+    view = {("field:" + k if k == "id" or k.startswith("field:") else k): preview(v)
+            for k, v in (fields or {}).items()}
+    view["id"] = str(entry_id)
+    return view
+
+
 def _read(conn, acl, who, raw_tag, via, op, key, count, now, after="") -> dict:
     if op == "get":
         value = conn.get(key)
@@ -502,17 +535,15 @@ def _read(conn, acl, who, raw_tag, via, op, key, count, now, after="") -> dict:
             entries = conn.xrange(key, min="(" + after, max="+", count=n + 1) or []
         more = len(entries) > n
         entries = entries[:n]
-        # `last` - the next after= - is the raw stream id, never the rendered entry's "id": a field named
-        # `id` overwrites that key in the rendering (Cursor on 2dc187a).
+        # `last` - the next after= - is the raw stream id of the last entry returned (Cursor on 2dc187a).
         out = {"ok": True, "op": op, "key": key, "entries": len(entries), "after": after, "more": more,
                "last": str(entries[-1][0]) if entries else after,
-               "value": [{"id": str(i), **{k: preview(v) for k, v in f.items()}} for i, f in entries]}
+               "value": [entry_view(i, f) for i, f in entries]}
     else:                                                                       # xrange, the newest n
         n = max(1, min(int(count or 10), MAX_RANGE))
         entries = conn.xrevrange(key, count=n) or []
         out = {"ok": True, "op": op, "key": key, "entries": len(entries),
-               "value": [{"id": str(i), **{k: preview(v) for k, v in f.items()}}
-                         for i, f in reversed(entries)]}
+               "value": [entry_view(i, f) for i, f in reversed(entries)]}
     # A read is audited too - "who looked at what" is half of governance - but cheaply: no value.
     _audit_alone(conn, audit_fields(acl, who, raw_tag, via, op, key, "", True, "", now=now))
     out["audit"] = "ok"
@@ -1305,7 +1336,8 @@ def _write(conn, acl, who, raw_tag, via, op, key, field, value, now) -> dict:
 
     Every Refused raised in here is audited by the caller. Every EXEC result is inspected: a success
     is reported only when both the write and its audit entry succeeded."""
-    ttl = ttl_for(acl, key)
+    # A saved read cursor never expires: FORWARD_ONLY compares against what the key holds.
+    ttl = None if (op == "set" and key.startswith(FORWARD_ONLY)) else ttl_for(acl, key)
     pipe = conn.pipeline(transaction=True)
     try:
         pipe.watch(key)                              # immediate mode until multi()
@@ -1316,6 +1348,13 @@ def _write(conn, acl, who, raw_tag, via, op, key, field, value, now) -> dict:
         # The OLD value, read under the WATCH, so the audit says exactly what this replaced.
         if op in ("set", "del"):
             old = pipe.get(key) if kind in ("none", "string") else "(%s)" % kind
+            if op == "set" and key.startswith(FORWARD_ONLY):
+                # Under the WATCH: if the key changes after this comparison, EXEC applies nothing.
+                if not stream_id_ok(value):
+                    raise Refused("a read cursor is a stream entry id, <ms>-<seq>")
+                held = _text(old) if old is not None else ""
+                if stream_id_ok(held) and _id_pair(value) < _id_pair(held):
+                    raise Refused("a read cursor only moves forward; the key holds a later one")
         elif op == "hset":
             old = pipe.hget(key, field)
         elif op == "hput":

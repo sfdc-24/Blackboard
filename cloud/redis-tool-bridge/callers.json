@@ -1,0 +1,7 @@
+{
+  "why": "Who a VERIFIED bridge caller acts as. The key is the email of the OIDC token main.verify_caller accepted; the value is a principal in scripts/redis_acl.json. A caller must ALSO be on the service's BRIDGE_CALLERS allowlist and hold run.invoker on the service: three independent gates, and this is the one that decides whose name goes in gov:audit.",
+  "how_to_change": "Add one line, in a reviewed PR, AFTER the service account exists and the owner has approved it (docs/REDIS-PRIMARY.md, D2). tests/test_redis_tool_bridge.py refuses a caller whose principal cannot write fleet: and conf:, and refuses a deploy allowlist that names a caller missing from here.",
+  "callers": {
+    "aya-runtime@sfdc24.iam.gserviceaccount.com": "chatgpt-codex-desktop"
+  }
+}

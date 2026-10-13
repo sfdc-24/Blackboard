@@ -98,6 +98,8 @@ zoom-agent/.tokens.json
 .foundry_waker_state.json
 .grok_wa_inbox_state.json
 .gemini_waker_state.json
+.redis_bridge_breaker.json
+.redis_bridge_unknown.jsonl
 
 # WhatsApp media fetched by scripts/wa_media.py. This is HIS content -
 # conference photographs, voice notes - pulled from Meta's media API into
