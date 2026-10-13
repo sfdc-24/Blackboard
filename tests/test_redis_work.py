@@ -48,8 +48,9 @@ def canon(agent):
 
 def work_description(**change):
     """A description with exactly the store's fields."""
-    return dict({"created": "2026-10-13T05:00:00Z", "done_when": "d", "kind": "task", "link": "-",
-                 "project": "Blackboard", "requested_by": ME, "source": "s", "title": "x"}, **change)
+    return dict({"created": "2026-10-13T05:00:00Z", "done_when": "d", "due": "-", "kind": "task", "link": "-",
+                 "milestone": "-", "project": "Blackboard", "requested_by": ME, "source": "s", "title": "x"},
+                **change)
 
 
 def account(agent):
@@ -203,6 +204,63 @@ class Records(unittest.TestCase):
                          re.findall(r"r\d+>r\d+", "\n".join(out.splitlines()[:7])), "oldest first, all of it")
 
     # ------------------------------------- Aya: "derive actor from authenticated transport"
+    # ------------------------------------------------------------------- plan against actual
+    def test_a_planned_date_and_a_milestone_are_part_of_what_was_asked_and_the_actual_date_is_the_stores(self):
+        rid = self.create(extra=("--due", "2026-10-20", "--milestone", "RED-M3"))
+        record = self.conn.data[work.REC % rid]
+        self.assertEqual(("2026-10-20", "RED-M3"), (record["due"], record["milestone"]))
+        code, out = self.cmd("grok", "show", rid)
+        self.assertEqual(0, code, out)
+        self.assertIn("milestone RED-M3; planned 2026-10-20; not done", out)
+        for who, argv in (("grok", ["accept", rid, "--next", "read the spec"]), ("grok", ["start", rid]),
+                          ("grok", ["done", rid, "--evidence", LINK])):
+            code, out = self.cmd(who, *argv)
+            self.assertEqual(0, code, out)
+        stamped = [dict(f)["at"] for _, f in self.conn.data[work.LOG % rid]][-1][:10]     # the governor's clock
+        code, out = self.cmd("gemini", "show", rid, route="board")
+        self.assertEqual(0, code, out)
+        self.assertIn("milestone RED-M3; planned 2026-10-20; done %s (" % stamped, out)
+        self.assertNotIn("actual", " ".join(sorted(record)), "nobody types the actual date: it is not a field")
+
+    def test_a_record_with_no_plan_says_so_and_a_date_that_does_not_exist_is_refused_before_anything_is_sent(self):
+        rid = self.create()
+        record = self.conn.data[work.REC % rid]
+        self.assertEqual(("-", "-"), (record["due"], record["milestone"]))
+        code, out = self.cmd("grok", "show", rid)
+        self.assertIn("no planned date; not done", out)
+        self.assertNotIn("milestone", out)
+        for extra, says in ((("--due", "2026-02-30"), "--due is the planned date"), (("--due", "next week"), "--due is"),
+                            (("--due", "13/10/2026"), "--due is"), (("--milestone", "two words"), "--milestone is"),
+                            (("--milestone", "x" * 31), "--milestone is")):
+            self.ops()
+            got = self.create(extra=extra, expect=2)
+            self.assertIn(says, got, extra)
+            self.assertEqual([], self.ops(), "a refused create sent nothing")
+
+    def test_plan_line_early_late_on_the_day_reopened_and_cancelled(self):
+        day = lambda text: datetime.datetime.strptime(text, "%Y-%m-%d").replace(tzinfo=datetime.timezone.utc)  # noqa: E731
+        rec = {"due": "2026-10-20", "milestone": "-"}
+        done = {"state": "done"}
+        for at, says in (("2026-10-18T09:00:00Z", "planned 2026-10-20; done 2026-10-18 (2 days early)"),
+                         ("2026-10-20T23:59:59Z", "planned 2026-10-20; done 2026-10-20 (on the day)"),
+                         ("2026-10-21T00:00:01Z", "planned 2026-10-20; done 2026-10-21 (1 day late)")):
+            self.assertEqual(says, work.plan_line(rec, [{"at": at}], done, day("2026-11-01")))
+        # a reopened record is not done: its old closing date is not its actual date
+        self.assertEqual("planned 2026-10-20; not done (3 days past the plan)",
+                         work.plan_line(rec, [{"at": "2026-10-18T09:00:00Z"}, {"at": "2026-10-19T09:00:00Z"}],
+                                        {"state": "working"}, day("2026-10-23")))
+        self.assertEqual("planned 2026-10-20; not done", work.plan_line(rec, [{"at": "x"}], {"state": "working"},
+                                                                       day("2026-10-20")))
+        self.assertEqual("planned 2026-10-20; cancelled, no actual date",
+                         work.plan_line(rec, [{"at": "2026-10-18T09:00:00Z"}], {"state": "cancelled"}, day("2026-11-01")))
+        self.assertEqual("milestone CLD-M3; no planned date; done 2026-10-18",
+                         work.plan_line({"due": "-", "milestone": "CLD-M3"}, [{"at": "2026-10-18T09:00:00Z"}], done,
+                                        day("2026-11-01")))
+        # a description written before these fields existed, or a stamp that is not a time: say less, never guess
+        self.assertEqual("no planned date; not done", work.plan_line({}, [], None, day("2026-11-01")))
+        self.assertEqual("planned 2026-10-20; not done (12 days past the plan)",
+                         work.plan_line(rec, [{"at": "soon"}], done, day("2026-11-01")))
+
     def test_REGRESSION_the_board_route_reads_a_record_and_can_never_move_one(self):
         """"Board claimed Source_Tag/--as is not authenticated identity; refuse this protected transition
         path." The owner's own legal move, sent with the owner's own tag, by the board."""

@@ -595,8 +595,9 @@ class AWorkRecordIsAdmittedNotTrusted(unittest.TestCase):
     def add(self, conn, who, text, verified=True, via="bridge:test"):
         return run(conn, who, "xadd", self.LOG, val=text, via=via, verified=verified)
 
-    DESCRIPTION = {"created": "2026-10-13T05:00:00Z", "done_when": "the suite is green", "kind": "task",
-                   "link": "-", "project": "Blackboard", "requested_by": "cursor",
+    DESCRIPTION = {"created": "2026-10-13T05:00:00Z", "done_when": "the suite is green", "due": "2026-10-20",
+                   "kind": "task", "link": "-", "milestone": "RED-M3", "project": "Blackboard",
+                   "requested_by": "cursor",
                    "source": "board row AYA-REDIS-STAGE1-EXIT-CRITERIA-20261013", "title": "Wire the reader"}
 
     def put(self, conn, who="cursor", requested_by=None, verified=True, key=None, **change):
@@ -881,6 +882,26 @@ class AWorkRecordIsAdmittedNotTrusted(unittest.TestCase):
         self.assertFalse(out["ok"])
         self.assertIn("nothing was written", out["refused"])
         self.assertNotIn(self.LOG, conn.data, "a log began under a description that changed beneath it")
+
+    def test_a_description_carries_a_planned_date_that_exists_or_none_and_one_milestone_id_or_none(self):
+        conn = FakeRedis()
+        for change, why in (({"due": "2026-02-30"}, "due is a calendar date"), ({"due": "tomorrow"}, "due is a calendar date"),
+                            ({"due": "2026-10-20T00:00:00Z"}, "due is a calendar date"), ({"due": ""}, "due is empty"),
+                            ({"due": 20261020}, "a string value"), ({"milestone": "RED M3"}, "milestone is one id"),
+                            ({"milestone": "m" * 31}, "milestone is one id"), ({"milestone": ""}, "milestone is empty")):
+            out = self.put(conn, **change)
+            self.assertIn(why, out.get("refused", ""), change)
+            self.assertNotIn(self.REC, conn.data)
+        for missing in ("due", "milestone"):                                    # the old shape is not a description
+            body = {k: v for k, v in self.DESCRIPTION.items() if k != missing}
+            out = run(conn, "cursor", "hput", self.REC, val=base64.b64encode(json.dumps(body).encode()).decode(),
+                      enc="b64", verified=True)
+            self.assertIn("exactly these fields", out["refused"])
+        out = self.put(conn, actual="2026-10-19")                              # nobody types the actual date
+        self.assertIn("exactly these fields", out["refused"])
+        self.assertTrue(self.put(conn, due="-", milestone="-")["ok"])
+        self.assertEqual(("-", "-"), (conn.data[self.REC]["due"], conn.data[self.REC]["milestone"]))
+        self.assertTrue(gov.work_due("2028-02-29") and not gov.work_due("2027-02-29"))
 
     # ----------------------------------------------------------- no raw bypass: the three keys
     def test_a_description_is_written_once_by_its_verified_requester_and_never_rewritten_or_removed(self):

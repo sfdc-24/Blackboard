@@ -133,7 +133,12 @@ WORK_MOVES = {
 }
 _WORK_REV = re.compile(r"r[1-9][0-9]{0,3}")           # r1..r9999: a log never reaches the stream's trim bound
 WORK_KINDS = ("task", "issue")
-WORK_FIELDS = ("created", "done_when", "kind", "link", "project", "requested_by", "source", "title")
+WORK_FIELDS = ("created", "done_when", "due", "kind", "link", "milestone", "project", "requested_by", "source", "title")
+# The plan a record is measured against. `due` is the planned date; "-" says none was planned. The ACTUAL
+# date is never a field: it is the time this governor stamps on the entry that closes the record, so
+# nobody can type it in. `milestone` names the deliverable the record counts toward, or "-".
+WORK_DUE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+WORK_MILESTONE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,29}$")
 WORK_LIST_TITLE = 30                                   # how much of a title a list line carries
 
 OPS_READ = ("get", "hgetall", "xrange")
@@ -273,6 +278,19 @@ def work_allowed(prev, ev: dict) -> str:
     return "" if same["lease"] else "%s does not change the lease" % action
 
 
+def work_due(value) -> bool:
+    """Is `value` a planned date a description may carry: "-" for none, or a day that exists."""
+    if value == "-":
+        return True
+    if not isinstance(value, str) or not WORK_DUE.match(value):
+        return False
+    try:
+        datetime.date(int(value[:4]), int(value[5:7]), int(value[8:]))
+    except ValueError:
+        return False
+    return True
+
+
 def work_described(mapping, acl) -> str:
     """Why `mapping` is NOT a work record's description ("" when it is): exactly WORK_FIELDS, each a
     non-empty string a governed read shows whole, a kind, and a requester who is an agent."""
@@ -284,6 +302,10 @@ def work_described(mapping, acl) -> str:
             return "%s is empty, or longer than a read shows whole" % name
     if mapping["kind"] not in WORK_KINDS:
         return "kind is task or issue"
+    if not work_due(mapping["due"]):
+        return "due is a calendar date, YYYY-MM-DD, or - when none is planned"
+    if mapping["milestone"] != "-" and not WORK_MILESTONE.match(mapping["milestone"]):
+        return "milestone is one id of at most 30 letters, digits, dot, dash or underscore, or -"
     if principal(acl, mapping["requested_by"]) != mapping["requested_by"]:
         return "requested_by is an agent in the access list"
     return ""
