@@ -33,7 +33,8 @@ WHAT IT DOES NOT DO
     python scripts/redis_inbox.py send --to grok --text "..."    one message
     python scripts/redis_inbox.py read [--wait 180] [--count 4]  new messages to me, after my cursor
     python scripts/redis_inbox.py selftest                       the grammar, no network
-    python scripts/redis_inbox.py reconcile                      settle writes whose outcome is unknown
+    python scripts/redis_inbox.py reconcile                      read the evidence about unknown writes
+    python scripts/redis_inbox.py settle <id> --outcome ... --why "..."   a person's verdict on one
 
 THE DIRECT ROUTE, WHEN THIS AGENT HAS ONE (2026-10-13, docs/REDIS-PRIMARY.md Phase 3b)
     `send` and `read` first try scripts/bridge_client.py: one HTTPS call to the redis-tool-bridge,
@@ -53,24 +54,28 @@ THE DIRECT ROUTE, WHEN THIS AGENT HAS ONE (2026-10-13, docs/REDIS-PRIMARY.md Pha
       denied caller there would be a downgrade around the refusal;
     - an operation the access rules REFUSED: the board route runs the same rules.
 
-    SETTLING AN UNKNOWN WRITE (`reconcile`; Aya's Stage 1 exit check 5)
-    A write the bridge may or may not have committed is journalled and announced in one row (a status
-    and a place, never the message). `reconcile` then READS the stream it was aimed at, from five
-    minutes before the write to fifteen after, and looks for an entry by this agent whose shown text
-    has the journalled hash. Found: COMMITTED, with the entry id. Read to the end of the window and
-    not found, ten minutes or more after the write: ABSENT - it did not commit, and whether to send
-    it again is a person's decision, not this command's. Anything else stays UNKNOWN. It only ever
-    reads, so it may be run as often as wanted.
+    AN UNKNOWN WRITE STAYS UNKNOWN UNTIL A PERSON SETTLES IT (Aya on 506b98a; Stage 1 exit check 5)
+    A write the bridge may or may not have committed is in bridge_client's journal from before it was
+    sent, and is announced in one row (a status and a place, never the message). It is never sent
+    again by this tool.
+    `reconcile` READS and reports EVIDENCE. It settles nothing, because nothing it can read is proof:
+    - NOT OBSERVED is not "did not commit". A write that was still on its way can land after any
+      wait, so time alone never permits sending it again.
+    - CANDIDATE is not "committed". An entry by this agent that shows the same text may be this
+      write or another message with the same first 200 characters, sent before or since. The
+      stream carries no id that binds an entry to one request.
+    `settle <id> --outcome committed|not-committed --why "..."` is a PERSON's decision, recorded with
+    its reason. Nothing else closes an UNKNOWN.
 
-    THE READ CURSOR'S SAVE IS A WRITE TOO (Aya on 0baa197: a blind re-save is not proven monotonic)
+    THE READ CURSOR'S SAVE IS A WRITE TOO
     A save of fleet:cursor:<me> whose outcome is UNKNOWN may still be on its way, and could land after
-    a newer one. Two things stop that from moving the cursor back:
-    - `read` sends NO later save, by either route, while one is UNKNOWN. It says HELD and exits 7; the
-      local cursor still moves, so nothing is shown twice. `reconcile` settles it by reading the key:
-      it holds what was sent (COMMITTED), or ten minutes on it does not (NOT HELD). Then saves resume.
-    - The store itself refuses a cursor lower than the one it holds (redis_gov.FORWARD_ONLY, decided
-      under the same WATCH as the write). So the old save is refused whenever it arrives, whatever
-      this reader did or did not do. To move a cursor back on purpose, `del` it first.
+    a newer one. So `read` sends NO later save, by either route, while one is UNKNOWN - or while the
+    journal itself cannot be read whole, since the unreadable part may be the line that says so. It
+    says HELD and exits 7; the local cursor still moves, so nothing is shown twice.
+    Settling a held save needs more than a wait: the store must refuse a cursor that moves back
+    (redis_gov.FORWARD_ONLY) ON EVERY ROUTE that can still deliver the old save - the bridge and the
+    board worker, with no older writer left. That is checked by a person against what is deployed,
+    and `settle` asks for it in so many words (--forward-only-verified).
 
 THE LAPTOP LANE (step 3 of the broken-telephone fix, Converspan Channel Architecture v0.1)
     The cloud routes a Drive request to this laptop only while fleet:alive:claude-code-cli is
@@ -455,7 +460,7 @@ def direct(op: str, key: str, *, value: str | None = None, count: int | None = N
     except bridge_client.Unknown as why:
         unknown_row(op, key)
         return "unknown", ("UNKNOWN OUTCOME: %s.\nThe write was sent and MAY HAVE COMMITTED. It is NOT sent "
-                           "again by any route; it is recorded in %s. Settle it with: "
+                           "again by any route; it is recorded in %s. See the evidence with: "
                            "python scripts/redis_inbox.py reconcile"
                            % (why, os.path.basename(bridge_client.JOURNAL)))
     return ("ok", result) if result is not None else ("board", None)
@@ -465,13 +470,18 @@ _EXITS = {"refused": REFUSED_EXIT, "denied": DENIED_EXIT, "unknown": UNKNOWN_EXI
 
 
 def unsettled_checkpoint() -> str:
-    """The journal id of a save of MY read cursor whose outcome is still UNKNOWN, or ""."""
+    """Why no save of MY read cursor may be sent now, or "". A journal that cannot be read whole is a
+    reason: the part that cannot be read may be the line that says a save is unsettled."""
     sys.path.insert(0, os.path.join(REPO, "scripts"))
     import bridge_client                                          # noqa: E402
 
-    for entry in bridge_client.pending():
+    try:
+        waiting = bridge_client.pending()
+    except bridge_client.JournalUncertain as why:
+        return "The journal of unknown writes cannot be trusted (%s)" % why
+    for entry in waiting:
         if entry.get("op") == "set" and entry.get("key") == CURSOR_KEY % ME:
-            return str(entry.get("id"))
+            return "An earlier save (%s) has an unknown outcome" % entry.get("id")
     return ""
 
 
@@ -553,9 +563,8 @@ def cmd_read(args) -> int:
         # blind re-save is not proven monotonic - the old one could land after the new one). The local
         # cursor has moved, so nothing is shown twice; only the copy in Redis waits.
         code = code or UNKNOWN_EXIT
-        print("cursor %s -> %s (local); in Redis: HELD. An earlier save (%s) has an unknown outcome, and no "
-              "later one is sent until it is settled: python scripts/redis_inbox.py reconcile"
-              % (start, cursor, held))
+        print("cursor %s -> %s (local); in Redis: HELD. %s. No later save is sent until a person settles "
+              "it: python scripts/redis_inbox.py reconcile" % (start, cursor, held))
     elif cursor != start or owed:
         # One save, by one route. An UNKNOWN outcome is journalled and holds every later save (above).
         # And the store itself refuses a cursor lower than the one it holds (redis_gov.FORWARD_ONLY), so
@@ -575,7 +584,7 @@ def cmd_read(args) -> int:
         else:
             code = code or 4
         print("cursor %s -> %s (local); in Redis: %s" % (
-            start, cursor, "saved" if ok else "NOT confirmed, the local one stands; held until reconciled"
+            start, cursor, "saved" if ok else "NOT confirmed, the local one stands; later saves are held until a person settles it"
             if kind == "unknown" else "NOT confirmed, the local one stands; retried next read"))
     print("%d shown from %s, cursor %s" % (shown, key, cursor))
     return code
@@ -584,9 +593,9 @@ def cmd_read(args) -> int:
 # ---------------------------------------------------------------------------------------- reconcile
 SETTLE_BEFORE = 300        # seconds before the journalled time the search starts: this clock is not Redis's
 SETTLE_AFTER = 900         # and seconds after it the search ends: a slow commit, and the same skew
-SETTLE_MIN_AGE = 600       # ABSENT is not said of a write younger than this: it could still land
 SETTLE_PAGES = 3           # pages read per unknown write; on the board route each page is one row
 UNSETTLED_EXIT = 8
+OUTCOMES = {"committed": "COMMITTED_BY_HAND", "not-committed": "NOT_COMMITTED_BY_HAND"}
 
 
 def one_page(key: str, cursor: str, count: int, wait: float, since: str) -> tuple:
@@ -607,15 +616,17 @@ def one_page(key: str, cursor: str, count: int, wait: float, since: str) -> tupl
 
 
 def find_write(entry: dict, wait: float, since: str, pages: int) -> tuple:
-    """Look for one journalled xadd in its stream. ("found", id) | ("absent", "") when the whole window
-    was read and it is not there | ("unread", why) when the window could not be read to its end."""
+    """Look for entries that COULD be one journalled xadd. ("seen", [ids]) when the whole window was
+    read - the list is every entry by this agent whose shown text has the journalled hash, and may
+    be empty | ("unread", why) when the window could not be read to its end. Neither is proof: an
+    empty list is not "it did not commit", and a match is not "this is the one"."""
     sys.path.insert(0, os.path.join(REPO, "scripts"))
     import bridge_client                                          # noqa: E402
 
     key, at = str(entry["key"]), int(entry["epoch"])
     cursor = "%d-0" % (max(0, at - SETTLE_BEFORE) * 1000)
     last_ms = (at + SETTLE_AFTER) * 1000
-    count = READ_COUNT
+    count, alike = READ_COUNT, []
     for _page in range(max(1, int(pages))):
         page, why = one_page(key, cursor, count, wait, since)
         if page is None:
@@ -627,12 +638,12 @@ def find_write(entry: dict, wait: float, since: str, pages: int) -> tuple:
             return "unread", page["why"]
         for shown_entry in page["entries"]:
             if stream_id(shown_entry["id"])[0] > last_ms:
-                return "absent", ""
+                return "seen", alike
             if (str(shown_entry.get("by", "")) == ME and
                     bridge_client._sha(str(shown_entry.get("text", ""))) == entry.get("shown_sha256")):
-                return "found", str(shown_entry["id"])
+                alike.append(str(shown_entry["id"]))
         if not page["more"]:
-            return "absent", ""
+            return "seen", alike
         cursor = page["last"]
     return "unread", "the window is longer than %d pages; run it again with --pages" % pages
 
@@ -679,76 +690,94 @@ def one_value(key: str, wait: float, since: str) -> tuple:
 
 
 def find_checkpoint(entry: dict, wait: float, since: str) -> tuple:
-    """Look at the cursor key for one journalled save. ("found", "") when the key holds exactly what was
-    sent | ("absent", "") when it holds anything else, or nothing | ("unread", why)."""
+    """Look at the cursor key for one journalled save. ("seen", True) when the key holds the value that
+    was sent - by this save, or by another save of the same value | ("seen", False) when it holds
+    anything else, or nothing | ("unread", why)."""
     sys.path.insert(0, os.path.join(REPO, "scripts"))
     import bridge_client                                          # noqa: E402
 
     value, why = one_value(str(entry["key"]), wait, since)
     if value is None:
         return "unread", why
-    return ("found", "") if bridge_client._sha(value) == entry.get("shown_sha256") else ("absent", "")
+    return "seen", bridge_client._sha(value) == entry.get("shown_sha256")
 
 
 def cmd_reconcile(args) -> int:
-    """Settle every UNKNOWN write in the journal that can be settled by READING. It sends no write."""
+    """Read what can be read about every UNKNOWN write, and report it AS EVIDENCE. It sends no write
+    and it settles nothing: `settle` does that, on a person's word."""
     sys.path.insert(0, os.path.join(REPO, "scripts"))
     import bridge_client                                          # noqa: E402
 
-    waiting = bridge_client.pending()
+    try:
+        waiting = bridge_client.pending()
+    except bridge_client.JournalUncertain as why:
+        print("THE JOURNAL CANNOT BE TRUSTED: %s. Every save of the read cursor is held until a person "
+              "repairs or sets aside %s." % (why, bridge_client.JOURNAL))
+        return UNSETTLED_EXIT
     if not waiting:
         print("nothing to reconcile: no write has an unknown outcome")
         return 0
-    left = 0
     for entry in waiting:
         what = "%s %s on %s at %s" % (entry["id"], entry.get("op"), entry.get("key"), entry.get("at"))
-        now = time.time()
-        # A save of MY read cursor is settled by reading the key it was aimed at. Until it is, cmd_read
-        # sends no later save (unsettled_checkpoint), so "the key holds something else" cannot be a
-        # later save of this reader's hiding a committed one.
         checkpoint = entry.get("op") == "set" and entry.get("key") == CURSOR_KEY % ME
         if (not (checkpoint or entry.get("op") == "xadd") or not entry.get("shown_sha256")
                 or "epoch" not in entry):
-            left += 1
-            print("UNKNOWN     %s: this command can only look for an xadd or a save of the read cursor; "
-                  "settle it by hand" % what)
-            continue
-        if checkpoint:
-            state, detail = find_checkpoint(entry, args.wait, args.since)
-            if state == "found":
-                bridge_client.settle(entry, "COMMITTED", "the cursor key holds it", now)
-                print("COMMITTED   %s: the cursor key holds it. Later saves may go." % what)
-            elif state == "absent" and now - int(entry["epoch"]) >= SETTLE_MIN_AGE:
-                bridge_client.settle(entry, "NOT_HELD", "the cursor key does not hold it", now)
-                print("NOT HELD    %s: the cursor key does not hold it. Later saves may go: the store "
-                      "refuses a cursor that moves back, so this one cannot undo a later one if it "
-                      "still arrives." % what)
-            elif state == "absent":
-                left += 1
-                print("UNKNOWN     %s: the cursor key does not hold it yet, and it is under %d s old, so it "
-                      "could still land. Run this again later." % (what, SETTLE_MIN_AGE))
+            print("UNKNOWN       %s: this command can only look for an xadd or a save of the read cursor" % what)
+        elif checkpoint:
+            state, seen = find_checkpoint(entry, args.wait, args.since)
+            if state == "unread":
+                print("UNKNOWN       %s: the cursor key could not be read (%s)" % (what, seen))
+            elif seen:
+                print("CANDIDATE     %s: the cursor key holds this value now - by this save, or by another "
+                      "save of the same value. Later saves stay HELD." % what)
             else:
-                left += 1
-                print("UNKNOWN     %s: the cursor key could not be read (%s)" % (what, detail))
-            continue
-        state, detail = find_write(entry, args.wait, args.since, args.pages)
-        if state == "found":
-            bridge_client.settle(entry, "COMMITTED", "entry %s" % detail, now)
-            print("COMMITTED   %s: it is entry %s. Do NOT send it again." % (what, detail))
-        elif state == "absent" and now - int(entry["epoch"]) >= SETTLE_MIN_AGE:
-            bridge_client.settle(entry, "ABSENT", "not in the stream from %d s before to %d s after"
-                                 % (SETTLE_BEFORE, SETTLE_AFTER), now)
-            print("ABSENT      %s: it did not commit. Sending it again is your decision; this command "
-                  "sends nothing." % what)
-        elif state == "absent":
-            left += 1
-            print("UNKNOWN     %s: not there yet, and it is under %d s old, so it could still land. "
-                  "Run this again later." % (what, SETTLE_MIN_AGE))
+                print("NOT OBSERVED  %s: the cursor key does not hold this value now. It may still land. "
+                      "Later saves stay HELD." % what)
         else:
-            left += 1
-            print("UNKNOWN     %s: the stream could not be read to the end of the window (%s)" % (what, detail))
-    print("%d settled, %d still unknown" % (len(waiting) - left, left))
-    return UNSETTLED_EXIT if left else 0
+            state, seen = find_write(entry, args.wait, args.since, args.pages)
+            if state == "unread":
+                print("UNKNOWN       %s: the stream could not be read to the end of the window (%s)" % (what, seen))
+            elif seen:
+                print("CANDIDATE     %s: %d entr%s by this agent show%s the same text (%s). That may be this "
+                      "write or another message alike in its first %d characters. Not sent again."
+                      % (what, len(seen), "y" if len(seen) == 1 else "ies", "s" if len(seen) == 1 else "",
+                         ", ".join(seen[:5]), PREVIEW_CHARS))
+            else:
+                print("NOT OBSERVED  %s: no entry like it from %d s before to %d s after. That is not proof "
+                      "it did not commit: it may still land. Not sent again." % (what, SETTLE_BEFORE, SETTLE_AFTER))
+    print("%d still unknown. This is evidence, not a verdict; a person settles each one:\n"
+          "python scripts/redis_inbox.py settle <id> --outcome committed|not-committed --why \"...\""
+          % len(waiting))
+    return UNSETTLED_EXIT
+
+
+def cmd_settle(args) -> int:
+    """A PERSON's verdict on one UNKNOWN write, appended with its reason. The only thing that closes one."""
+    sys.path.insert(0, os.path.join(REPO, "scripts"))
+    import bridge_client                                          # noqa: E402
+
+    why = " ".join(str(args.why or "").split())[:300]
+    if len(why) < 10:
+        raise SystemExit("--why is the reason a reader will be given later: say what was checked")
+    try:
+        waiting = {str(entry["id"]): entry for entry in bridge_client.pending()}
+    except bridge_client.JournalUncertain as error:
+        raise SystemExit("the journal cannot be trusted (%s): repair or set aside %s first"
+                         % (error, bridge_client.JOURNAL)) from None
+    entry = waiting.get(args.id)
+    if entry is None:
+        raise SystemExit("%s is not an unsettled write in the journal" % args.id)
+    if entry.get("op") == "set" and str(entry.get("key", "")).startswith("fleet:cursor:") \
+            and not args.forward_only_verified:
+        raise SystemExit(
+            "%s is a save of a read cursor. Settling it lets later saves go, and the old one may still "
+            "arrive. That is safe only where the store refuses a cursor that moves back, on EVERY route "
+            "that can still deliver it: the bridge AND the board worker, with no older writer left. A "
+            "wait is not that check. When a person has checked what is deployed, say so: "
+            "--forward-only-verified" % args.id)
+    bridge_client.settle(entry, OUTCOMES[args.outcome], "by hand: " + why, time.time())
+    print("%s settled as %s, by hand: %s" % (args.id, OUTCOMES[args.outcome], why))
+    return 0
 
 
 def task_id_ok(task: str) -> str:
@@ -938,8 +967,16 @@ def cmd_selftest(_args) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="what", required=True)
-    for name in ("send", "read", "selftest", "beat", "accept", "done", "reconcile"):
+    for name in ("send", "read", "selftest", "beat", "accept", "done", "reconcile", "settle"):
         p = sub.add_parser(name)
+        if name == "settle":
+            p.add_argument("id", help="the journal id `reconcile` prints")
+            p.add_argument("--outcome", required=True, choices=sorted(OUTCOMES))
+            p.add_argument("--why", required=True, help="what was checked; kept with the verdict")
+            p.add_argument("--forward-only-verified", action="store_true",
+                           help="for a cursor save: the forward-only governor is deployed on the bridge "
+                                "AND the board worker, and no older writer is left")
+            continue
         if name not in ("selftest", "beat"):
             p.add_argument("--wait", type=float, default=WAIT_SECONDS,
                            help="seconds to wait for the worker (default %d)" % WAIT_SECONDS)
@@ -978,7 +1015,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=()) -> int:
     args = build_parser().parse_args(list(argv))
     return {"send": cmd_send, "read": cmd_read, "selftest": cmd_selftest, "beat": cmd_beat,
-            "accept": cmd_accept, "done": cmd_done, "reconcile": cmd_reconcile}[args.what](args)
+            "accept": cmd_accept, "done": cmd_done, "reconcile": cmd_reconcile,
+            "settle": cmd_settle}[args.what](args)
 
 
 if __name__ == "__main__":

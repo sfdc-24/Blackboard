@@ -50,16 +50,22 @@ FIVE OUTCOMES, AND WHAT EACH ONE PERMITS (Aya's review of a125337, blockers 1 an
                   the operation is recorded in a local journal as UNKNOWN and is NOT sent again.
                   Whether it committed is for a reconciliation to find out, not for a retry.
 
-THE JOURNAL, AND HOW AN UNKNOWN IS SETTLED (Aya's Stage 1 exit check 5)
-    .redis_bridge_unknown.jsonl is append-only. An UNKNOWN line holds what was sent, where and when,
-    and two hashes: of the value, and of the value AS A READ WOULD SHOW IT (redis_gov quotes a value
-    at 200 characters and replaces a pipe or a newline). It never holds the value. `redis_inbox.py
-    reconcile` READS the place the write was aimed at and looks for an entry by this agent whose
-    shown text has that second hash; reading changes nothing, so it can be run any number of times.
-    What it finds is appended as a second line that names the first. Nothing here ever sends the
-    operation again: a write found absent is reported, and sending it again is a person's decision.
-    A save of the read cursor is settled by reading its key, and while it is unsettled redis_inbox
-    sends no later save: pending() is what it asks.
+THE JOURNAL IS WRITTEN FIRST, AND IT FAILS CLOSED (Aya on 506b98a, defect 3)
+    .redis_bridge_unknown.jsonl is append-only. Before a WRITE leaves, one line is appended and
+    flushed to disk: what is about to be sent, where and when, and two hashes - of the value, and of
+    the value AS A READ WOULD SHOW IT (redis_gov quotes a value at 200 characters and replaces a pipe
+    or a newline). It never holds the value. That line says UNKNOWN from the moment it is written. A
+    second line closes it when the bridge gave an answer that settles it (done; refused; denied;
+    proved not executed). So:
+    - If the line cannot be written, the write is NOT sent through the bridge at all. There is no
+      write whose unknown outcome went unrecorded, in this invocation or the next.
+    - If the process dies between the send and the answer, the line is still there: UNKNOWN.
+    - If the closing line cannot be written, the write stays listed as UNKNOWN: a hold that is not
+      needed, never a release that is not earned.
+    - A journal that cannot be read whole - unreadable, or holding a line that is not a JSON object -
+      is UNCERTAIN: journal() raises, and everything that asks "is anything unsettled?" answers yes.
+    Nothing here ever sends an operation again, and nothing here settles an UNKNOWN on its own:
+    `redis_inbox.py reconcile` reads and reports what it sees as EVIDENCE, and a person settles.
 
 WHAT IS SAID, AND TO WHOM (blocker 5)
     Every failure is said out loud, in CLOSED words: a status number and a label from the table
@@ -81,6 +87,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import time
@@ -134,6 +141,11 @@ class Denied(BridgeProblem):
 
 class Unknown(BridgeProblem):
     """A request was sent and what happened to it is not known."""
+
+
+class JournalUncertain(Exception):
+    """The UNKNOWN journal exists and cannot be read whole. Whoever asked must act as if a write is
+    unsettled: the line that cannot be read may be the one that says so."""
 
 
 class Refused(Exception):
@@ -291,50 +303,74 @@ def _sha(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def journal_unknown(op: str, key: str, value, label: str, now: float, path=None) -> dict:
-    """One line per write whose outcome is unknown: what, where, when, and hashes of the value - never
-    the value. This is what a reconciliation reads; nothing here retries. Returns the record."""
-    text = "" if value is None else str(value)
-    at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
-    record = {"id": _sha("%s|%s|%s|%s" % (at, op, key, _sha(text)))[:16], "at": at, "epoch": int(now),
-              "op": op, "key": key, "value_sha256": _sha(text), "shown_sha256": _sha(shown(text)),
-              "value_chars": len(text), "outcome": "UNKNOWN", "why": label}
+def _append(record: dict, path=None) -> None:
+    """One line, on disk before this returns. OSError is the caller's to act on."""
     with open(path or JOURNAL, "a", encoding="utf-8", newline="") as fh:
         fh.write(json.dumps(record, sort_keys=True) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+def journal_unknown(op: str, key: str, value, label: str, now: float, path=None) -> dict:
+    """One line for a write whose outcome is not (yet) known: what, where, when, and hashes of the
+    value - never the value. attempt() writes it BEFORE the write is sent. Returns the record."""
+    text = "" if value is None else str(value)
+    record = {"id": secrets.token_hex(8), "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+              "epoch": int(now), "op": op, "key": key, "value_sha256": _sha(text),
+              "shown_sha256": _sha(shown(text)), "value_chars": len(text), "outcome": "UNKNOWN", "why": label}
+    _append(record, path)
     return record
 
 
 def journal(path=None) -> list:
-    """Every line of the journal that is a JSON object, in order. A line that is not is skipped: one
-    damaged line must not hide the rest."""
+    """Every line of the journal, in order. No file is no lines. A file that cannot be read, or that
+    holds a line that is not a JSON object, raises JournalUncertain: a damaged line is not skipped,
+    because it may be the one that says a write is unsettled."""
+    target = path or JOURNAL
+    if not os.path.exists(target):
+        return []
     out = []
     try:
-        with open(path or JOURNAL, encoding="utf-8") as fh:
-            for line in fh:
+        with open(target, encoding="utf-8") as fh:
+            for number, line in enumerate(fh, 1):
+                if not line.strip():
+                    continue
                 try:
                     record = json.loads(line)
                 except ValueError:
-                    continue
-                if isinstance(record, dict):
-                    out.append(record)
-    except OSError:
-        pass
+                    record = None
+                if not isinstance(record, dict):
+                    raise JournalUncertain("line %d of %s is damaged" % (number, os.path.basename(target)))
+                out.append(record)
+    except (OSError, UnicodeDecodeError) as error:
+        raise JournalUncertain("%s cannot be read (%s)" % (os.path.basename(target),
+                                                           type(error).__name__)) from None
     return out
 
 
 def pending(path=None) -> list:
-    """The UNKNOWN writes that no later line has settled."""
+    """The UNKNOWN writes that no later line has closed. Raises JournalUncertain with journal()."""
     lines = journal(path)
     settled = {str(r.get("resolves")) for r in lines if r.get("resolves")}
     return [r for r in lines if r.get("outcome") == "UNKNOWN" and r.get("id") and r["id"] not in settled]
 
 
 def settle(entry: dict, outcome: str, detail: str, now: float, path=None) -> None:
-    """Append what a reconciliation found. Append-only: the UNKNOWN line it names is never rewritten."""
-    record = {"resolves": entry["id"], "outcome": outcome, "detail": detail,
-              "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))}
-    with open(path or JOURNAL, "a", encoding="utf-8", newline="") as fh:
-        fh.write(json.dumps(record, sort_keys=True) + "\n")
+    """Append the line that closes an UNKNOWN one. Append-only: the line it names is never rewritten."""
+    _append({"resolves": entry["id"], "outcome": outcome, "detail": detail,
+             "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))}, path)
+
+
+def _close(intent, outcome: str, now: float, path, say) -> None:
+    """Close the line written before a write was sent. If that cannot be recorded the write stays
+    listed as UNKNOWN, and that is said: a hold that is not needed, never a release not earned."""
+    if intent is None:
+        return
+    try:
+        settle(intent, outcome, "", now, path)
+    except OSError as error:
+        say("the journal could not record that this write is settled (%s): it stays listed as UNKNOWN "
+            "(%s) until a person settles it" % (type(error).__name__, intent["id"]))
 
 
 def attempt(op: str, key: str, *, me: str, value=None, count=None, after=None, environ=None,
@@ -381,6 +417,15 @@ def attempt(op: str, key: str, *, me: str, value=None, count=None, after=None, e
         request["count"] = int(count)
     if after is not None:
         request["after"] = str(after)
+    intent = None
+    if write:
+        # BEFORE anything is sent. A write that cannot be remembered is not sent by this route.
+        try:
+            intent = journal_unknown(op, key, value, "sent; no answer recorded", now, journal_path)
+        except OSError as error:
+            say("BRIDGE NOT USED: the UNKNOWN journal cannot be written (%s), so a write that went wrong "
+                "could not be remembered. Using the board route." % type(error).__name__)
+            return None
     try:
         token = (minter or mint)(url, account)
         result = (caller or call)(url, token, request)
@@ -389,20 +434,23 @@ def attempt(op: str, key: str, *, me: str, value=None, count=None, after=None, e
             # may already have happened under that name: unknown, and never sent again.
             raise Unknown("answered as another principal") if write else Denied(
                 "answered as another principal")
-    except (Refused, Denied):
+    except (Refused, Denied) as why:
         _record(state_path, {"failures": 0, "open_until": 0.0}, say, only_if=state)  # it answered
+        _close(intent, "REFUSED" if isinstance(why, Refused) else "DENIED", now, journal_path, say)
         raise
     except (NotSent, NotExecuted, Unknown) as why:
         _count_failure(state, state_path, now, str(why), say, announce)
         if isinstance(why, Unknown) and write:
-            try:
-                journal_unknown(op, key, value, str(why), now, journal_path)
-            except OSError as error:
-                say("the UNKNOWN journal could not be written (%s)" % type(error).__name__)
+            try:                                      # why it is unknown, for whoever reads the journal
+                _append({"about": intent["id"], "why": str(why)}, journal_path)
+            except OSError:
+                pass                                  # the line that matters is already on disk
             raise
+        _close(intent, "NOT_EXECUTED", now, journal_path, say)
         say("Using the board route for this %s." % ("read" if not write else "message"))
         return None
     _record(state_path, {"failures": 0, "open_until": 0.0}, say, only_if=state)
+    _close(intent, "DONE", now, journal_path, say)
     return result
 
 
