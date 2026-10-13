@@ -478,7 +478,7 @@ class Outcomes(unittest.TestCase):
 
 
 # =====================================================================================================
-class Integrated(unittest.TestCase):
+class Harness:
     """redis_inbox over both routes at once: the bridge is redis_gov.execute, the board is PR 397's
     Worker, and they share one FakeRedis. A board row spent is an entry in worker.asked."""
 
@@ -488,7 +488,7 @@ class Integrated(unittest.TestCase):
         self.bookmark = os.path.join(self.tmp.name, "seen.json")
         self.journal = os.path.join(self.tmp.name, "unknown.jsonl")
 
-    def run_cmd(self, argv, worker, bridge=None, environ=ON, callers=MINE, opener=None):
+    def run_cmd(self, argv, worker, bridge=None, environ=ON, callers=MINE, opener=None, clock=None):
         printed = []
         patches = [
             mock.patch.object(inbox, "post", worker.post), mock.patch.object(inbox, "answer", worker.answer),
@@ -499,6 +499,8 @@ class Integrated(unittest.TestCase):
             mock.patch.object(bc, "mint", lambda url, account: TOKEN),
             mock.patch("builtins.print", side_effect=lambda *a, **k: printed.append(" ".join(map(str, a)))),
         ]
+        if clock is not None:
+            patches.append(mock.patch("time.time", return_value=float(clock)))
         if opener is not None:
             real_call = bc.call
             patches.append(mock.patch.object(bc, "call", lambda u, t, r: real_call(u, t, r, opener=opener)))
@@ -529,6 +531,10 @@ class Integrated(unittest.TestCase):
 
     def inbox_of(self, conn, agent="grok"):
         return [fields.get("text") for _, fields in conn.data.get("fleet:inbox:%s" % agent, [])]
+
+
+class Integrated(Harness, unittest.TestCase):
+    """Aya's named regressions, each over both routes."""
 
     # ------------------------------------------------------------------------------- the flag is OFF
     def test_off_is_exactly_the_old_behaviour(self):
@@ -811,6 +817,217 @@ class Integrated(unittest.TestCase):
         """The board page and the bridge page end in the same function."""
         source = (ROOT / "scripts" / "redis_inbox.py").read_text(encoding="utf-8")
         self.assertEqual(3, source.count("whole_page("), "defined once, called by page_of and page_of_result")
+
+
+def lost_after_commit(sim, request):
+    sim.execute(request)                              # the write lands in Redis
+    raise bc.Unknown("no answer (TimeoutError)")      # and its answer never arrives
+
+
+def lost_before_commit(sim, request):
+    raise bc.Unknown("no answer (TimeoutError)")      # nothing landed; the client cannot know that
+
+
+class Reconciling(Harness, unittest.TestCase):
+    """`redis_inbox.py reconcile`: an UNKNOWN write is settled by READING, never by sending again
+    (Aya's Stage 1 exit check 5). The fake Redis numbers its stream ids 1-0, 2-0, ..., so the clock
+    here is near zero: a write journalled at second 300 searches from id 0-0."""
+
+    SENT_AT = 300
+
+    def unknown_send(self, conn, worker, fault, text="only once"):
+        code, out = self.send(worker, BridgeSim(conn, fault=fault), text=text, clock=self.SENT_AT)
+        self.assertEqual(inbox.UNKNOWN_EXIT, code, out)
+        return out
+
+    def reconcile(self, worker, bridge=None, clock=None, **kw):
+        return self.run_cmd(["reconcile", "--wait", "0"], worker, bridge,
+                            clock=self.SENT_AT + 700 if clock is None else clock, **kw)
+
+    def lines(self):
+        with open(self.journal, encoding="utf-8") as fh:
+            return [json.loads(line) for line in fh if line.strip()]
+
+    def test_a_write_that_did_commit_is_found_and_never_sent_again(self):
+        conn = FakeRedis()
+        worker = Worker(conn)
+        out = self.unknown_send(conn, worker, lost_after_commit)
+        self.assertIn("reconcile", out)
+        code, out = self.reconcile(worker, BridgeSim(conn))
+        self.assertEqual(0, code, out)
+        self.assertIn("COMMITTED", out)
+        self.assertIn("it is entry 1-0. Do NOT send it again.", out)
+        self.assertEqual(["only once"], self.inbox_of(conn), "reconciling wrote something")
+        self.assertEqual([], worker.asked, "the whole reconciliation went by the bridge, and wrote nothing")
+        unknown, settled = self.lines()
+        self.assertEqual((unknown["id"], "COMMITTED", "entry 1-0"),
+                         (settled["resolves"], settled["outcome"], settled["detail"]))
+        code, out = self.reconcile(worker, BridgeSim(conn))
+        self.assertEqual((0, "nothing to reconcile: no write has an unknown outcome"), (code, out))
+
+    def test_a_write_that_never_landed_is_absent_and_the_command_sends_nothing(self):
+        conn = FakeRedis()
+        worker = Worker(conn)
+        self.unknown_send(conn, worker, lost_before_commit)
+        code, out = self.reconcile(worker, BridgeSim(conn))
+        self.assertEqual(0, code, out)
+        self.assertIn("ABSENT", out)
+        self.assertIn("this command sends nothing", out)
+        self.assertEqual([], self.inbox_of(conn), "reconcile resent the message itself")
+        self.assertEqual("ABSENT", self.lines()[-1]["outcome"])
+
+    def test_absent_is_not_said_of_a_write_that_could_still_land(self):
+        conn = FakeRedis()
+        worker = Worker(conn)
+        self.unknown_send(conn, worker, lost_before_commit)
+        code, out = self.reconcile(worker, BridgeSim(conn), clock=self.SENT_AT + inbox.SETTLE_MIN_AGE - 1)
+        self.assertEqual(inbox.UNSETTLED_EXIT, code)
+        self.assertIn("could still land", out)
+        self.assertEqual(1, len(self.lines()), "nothing was settled, so nothing was appended")
+        code, out = self.reconcile(worker, BridgeSim(conn), clock=self.SENT_AT + inbox.SETTLE_MIN_AGE)
+        self.assertEqual(0, code, out)
+
+    def test_it_is_matched_as_a_read_shows_it_long_or_with_a_pipe(self):
+        for text in ("L" * 450, "a | b and more", "plain"):
+            if os.path.exists(self.journal):
+                os.unlink(self.journal)
+            conn = FakeRedis()
+            worker = Worker(conn)
+            self.unknown_send(conn, worker, lost_after_commit, text=text)
+            code, out = self.reconcile(worker, BridgeSim(conn))
+            self.assertEqual(0, code, (text[:20], out))
+            self.assertIn("COMMITTED", out, text[:20])
+
+    def test_shown_is_exactly_redis_govs_preview(self):
+        self.assertEqual(redis_gov.PREVIEW_CHARS, bc.PREVIEW_CHARS)
+        for value in ("", "plain", "a|b", "line\nbreak", "cr\rhere", "x" * 200, "x" * 201, "y" * 999, None, 7):
+            self.assertEqual(redis_gov.preview(value), bc.shown(value), repr(value)[:30])
+
+    def test_the_same_words_from_another_agent_are_not_my_write(self):
+        conn = FakeRedis()
+        worker = Worker(conn)
+        assert run(conn, "grok", "xadd", "fleet:inbox:grok", val="only once")["ok"]    # by grok, not me
+        self.unknown_send(conn, worker, lost_before_commit)
+        code, out = self.reconcile(worker, BridgeSim(conn))
+        self.assertIn("ABSENT", out, "another agent's identical text was taken for this agent's write")
+
+    def test_an_entry_outside_the_window_is_not_my_write(self):
+        conn = FakeRedis()
+        worker = Worker(conn)
+        self.unknown_send(conn, worker, lost_after_commit)        # committed as 1-0, journalled at 300
+        with mock.patch.object(inbox, "SETTLE_BEFORE", -1), mock.patch.object(inbox, "SETTLE_AFTER", 2):
+            code, out = self.reconcile(worker, BridgeSim(conn))   # the window is now ids 301000-0 .. 302000-0
+        self.assertIn("ABSENT", out, "an entry before the window was matched")
+        os.unlink(self.journal)
+        conn = FakeRedis()
+        worker = Worker(conn)
+        self.unknown_send(conn, worker, lost_after_commit)        # 1-0 again
+        with mock.patch.object(inbox, "SETTLE_AFTER", -300):      # the window now ENDS at id 0: 1-0 is after it
+            code, out = self.reconcile(worker, BridgeSim(conn))
+        self.assertIn("ABSENT", out, "an entry after the window was matched")
+
+    def test_a_stream_that_cannot_be_read_leaves_it_unknown(self):
+        conn = FakeRedis()
+        worker = Worker(conn)
+        self.unknown_send(conn, worker, lost_after_commit)
+        worker.drop.add("xrange")                                  # the board never answers the read
+        code, out = self.reconcile(worker, opener=Opener(http_error(404, {"error": "no such endpoint"})))
+        self.assertEqual(inbox.UNSETTLED_EXIT, code)
+        self.assertIn("could not be read", out)
+        self.assertEqual(1, len(self.lines()))
+        denied = Opener(http_error(403, {"error": "not authorised"}))
+        code, out = self.reconcile(worker, opener=denied)
+        self.assertEqual(inbox.UNSETTLED_EXIT, code, "a denied read settled something")
+
+    def test_by_the_board_route_it_reads_and_only_reads(self):
+        conn = FakeRedis()
+        worker = Worker(conn)
+        self.unknown_send(conn, worker, lost_after_commit)
+        code, out = self.reconcile(worker, environ={})             # the bridge is off: the board carries it
+        self.assertEqual(0, code, out)
+        self.assertIn("COMMITTED", out)
+        self.assertTrue(worker.asked)
+        self.assertTrue(all("op=xrange" in asked for asked in worker.asked), worker.asked)
+        self.assertEqual(["only once"], self.inbox_of(conn))
+
+    def test_a_window_longer_than_the_page_cap_stays_unknown_and_says_how_to_go_on(self):
+        conn = FakeRedis()
+        for k in range(1, 40):
+            assert run(conn, "grok", "xadd", "fleet:inbox:grok", val="noise %d" % k)["ok"]
+        worker = Worker(conn)
+        self.unknown_send(conn, worker, lost_after_commit)         # entry 40-0
+        code, out = self.reconcile(worker, BridgeSim(conn))
+        self.assertEqual(inbox.UNSETTLED_EXIT, code)
+        self.assertIn("--pages", out)
+        code, out = self.run_cmd(["reconcile", "--wait", "0", "--pages", "20"], worker, BridgeSim(conn),
+                                 clock=self.SENT_AT + 700)
+        self.assertEqual(0, code, out)
+        self.assertIn("it is entry 40-0", out)
+
+    def test_an_unknown_cursor_save_is_superseded_not_searched_for(self):
+        conn = stream(["m1"])
+        worker = Worker(conn)
+
+        def read_ok_save_lost(sim, request):
+            if request["op"] == "set":
+                raise bc.Unknown("no answer (TimeoutError)")
+            return sim.execute(request)
+
+        self.read(worker, BridgeSim(conn, fault=read_ok_save_lost), clock=self.SENT_AT)
+        bridge = BridgeSim(conn)
+        code, out = self.reconcile(worker, bridge)
+        self.assertEqual(0, code, out)
+        self.assertIn("SUPERSEDED", out)
+        self.assertEqual([], bridge.requests, "nothing needs reading for a cursor save")
+
+    def test_any_other_op_stays_unknown_for_a_person(self):
+        bc.journal_unknown("del", "fleet:test:x", None, "no answer (TimeoutError)", 300.0, self.journal)
+        bc.journal_unknown("set", "fleet:test:not-the-cursor", "v", "no answer (TimeoutError)", 300.0,
+                           self.journal)
+        code, out = self.reconcile(Worker(FakeRedis()), BridgeSim(FakeRedis()))
+        self.assertEqual(inbox.UNSETTLED_EXIT, code)
+        self.assertEqual(2, out.count("settle it by hand"), "only the read cursor's own SET is superseded")
+        self.assertNotIn("SUPERSEDED", out)
+
+    def test_one_alert_row_per_unknown_write_and_it_holds_no_message(self):
+        conn = FakeRedis()
+        worker = Worker(conn)
+        self.unknown_send(conn, worker, lost_after_commit, text="the secret plan")
+        alerts = [note for note in worker.notes if "BRIDGE-UNKNOWN" in note]
+        self.assertEqual(1, len(alerts))
+        text = alerts[0].split("|text=", 1)[1]
+        self.assertEqual("UNKNOWN outcome for one xadd on fleet:inbox:grok through the Redis bridge; it was NOT "
+                         "sent again; reconcile is pending on the sender's machine", text)
+        self.assertNotIn("the secret plan", alerts[0])
+
+    def test_an_alert_that_cannot_be_posted_does_not_turn_unknown_into_a_crash(self):
+        conn = FakeRedis()
+        worker = Worker(conn)
+        real_post = worker.post
+
+        def post(spec):
+            if spec.get("action_type") == "NOTE":
+                raise SystemExit("the request row did not read back")
+            return real_post(spec)
+
+        worker.post = post
+        out = self.unknown_send(conn, worker, lost_after_commit)
+        self.assertIn("alert row could not be posted", out)
+        self.assertEqual(1, len(self.lines()), "the journal still has it")
+
+    def test_the_journal_is_append_only_and_a_damaged_line_hides_nothing(self):
+        first = bc.journal_unknown("xadd", "fleet:inbox:grok", "one", "x", 300.0, self.journal)
+        with open(self.journal, "a", encoding="utf-8") as fh:
+            fh.write("this line is not json\n")
+        second = bc.journal_unknown("xadd", "fleet:inbox:grok", "two", "x", 301.0, self.journal)
+        self.assertEqual([first["id"], second["id"]], [r["id"] for r in bc.pending(self.journal)])
+        before = pathlib.Path(self.journal).read_text(encoding="utf-8")
+        bc.settle(first, "COMMITTED", "entry 1-0", 900.0, self.journal)
+        after = pathlib.Path(self.journal).read_text(encoding="utf-8")
+        self.assertTrue(after.startswith(before), "settling rewrote the journal instead of appending")
+        self.assertEqual([second["id"]], [r["id"] for r in bc.pending(self.journal)])
+        for record in bc.journal(self.journal):
+            self.assertNotIn("one", [record.get("value"), record.get("text")])
 
 
 if __name__ == "__main__":

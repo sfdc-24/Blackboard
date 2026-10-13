@@ -33,6 +33,7 @@ WHAT IT DOES NOT DO
     python scripts/redis_inbox.py send --to grok --text "..."    one message
     python scripts/redis_inbox.py read [--wait 180] [--count 4]  new messages to me, after my cursor
     python scripts/redis_inbox.py selftest                       the grammar, no network
+    python scripts/redis_inbox.py reconcile                      settle writes whose outcome is unknown
 
 THE DIRECT ROUTE, WHEN THIS AGENT HAS ONE (2026-10-13, docs/REDIS-PRIMARY.md Phase 3b)
     `send` and `read` first try scripts/bridge_client.py: one HTTPS call to the redis-tool-bridge,
@@ -51,6 +52,15 @@ THE DIRECT ROUTE, WHEN THIS AGENT HAS ONE (2026-10-13, docs/REDIS-PRIMARY.md Pha
     - a caller the bridge DENIED (401 or 403): the board route identifies by claim, and moving a
       denied caller there would be a downgrade around the refusal;
     - an operation the access rules REFUSED: the board route runs the same rules.
+
+    SETTLING AN UNKNOWN WRITE (`reconcile`; Aya's Stage 1 exit check 5)
+    A write the bridge may or may not have committed is journalled and announced in one row (a status
+    and a place, never the message). `reconcile` then READS the stream it was aimed at, from five
+    minutes before the write to fifteen after, and looks for an entry by this agent whose shown text
+    has the journalled hash. Found: COMMITTED, with the entry id. Read to the end of the window and
+    not found, ten minutes or more after the write: ABSENT - it did not commit, and whether to send
+    it again is a person's decision, not this command's. Anything else stays UNKNOWN. It only ever
+    reads, so it may be run as often as wanted.
 
 THE LAPTOP LANE (step 3 of the broken-telephone fix, Converspan Channel Architecture v0.1)
     The cloud routes a Drive request to this laptop only while fleet:alive:claude-code-cli is
@@ -390,6 +400,25 @@ def breaker_row(text: str) -> None:
     })
 
 
+def unknown_row(op: str, key: str) -> None:
+    """The alert for ONE write whose outcome is unknown: closed words, the op and the key, never a value.
+    Best effort: an alert that cannot be posted must not turn an UNKNOWN into a crash."""
+    rid = "CCC-BRIDGE-UNKNOWN-%s" % secrets.token_hex(4)
+    line = ("UNKNOWN outcome for one %s on %s through the Redis bridge; it was NOT sent again; reconcile "
+            "is pending on the sender's machine" % (re.sub(r"[^a-z]", "", op)[:12],
+                                                    re.sub(r"[^A-Za-z0-9:._-]", "?", key)[:120]))
+    try:
+        post({
+            "row_id": rid, "source_tag": ME, "target_surface": "claude-code-cli;aya",
+            "action_type": "NOTE", "category": "OPEN", "project_tag": "Blackboard",
+            "gist": "redis bridge unknown outcome", "subgist": "",
+            "payload": "|".join(["BCB|v=1", "id=" + rid, "phase=NOTE", "from=" + ME,
+                                 "to=claude-code-cli,aya", "via=direct", "text=" + line]),
+        })
+    except (Exception, SystemExit) as error:  # noqa: BLE001
+        print("the UNKNOWN alert row could not be posted (%s)" % type(error).__name__)
+
+
 def direct(op: str, key: str, *, value: str | None = None, count: int | None = None,
            after: str | None = None) -> tuple:
     """One operation by the direct route. (kind, what):
@@ -414,8 +443,10 @@ def direct(op: str, key: str, *, value: str | None = None, count: int | None = N
         return "denied", ("DENIED by the bridge: %s.\nNot sent on the board route: that route identifies a "
                           "sender by claim, and a denied caller is not moved to a weaker check." % why)
     except bridge_client.Unknown as why:
+        unknown_row(op, key)
         return "unknown", ("UNKNOWN OUTCOME: %s.\nThe write was sent and MAY HAVE COMMITTED. It is NOT sent "
-                           "again by any route; it is recorded in %s for reconciliation."
+                           "again by any route; it is recorded in %s. Settle it with: "
+                           "python scripts/redis_inbox.py reconcile"
                            % (why, os.path.basename(bridge_client.JOURNAL)))
     return ("ok", result) if result is not None else ("board", None)
 
@@ -517,6 +548,105 @@ def cmd_read(args) -> int:
                                                           "NOT confirmed, the local one stands; retried next read"))
     print("%d shown from %s, cursor %s" % (shown, key, cursor))
     return code
+
+
+# ---------------------------------------------------------------------------------------- reconcile
+SETTLE_BEFORE = 300        # seconds before the journalled time the search starts: this clock is not Redis's
+SETTLE_AFTER = 900         # and seconds after it the search ends: a slow commit, and the same skew
+SETTLE_MIN_AGE = 600       # ABSENT is not said of a write younger than this: it could still land
+SETTLE_PAGES = 3           # pages read per unknown write; on the board route each page is one row
+UNSETTLED_EXIT = 8
+
+
+def one_page(key: str, cursor: str, count: int, wait: float, since: str) -> tuple:
+    """(page, "") for one judged page after `cursor`, by whichever route answers; (None, why) when no
+    page could be had at all. A read, on either route: it changes nothing."""
+    kind, what = direct("xrange", key, count=count, after=cursor)
+    if kind in _EXITS:
+        return None, what.splitlines()[0]
+    if kind == "ok":
+        return page_of_result(what, key, cursor), ""
+    rid = post(request_row("xrange", key, count=count, after=cursor))
+    got = answer(rid, wait, since=since or stamp())
+    if not got:
+        return None, "no answer yet from the worker (request %s)" % rid
+    if got.get("from") != WORKER:
+        return None, "the answer row is from %r, not %s" % (got.get("from"), WORKER)
+    return page_of(got["payload"], key, cursor), ""
+
+
+def find_write(entry: dict, wait: float, since: str, pages: int) -> tuple:
+    """Look for one journalled xadd in its stream. ("found", id) | ("absent", "") when the whole window
+    was read and it is not there | ("unread", why) when the window could not be read to its end."""
+    sys.path.insert(0, os.path.join(REPO, "scripts"))
+    import bridge_client                                          # noqa: E402
+
+    key, at = str(entry["key"]), int(entry["epoch"])
+    cursor = "%d-0" % (max(0, at - SETTLE_BEFORE) * 1000)
+    last_ms = (at + SETTLE_AFTER) * 1000
+    count = READ_COUNT
+    for _page in range(max(1, int(pages))):
+        page, why = one_page(key, cursor, count, wait, since)
+        if page is None:
+            return "unread", why
+        if page["status"] == "cut" and count > 1:
+            count = max(1, count // 2)
+            continue
+        if page["status"] != "ok":
+            return "unread", page["why"]
+        for shown_entry in page["entries"]:
+            if stream_id(shown_entry["id"])[0] > last_ms:
+                return "absent", ""
+            if (str(shown_entry.get("by", "")) == ME and
+                    bridge_client._sha(str(shown_entry.get("text", ""))) == entry.get("shown_sha256")):
+                return "found", str(shown_entry["id"])
+        if not page["more"]:
+            return "absent", ""
+        cursor = page["last"]
+    return "unread", "the window is longer than %d pages; run it again with --pages" % pages
+
+
+def cmd_reconcile(args) -> int:
+    """Settle every UNKNOWN write in the journal that can be settled by READING. It sends no write."""
+    sys.path.insert(0, os.path.join(REPO, "scripts"))
+    import bridge_client                                          # noqa: E402
+
+    waiting = bridge_client.pending()
+    if not waiting:
+        print("nothing to reconcile: no write has an unknown outcome")
+        return 0
+    left = 0
+    for entry in waiting:
+        what = "%s %s on %s at %s" % (entry["id"], entry.get("op"), entry.get("key"), entry.get("at"))
+        now = time.time()
+        if entry.get("op") == "set" and entry.get("key") == CURSOR_KEY % ME:
+            # A SET of the read cursor: the next read saves the cursor it has then, this one or a later
+            # one, and writing one value twice is writing it once. Nothing to look for.
+            bridge_client.settle(entry, "SUPERSEDED", "the next read saves the cursor", now)
+            print("SUPERSEDED  %s: the next read saves the cursor again; nothing can be duplicated" % what)
+            continue
+        if entry.get("op") != "xadd" or not entry.get("shown_sha256") or "epoch" not in entry:
+            left += 1
+            print("UNKNOWN     %s: this command can only look for an xadd; settle it by hand" % what)
+            continue
+        state, detail = find_write(entry, args.wait, args.since, args.pages)
+        if state == "found":
+            bridge_client.settle(entry, "COMMITTED", "entry %s" % detail, now)
+            print("COMMITTED   %s: it is entry %s. Do NOT send it again." % (what, detail))
+        elif state == "absent" and now - int(entry["epoch"]) >= SETTLE_MIN_AGE:
+            bridge_client.settle(entry, "ABSENT", "not in the stream from %d s before to %d s after"
+                                 % (SETTLE_BEFORE, SETTLE_AFTER), now)
+            print("ABSENT      %s: it did not commit. Sending it again is your decision; this command "
+                  "sends nothing." % what)
+        elif state == "absent":
+            left += 1
+            print("UNKNOWN     %s: not there yet, and it is under %d s old, so it could still land. "
+                  "Run this again later." % (what, SETTLE_MIN_AGE))
+        else:
+            left += 1
+            print("UNKNOWN     %s: the stream could not be read to the end of the window (%s)" % (what, detail))
+    print("%d settled, %d still unknown" % (len(waiting) - left, left))
+    return UNSETTLED_EXIT if left else 0
 
 
 def task_id_ok(task: str) -> str:
@@ -706,7 +836,7 @@ def cmd_selftest(_args) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="what", required=True)
-    for name in ("send", "read", "selftest", "beat", "accept", "done"):
+    for name in ("send", "read", "selftest", "beat", "accept", "done", "reconcile"):
         p = sub.add_parser(name)
         if name not in ("selftest", "beat"):
             p.add_argument("--wait", type=float, default=WAIT_SECONDS,
@@ -723,6 +853,10 @@ def build_parser() -> argparse.ArgumentParser:
             p.add_argument("--after", default="", help="read after this stream id instead of the saved cursor")
             p.add_argument("--past-cut", action="store_true",
                            help="move the cursor past entries whose text arrived cut at %d characters" % PREVIEW_CHARS)
+        if name == "reconcile":
+            p.add_argument("--pages", type=int, default=SETTLE_PAGES,
+                           help="pages read per unknown write (default %d); on the board route each is one row"
+                                % SETTLE_PAGES)
         if name == "beat":
             p.add_argument("--every", type=int, default=0,
                            help="loop: seconds between beats, 60..%d (0 = one beat); the reader's window is 300 s" % BEAT_EVERY)
@@ -742,7 +876,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=()) -> int:
     args = build_parser().parse_args(list(argv))
     return {"send": cmd_send, "read": cmd_read, "selftest": cmd_selftest, "beat": cmd_beat,
-            "accept": cmd_accept, "done": cmd_done}[args.what](args)
+            "accept": cmd_accept, "done": cmd_done, "reconcile": cmd_reconcile}[args.what](args)
 
 
 if __name__ == "__main__":

@@ -50,6 +50,15 @@ FIVE OUTCOMES, AND WHAT EACH ONE PERMITS (Aya's review of a125337, blockers 1 an
                   the operation is recorded in a local journal as UNKNOWN and is NOT sent again.
                   Whether it committed is for a reconciliation to find out, not for a retry.
 
+THE JOURNAL, AND HOW AN UNKNOWN IS SETTLED (Aya's Stage 1 exit check 5)
+    .redis_bridge_unknown.jsonl is append-only. An UNKNOWN line holds what was sent, where and when,
+    and two hashes: of the value, and of the value AS A READ WOULD SHOW IT (redis_gov quotes a value
+    at 200 characters and replaces a pipe or a newline). It never holds the value. `redis_inbox.py
+    reconcile` READS the place the write was aimed at and looks for an entry by this agent whose
+    shown text has that second hash; reading changes nothing, so it can be run any number of times.
+    What it finds is appended as a second line that names the first. Nothing here ever sends the
+    operation again: a write found absent is reported, and sending it again is a person's decision.
+
 WHAT IS SAID, AND TO WHOM (blocker 5)
     Every failure is said out loud, in CLOSED words: a status number and a label from the table
     below, or an exception's class name. Nothing the server sent in an error body is ever repeated
@@ -89,6 +98,9 @@ HTTP_TIMEOUT = 20
 MINT_TIMEOUT = 60
 # redis_gov.OPS_READ, restated: asking one of these twice changes nothing a caller owns.
 READS = ("get", "hgetall", "xrange")
+# redis_gov.PREVIEW_CHARS and redis_gov.preview(), restated and held equal by a test: how a read shows
+# a stored value. The journal hashes this form so a reconciliation can match what it reads.
+PREVIEW_CHARS = 200
 # The ONLY words a status is ever described with. Never the body's own.
 STATUS_LABELS = {400: "bad request", 401: "unauthenticated", 403: "not authorised",
                  404: "no such endpoint", 413: "body too large", 429: "rate limited",
@@ -265,13 +277,60 @@ def clock(moment: float) -> str:
     return time.strftime("%H:%M:%SZ", time.gmtime(moment))
 
 
-def journal_unknown(op: str, key: str, value, label: str, now: float, path=None) -> None:
-    """One line per write whose outcome is unknown: what, where, when, and the value's sha256 and
-    length - never the value. This is what a reconciliation reads; nothing here retries."""
+def shown(value) -> str:
+    """A value as a governed read shows it: redis_gov.preview(), restated."""
+    if value is None:
+        return ""
+    text = str(value).replace("\r", " ").replace("\n", " ").replace("|", "/")
+    return text if len(text) <= PREVIEW_CHARS else text[:PREVIEW_CHARS] + "..."
+
+
+def _sha(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def journal_unknown(op: str, key: str, value, label: str, now: float, path=None) -> dict:
+    """One line per write whose outcome is unknown: what, where, when, and hashes of the value - never
+    the value. This is what a reconciliation reads; nothing here retries. Returns the record."""
     text = "" if value is None else str(value)
-    record = {"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)), "op": op, "key": key,
-              "value_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+    at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+    record = {"id": _sha("%s|%s|%s|%s" % (at, op, key, _sha(text)))[:16], "at": at, "epoch": int(now),
+              "op": op, "key": key, "value_sha256": _sha(text), "shown_sha256": _sha(shown(text)),
               "value_chars": len(text), "outcome": "UNKNOWN", "why": label}
+    with open(path or JOURNAL, "a", encoding="utf-8", newline="") as fh:
+        fh.write(json.dumps(record, sort_keys=True) + "\n")
+    return record
+
+
+def journal(path=None) -> list:
+    """Every line of the journal that is a JSON object, in order. A line that is not is skipped: one
+    damaged line must not hide the rest."""
+    out = []
+    try:
+        with open(path or JOURNAL, encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(record, dict):
+                    out.append(record)
+    except OSError:
+        pass
+    return out
+
+
+def pending(path=None) -> list:
+    """The UNKNOWN writes that no later line has settled."""
+    lines = journal(path)
+    settled = {str(r.get("resolves")) for r in lines if r.get("resolves")}
+    return [r for r in lines if r.get("outcome") == "UNKNOWN" and r.get("id") and r["id"] not in settled]
+
+
+def settle(entry: dict, outcome: str, detail: str, now: float, path=None) -> None:
+    """Append what a reconciliation found. Append-only: the UNKNOWN line it names is never rewritten."""
+    record = {"resolves": entry["id"], "outcome": outcome, "detail": detail,
+              "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))}
     with open(path or JOURNAL, "a", encoding="utf-8", newline="") as fh:
         fh.write(json.dumps(record, sort_keys=True) + "\n")
 
