@@ -30,9 +30,11 @@ import sys
 import tempfile
 import unittest
 import urllib.error
+import urllib.parse
 from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "cloud" / "redis-tool-bridge"))
 sys.path.insert(0, str(ROOT / "scripts"))
 sys.path.insert(0, str(ROOT / "tests"))
 
@@ -41,6 +43,11 @@ import redis_gov  # noqa: E402
 import redis_inbox as inbox  # noqa: E402
 from test_redis_gov import ACL, FakeRedis, FakePipeline, run  # noqa: E402
 from test_redis_inbox import KEY, Worker as BoardWorker, stream  # noqa: E402
+import main as bridge_main  # noqa: E402   cloud/redis-tool-bridge: the service's real HTTP handler
+import op as bridge_op  # noqa: E402       and its real /op
+from test_redis_tool_bridge import Verifier  # noqa: E402   the stand-in for Google's token verifier
+
+REAL_CALL = bc.call      # the harness puts a BridgeSim where bc.call is; this is the function it wraps
 
 
 class Worker(BoardWorker):
@@ -104,31 +111,96 @@ def http_error(code, body):
 
 
 class BridgeSim:
-    """What the endpoint does, with the real governed function: check `expect`, run redis_gov.execute
-    as the bound principal, answer in the endpoint's shape. `fault` replaces one or every call."""
+    """THE REAL BOUNDARY, in one process (Aya on 0baa197: the combined test mocked the endpoint).
 
-    def __init__(self, conn, principal=ME, fault=None):
-        self.conn, self.principal, self.fault, self.requests = conn, principal, fault, []
+    One call is bridge_client.call -> an HTTP request -> main.Handler.do_POST -> main.verify_caller ->
+    op.handle -> redis_gov.execute over the shared FakeRedis -> the handler's own bytes -> and
+    bridge_client.call's own reading of them. Three things are stood in, and only these: the socket (the
+    handler is handed the request, and its reply is read off its wfile), Google's token verifier
+    (test_redis_tool_bridge.Verifier), and Redis (test_redis_gov.FakeRedis).
+
+    principal  who callers.json binds the account to ON THE SERVER; "file" leaves the real file in place.
+    fault      fault(sim, request) replaces a call. It can still run the real thing: sim.execute(...).
+    claims     what the verifier says the token carries, when it is not this account, verified.
+    """
+
+    def __init__(self, conn, principal=ME, fault=None, account=SA, claims=None, environ=None):
+        self.conn, self.principal, self.fault, self.account = conn, principal, fault, account
+        self.claims = {"email": account, "email_verified": True} if claims is None else claims
+        self.environ = ({bridge_main.AUDIENCE_ENV: URL, bridge_main.CALLERS_ENV: account}
+                        if environ is None else environ)
+        self.requests, self.held, self.down, self.log = [], [], False, io.StringIO()
 
     def __call__(self, url, token, request):
         self.requests.append(dict(request))
         if self.fault is not None:
             return self.fault(self, request)
-        return self.execute(request)
+        return self.execute(request, url=url, token=token)
 
-    def execute(self, request):
-        if request.get("expect") != self.principal:
-            raise bc.Denied("HTTP 403 principal mismatch")
-        result = redis_gov.execute(self.conn, ACL, self.principal, "bridge:test", request["op"],
-                                   request["key"], raw_value=request.get("val", ""),
-                                   enc=request.get("enc", ""), count=request.get("count", 10),
-                                   after=request.get("after", ""))
-        if result.get("ok"):
-            return dict(result, principal=self.principal)
-        if "refused" in result:
-            raise bc.Refused(bc.clean_reason(result["refused"]),
-                             "ok" if result.get("audit") == "ok" else "not confirmed")
-        raise bc.Unknown("HTTP 502 failed upstream")
+    def execute(self, request, lose=None, url=URL, token=TOKEN):
+        """One request through the real client and the real service.
+        lose="after"   the service runs it and its answer never arrives
+        lose="before"  it never reaches the service
+        lose="held"    it is still on its way when the client gives up; deliver() lets it arrive"""
+        return REAL_CALL(url, token, request, opener=_Wire(self, lose))
+
+    def serve(self, request):
+        """(status, body bytes): the real handler's answer to one urllib request."""
+        handler = object.__new__(bridge_main.Handler)
+        handler.path = urllib.parse.urlsplit(request.full_url).path
+        handler.command, handler.request_version = "POST", "HTTP/1.1"
+        handler.requestline = "POST %s HTTP/1.1" % handler.path
+        handler.client_address = ("127.0.0.1", 0)
+        body = request.data or b""
+        handler.headers = {"Content-Length": str(len(body)),
+                           "Authorization": request.get_header("Authorization", "")}
+        handler.rfile, handler.wfile = io.BytesIO(body), io.BytesIO()
+
+        def connect():
+            if self.down:
+                raise ConnectionError("redis unreachable")
+            return self.conn
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.dict(os.environ, self.environ))
+            for name in (bridge_main.AUDIENCE_ENV, bridge_main.CALLERS_ENV):
+                if name not in self.environ:
+                    os.environ.pop(name, None)
+            stack.enter_context(mock.patch.object(bridge_main, "connect", connect))
+            if self.principal != "file":
+                stack.enter_context(mock.patch.object(
+                    bridge_op, "load_callers", lambda path=None: {self.account: self.principal}))
+            stack.enter_context(Verifier(self.claims))
+            stack.enter_context(contextlib.redirect_stderr(self.log))
+            handler.do_POST()
+        head, _, raw = handler.wfile.getvalue().partition(b"\r\n\r\n")
+        return int(head.split()[1]), raw
+
+    def deliver(self):
+        """The requests that were still on their way now reach the service. [(status, body)]."""
+        late, self.held = self.held, []
+        return [(status, json.loads(raw.decode("utf-8"))) for status, raw in map(self.serve, late)]
+
+
+class _Wire:
+    """The opener bridge_client.call is handed. The request goes to the real handler and its bytes come
+    back as urllib gives them: an answer on a 200, an HTTPError on anything else."""
+
+    def __init__(self, sim, lose):
+        self.sim, self.lose = sim, lose
+
+    def open(self, request, timeout=None):
+        if self.lose == "before":
+            raise TimeoutError("timed out")
+        if self.lose == "held":
+            self.sim.held.append(request)
+            raise TimeoutError("timed out")
+        status, raw = self.sim.serve(request)
+        if self.lose == "after":
+            raise TimeoutError("timed out")
+        if status == 200:
+            return Answer(200, raw)
+        raise urllib.error.HTTPError(request.full_url, status, "x", {}, io.BytesIO(raw))
 
 
 # =====================================================================================================
@@ -554,11 +626,7 @@ class Integrated(Harness, unittest.TestCase):
         conn = FakeRedis()
         worker = Worker(conn)
 
-        def commits_then_loses(sim, request):
-            sim.execute(request)                              # the write lands in Redis
-            raise bc.Unknown("no answer (TimeoutError)")      # and its answer never arrives
-
-        code, out = self.send(worker, BridgeSim(conn, fault=commits_then_loses), text="only once")
+        code, out = self.send(worker, BridgeSim(conn, fault=lost_after_commit), text="only once")
         self.assertEqual(inbox.UNKNOWN_EXIT, code)
         self.assertEqual([], worker.asked, "a second mutation went out by the board route")
         self.assertEqual(["only once"], self.inbox_of(conn), "the message is in the inbox exactly once")
@@ -599,10 +667,8 @@ class Integrated(Harness, unittest.TestCase):
         self.assertEqual(inbox.UNKNOWN_EXIT, code)
         self.assertEqual([], worker.asked)
         # (b) a refusal whose own audit entry failed: still a refusal, and the failed audit is said.
-        def refuse(sim, request):
-            result = redis_gov.execute(conn, ACL, ME, "bridge:test", "set", "gov:audit", raw_value="x")
-            raise bc.Refused(bc.clean_reason(result["refused"]),
-                             "ok" if result.get("audit") == "ok" else "not confirmed")
+        def refuse(sim, request):                     # the same call, aimed at a key nobody may write
+            return sim.execute(dict(request, key="gov:audit"))
 
         code, out = self.send(worker, BridgeSim(conn, fault=refuse))
         self.assertEqual(inbox.REFUSED_EXIT, code)
@@ -643,7 +709,7 @@ class Integrated(Harness, unittest.TestCase):
         self.assertNotIn("gov:audit", [k for k in conn.data if k != redis_gov.AUDIT_STREAM] + ["x"])
 
         def refuse(sim, request):
-            raise bc.Refused("claude-code-cli may not write gov:", "ok")
+            return sim.execute(dict(request, key="gov:audit"))
 
         code, out = self.send(worker, BridgeSim(conn, fault=refuse))
         self.assertEqual(inbox.REFUSED_EXIT, code)
@@ -712,9 +778,8 @@ class Integrated(Harness, unittest.TestCase):
 
         def first_page_then_down(sim, request):
             calls["n"] += 1
-            if calls["n"] == 1:
-                return sim.execute(request)
-            raise bc.NotExecuted("HTTP 503 unavailable")
+            sim.down = calls["n"] > 1                 # the service cannot reach Redis: its own 503
+            return sim.execute(request)
 
         code, out = self.read(worker, BridgeSim(conn, fault=first_page_then_down))
         self.assertEqual(["m%d" % k for k in range(1, 12)], self.shown(out))
@@ -726,23 +791,31 @@ class Integrated(Harness, unittest.TestCase):
         code, out = self.read(worker, BridgeSim(conn))
         self.assertEqual(["m12"], self.shown(out))
 
-    def test_an_unknown_cursor_save_is_not_sent_again_now_and_is_retried_by_the_next_read(self):
+    def test_an_unknown_cursor_save_holds_every_later_save_by_either_route(self):
+        """Aya on 0baa197: a blind re-save after UNKNOWN is not proven monotonic. So there is none."""
         conn = stream(["m1"])
         worker = Worker(conn)
-
-        def read_ok_save_lost(sim, request):
-            if request["op"] == "set":
-                raise bc.Unknown("no answer (TimeoutError)")
-            return sim.execute(request)
-
-        code, out = self.read(worker, BridgeSim(conn, fault=read_ok_save_lost))
+        code, out = self.read(worker, BridgeSim(conn, fault=save_lost("before")))
         self.assertEqual(4, code, out)
         self.assertEqual([], worker.asked, "the unknown save was repeated by the board route")
         self.assertEqual("1-0", self.cursor(), "the local cursor stands")
-        self.assertIn("NOT confirmed", out)
-        code, out = self.read(worker, BridgeSim(conn))
-        self.assertEqual(0, code, out)
-        self.assertEqual("1-0", conn.data["fleet:cursor:claude-code-cli"], "the next read saved it")
+        self.assertIn("held until reconciled", out)
+        assert run(conn, "grok", "xadd", KEY, val="m2")["ok"]
+        bridge = BridgeSim(conn)
+        code, out = self.read(worker, bridge)                       # the bridge is healthy again
+        self.assertEqual(inbox.UNKNOWN_EXIT, code, out)
+        self.assertEqual(["m2"], self.shown(out), "reading goes on; only the save waits")
+        self.assertIn("in Redis: HELD", out)
+        self.assertEqual(["xrange"], [r["op"] for r in bridge.requests], "a later save went out by the bridge")
+        assert run(conn, "grok", "xadd", KEY, val="m3")["ok"]
+        code, out = self.read(worker, environ={})                   # and with the bridge off
+        self.assertEqual(["m3"], self.shown(out))
+        self.assertIn("in Redis: HELD", out)
+        self.assertFalse([a for a in worker.asked if "op=set" in a], "a later save went out by the board")
+        self.assertNotIn("fleet:cursor:claude-code-cli", conn.data)
+        code, out = self.read(worker, bridge)                       # nothing new: still owed, still held
+        self.assertEqual(inbox.UNKNOWN_EXIT, code, out)
+        self.assertEqual(["xrange", "xrange"], [r["op"] for r in bridge.requests])
 
     # ------------------------------------------------------------------------ blocker 4, integrated
     def test_a_client_given_another_agents_account_does_not_use_the_bridge(self):
@@ -819,13 +892,136 @@ class Integrated(Harness, unittest.TestCase):
         self.assertEqual(3, source.count("whole_page("), "defined once, called by page_of and page_of_result")
 
 
+AYA_SA = "aya-runtime@sfdc24.iam.gserviceaccount.com"
+AYA = "chatgpt-codex-desktop"
+
+
+class TheRealBoundary(Harness, unittest.TestCase):
+    """What only the real client, the real handler and the real governor TOGETHER can show (Aya on
+    a743a94 and 0baa197: integrate PR 397's governor, and test the actual boundary)."""
+
+    def attempt(self, sim, op="xadd", key="fleet:inbox:grok", me=ME, account=SA, callers=MINE, caller=None,
+                **kw):
+        said = []
+        out = bc.attempt(op, key, me=me, environ=dict(ON, REDIS_BRIDGE_IMPERSONATE=account), callers=callers,
+                         caller=caller or sim, minter=lambda url, sa: TOKEN, say=said.append,
+                         state_path=os.path.join(self.tmp.name, "breaker.json"), journal_path=self.journal,
+                         **kw)
+        return out, said
+
+    def test_the_committed_callers_file_means_the_same_to_both_sides(self):
+        """callers.json is read by the client (may I use this account?) and by the service (who is this
+        caller?). With the file as committed, Aya's runtime account writes as her principal, end to end."""
+        conn = FakeRedis()
+        sim = BridgeSim(conn, principal="file", account=AYA_SA)
+        out, said = self.attempt(sim, me=AYA, account=AYA_SA, callers=None, value="from aya")
+        self.assertEqual((True, AYA, AYA_SA), (out["ok"], out["principal"], out["caller"]), said)
+        ((_, entry),) = conn.data["fleet:inbox:grok"]
+        self.assertEqual(("from aya", AYA), (entry["text"], entry["by"]))
+        self.assertEqual("bridge:" + AYA_SA, conn.audit()[-1]["via"], "the audit names the verified account")
+        # and this agent's account is not in the committed file: the client does not even ask
+        out, said = self.attempt(BridgeSim(conn, principal="file"), callers=None, value="x",
+                                 caller=lambda *a: self.fail("called with an unbound account"))
+        self.assertIsNone(out)
+        self.assertIn("would not be acting as itself", said[0])
+
+    def test_a_field_named_id_cannot_ride_over_the_stream_id_through_the_bridge(self):
+        """Aya on a743a94: PR 400 alone carried a governor whose read let a field named id overwrite the
+        stream id. Integrated, the bridge shows the stream id and the reader's cursor follows it."""
+        conn = stream(["m1"])
+        conn.xadd(KEY, {"id": "999-0", "text": "carries its own id", "by": "grok", "at": "2026-10-13T00:00:00Z"})
+        worker = Worker(conn)
+        bridge = BridgeSim(conn)
+        code, out = self.read(worker, bridge)
+        self.assertEqual(0, code, out)
+        self.assertEqual(["m1", "carries its own id"], self.shown(out))
+        self.assertEqual("2-0", self.cursor(), "the cursor took the field named id for the stream id")
+        page = bridge.execute({"op": "xrange", "key": KEY, "after": "1-0", "count": 4, "expect": ME})
+        self.assertEqual(("2-0", "999-0"), (page["value"][0]["id"], page["value"][0]["field:id"]))
+
+    def test_the_service_and_the_client_show_neither_the_message_nor_the_token(self):
+        conn = FakeRedis()
+        worker = Worker(conn)
+        bridge = BridgeSim(conn)
+        code, out = self.send(worker, bridge, text="the secret plan")
+        self.assertEqual(0, code, out)
+        self.assertEqual(["the secret plan"], self.inbox_of(conn))
+        log = bridge.log.getvalue()
+        self.assertIn("op by %s as %s: xadd ok" % (SA, ME), log, "the service logs who and what op")
+        for hidden in ("the secret plan", TOKEN, "fleet:inbox"):
+            self.assertNotIn(hidden, log)
+        for hidden in ("the secret plan", TOKEN):
+            self.assertNotIn(hidden, out)
+
+    def test_a_caller_the_service_does_not_verify_is_denied_and_never_moved_to_the_board(self):
+        for name, sim in (
+                ("the token's email is not verified",
+                 lambda c: BridgeSim(c, claims={"email": SA, "email_verified": "true"})),
+                ("a verified account that is not on the allowlist",
+                 lambda c: BridgeSim(c, environ={bridge_main.AUDIENCE_ENV: URL, bridge_main.CALLERS_ENV: AYA_SA})),
+                ("an account bound to another principal", lambda c: BridgeSim(c, principal=AYA))):
+            conn = stream(["m1"])
+            worker = Worker(conn)
+            code, out = self.send(worker, sim(conn))
+            self.assertEqual(inbox.DENIED_EXIT, code, name)
+            code, out = self.read(worker, sim(conn))
+            self.assertEqual(inbox.DENIED_EXIT, code, name)
+            self.assertEqual(([], []), (self.shown(out), worker.asked), name)
+            self.assertEqual([], self.inbox_of(conn), name)
+
+    def test_what_the_service_proves_it_did_not_run_goes_by_the_board_exactly_once(self):
+        """Its own "executed": false answers: no audience configured, Redis unreachable, a body over the
+        bound. Each is the real handler's answer, and each lets the message go once by the board."""
+        def misconfigured(conn):
+            return BridgeSim(conn, environ={bridge_main.CALLERS_ENV: SA})
+
+        def unreachable(conn):
+            sim = BridgeSim(conn)
+            sim.down = True
+            return sim
+
+        for name, make in (("no audience", misconfigured), ("redis unreachable", unreachable)):
+            for leftover in ("breaker.json",):
+                path = os.path.join(self.tmp.name, leftover)
+                if os.path.exists(path):
+                    os.unlink(path)
+            conn = FakeRedis()
+            worker = Worker(conn)
+            code, out = self.send(worker, make(conn))
+            self.assertEqual(0, code, (name, out))
+            self.assertEqual(["hello"], self.inbox_of(conn), name)
+            self.assertEqual(1, len(worker.asked), name)
+        conn = FakeRedis()
+        sim = BridgeSim(conn)
+        out, said = self.attempt(sim, key="fleet:test:big", op="set", value="x" * 20000)
+        self.assertIsNone(out, "a 413 is the service saying it read nothing")
+        self.assertIn("HTTP 413", said[0])
+        self.assertNotIn("fleet:test:big", conn.data)
+        self.assertFalse(os.path.exists(self.journal), "nothing ran, so nothing is unknown")
+
+    def test_a_refusal_carries_the_governors_own_reason_and_audit_through_both_layers(self):
+        conn = FakeRedis()
+        with self.assertRaises(bc.Refused) as raised:
+            self.attempt(BridgeSim(conn), op="set", key="v1:bus:1", value="x")
+        self.assertEqual("ok", raised.exception.audit)
+        self.assertTrue(raised.exception.reason)
+        self.assertEqual(("0", "bridge:" + SA), (conn.audit()[-1]["ok"], conn.audit()[-1]["via"]))
+        self.assertNotIn("v1:bus:1", conn.data)
+
+
 def lost_after_commit(sim, request):
-    sim.execute(request)                              # the write lands in Redis
-    raise bc.Unknown("no answer (TimeoutError)")      # and its answer never arrives
+    return sim.execute(request, lose="after")         # the service commits it; its answer never arrives
 
 
 def lost_before_commit(sim, request):
-    raise bc.Unknown("no answer (TimeoutError)")      # nothing landed; the client cannot know that
+    return sim.execute(request, lose="before")        # nothing landed; the client cannot know that
+
+
+def save_lost(how):
+    """A fault: everything answers, but the save of the read cursor is lost in the way named."""
+    def fault(sim, request):
+        return sim.execute(request, lose=how if request["op"] == "set" else None)
+    return fault
 
 
 class Reconciling(Harness, unittest.TestCase):
@@ -964,21 +1160,136 @@ class Reconciling(Harness, unittest.TestCase):
         self.assertEqual(0, code, out)
         self.assertIn("it is entry 40-0", out)
 
-    def test_an_unknown_cursor_save_is_superseded_not_searched_for(self):
+    CURSOR = "fleet:cursor:claude-code-cli"
+
+    def test_a_cursor_save_that_did_commit_is_found_by_reading_the_key(self):
         conn = stream(["m1"])
         worker = Worker(conn)
-
-        def read_ok_save_lost(sim, request):
-            if request["op"] == "set":
-                raise bc.Unknown("no answer (TimeoutError)")
-            return sim.execute(request)
-
-        self.read(worker, BridgeSim(conn, fault=read_ok_save_lost), clock=self.SENT_AT)
+        self.read(worker, BridgeSim(conn, fault=save_lost("after")), clock=self.SENT_AT)
+        self.assertEqual("1-0", conn.data[self.CURSOR])
         bridge = BridgeSim(conn)
-        code, out = self.reconcile(worker, bridge)
+        code, out = self.reconcile(worker, bridge, clock=self.SENT_AT + 1)      # no need to wait for a yes
         self.assertEqual(0, code, out)
-        self.assertIn("SUPERSEDED", out)
-        self.assertEqual([], bridge.requests, "nothing needs reading for a cursor save")
+        self.assertIn("COMMITTED", out)
+        self.assertEqual(["get"], [r["op"] for r in bridge.requests], "it reads the key and sends nothing")
+        self.assertEqual("COMMITTED", self.lines()[-1]["outcome"])
+        code, out = self.read(worker, bridge, clock=self.SENT_AT + 2)
+        self.assertEqual(0, code, out)
+        self.assertIn("in Redis: saved", out, "once settled, the save goes again")
+
+    def test_THE_DELAYED_COMPLETION_an_old_save_that_arrives_after_a_newer_one_is_refused(self):
+        """REGRESSION (Aya on 0baa197): "Delayed old SET may land after a newer confirmed checkpoint."
+        Through the real handler and the real governor: it is held, settled, overtaken - and refused."""
+        conn = stream(["m1"])
+        worker = Worker(conn)
+        slow = BridgeSim(conn, fault=save_lost("held"))
+        code, out = self.read(worker, slow, clock=self.SENT_AT)     # the save of 1-0 is still on its way
+        self.assertEqual(1, len(slow.held))
+        self.assertNotIn(self.CURSOR, conn.data)
+        assert run(conn, "grok", "xadd", KEY, val="m2")["ok"]
+        bridge = BridgeSim(conn)
+        code, out = self.read(worker, bridge, clock=self.SENT_AT + 5)
+        self.assertIn("in Redis: HELD", out)                        # 1. no later checkpoint while unknown
+        self.assertNotIn(self.CURSOR, conn.data)
+        code, out = self.reconcile(worker, bridge, clock=self.SENT_AT + 5)
+        self.assertEqual(inbox.UNSETTLED_EXIT, code)                # 2. nor is it called settled too early
+        self.assertIn("could still land", out)
+        code, out = self.reconcile(worker, bridge, clock=self.SENT_AT + inbox.SETTLE_MIN_AGE)
+        self.assertEqual(0, code, out)
+        self.assertIn("NOT HELD", out)
+        self.assertEqual("NOT_HELD", self.lines()[-1]["outcome"])
+        code, out = self.read(worker, bridge, clock=self.SENT_AT + inbox.SETTLE_MIN_AGE + 1)
+        self.assertEqual(0, code, out)
+        self.assertEqual("2-0", conn.data[self.CURSOR], "the newer checkpoint is confirmed")
+        ((status, body),) = slow.deliver()                          # 3. NOW the old save arrives
+        self.assertEqual(403, status)
+        self.assertEqual(("refused", False), (body["error"], body["executed"]))
+        self.assertIn("only moves forward", body["reason"])
+        self.assertEqual("2-0", conn.data[self.CURSOR], "the delayed old save moved the cursor back")
+        self.assertEqual(self.cursor(), conn.data[self.CURSOR], "the local cursor and the stored one agree")
+
+    def test_an_old_save_that_arrives_DURING_the_hold_is_found_and_the_next_one_moves_forward(self):
+        conn = stream(["m1"])
+        worker = Worker(conn)
+        slow = BridgeSim(conn, fault=save_lost("held"))
+        self.read(worker, slow, clock=self.SENT_AT)
+        assert run(conn, "grok", "xadd", KEY, val="m2")["ok"]
+        bridge = BridgeSim(conn)
+        self.read(worker, bridge, clock=self.SENT_AT + 5)           # held; the local cursor is 2-0
+        ((status, body),) = slow.deliver()
+        self.assertEqual((200, "1-0"), (status, conn.data[self.CURSOR]))
+        code, out = self.reconcile(worker, bridge, clock=self.SENT_AT + 6)
+        self.assertEqual("COMMITTED", self.lines()[-1]["outcome"], out)
+        code, out = self.read(worker, bridge, clock=self.SENT_AT + 7)
+        self.assertEqual("2-0", conn.data[self.CURSOR])
+
+    def test_only_an_unknown_save_of_MY_cursor_holds_my_saves(self):
+        bc.journal_unknown("xadd", "fleet:inbox:grok", "a message", "no answer (TimeoutError)", 300.0, self.journal)
+        bc.journal_unknown("set", "fleet:cursor:grok", "9-0", "no answer (TimeoutError)", 300.0, self.journal)
+        bc.journal_unknown("del", self.CURSOR, None, "no answer (TimeoutError)", 300.0, self.journal)
+        conn = stream(["m1"])
+        code, out = self.read(Worker(conn), BridgeSim(conn))
+        self.assertEqual(0, code, out)
+        self.assertEqual("1-0", conn.data[self.CURSOR], "an unrelated unknown write held this reader's save")
+
+    def test_an_answer_that_is_not_a_get_of_the_cursor_key_settles_nothing(self):
+        conn = stream(["m1"])
+        worker = Worker(conn)
+        self.read(worker, BridgeSim(conn, fault=save_lost("after")), clock=self.SENT_AT)
+        good = {"ok": True, "op": "get", "key": self.CURSOR, "found": True, "value": "1-0", "principal": ME}
+        for name, answer in (("another key", dict(good, key="fleet:cursor:grok")),
+                             ("another op", dict(good, op="xrange")),
+                             ("no value", {k: v for k, v in good.items() if k != "value"}),
+                             ("a value that is not text", dict(good, value=["1-0"]))):
+            code, out = self.reconcile(worker, lambda u, t, r, answer=answer: answer)
+            self.assertEqual(inbox.UNSETTLED_EXIT, code, name)
+            self.assertEqual(1, len(self.lines()), name)
+        code, out = self.reconcile(worker, lambda u, t, r: good)
+        self.assertEqual(0, code, out)
+
+    def test_a_cursor_key_that_cannot_be_read_settles_nothing(self):
+        conn = stream(["m1"])
+        worker = Worker(conn)
+        self.read(worker, BridgeSim(conn, fault=save_lost("after")), clock=self.SENT_AT)
+        code, out = self.reconcile(worker, BridgeSim(conn, principal="chatgpt-codex-desktop"))   # denied
+        self.assertEqual(inbox.UNSETTLED_EXIT, code, out)
+        worker.drop.add("get")                                      # and by the board, no answer comes
+        code, out = self.reconcile(worker, environ={})
+        self.assertEqual(inbox.UNSETTLED_EXIT, code, out)
+        self.assertIn("could not be read", out)
+        self.assertEqual(1, len(self.lines()), "nothing was settled")
+
+    def test_a_cursor_save_is_settled_by_the_board_route_too_and_only_by_reading(self):
+        for how, word in (("after", "COMMITTED"), ("before", "NOT HELD")):
+            if os.path.exists(self.journal):
+                os.unlink(self.journal)
+                os.unlink(self.bookmark)
+            conn = stream(["m1"])
+            worker = Worker(conn)
+            self.read(worker, BridgeSim(conn, fault=save_lost(how)), clock=self.SENT_AT)
+            def governed():                       # everything but gov: (the audit, the worker's own locks)
+                return {k: v for k, v in conn.data.items() if not k.startswith("gov:")}
+
+            before = governed()
+            code, out = self.reconcile(worker, environ={})
+            self.assertEqual(0, code, out)
+            self.assertIn(word, out)
+            self.assertEqual(["op=get"], [a.split("|")[7] for a in worker.asked], "one read, and no write")
+            self.assertEqual(before, governed(), "reconciling changed something")
+
+    def test_the_board_rows_value_is_read_whole_or_not_at_all(self):
+        key = self.CURSOR
+        row = "BCB|v=1|id=X|phase=AYA_RESULT|from=bus-reconciler|text=OK get %s: %s"
+        self.assertEqual(("12-0", ""), inbox.value_of(row % (key, '"12-0"'), key))
+        self.assertEqual(("", ""), inbox.value_of(row % (key, '""'), key), "an absent key shows as empty")
+        for bad in (row % ("fleet:cursor:grok", '"12-0"'), row % (key, "12-0"), row % (key, '["12-0"]'),
+                    row % (key, '"12-0"') + "|truncated=1", "BCB|v=1|id=X|no text here",
+                    "BCB|v=1|id=X|truncated=1|text=OK get %s: %s" % (key, '"12-0"'),
+                    "BCB|v=1|id=X|full=file:x|text=OK get %s: %s" % (key, '"12-0"'),
+                    "BCB|v=1|text=REFUSED: no (audited: ok)", "BCB|v=1|text=OK xrange %s: []" % key):
+            value, why = inbox.value_of(bad, key)
+            self.assertIsNone(value, bad)
+            self.assertTrue(why, bad)
 
     def test_any_other_op_stays_unknown_for_a_person(self):
         bc.journal_unknown("del", "fleet:test:x", None, "no answer (TimeoutError)", 300.0, self.journal)
@@ -986,8 +1297,7 @@ class Reconciling(Harness, unittest.TestCase):
                            self.journal)
         code, out = self.reconcile(Worker(FakeRedis()), BridgeSim(FakeRedis()))
         self.assertEqual(inbox.UNSETTLED_EXIT, code)
-        self.assertEqual(2, out.count("settle it by hand"), "only the read cursor's own SET is superseded")
-        self.assertNotIn("SUPERSEDED", out)
+        self.assertEqual(2, out.count("settle it by hand"), "only an xadd and the read cursor's own SET are looked for")
 
     def test_one_alert_row_per_unknown_write_and_it_holds_no_message(self):
         conn = FakeRedis()

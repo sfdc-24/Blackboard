@@ -1074,6 +1074,9 @@ jobs:
       # fake bucket), proved by the empty network namespace.
       # test_bridge_client (2026-10-13): the direct route's client. gcloud and the HTTP opener are
       # fakes; the empty network namespace is what proves no token is minted and no socket opened.
+      # Its combined tests drive the REAL service in process: bridge_client.call -> main.Handler.do_POST
+      # -> op.handle -> redis_gov.execute (Aya on 0baa197). Only the socket, Google's verifier and Redis
+      # are stood in, so this suite also fails on a change to cloud/redis-tool-bridge/ or redis_gov.py.
       - name: "redis gov, git requests, live mode, archive, inbox, bridge client: the governed path and its worker (no network)"
         run: |
           set -euo pipefail

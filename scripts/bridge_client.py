@@ -58,6 +58,8 @@ THE JOURNAL, AND HOW AN UNKNOWN IS SETTLED (Aya's Stage 1 exit check 5)
     shown text has that second hash; reading changes nothing, so it can be run any number of times.
     What it finds is appended as a second line that names the first. Nothing here ever sends the
     operation again: a write found absent is reported, and sending it again is a person's decision.
+    A save of the read cursor is settled by reading its key, and while it is unsettled redis_inbox
+    sends no later save: pending() is what it asks.
 
 WHAT IS SAID, AND TO WHOM (blocker 5)
     Every failure is said out loud, in CLOSED words: a status number and a label from the table

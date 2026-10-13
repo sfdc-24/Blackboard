@@ -486,6 +486,95 @@ class TheWriteAndItsAuditStayTogether(unittest.TestCase):
         self.assertEqual("write failed", out["error"])
 
 
+class AReadCursorOnlyMovesForward(unittest.TestCase):
+    """fleet:cursor:<agent> (Aya, 2026-10-13): a checkpoint whose answer was lost may land late. It must
+    not move the cursor back past a newer one, whenever it arrives and by whichever route."""
+
+    KEY = "fleet:cursor:grok"
+
+    def test_forward_and_equal_are_written_and_backward_is_refused(self):
+        conn = FakeRedis()
+        self.assertTrue(run(conn, "grok", "set", self.KEY, val="5-0")["ok"], "the first save")
+        self.assertTrue(run(conn, "grok", "set", self.KEY, val="5-0")["ok"], "saving one value twice")
+        self.assertTrue(run(conn, "grok", "set", self.KEY, val="5-1")["ok"])
+        out = run(conn, "grok", "set", self.KEY, val="5-0")
+        self.assertFalse(out["ok"])
+        self.assertIn("only moves forward", out["refused"])
+        self.assertEqual("5-1", conn.data[self.KEY])
+        self.assertEqual("0", conn.audit()[-1]["ok"], "the refusal is audited like any other")
+
+    def test_ids_compare_as_numbers_not_as_text(self):
+        conn = FakeRedis()
+        run(conn, "grok", "set", self.KEY, val="9-0")
+        self.assertTrue(run(conn, "grok", "set", self.KEY, val="10-0")["ok"], '"10-0" sorts before "9-0" as text')
+        self.assertIn("refused", run(conn, "grok", "set", self.KEY, val="9-0"))
+        self.assertIn("refused", run(conn, "grok", "set", self.KEY, val="9-99"))
+        self.assertEqual("10-0", conn.data[self.KEY])
+
+    def test_a_cursor_is_a_stream_id_or_it_is_refused(self):
+        for bad in ("", "banana", "5", "5-", "-5", "5-0-0", " 5-0", "99999999999999999999-0", "\u0665-0"):
+            conn = FakeRedis()
+            out = run(conn, "grok", "set", self.KEY, val=bad)
+            self.assertFalse(out["ok"], repr(bad))
+            self.assertNotIn(self.KEY, conn.data, repr(bad))
+
+    def test_the_delayed_old_save_is_refused_after_a_newer_one(self):
+        """The delayed completion itself: A was sent, its answer lost; B is saved; then A arrives."""
+        conn = FakeRedis()
+        self.assertTrue(run(conn, "grok", "set", self.KEY, val="20-0", via="bridge:later")["ok"])   # B
+        late = run(conn, "grok", "set", self.KEY, val="12-0", via="bridge:earlier")               # A, late
+        self.assertIn("only moves forward", late["refused"])
+        self.assertEqual("20-0", conn.data[self.KEY], "the newer checkpoint stands")
+
+    def test_it_is_a_compare_and_set_not_a_look_then_write(self):
+        """A newer save that lands between this one's comparison and its EXEC: nothing is applied."""
+        conn = FakeRedis()
+        run(conn, "grok", "set", self.KEY, val="5-0")
+        real = conn.pipeline
+
+        def racing_pipeline(transaction=True):
+            pipe = real(transaction)
+            original_multi = pipe.multi
+
+            def multi():
+                conn.set(self.KEY, "30-0")                       # between the comparison and the EXEC
+                original_multi()
+            pipe.multi = multi
+            return pipe
+        conn.pipeline = racing_pipeline
+        out = run(conn, "grok", "set", self.KEY, val="12-0")      # forward of 5-0 when it looked
+        self.assertFalse(out["ok"])
+        self.assertEqual("30-0", conn.data[self.KEY], "the older save overwrote the newer one")
+
+    def test_a_key_that_holds_no_stream_id_can_be_repaired(self):
+        conn = FakeRedis()
+        conn.set(self.KEY, "left by an older writer")
+        self.assertTrue(run(conn, "grok", "set", self.KEY, val="7-0")["ok"])
+
+    def test_del_still_removes_it_so_moving_back_is_a_deletion_first(self):
+        conn = FakeRedis()
+        run(conn, "grok", "set", self.KEY, val="20-0")
+        self.assertTrue(run(conn, "grok", "del", self.KEY)["ok"])
+        self.assertTrue(run(conn, "grok", "set", self.KEY, val="3-0")["ok"])
+        self.assertEqual(["set", "del", "set"], [e["op"] for e in conn.audit()[-3:]], "each step is audited")
+
+    def test_only_the_cursor_namespace_is_held_to_it(self):
+        conn = FakeRedis()
+        run(conn, "grok", "set", "fleet:x", val="9-0")
+        self.assertTrue(run(conn, "grok", "set", "fleet:x", val="1-0")["ok"])
+        self.assertTrue(run(conn, "grok", "set", "fleet:x", val="not an id")["ok"])
+        self.assertEqual(("fleet:cursor:",), gov.FORWARD_ONLY)
+
+    def test_the_rule_is_in_code_and_no_acl_can_switch_it_off(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            from_file = gov.load_acl(acl_file(tmp, forward_only=[], FORWARD_ONLY=[]))
+        # the file as loaded, and the same rules handed over as a dict that carries the would-be switch
+        for acl in (from_file, dict(from_file, forward_only=[], FORWARD_ONLY=[])):
+            conn = FakeRedis()
+            run(conn, "grok", "set", self.KEY, val="20-0", acl=acl)
+            self.assertIn("refused", run(conn, "grok", "set", self.KEY, val="3-0", acl=acl))
+
+
 class TheServerSetsTheTTL(unittest.TestCase):
     def test_longest_prefix_wins(self):
         conn = FakeRedis()

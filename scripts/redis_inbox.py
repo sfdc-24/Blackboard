@@ -62,6 +62,16 @@ THE DIRECT ROUTE, WHEN THIS AGENT HAS ONE (2026-10-13, docs/REDIS-PRIMARY.md Pha
     it again is a person's decision, not this command's. Anything else stays UNKNOWN. It only ever
     reads, so it may be run as often as wanted.
 
+    THE READ CURSOR'S SAVE IS A WRITE TOO (Aya on 0baa197: a blind re-save is not proven monotonic)
+    A save of fleet:cursor:<me> whose outcome is UNKNOWN may still be on its way, and could land after
+    a newer one. Two things stop that from moving the cursor back:
+    - `read` sends NO later save, by either route, while one is UNKNOWN. It says HELD and exits 7; the
+      local cursor still moves, so nothing is shown twice. `reconcile` settles it by reading the key:
+      it holds what was sent (COMMITTED), or ten minutes on it does not (NOT HELD). Then saves resume.
+    - The store itself refuses a cursor lower than the one it holds (redis_gov.FORWARD_ONLY, decided
+      under the same WATCH as the write). So the old save is refused whenever it arrives, whatever
+      this reader did or did not do. To move a cursor back on purpose, `del` it first.
+
 THE LAPTOP LANE (step 3 of the broken-telephone fix, Converspan Channel Architecture v0.1)
     The cloud routes a Drive request to this laptop only while fleet:alive:claude-code-cli is
     fresh (cloud/drive-intake reads it; 300 s is the owner's window). This laptop cannot reach
@@ -454,6 +464,17 @@ def direct(op: str, key: str, *, value: str | None = None, count: int | None = N
 _EXITS = {"refused": REFUSED_EXIT, "denied": DENIED_EXIT, "unknown": UNKNOWN_EXIT}
 
 
+def unsettled_checkpoint() -> str:
+    """The journal id of a save of MY read cursor whose outcome is still UNKNOWN, or ""."""
+    sys.path.insert(0, os.path.join(REPO, "scripts"))
+    import bridge_client                                          # noqa: E402
+
+    for entry in bridge_client.pending():
+        if entry.get("op") == "set" and entry.get("key") == CURSOR_KEY % ME:
+            return str(entry.get("id"))
+    return ""
+
+
 def cmd_send(args) -> int:
     to = canonical(args.to)
     text = message(args.text)
@@ -525,11 +546,20 @@ def cmd_read(args) -> int:
             break
     else:
         print("more is waiting after %s: read again (each page is one row)" % cursor)
-    if cursor != start or owed:
-        # The cursor's copy in Redis is a SET of one value: writing it twice is writing it once. So an
-        # unconfirmed or UNKNOWN save is not sent again NOW, by either route; it is left "not synced" and
-        # the NEXT read saves the cursor it has then, which is this one or a later one. Unlike an xadd, a
-        # repeat here cannot add anything.
+    held = unsettled_checkpoint() if (cursor != start or owed) else ""
+    if held:
+        # A save of this cursor went out earlier and its outcome is UNKNOWN: it may still be on its way.
+        # NO later checkpoint is sent, by either route, until that one is settled (Aya, 2026-10-13: a
+        # blind re-save is not proven monotonic - the old one could land after the new one). The local
+        # cursor has moved, so nothing is shown twice; only the copy in Redis waits.
+        code = code or UNKNOWN_EXIT
+        print("cursor %s -> %s (local); in Redis: HELD. An earlier save (%s) has an unknown outcome, and no "
+              "later one is sent until it is settled: python scripts/redis_inbox.py reconcile"
+              % (start, cursor, held))
+    elif cursor != start or owed:
+        # One save, by one route. An UNKNOWN outcome is journalled and holds every later save (above).
+        # And the store itself refuses a cursor lower than the one it holds (redis_gov.FORWARD_ONLY), so
+        # a save that arrives late cannot move the cursor back whatever this reader does.
         kind, what = direct("set", CURSOR_KEY % ME, value=cursor)
         if kind == "ok":
             ok = True
@@ -544,8 +574,9 @@ def cmd_read(args) -> int:
             remember(cursor, synced=True)
         else:
             code = code or 4
-        print("cursor %s -> %s (local); in Redis: %s" % (start, cursor, "saved" if ok else
-                                                          "NOT confirmed, the local one stands; retried next read"))
+        print("cursor %s -> %s (local); in Redis: %s" % (
+            start, cursor, "saved" if ok else "NOT confirmed, the local one stands; held until reconciled"
+            if kind == "unknown" else "NOT confirmed, the local one stands; retried next read"))
     print("%d shown from %s, cursor %s" % (shown, key, cursor))
     return code
 
@@ -606,6 +637,59 @@ def find_write(entry: dict, wait: float, since: str, pages: int) -> tuple:
     return "unread", "the window is longer than %d pages; run it again with --pages" % pages
 
 
+_VALUE = re.compile(r"OK get (?P<key>\S+): (?P<body>.*)", re.S)
+
+
+def value_of(payload: str, key: str) -> tuple:
+    """(the value one governed GET showed, "") out of a RESULT row, or (None, why). A key that does not
+    exist shows as the empty string on this route; the reconcile needs only "is it what was sent"."""
+    head, sep, text = payload.partition("|text=")
+    if not sep:
+        return None, "no text= in the answer"
+    if re.search(r"(^|\|)(truncated=1|full=)", head + "|" + text):
+        return None, "the answer was longer than one row"
+    m = _VALUE.fullmatch(text.strip())
+    if not m or m["key"] != key:
+        return None, "the answer is not a get of this key"
+    try:
+        value = json.loads(m["body"])
+    except ValueError:
+        return None, "the value shown is not JSON"
+    return (value, "") if isinstance(value, str) else (None, "the value shown is not a string")
+
+
+def one_value(key: str, wait: float, since: str) -> tuple:
+    """(the value a governed GET shows for `key`, "") by whichever route answers, or (None, why). A read,
+    on either route: it changes nothing."""
+    kind, what = direct("get", key)
+    if kind in _EXITS:
+        return None, what.splitlines()[0]
+    if kind == "ok":
+        if (not isinstance(what, dict) or what.get("op") != "get" or what.get("key") != key
+                or not isinstance(what.get("value"), str)):
+            return None, "the bridge's answer is not a get of this key"
+        return what["value"], ""
+    rid = post(request_row("get", key))
+    got = answer(rid, wait, since=since or stamp())
+    if not got:
+        return None, "no answer yet from the worker (request %s)" % rid
+    if got.get("from") != WORKER:
+        return None, "the answer row is from %r, not %s" % (got.get("from"), WORKER)
+    return value_of(got["payload"], key)
+
+
+def find_checkpoint(entry: dict, wait: float, since: str) -> tuple:
+    """Look at the cursor key for one journalled save. ("found", "") when the key holds exactly what was
+    sent | ("absent", "") when it holds anything else, or nothing | ("unread", why)."""
+    sys.path.insert(0, os.path.join(REPO, "scripts"))
+    import bridge_client                                          # noqa: E402
+
+    value, why = one_value(str(entry["key"]), wait, since)
+    if value is None:
+        return "unread", why
+    return ("found", "") if bridge_client._sha(value) == entry.get("shown_sha256") else ("absent", "")
+
+
 def cmd_reconcile(args) -> int:
     """Settle every UNKNOWN write in the journal that can be settled by READING. It sends no write."""
     sys.path.insert(0, os.path.join(REPO, "scripts"))
@@ -619,15 +703,33 @@ def cmd_reconcile(args) -> int:
     for entry in waiting:
         what = "%s %s on %s at %s" % (entry["id"], entry.get("op"), entry.get("key"), entry.get("at"))
         now = time.time()
-        if entry.get("op") == "set" and entry.get("key") == CURSOR_KEY % ME:
-            # A SET of the read cursor: the next read saves the cursor it has then, this one or a later
-            # one, and writing one value twice is writing it once. Nothing to look for.
-            bridge_client.settle(entry, "SUPERSEDED", "the next read saves the cursor", now)
-            print("SUPERSEDED  %s: the next read saves the cursor again; nothing can be duplicated" % what)
-            continue
-        if entry.get("op") != "xadd" or not entry.get("shown_sha256") or "epoch" not in entry:
+        # A save of MY read cursor is settled by reading the key it was aimed at. Until it is, cmd_read
+        # sends no later save (unsettled_checkpoint), so "the key holds something else" cannot be a
+        # later save of this reader's hiding a committed one.
+        checkpoint = entry.get("op") == "set" and entry.get("key") == CURSOR_KEY % ME
+        if (not (checkpoint or entry.get("op") == "xadd") or not entry.get("shown_sha256")
+                or "epoch" not in entry):
             left += 1
-            print("UNKNOWN     %s: this command can only look for an xadd; settle it by hand" % what)
+            print("UNKNOWN     %s: this command can only look for an xadd or a save of the read cursor; "
+                  "settle it by hand" % what)
+            continue
+        if checkpoint:
+            state, detail = find_checkpoint(entry, args.wait, args.since)
+            if state == "found":
+                bridge_client.settle(entry, "COMMITTED", "the cursor key holds it", now)
+                print("COMMITTED   %s: the cursor key holds it. Later saves may go." % what)
+            elif state == "absent" and now - int(entry["epoch"]) >= SETTLE_MIN_AGE:
+                bridge_client.settle(entry, "NOT_HELD", "the cursor key does not hold it", now)
+                print("NOT HELD    %s: the cursor key does not hold it. Later saves may go: the store "
+                      "refuses a cursor that moves back, so this one cannot undo a later one if it "
+                      "still arrives." % what)
+            elif state == "absent":
+                left += 1
+                print("UNKNOWN     %s: the cursor key does not hold it yet, and it is under %d s old, so it "
+                      "could still land. Run this again later." % (what, SETTLE_MIN_AGE))
+            else:
+                left += 1
+                print("UNKNOWN     %s: the cursor key could not be read (%s)" % (what, detail))
             continue
         state, detail = find_write(entry, args.wait, args.since, args.pages)
         if state == "found":
