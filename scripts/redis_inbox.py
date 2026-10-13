@@ -34,6 +34,24 @@ WHAT IT DOES NOT DO
     python scripts/redis_inbox.py read [--wait 180] [--count 4]  new messages to me, after my cursor
     python scripts/redis_inbox.py selftest                       the grammar, no network
 
+THE DIRECT ROUTE, WHEN THIS AGENT HAS ONE (2026-10-13, docs/REDIS-PRIMARY.md Phase 3b)
+    `send` and `read` first try scripts/bridge_client.py: one HTTPS call to the redis-tool-bridge,
+    no board row, the caller verified by an impersonated identity token and bound to THIS agent's
+    principal. It is OFF unless REDIS_BRIDGE=on is set for this agent, and until the bridge's op
+    endpoint is deployed the switch has nothing to reach.
+
+    It is a TRANSPORT, not a second reader (Aya on a125337). A page that came by the bridge is
+    judged by the same function as a page that came by the board (whole_page): numeric stream ids,
+    in order after the cursor, `last` the last id shown, a text cut at the preview bound stops the
+    cursor before it. One cursor, one bookmark, whichever route carried the page; a read may change
+    route between two pages and loses and repeats nothing.
+
+    WHAT NEVER FALLS BACK TO THE BOARD ROUTE (the same review, blockers 1 and 2):
+    - a WRITE whose outcome is UNKNOWN: it may have committed, so it is journalled and not sent again;
+    - a caller the bridge DENIED (401 or 403): the board route identifies by claim, and moving a
+      denied caller there would be a downgrade around the refusal;
+    - an operation the access rules REFUSED: the board route runs the same rules.
+
 THE LAPTOP LANE (step 3 of the broken-telephone fix, Converspan Channel Architecture v0.1)
     The cloud routes a Drive request to this laptop only while fleet:alive:claude-code-cli is
     fresh (cloud/drive-intake reads it; 300 s is the owner's window). This laptop cannot reach
@@ -297,9 +315,18 @@ def page_of(payload: str, key: str, after: str) -> dict:
         if body.endswith("..."):
             return {"status": "cut", "why": "the body was cut at its 1500-character bound"}
         return {"status": "unparsed", "why": "the body is not JSON"}
+    return whole_page(entries, m["more"] == "true", m["last"], after)
+
+
+def whole_page(entries, more, last, after: str) -> dict:
+    """The ONE judgement of a page, whichever route carried it (the board's RESULT row or the bridge's
+    answer). "ok" only when the page can move the cursor: a list of entries, every shown id a stream id,
+    in numeric order after the cursor, and `last` the last of them."""
     if not isinstance(entries, list) or not all(isinstance(e, dict) for e in entries):
         return {"status": "unparsed", "why": "the body is not a list of entries"}
-    last = m["last"]
+    if not isinstance(more, bool) or stream_id(last) is None:
+        return {"status": "unparsed", "why": "the page has no usable more/last"}
+    last = str(last)
     # Every shown id is a stream id, in order, after the cursor, and `last` IS the last of them. A worker
     # from before PR 397 showed a field named `id` in place of the stream id, so such a page is not read
     # rather than trusted; and a `last` beyond the entries shown would skip the ones between (Cursor).
@@ -309,7 +336,18 @@ def page_of(payload: str, key: str, after: str) -> dict:
                                              "from before PR 397 shows a field named id over them)" % after}
     if (str(entries[-1]["id"]) if entries else after) != last:
         return {"status": "unparsed", "why": "last=%s is not the last id shown after %s" % (last, after)}
-    return {"status": "ok", "entries": entries, "more": m["more"] == "true", "last": last}
+    return {"status": "ok", "entries": entries, "more": more, "last": last}
+
+
+def page_of_result(result, key: str, after: str) -> dict:
+    """One answer from the bridge to an `xrange after=`, judged exactly as a board page is. The answer is
+    redis_gov's own result dict. It is the page asked for only when it names this key and this cursor:
+    an endpoint that ignored after= answers the newest-N read, which carries no `after`, and is not read."""
+    if not isinstance(result, dict) or result.get("op") != "xrange":
+        return {"status": "unparsed", "why": "the bridge's answer is not an xrange result"}
+    if result.get("key") != key or result.get("after") != after:
+        return {"status": "unparsed", "why": "the page is not the one asked for (%s after %s)" % (key, after)}
+    return whole_page(result.get("value"), result.get("more"), result.get("last"), after)
 
 
 def text_cut(entry: dict) -> bool:
@@ -334,9 +372,68 @@ def advance(page: dict, cursor: str, past_cut: bool):
     return entries, page["last"], ""
 
 
+# Exit codes of the three outcomes that end a command without the board route being used.
+REFUSED_EXIT, DENIED_EXIT, UNKNOWN_EXIT = 5, 6, 7
+
+
+def breaker_row(text: str) -> None:
+    """The ONE row a tripped bridge breaker posts (bridge_client.attempt's `announce`). bridge_client
+    hands it closed words only - a count, a status label, a time - and never a message or an error body."""
+    rid = "CCC-BRIDGE-BREAKER-%s" % secrets.token_hex(4)
+    line = " ".join(str(text).replace("|", "/").split())[:400]
+    post({
+        "row_id": rid, "source_tag": ME, "target_surface": "claude-code-cli;aya",
+        "action_type": "NOTE", "category": "OPEN", "project_tag": "Blackboard",
+        "gist": "redis bridge breaker open", "subgist": "",
+        "payload": "|".join(["BCB|v=1", "id=" + rid, "phase=NOTE", "from=" + ME,
+                             "to=claude-code-cli,aya", "via=direct", "text=" + line]),
+    })
+
+
+def direct(op: str, key: str, *, value: str | None = None, count: int | None = None,
+           after: str | None = None) -> tuple:
+    """One operation by the direct route. (kind, what):
+        ("ok", result)        done through the bridge; no board row was spent
+        ("board", None)       use the governed board route (the switch is off, or bridge_client has
+                              already said why the bridge was not used for this one)
+        ("refused", line)     the access rules refused it            - TERMINAL, never the board route
+        ("denied", line)      the bridge refused this caller         - TERMINAL, never the board route
+        ("unknown", line)     a WRITE was sent and may have committed - TERMINAL, never sent again
+    """
+    sys.path.insert(0, os.path.join(REPO, "scripts"))
+    import bridge_client                                          # noqa: E402
+
+    try:
+        result = bridge_client.attempt(op, key, me=ME, value=value, count=count, after=after,
+                                       announce=breaker_row)
+    except bridge_client.Refused as why:
+        return "refused", ("REFUSED by the access rules: %s (the refusal's audit entry: %s)\n"
+                           "Not sent on the board route: it runs the same rules and would refuse it again."
+                           % (why.reason, why.audit or "not confirmed"))
+    except bridge_client.Denied as why:
+        return "denied", ("DENIED by the bridge: %s.\nNot sent on the board route: that route identifies a "
+                          "sender by claim, and a denied caller is not moved to a weaker check." % why)
+    except bridge_client.Unknown as why:
+        return "unknown", ("UNKNOWN OUTCOME: %s.\nThe write was sent and MAY HAVE COMMITTED. It is NOT sent "
+                           "again by any route; it is recorded in %s for reconciliation."
+                           % (why, os.path.basename(bridge_client.JOURNAL)))
+    return ("ok", result) if result is not None else ("board", None)
+
+
+_EXITS = {"refused": REFUSED_EXIT, "denied": DENIED_EXIT, "unknown": UNKNOWN_EXIT}
+
+
 def cmd_send(args) -> int:
     to = canonical(args.to)
-    rid = post(request_row("xadd", KEY % to, value=message(args.text)))
+    text = message(args.text)
+    kind, what = direct("xadd", KEY % to, value=text)
+    if kind in _EXITS:
+        print(what)
+        return _EXITS[kind]
+    if kind == "ok":
+        print("sent to %s through the bridge as %s: no board row" % (to, what.get("principal", "?")))
+        return 0
+    rid = post(request_row("xadd", KEY % to, value=text))
     print("sent to %s, request %s" % (to, rid))
     got = answer(rid, args.wait, since=args.since or stamp())
     print("worker: %s" % (got["payload"][:300] if got else not_yet(args.wait, rid)))
@@ -357,14 +454,22 @@ def cmd_read(args) -> int:
         raise SystemExit("the read cursor is not a stream id: %r (fix %s or pass --after)" % (start, BOOKMARK))
     cursor, count, shown, code = start, max(1, min(int(args.count), 20)), 0, 0
     for _page in range(max(1, int(args.pages))):
-        rid = post(request_row("xrange", key, count=count, after=cursor))
-        got = answer(rid, args.wait, since=args.since or stamp())
-        if not got:
-            print(read_timeout(args.wait, rid))
-            code = 2
+        kind, what = direct("xrange", key, count=count, after=cursor)
+        if kind in _EXITS:                       # refused or denied: a read is never "unknown"
+            print(what)
+            code = _EXITS[kind]
             break
-        page = (page_of(got["payload"], key, cursor) if got.get("from") == WORKER else
-                {"status": "unparsed", "why": "the answer row is from %r, not %s" % (got.get("from"), WORKER)})
+        if kind == "ok":
+            page = page_of_result(what, key, cursor)
+        else:
+            rid = post(request_row("xrange", key, count=count, after=cursor))
+            got = answer(rid, args.wait, since=args.since or stamp())
+            if not got:
+                print(read_timeout(args.wait, rid))
+                code = 2
+                break
+            page = (page_of(got["payload"], key, cursor) if got.get("from") == WORKER else
+                    {"status": "unparsed", "why": "the answer row is from %r, not %s" % (got.get("from"), WORKER)})
         if page["status"] == "cut" and count > 1:
             count = max(1, count // 2)
             print("page cut (%s); asking again for %d" % (page["why"], count))
@@ -390,9 +495,20 @@ def cmd_read(args) -> int:
     else:
         print("more is waiting after %s: read again (each page is one row)" % cursor)
     if cursor != start or owed:
-        rid = post(request_row("set", CURSOR_KEY % ME, value=cursor))
-        saved = answer(rid, args.wait, since=args.since or stamp())
-        ok = bool(saved) and saved.get("from") == WORKER and "|text=OK" in saved["payload"]
+        # The cursor's copy in Redis is a SET of one value: writing it twice is writing it once. So an
+        # unconfirmed or UNKNOWN save is not sent again NOW, by either route; it is left "not synced" and
+        # the NEXT read saves the cursor it has then, which is this one or a later one. Unlike an xadd, a
+        # repeat here cannot add anything.
+        kind, what = direct("set", CURSOR_KEY % ME, value=cursor)
+        if kind == "ok":
+            ok = True
+        elif kind in _EXITS:
+            print(what)
+            ok = False
+        else:
+            rid = post(request_row("set", CURSOR_KEY % ME, value=cursor))
+            saved = answer(rid, args.wait, since=args.since or stamp())
+            ok = bool(saved) and saved.get("from") == WORKER and "|text=OK" in saved["payload"]
         if ok:
             remember(cursor, synced=True)
         else:
