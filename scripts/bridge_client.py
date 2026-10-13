@@ -373,7 +373,7 @@ def _close(intent, outcome: str, now: float, path, say) -> None:
             "(%s) until a person settles it" % (type(error).__name__, intent["id"]))
 
 
-def attempt(op: str, key: str, *, me: str, value=None, count=None, after=None, environ=None,
+def attempt(op: str, key: str, *, me: str, value=None, count=None, after=None, field=None, environ=None,
             now=None, state_path=None, journal_path=None, callers=None, say=None, announce=None,
             minter=None, caller=None):
     """Try one operation through the bridge, as `me`.
@@ -410,6 +410,8 @@ def attempt(op: str, key: str, *, me: str, value=None, count=None, after=None, e
         say("bridge breaker is open until %s; using the board route" % clock(state["open_until"]))
         return None
     request = {"op": op, "key": key, "expect": me}
+    if field:
+        request["field"] = str(field)                  # a hash field, for hset
     if value is not None:
         request["val"] = base64.b64encode(str(value).encode("utf-8")).decode("ascii")
         request["enc"] = "b64"

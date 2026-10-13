@@ -213,8 +213,9 @@ class FakePipeline:
 ACL = gov.load_acl()
 
 
-def run(conn, tag, op, key, field="", val="", enc="", via="REQ-1", acl=None):
-    return gov.execute(conn, acl or ACL, tag, via, op, key, field=field, raw_value=val, enc=enc)
+def run(conn, tag, op, key, field="", val="", enc="", via="REQ-1", acl=None, verified=False):
+    return gov.execute(conn, acl or ACL, tag, via, op, key, field=field, raw_value=val, enc=enc,
+                       verified=verified)
 
 
 def acl_file(tmp, **override):
@@ -573,6 +574,437 @@ class AReadCursorOnlyMovesForward(unittest.TestCase):
             conn = FakeRedis()
             run(conn, "grok", "set", self.KEY, val="20-0", acl=acl)
             self.assertIn("refused", run(conn, "grok", "set", self.KEY, val="3-0", acl=acl))
+
+
+def work_entry(rev, action, state, owner="grok", reviewer="-", requester="cursor", lease="-", req="req00001",
+               words=""):
+    """One log entry in the grammar redis_gov.work_event reads."""
+    return ("r%d %s %s %s %s %s %s %s" % (rev, action, state, owner, reviewer, requester, lease, req)
+            + ((" " + words) if words else ""))
+
+
+class AWorkRecordIsAdmittedNotTrusted(unittest.TestCase):
+    """proj:work:v1: (Aya on PR 403 at da4488a): the actor comes from an authenticated transport, and the
+    revision, the state, the owner and the evidence a move needs are checked INSIDE the governed write,
+    under its WATCH, before the append and its audit. A generic raw write is not a way round it."""
+
+    RID = "W-20261013-a1b2c3"
+    REC, LOG, INDEX = "proj:work:v1:rec:" + RID, "proj:work:v1:log:" + RID, "proj:work:v1:index:20261013"
+    LEASE = "20261013T0900Z"
+
+    def add(self, conn, who, text, verified=True, via="bridge:test"):
+        return run(conn, who, "xadd", self.LOG, val=text, via=via, verified=verified)
+
+    DESCRIPTION = {"created": "2026-10-13T05:00:00Z", "done_when": "the suite is green", "kind": "task",
+                   "link": "-", "project": "Blackboard", "requested_by": "cursor",
+                   "source": "board row AYA-REDIS-STAGE1-EXIT-CRITERIA-20261013", "title": "Wire the reader"}
+
+    def put(self, conn, who="cursor", requested_by=None, verified=True, key=None, **change):
+        body = json.dumps(dict(self.DESCRIPTION, requested_by=who if requested_by is None else requested_by,
+                               **change))
+        return run(conn, who, "hput", key or self.REC, val=base64.b64encode(body.encode()).decode(), enc="b64",
+                   verified=verified)
+
+    def line(self, conn, text, who="grok", field=None, verified=True):
+        return run(conn, who, "hset", self.INDEX, field=field or self.RID, val=text, verified=verified)
+
+    def created(self):
+        """The description, then r1: cursor asks grok. Returns the connection."""
+        conn = FakeRedis()
+        self.assertTrue(self.put(conn)["ok"])
+        self.assertTrue(self.add(conn, "cursor", work_entry(1, "create", "requested"))["ok"])
+        return conn
+
+    def accepted(self):
+        conn = self.created()
+        self.assertTrue(self.add(conn, "grok", work_entry(2, "accept", "accepted", lease=self.LEASE,
+                                                          words="next=read the spec"))["ok"])
+        return conn
+
+    def texts(self, conn):
+        return [f["text"] for _, f in conn.data.get(self.LOG, [])]
+
+    def refused_and_unchanged(self, conn, out, why):
+        """The refusal named its reason, and the stream is exactly what it was."""
+        self.assertFalse(out.get("ok"), out)
+        self.assertIn(why, out.get("refused", ""), out)
+        self.assertEqual(("0", why in conn.audit()[-1]["reason"]), (conn.audit()[-1]["ok"], True), "it is audited")
+
+    # ------------------------------------------------- the actor comes from an authenticated transport
+    def test_REGRESSION_a_claimed_identity_writes_nothing_here_whatever_its_tag_says(self):
+        """Aya: "Board claimed Source_Tag/--as is not authenticated identity; refuse this protected
+        transition path unless equivalently verified." The same legal move, from a caller nobody verified."""
+        conn = self.created()
+        before = self.texts(conn)
+        legal = work_entry(2, "accept", "accepted", lease=self.LEASE, words="next=read the spec")
+        out = self.add(conn, "grok", legal, verified=False, via="REQ-1")
+        self.refused_and_unchanged(conn, out, "written only by an authenticated caller")
+        self.assertEqual(before, self.texts(conn), "a claimed identity moved the record")
+        self.assertIn("refused", self.put(FakeRedis(), verified=False))
+        self.assertIn("refused", self.line(conn, "1 requested grok - task x", verified=False))
+        self.assertTrue(self.add(conn, "grok", legal)["ok"], "the same move, from the verified owner")
+        for op, key in (("xrange", self.LOG), ("hgetall", self.REC), ("hgetall", self.INDEX)):
+            self.assertTrue(run(conn, "gemini", op, key)["ok"], "reading needs no verification")
+
+    def test_the_board_worker_never_passes_for_verified(self):
+        """Through bus_request.handle, the function the bus-requests job runs: a row from the owner's own
+        tag asking for the owner's own legal move is answered REFUSED, and the log is untouched."""
+        import datetime
+        import bus_request
+        conn = self.created()
+        legal = work_entry(2, "accept", "accepted", lease=self.LEASE, words="next=read the spec")
+        row = ["ROW-1", "2026-10-13T04:59:00Z", "grok", "bus-reconciler", "AYA_REQ",
+               "BCB|v=1|id=REQ-0001|req=REQ-0001|do=redis-op|op=xadd|key=%s|val=%s|enc=b64"
+               % (self.LOG, base64.b64encode(legal.encode()).decode()), "", "", "", ""]
+        out = []
+        bus_request.handle([row], conn, now=datetime.datetime(2026, 10, 13, 5, 0, tzinfo=datetime.timezone.utc),
+                           append=out.append)
+        self.assertEqual(1, len(out))
+        self.assertIn("REFUSED: a work record is written only by an authenticated caller", out[0]["payload"])
+        self.assertEqual(1, len(self.texts(conn)))
+        self.assertNotIn("verified=", pathlib.Path(bus_request.__file__).read_text(encoding="utf-8"),
+                         "the board worker must have no way to say its caller was verified")
+
+    # ----------------------------------------------- unauthorized moves never reach the stream
+    def test_REGRESSION_an_unauthorized_done_or_handoff_is_refused_before_the_stream_changes(self):
+        """Aya: "unauthorized done/handoff ... refused BEFORE stream changes". Each is in sequence, well
+        formed, and from a VERIFIED caller - who is simply not allowed to make that move."""
+        conn = self.accepted()
+        before = self.texts(conn)
+        done = work_entry(3, "done", "done", words="evidence=https://example.test/1")
+        theft = work_entry(3, "handoff", "requested", owner="gemini")
+        for who, text, why in (("gemini", done, "only grok may done it, and this is gemini"),
+                               ("cursor", done, "only grok may done it, and this is cursor"),    # the requester
+                               ("gemini", theft, "only grok or cursor may handoff it, and this is gemini"),
+                               ("gemini", work_entry(3, "start", "working", lease=self.LEASE), "only grok may start it"),
+                               ("gemini", work_entry(3, "cancel", "cancelled", words="note=mine now"),
+                                "only grok or cursor may cancel it")):
+            out = self.add(conn, who, text)
+            self.refused_and_unchanged(conn, out, why)
+            self.assertEqual(before, self.texts(conn), (who, text))
+        self.assertTrue(self.add(conn, "grok", work_entry(3, "done", "done", words="unreviewed evidence=https://x.test/1"))["ok"])
+
+    def test_REGRESSION_a_forged_actor_is_refused_before_the_stream_changes(self):
+        """An entry has no field for its actor: the actor is the verified caller and nothing else. What
+        CAN be forged is who asked, at create and afterwards."""
+        conn = FakeRedis()
+        self.assertTrue(self.put(conn)["ok"])                         # cursor described it; gemini begins it "for cursor"
+        out = self.add(conn, "gemini", work_entry(1, "create", "requested", requester="cursor"))
+        self.refused_and_unchanged(conn, out, "by its requester")
+        self.assertNotIn(self.LOG, conn.data, "a refused create made the stream")
+        conn = self.accepted()
+        out = self.add(conn, "grok", work_entry(3, "start", "working", requester="grok", lease=self.LEASE))
+        self.refused_and_unchanged(conn, out, "this record's description names another requester")
+        out = self.add(conn, "grok", work_entry(3, "start", "working", owner="nobody-at-all", lease=self.LEASE))
+        self.refused_and_unchanged(conn, out, "are agents in the access list")
+        self.assertEqual(2, len(self.texts(conn)))
+        self.assertEqual(["cursor", "grok"], [f["by"] for _, f in conn.data[self.LOG]], "by is the verified caller")
+
+    def test_REGRESSION_a_move_without_the_evidence_it_requires_is_refused(self):
+        """Aya: "missing evidence refused"."""
+        conn = self.created()
+        out = self.add(conn, "grok", work_entry(2, "accept", "accepted", lease=self.LEASE))
+        self.refused_and_unchanged(conn, out, "accept must carry next=")
+        out = self.add(conn, "grok", work_entry(2, "accept", "accepted", lease=self.LEASE, words="next="))
+        self.refused_and_unchanged(conn, out, "accept must carry next=")
+        conn = self.accepted()
+        for text, why in ((work_entry(3, "done", "done"), "done must carry evidence="),
+                          (work_entry(3, "done", "done", words="note=trust me"), "done must carry evidence="),
+                          (work_entry(3, "block", "blocked", lease=self.LEASE), "block must carry blocker="),
+                          (work_entry(3, "cancel", "cancelled"), "cancel must carry note="),
+                          (work_entry(3, "note", "accepted", lease=self.LEASE), "a note says something")):
+            out = self.add(conn, "grok", text)
+            self.refused_and_unchanged(conn, out, why)
+        self.assertEqual(2, len(self.texts(conn)))
+        self.assertEqual({"accept": "next", "block": "blocker", "return": "note", "done": "evidence",
+                          "cancel": "note", "reopen": "note"},
+                         {name: rule[3] for name, rule in gov.WORK_MOVES.items() if rule[3]})
+
+    # ------------------------------------------------------------------------- the compare-and-set
+    def test_REGRESSION_two_valid_next_revisions_have_one_winner(self):
+        """Aya: "concurrent valid revisions one winner". Both read r1; both moves are legal from r1."""
+        conn = self.created()
+        accept = work_entry(2, "accept", "accepted", lease=self.LEASE, words="next=read the spec")
+        cancel = work_entry(2, "cancel", "cancelled", words="note=no longer wanted")
+        self.assertTrue(self.add(conn, "grok", accept)["ok"])
+        out = self.add(conn, "cursor", cancel)
+        self.refused_and_unchanged(conn, out, "revision conflict: the record is at r2")
+        self.assertEqual([work_entry(1, "create", "requested"), accept], self.texts(conn))
+
+    def test_it_is_decided_under_the_watch_not_before_it(self):
+        """A rival r2 that lands between this write's replay and its EXEC: nothing of this one applies."""
+        conn = self.created()
+        real = conn.pipeline
+        rival = work_entry(2, "cancel", "cancelled", words="note=no longer wanted")
+
+        def racing_pipeline(transaction=True):
+            pipe = real(transaction)
+            original_multi = pipe.multi
+
+            def multi():
+                conn.xadd(self.LOG, {"text": rival, "by": "cursor", "at": "x"})         # after the look
+                original_multi()
+            pipe.multi = multi
+            return pipe
+        conn.pipeline = racing_pipeline
+        audits = len(conn.audit())
+        out = self.add(conn, "grok", work_entry(2, "accept", "accepted", lease=self.LEASE, words="next=x"))
+        self.assertFalse(out["ok"])
+        self.assertEqual(rival, self.texts(conn)[-1])
+        self.assertEqual(2, len(self.texts(conn)))
+        self.assertEqual((audits + 1, "0"), (len(conn.audit()), conn.audit()[-1]["ok"]), "no audit of a write that did not happen")
+
+    def test_a_move_whose_answer_was_lost_cannot_land_after_someone_elses(self):
+        conn = self.created()
+        self.assertTrue(self.add(conn, "cursor", work_entry(2, "handoff", "requested", owner="gemini"),
+                                 via="bridge:later")["ok"])
+        late = self.add(conn, "grok", work_entry(2, "accept", "accepted", lease=self.LEASE, words="next=x"),
+                        via="bridge:earlier")
+        self.assertIn("revision conflict", late["refused"])
+        self.assertEqual(2, len(self.texts(conn)))
+
+    def test_what_is_not_an_entry_or_not_the_next_revision_is_refused(self):
+        conn = FakeRedis()
+        for bad in ("r1 create", "create requested grok - cursor - req", "r0 create requested grok - cursor - req",
+                    "r01 create requested grok - cursor - req", "r10000 create requested grok - cursor - req",
+                    "r1 dance requested grok - cursor - req", "r1 create sleeping grok - cursor - req",
+                    "r1 create requested  grok - cursor - req", "R1 create requested grok - cursor - req", ""):
+            out = self.add(conn, "cursor", bad)
+            self.assertFalse(out.get("ok"), bad)
+        self.assertNotIn(self.LOG, conn.data, "a refused first entry created the stream")
+        out = self.add(conn, "cursor", work_entry(2, "create", "requested"))
+        self.assertIn("revision conflict: the record is at r0", out["refused"])
+        conn = self.accepted()
+        out = self.add(conn, "grok", work_entry(4, "start", "working", lease=self.LEASE))
+        self.assertIn("revision conflict: the record is at r2", out["refused"])
+
+    # --------------------------------------------------- a tainted history is never built upon
+    def test_REGRESSION_tainted_history_stays_disputed_after_a_legal_looking_tail(self):
+        """Aya: "tainted history stays disputed after a legal-looking tail". The theft and the accept after
+        it were written AROUND the governor, straight into Redis. The last pair is legal. The chain is not."""
+        conn = self.accepted()
+        theft = work_entry(3, "handoff", "requested", owner="gemini")
+        tail = work_entry(4, "accept", "accepted", owner="gemini", lease=self.LEASE, words="next=mine now")
+        conn.xadd(self.LOG, {"text": theft, "by": "gemini", "at": "x"})          # illegal: gemini holds nothing
+        conn.xadd(self.LOG, {"text": tail, "by": "gemini", "at": "x"})           # legal after it, on its face
+        prev, last = gov.work_event(theft, "gemini"), gov.work_event(tail, "gemini")
+        self.assertEqual("", gov.work_allowed(prev, last), "the last pair alone is a legal move")
+        before = self.texts(conn)
+        for who, text in (("gemini", work_entry(5, "start", "working", owner="gemini", lease=self.LEASE)),
+                          ("cursor", work_entry(5, "cancel", "cancelled", owner="gemini", words="note=stop")),
+                          ("grok", work_entry(5, "note", "accepted", owner="gemini", lease=self.LEASE, words="what"))):
+            out = self.add(conn, who, text)
+            self.refused_and_unchanged(conn, out, "this record is disputed at entry 3-0 (only grok or cursor may handoff it")
+        self.assertEqual(before, self.texts(conn), "history is preserved exactly, for reconciliation")
+        out = self.line(conn, "4 accepted gemini %s task Wire the reader" % self.LEASE, who="gemini")
+        self.assertIn("this record is disputed at entry 3-0", out.get("refused", ""),
+                      "its list line, exactly what the tainted tail says, followed the theft")
+
+    def test_a_log_whose_entries_are_not_entries_takes_nothing_more(self):
+        conn = FakeRedis()
+        conn.xadd(self.LOG, {"text": "written around the governor", "by": "x", "at": "x"})
+        out = self.add(conn, "cursor", work_entry(2, "note", "requested", words="hello"))
+        self.assertIn("disputed at entry 1-0 (it is not a work-record entry)", out["refused"])
+
+    # ---------------------------------- a log is bound to its description: no takeover, no orphan
+    def test_REGRESSION_takeover_nobody_begins_a_record_another_agent_described(self):
+        """Aya on 647b0d9: "Authenticated B can append r1 under A's record ID between description write and
+        first log ... because the governor never reads/watches the record." cursor has described the record
+        and not yet begun it. gemini, verified, begins it as its own."""
+        conn = FakeRedis()
+        self.assertTrue(self.put(conn)["ok"])                         # cursor's description
+        for text, why in ((work_entry(1, "create", "requested", owner="gemini", requester="gemini"),
+                           "this record's description names another requester"),
+                          (work_entry(1, "create", "requested", owner="grok", requester="gemini"),
+                           "this record's description names another requester")):
+            out = self.add(conn, "gemini", text)
+            self.refused_and_unchanged(conn, out, why)
+            self.assertNotIn(self.LOG, conn.data, "another agent began the record")
+        self.assertTrue(self.add(conn, "cursor", work_entry(1, "create", "requested"))["ok"], "its describer begins it")
+        self.assertEqual("cursor", conn.data[self.LOG][0][1]["by"])
+
+    def test_REGRESSION_the_describer_completes_a_partial_create_without_overwrite_or_substitution(self):
+        """Aya: "legitimate A completion after partial create. Keep valid recovery without overwrite/
+        identity substitution." The description landed and the first entry did not."""
+        conn = FakeRedis()
+        self.assertTrue(self.put(conn)["ok"])
+        described = dict(conn.data[self.REC])
+        self.assertIn("written once", self.put(conn, title="A different ask")["refused"], "recovery by overwrite")
+        self.assertIn("refused", self.put(conn, who="gemini"), "recovery by another identity")
+        self.assertIn("refused", self.add(conn, "gemini", work_entry(1, "create", "requested", requester="gemini")))
+        self.assertEqual(described, conn.data[self.REC])
+        self.assertNotIn(self.LOG, conn.data)
+        self.assertTrue(self.add(conn, "cursor", work_entry(1, "create", "requested"))["ok"], "A finishes its own create")
+        self.assertEqual(described, conn.data[self.REC], "finishing it rewrote the description")
+
+    def test_REGRESSION_orphan_a_log_never_begins_without_its_description(self):
+        conn = FakeRedis()
+        out = self.add(conn, "cursor", work_entry(1, "create", "requested"))
+        self.refused_and_unchanged(conn, out, "this record has no description")
+        self.assertNotIn(self.LOG, conn.data, "an orphan log was created")
+        conn.set(self.REC, "not a hash")                              # something else squats the key
+        self.assertIn("has no description", self.add(conn, "cursor", work_entry(1, "create", "requested"))["refused"])
+        self.assertNotIn(self.LOG, conn.data)
+
+    def test_a_description_that_is_not_one_admits_nothing_and_every_later_move_checks_it_too(self):
+        conn = FakeRedis()
+        conn.hset(self.REC, mapping={"title": "left by something else", "requested_by": "cursor"})
+        out = self.add(conn, "cursor", work_entry(1, "create", "requested"))
+        self.assertIn("this record's description is not one (a description has exactly these fields", out["refused"])
+        self.assertNotIn(self.LOG, conn.data)
+        conn = self.accepted()
+        conn.data[self.REC]["requested_by"] = "gemini"                # the description altered around the governor
+        out = self.add(conn, "grok", work_entry(3, "start", "working", lease=self.LEASE))
+        self.refused_and_unchanged(conn, out, "this record's description names another requester")
+        self.assertEqual(2, len(self.texts(conn)))
+        del conn.data[self.REC]                                       # or removed around it
+        out = self.add(conn, "grok", work_entry(3, "start", "working", lease=self.LEASE))
+        self.refused_and_unchanged(conn, out, "this record has no description")
+
+    def test_the_description_is_read_under_the_same_watch_as_the_move(self):
+        """The description changes between this write's look at it and its EXEC: nothing applies."""
+        conn = FakeRedis()
+        self.assertTrue(self.put(conn)["ok"])
+        real = conn.pipeline
+
+        def racing_pipeline(transaction=True):
+            pipe = real(transaction)
+            original_multi = pipe.multi
+
+            def multi():
+                conn.hset(self.REC, "requested_by", "gemini")            # after the look, before the EXEC
+                original_multi()
+            pipe.multi = multi
+            return pipe
+        conn.pipeline = racing_pipeline
+        out = self.add(conn, "cursor", work_entry(1, "create", "requested"))
+        self.assertFalse(out["ok"])
+        self.assertIn("nothing was written", out["refused"])
+        self.assertNotIn(self.LOG, conn.data, "a log began under a description that changed beneath it")
+
+    # ----------------------------------------------------------- no raw bypass: the three keys
+    def test_a_description_is_written_once_by_its_verified_requester_and_never_rewritten_or_removed(self):
+        conn = FakeRedis()
+        out = self.put(conn, who="gemini", requested_by="cursor")                 # "cursor asked for this"
+        self.assertIn("names its verified writer as requested_by", out["refused"])
+        self.assertNotIn(self.REC, conn.data)
+        for change, why in (({"kind": "epic"}, "kind is task or issue"), ({"title": ""}, "title is empty"),
+                            ({"title": "t" * 201}, "longer than a read shows whole"),
+                            ({"source": "a | b"}, "longer than a read shows whole"),
+                            ({"owner": "grok"}, "exactly these fields")):
+            out = self.put(conn, **change)
+            self.assertIn(why, out.get("refused", ""), change)
+        body = {k: v for k, v in self.DESCRIPTION.items() if k != "done_when"}        # no definition of done
+        out = run(conn, "cursor", "hput", self.REC, val=base64.b64encode(json.dumps(body).encode()).decode(),
+                  enc="b64", verified=True)
+        self.assertIn("exactly these fields", out["refused"])
+        self.assertNotIn(self.REC, conn.data)
+        self.assertTrue(self.put(conn)["ok"])
+        self.assertIn("written once", self.put(conn)["refused"])
+        for op, kw in (("hset", {"field": "title", "val": "x"}), ("del", {}), ("set", {"val": "x"}),
+                       ("xadd", {"val": "r1 x"})):
+            out = run(conn, "cursor", op, self.REC, verified=True, **kw)
+            self.assertIn("this key takes hput and nothing else", out.get("refused", ""), op)
+        self.assertEqual("Wire the reader", conn.data[self.REC]["title"])
+
+    def test_a_log_is_append_only(self):
+        conn = self.created()
+        for op, kw in (("del", {}), ("set", {"val": "x"}), ("hset", {"field": "a", "val": "x"})):
+            out = run(conn, "cursor", op, self.LOG, verified=True, **kw)
+            self.assertIn("this key takes xadd and nothing else", out.get("refused", ""), op)
+        self.assertEqual(1, len(conn.data[self.LOG]))
+        fresh = FakeRedis()                                  # nor may a key be squatted before its log exists
+        self.assertIn("refused", run(fresh, "grok", "set", self.LOG, val="x", verified=True))
+        self.assertNotIn(self.LOG, fresh.data)
+
+    def test_a_list_line_says_what_the_log_says_or_it_is_refused(self):
+        conn = self.created()
+        self.assertTrue(self.line(conn, "1 requested grok - task Wire the reader")["ok"])
+        for lie, why in (("1 done grok - task Wire the reader", "it is at r1 requested"),
+                         ("1 requested gemini - task Wire the reader", "it is at r1 requested"),
+                         ("9 requested grok - task Wire the reader", "it is at r1 requested"),
+                         ("1 requested grok - issue Wire the reader", "it is at r1 requested"),      # another kind
+                         ("1 requested grok - task Something far more urgent", "it is at r1 requested"),
+                         ("1 requested grok - task Wire the reader and more", "it is at r1 requested"),
+                         ("requested grok", "it is at r1 requested")):
+            self.assertIn(why, self.line(conn, lie)["refused"], lie)
+        self.assertTrue(self.add(conn, "grok", work_entry(2, "accept", "accepted", lease=self.LEASE, words="next=x"))["ok"])
+        self.assertIn("it is at r2 accepted", self.line(conn, "1 requested grok - task Wire the reader")["refused"],
+                      "a stale line that arrives late cannot take the list back")
+        self.assertTrue(self.line(conn, "2 accepted grok %s task Wire the reader" % self.LEASE)["ok"])
+        self.assertTrue(self.line(conn, "2 accepted grok %s task Wire the reader" % self.LEASE)["ok"], "a repair")
+        out = self.line(conn, "1 requested grok - task x", field="W-20261013-ffffff")
+        self.assertIn("only for a record whose log exists", out["refused"])
+        for op, kw in (("del", {}), ("hput", {"val": base64.b64encode(b'{"a": "1 x"}').decode(), "enc": "b64"})):
+            self.assertIn("this key takes hset and nothing else",
+                          run(conn, "grok", op, self.INDEX, verified=True, **kw)["refused"])
+
+    def test_the_record_is_given_no_expiry_and_its_list_is(self):
+        conn = self.created()
+        self.assertTrue(self.line(conn, "1 requested grok - task Wire the reader")["ok"])
+        self.assertNotIn(self.REC, conn.ttls, "the description was given an expiry")
+        self.assertNotIn(self.LOG, conn.ttls, "the only audit record was given an expiry")
+        self.assertEqual(ACL["ttl_seconds"]["proj:"], conn.ttls[self.INDEX], "the list is a cache")
+        self.assertTrue(gov.ttl_for(ACL, self.LOG), "the access list would have expired it; the code does not")
+
+    # ------------------------------------------------------------------------------- the edges
+    def test_only_these_three_prefixes_and_no_access_list_can_change_them(self):
+        self.assertEqual((("proj:work:v1:rec:",), ("proj:work:v1:log:",), ("proj:work:v1:index:",)),
+                         (gov.WRITE_ONCE, gov.SEQUENCED, gov.REV_FORWARD))
+        conn = FakeRedis()
+        for key in ("proj:work:v2:log:x", "proj:pr-board:v1:log:x", "proj:worklog:x", "fleet:inbox:grok"):
+            self.assertTrue(run(conn, "grok", "xadd", key, val="no revision here")["ok"],
+                            "%s is not held to these rules and needs no verified caller" % key)
+            self.assertTrue(conn.ttls.get(key), key)
+        self.assertTrue(run(conn, "grok", "hset", "proj:pr-board:v1:index:20261013", field="a", val="anything")["ok"])
+        loose = dict(ACL, WRITE_ONCE=[], SEQUENCED=[], REV_FORWARD=[], ledger=False, verified=True)
+        self.assertIn("refused", run(conn, "cursor", "xadd", self.LOG, val=work_entry(1, "create", "requested"), acl=loose))
+        self.assertIn("refused", run(conn, "nobody", "xadd", self.LOG, val=work_entry(1, "create", "requested",
+                                                                               requester="nobody"), verified=True),
+                      "the access list still decides who is anyone at all")
+
+    def test_verified_is_true_and_nothing_else(self):
+        conn = FakeRedis()
+        for almost in (1, "true", "yes", [1], object()):
+            out = gov.execute(conn, ACL, "cursor", "x", "xadd", self.LOG, raw_value=work_entry(1, "create", "requested"),
+                              verified=almost)
+            self.assertIn("authenticated caller", out.get("refused", ""), repr(almost))
+        self.assertNotIn(self.LOG, conn.data)
+
+    def test_the_rules_table_one_legal_life_and_what_each_step_refuses(self):
+        one = gov.work_event(work_entry(1, "create", "requested"), "cursor")
+        self.assertEqual("", gov.work_allowed(None, one))
+        for change, why in (({"by": "grok"}, "by its requester"), ({"rev": 2}, "r1 create"),
+                            ({"state": "done"}, "created requested"), ({"lease": self.LEASE}, "no lease"),
+                            ({"reviewer": "grok"}, "reviewer cannot be the owner")):
+            self.assertIn(why, gov.work_allowed(None, dict(one, **change)), change)
+        accept = gov.work_event(work_entry(2, "accept", "accepted", lease=self.LEASE, words="next=x"), "grok")
+        self.assertEqual("", gov.work_allowed(one, accept))
+        for change, why in (({"rev": 3}, "does not follow"), ({"requester": "grok"}, "requester of a record never"),
+                            ({"owner": "gemini"}, "only a handoff changes the owner"), ({"lease": "-"}, "sets a lease"),
+                            ({"lease": "soon"}, "sets a lease"), ({"reviewer": "gemini"}, "changes the reviewer"),
+                            ({"state": "working"}, "ends in accepted"), ({"action": "fly"}, "is not a move")):
+            self.assertIn(why, gov.work_allowed(one, dict(accept, **change)), change)
+        start = gov.work_event(work_entry(2, "start", "working"), "grok")
+        self.assertIn("start starts from accepted, not from requested", gov.work_allowed(one, start))
+        conn = self.created()                                         # and the store says the same
+        self.refused_and_unchanged(conn, self.add(conn, "grok", work_entry(2, "start", "working")),
+                                   "start starts from accepted, not from requested")
+        review = gov.work_event(work_entry(3, "review", "review", reviewer="gemini", lease=self.LEASE), "grok")
+        self.assertEqual("", gov.work_allowed(accept, review))
+        self.assertIn("a reviewer who is not the owner", gov.work_allowed(accept, dict(review, reviewer="grok")))
+        done = gov.work_event(work_entry(4, "done", "done", reviewer="gemini", words="evidence=https://x.test/1"), "gemini")
+        self.assertEqual("", gov.work_allowed(review, done))
+        self.assertIn("only gemini may done it", gov.work_allowed(review, dict(done, by="grok")))
+        self.assertIn("a closed record holds no lease", gov.work_allowed(review, dict(done, lease=self.LEASE)))
+        reopen = gov.work_event(work_entry(5, "reopen", "requested", words="note=it broke"), "cursor")
+        self.assertEqual("", gov.work_allowed(done, reopen))
+        self.assertIn("only cursor may reopen it", gov.work_allowed(done, dict(reopen, by="grok")))
+        note = gov.work_event(work_entry(6, "note", "requested", words="anyone may say something"), "gemini")
+        self.assertEqual("", gov.work_allowed(reopen, note))
+        self.assertIn("a note moves nothing", gov.work_allowed(reopen, dict(note, state="done")))
+        self.assertIsNone(gov.work_lease("-"))
+        self.assertIsNone(gov.work_lease("20261399T9999Z"))
 
 
 class TheServerSetsTheTTL(unittest.TestCase):
