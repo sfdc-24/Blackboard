@@ -25,10 +25,25 @@ THE TWO LAYERS THAT CAN FAIL ON THEIR OWN, AND THEIR STATUSES
         503 service unavailable  the bridge itself is misconfigured (said in OUR log, not to them)
     This file answers:
         400 bad request          the body is not the small JSON object described below
-        403 refused              redis_gov refused it; `reason` is redis_gov's own
-        502 failed               the operation raised inside Redis; the error TYPE only
-        503 redis unreachable    no connection, or the connection failed mid-operation
+        403 principal mismatch   the caller is bound to a different principal than the one the
+                                 client said it expects to be; nothing was executed
+        403 refused              redis_gov refused it; `reason` is redis_gov's own, and `audit` says
+                                 whether the refusal itself was recorded
+        503 redis unreachable    NO CONNECTION WAS MADE. Always with "executed": false
+        502 failed               a READ raised inside Redis; the error TYPE only; nothing changed
+        502 outcome unknown      a WRITE raised after the connection was made. It may have
+                                 committed. The error TYPE only
         200                      redis_gov's result, as it returned it
+
+    "EXECUTED": FALSE IS A PROMISE, AND ITS ABSENCE IS NOT ONE (Aya on 919fd52)
+    A client that gets a failure has one question: may I send this again by another route? For a
+    write the answer is only yes when the first attempt provably did nothing. So every body this
+    file writes for a request it did NOT hand to redis_gov carries "executed": false - a bad body, a
+    principal mismatch, an unmapped caller, no connection. A write that reached redis_gov and then
+    raised is "outcome unknown": the transaction may have committed before the connection dropped,
+    and this file does not guess. The first version called that 503 "redis unreachable", the same
+    words as a connection that was never made, and a client that fell back on it would have written
+    the message twice.
 
     The plan's draft said 403 "not-a-caller" for a token off the allowlist. That refusal already
     exists in main.py as "not authorised", deliberately coarse and already tested; one refusal with
@@ -42,6 +57,13 @@ THE BODY
     Every member is optional except op and key. Every member is a string, except count, which is an
     integer. Nothing else is accepted: an unknown member is a 400, so a caller cannot believe it
     passed something this file ignored. No caller-chosen TTL exists; redis_gov sets it from the key.
+
+    "expect" IS A CHECK, NOT A CHOICE (Aya on 919fd52, the principal binding)
+    {"expect": "claude-code-cli"} says who the client believes it is acting as. It can never select
+    a principal: who the caller acts as is callers.json's word alone. It can only REFUSE: if the
+    bound principal is not the expected one, the answer is 403 "principal mismatch" and nothing is
+    executed. Without it a client configured with another agent's service account would write under
+    that agent's name and learn of it only from the answer, after the fact.
 """
 from __future__ import annotations
 
@@ -52,12 +74,10 @@ import os
 # read without refusing a legitimate write. main.py reads no more than this for /op.
 MAX_BODY_BYTES = 16384
 CALLERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "callers.json")
-MEMBERS = ("op", "key", "field", "val", "enc", "count", "after")
-# What a failed connection is called, by TYPE NAME, across redis-py and the socket layer. A result
-# whose error is one of these is "Redis unreachable" (503); any other error is "failed" (502).
-UNREACHABLE = ("ConnectionError", "TimeoutError", "BusyLoadingError", "ConnectionRefusedError",
-               "ConnectionResetError", "OSError", "gaierror", "timeout", "SSLError",
-               "AuthenticationError")
+MEMBERS = ("op", "key", "field", "val", "enc", "count", "after", "expect")
+# The ops that change nothing a caller owns. A failure inside one of these changed nothing; a failure
+# inside any other op is an unknown outcome. Restated from redis_gov.OPS_READ and held equal by a test.
+READS = ("get", "hgetall", "xrange")
 
 
 def load_callers(path=None) -> dict:
@@ -113,18 +133,23 @@ def handle(caller: str, raw: bytes, connect, log, callers=None, gov=None, acl=No
     if not who:
         log("REFUSING /op: %s is on the caller allowlist and has no principal in callers.json"
             % caller)
-        return 503, {"error": "service unavailable"}
+        return 503, {"error": "service unavailable", "executed": False}
     request, why = parse(raw)
     if why:
         log("op by %s: bad request (%s)" % (caller, why))
-        return 400, {"error": "bad request"}
+        return 400, {"error": "bad request", "executed": False}
+    expected = request["expect"].strip().lower()
+    if expected and expected != who:
+        # BEFORE the connection, so "nothing was executed" is true by construction.
+        log("op by %s: principal mismatch (bound to %s; the client expected another)" % (caller, who))
+        return 403, {"error": "principal mismatch", "executed": False, "principal": who}
     if gov is None:
         import redis_gov as gov
     try:
         conn = connect()
     except Exception as error:  # noqa: BLE001 - the TYPE only: a client's message can quote a secret
         log("op by %s: redis unreachable (%s)" % (caller, type(error).__name__))
-        return 503, {"error": "redis unreachable"}
+        return 503, {"error": "redis unreachable", "executed": False}
     result = gov.execute(conn, gov.load_acl() if acl is None else acl, who,
                          ("bridge:%s" % caller)[:120], request["op"], request["key"],
                          field=request["field"], raw_value=request["val"], enc=request["enc"],
@@ -135,10 +160,15 @@ def handle(caller: str, raw: bytes, connect, log, callers=None, gov=None, acl=No
         return 200, dict(result, caller=caller, principal=who)
     if "refused" in result:
         log("op by %s as %s: %s refused" % (caller, who, op))
-        return 403, {"error": "refused", "reason": str(result["refused"]),
+        # A refusal is redis_gov deciding NOT to act, so nothing ran. `audit` is passed through as
+        # it came: "ok", or "FAILED:<type>" when the refusal itself could not be recorded.
+        return 403, {"error": "refused", "reason": str(result["refused"]), "executed": False,
                      "audit": result.get("audit", ""), "caller": caller, "principal": who}
     kind = str(result.get("error") or "unknown")
-    log("op by %s as %s: %s failed (%s)" % (caller, who, op, kind))
-    if kind in UNREACHABLE:
-        return 503, {"error": "redis unreachable"}
-    return 502, {"error": "failed", "type": kind, "caller": caller, "principal": who}
+    if op in READS:
+        log("op by %s as %s: %s failed (%s)" % (caller, who, op, kind))
+        return 502, {"error": "failed", "type": kind, "caller": caller, "principal": who}
+    # A write that reached redis_gov and raised. Whether it committed is NOT known here: a dropped
+    # connection can lose the reply to an EXEC that ran. Said as exactly that, never as "unreachable".
+    log("op by %s as %s: %s OUTCOME UNKNOWN (%s)" % (caller, who, op, kind))
+    return 502, {"error": "outcome unknown", "type": kind, "caller": caller, "principal": who}

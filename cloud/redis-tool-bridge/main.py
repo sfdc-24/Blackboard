@@ -243,6 +243,10 @@ class Handler(BaseHTTPRequestHandler):
                 # opaque in the response. Cursor, PR 340: the old body was `why if code == 503 else
                 # why` - `why` on both arms - so the missing setting was named to the caller.
                 sys.stderr.write("%s REFUSING EVERY REQUEST: %s\n" % (stamp(), why))
+                if path == "/op":
+                    # Nothing reached redis_gov. Said so, because a client decides whether a write
+                    # may go by another route on exactly this (op.py, "executed": false).
+                    return self._send(503, {"error": UNAVAILABLE, "executed": False})
                 return self._send(503, {"error": UNAVAILABLE})
             return self._send(code, {"error": why})
 

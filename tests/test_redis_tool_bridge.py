@@ -693,15 +693,124 @@ class TheOpEndpoint(unittest.TestCase):
             raise ConnectionError("AUTH hunter2 failed")
         code, out = self.post({"op": "get", "key": "fleet:x"}, connect=down)
         self.assertEqual((503, "redis unreachable"), (code, out["error"]))
+        self.assertIs(False, out["executed"], "no connection was made, and the answer must say so")
         self.assertNotIn("hunter2", repr(out) + self.log)
         self.assertIn("ConnectionError", self.log, "the TYPE reaches our log")
 
-    def test_a_connection_lost_mid_operation_is_503(self):
+    def test_a_read_that_fails_mid_operation_is_502_failed_never_unreachable(self):
         class Dropping(gov_tests.FakeRedis):
             def get(self, key):
                 raise ConnectionError("reset by peer")
         code, out = self.post({"op": "get", "key": "fleet:x"}, conn=Dropping())
-        self.assertEqual((503, "redis unreachable"), (code, out["error"]))
+        self.assertEqual((502, "failed", "ConnectionError"), (code, out["error"], out["type"]))
+        self.assertNotIn("executed", out, "a 502 never promises that nothing ran")
+
+    # --- "executed": false is a promise; its absence is not one (Aya on 919fd52)
+    class CommitsThenDrops(gov_tests.FakeRedis):
+        """The transaction RUNS and the reply is lost: the committed-write-with-a-lost-response case."""
+
+        def pipeline(self, transaction=True):
+            pipe = gov_tests.FakePipeline(self)
+            real = pipe.execute
+
+            def execute(raise_on_error=True):
+                real(raise_on_error)
+                raise ConnectionError("the reply was lost after EXEC")
+            pipe.execute = execute
+            return pipe
+
+    def test_a_write_whose_reply_is_lost_is_OUTCOME_UNKNOWN_and_it_did_commit(self):
+        conn = self.CommitsThenDrops()
+        code, out = self.post({"op": "xadd", "key": "fleet:inbox:grok",
+                               "val": self.b64("only once, please"), "enc": "b64"}, conn=conn)
+        self.assertEqual((502, "outcome unknown", "ConnectionError"), (code, out["error"], out["type"]))
+        self.assertNotIn("executed", out, "the bridge must not say a committed write did not run")
+        self.assertNotEqual("redis unreachable", out["error"],
+                            "the words for a connection never made must not describe this")
+        stored = [fields for _, fields in conn.data.get("fleet:inbox:grok", [])]
+        self.assertEqual(1, len(stored), "the write DID commit: a client that resends it writes twice")
+        self.assertIn("OUTCOME UNKNOWN", self.log)
+
+    def test_every_answer_for_a_request_that_never_reached_redis_gov_says_so(self):
+        def down():
+            raise ConnectionError("no route")
+        cases = (
+            ("no connection", dict(body={"op": "get", "key": "fleet:x"}, connect=down), 503),
+            ("bad body", dict(body=b"not json"), 400),
+            ("principal mismatch", dict(body={"op": "get", "key": "fleet:x", "expect": "owner"}), 403),
+            ("unmapped caller", dict(body={"op": "get", "key": "fleet:x"}, callers={}), 503),
+        )
+        for name, kwargs, status in cases:
+            code, out = self.post(**kwargs)
+            self.assertEqual(status, code, name)
+            self.assertIs(False, out.get("executed"), "%s must carry executed: false" % name)
+            self.assertEqual([], self.conn.audit(), "%s reached Redis" % name)
+
+    def test_a_misconfigured_bridge_says_executed_false_on_op_and_nothing_new_on_probe(self):
+        saved = {k: os.environ.pop(k, None) for k in ("BRIDGE_AUDIENCE", "BRIDGE_CALLERS")}
+        try:
+            for path, expected in (("/op", {"error": bridge.UNAVAILABLE, "executed": False}),
+                                   ("/probe", {"error": bridge.UNAVAILABLE})):
+                handler = object.__new__(bridge.Handler)
+                handler.path = path
+                handler.headers = {"Content-Length": "0", "Authorization": "Bearer tok"}
+                handler.rfile = io.BytesIO(b"")
+                sent = []
+                handler._send = lambda code, body: sent.append((code, body))
+                with contextlib.redirect_stderr(io.StringIO()):
+                    handler.do_POST()
+                self.assertEqual([(503, expected)], sent, path)
+        finally:
+            for k, v in saved.items():
+                if v is not None:
+                    os.environ[k] = v
+
+    def test_the_reads_are_exactly_redis_govs(self):
+        self.assertEqual(tuple(redis_gov.OPS_READ), bridge_op.READS)
+
+    # --- the principal binding: expect is a check, never a choice
+    def test_expect_that_matches_the_bound_principal_changes_nothing(self):
+        code, out = self.post({"op": "set", "key": "fleet:test:x", "val": self.b64("v"), "enc": "b64",
+                               "expect": "chatgpt-codex-desktop"})
+        self.assertEqual(200, code, out)
+        self.assertEqual("chatgpt-codex-desktop", self.conn.audit()[-1]["actor"])
+
+    def test_expect_that_does_not_match_is_refused_before_anything_runs(self):
+        """A client set up with another agent's account must not write under that agent's name."""
+        connected = []
+
+        def connect():
+            connected.append(1)
+            return self.conn
+
+        code, out = self.post({"op": "xadd", "key": "fleet:inbox:grok", "val": self.b64("as someone else"),
+                               "enc": "b64", "expect": "claude-code-cli"}, connect=connect)
+        self.assertEqual((403, "principal mismatch"), (code, out["error"]))
+        self.assertIs(False, out["executed"])
+        self.assertEqual([], connected, "no connection is made for a mismatched principal")
+        self.assertEqual([], self.conn.audit())
+        self.assertNotIn("fleet:inbox:grok", self.conn.data)
+
+    def test_expect_cannot_select_a_principal(self):
+        """Naming a more powerful principal gets a refusal, never that principal."""
+        for wanted in ("owner", "milestones-sync", "bus-reconciler"):
+            code, out = self.post({"op": "set", "key": "fleet:test:x", "val": self.b64("v"),
+                                   "enc": "b64", "expect": wanted})
+            self.assertEqual((403, "principal mismatch"), (code, out["error"]), wanted)
+        self.assertEqual([], self.conn.audit())
+
+    # --- a refusal whose own audit entry failed is still a refusal, and says its audit failed
+    def test_a_refusal_with_a_failed_audit_keeps_both_facts(self):
+        class AuditDown(gov_tests.FakeRedis):
+            def xadd(self, key, fields, maxlen=None, approximate=None):
+                if key == redis_gov.AUDIT_STREAM:
+                    raise ConnectionError("audit stream unreachable")
+                return super().xadd(key, fields, maxlen=maxlen, approximate=approximate)
+        code, out = self.post({"op": "set", "key": "gov:audit", "val": self.b64("x"), "enc": "b64"},
+                              conn=AuditDown())
+        self.assertEqual((403, "refused"), (code, out["error"]))
+        self.assertEqual("FAILED:ConnectionError", out["audit"], "the partial audit must be visible")
+        self.assertIs(False, out["executed"], "a refused operation did not run")
 
     def test_another_failure_inside_redis_is_502_with_the_type_only(self):
         class Broken(gov_tests.FakeRedis):

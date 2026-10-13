@@ -93,13 +93,26 @@ governed ops, after the source is verified"). **D1 has not been given. Nothing h
 |---|---|
 | 401 `unauthenticated` | no token, bad signature, wrong audience, unverified email |
 | 403 `not authorised` | a verified identity that is not on `BRIDGE_CALLERS` |
-| 400 `bad request` | the body is not the small JSON object `op.py` describes |
+| 400 `bad request` | the body is not the small JSON object `op.py` describes; `executed: false` |
 | 413 `body too large` | over 16 KB; refused before it is read |
-| 403 `refused` | `redis_gov` refused it; `reason` is its own, and the refusal is audited |
-| 502 `failed` | the operation raised inside Redis; the error type only |
-| 503 `redis unreachable` | no connection, or it failed mid-operation |
-| 503 `service unavailable` | the bridge is misconfigured, including a caller on the allowlist with no principal |
+| 403 `principal mismatch` | the caller is bound to another principal than the client's `expect`; `executed: false` |
+| 403 `refused` | `redis_gov` refused it; `reason` is its own; `audit` says whether the refusal was recorded; `executed: false` |
+| 503 `redis unreachable` | no connection was made; always `executed: false` |
+| 503 `service unavailable` | the bridge is misconfigured, including a caller with no principal; `executed: false` |
+| 502 `failed` | a read raised inside Redis; the error type only |
+| 502 `outcome unknown` | a **write** raised after the connection was made; it may have committed |
 | 200 | `redis_gov`'s result |
+
+**`executed: false` is a promise, and its absence is not one** (Aya's review of `919fd52`). A client may
+send a write again by another route only when the first attempt provably did nothing. A write that
+reached `redis_gov` and then raised is `outcome unknown`: a dropped connection can lose the reply to a
+transaction that ran. The first version called that `redis unreachable`, the same words as a connection
+never made.
+
+**`expect` is a check, not a choice.** A body may carry `"expect": "<principal>"`. It can never select a
+principal; it can only make the bridge refuse, before anything runs, when the caller is bound to a
+different one. That is what stops a client configured with another agent's account from writing under
+that agent's name.
 
 **Not built here** (the rest of Phase 3a and all of 3b): the hourly canary, the negative controls
 against a deployed bridge, the client (`scripts/redis_inbox.py` sending through the bridge with its
