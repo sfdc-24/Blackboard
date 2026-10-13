@@ -34,6 +34,15 @@ WHAT IT DOES NOT DO
     python scripts/redis_inbox.py read [--wait 180] [--count 20] new messages to me
     python scripts/redis_inbox.py selftest                       the grammar, no network
 
+THE DIRECT ROUTE, WHEN THIS AGENT HAS ONE (2026-10-13, docs/REDIS-PRIMARY.md Phase 3b)
+    `send` and `read` first try scripts/bridge_client.py: one HTTPS call to the redis-tool-bridge,
+    no board row, the caller verified by an impersonated identity token. It is OFF unless
+    REDIS_BRIDGE=on is set for this agent, and until the bridge's op endpoint is deployed the
+    switch has nothing to reach. Off, failing or tripped, everything below is unchanged: the
+    governed board route above is the fallback, and a bridge failure is said out loud before it is
+    used. One case does NOT fall back: an operation the access rules refused. The board route runs
+    the same rules, so retrying there would be a second refusal and a wasted pair of rows.
+
 THE LAPTOP LANE (step 3 of the broken-telephone fix, Converspan Channel Architecture v0.1)
     The cloud routes a Drive request to this laptop only while fleet:alive:claude-code-cli is
     fresh (cloud/drive-intake reads it; 300 s is the owner's window). This laptop cannot reach
@@ -240,9 +249,54 @@ def entries_of(payload: str) -> list:
         return []
 
 
+REFUSED_EXIT = 3
+
+
+def breaker_row(text: str) -> None:
+    """The ONE row a tripped bridge breaker posts (bridge_client.attempt's `announce`). A status and
+    a time, never a message's content: the board is public."""
+    rid = "CCC-BRIDGE-BREAKER-%s" % secrets.token_hex(4)
+    line = " ".join(str(text).replace("|", "/").split())[:400]
+    post({
+        "row_id": rid, "source_tag": ME, "target_surface": "claude-code-cli;aya",
+        "action_type": "NOTE", "category": "OPEN", "project_tag": "Blackboard",
+        "gist": "redis bridge breaker open", "subgist": "",
+        "payload": "|".join(["BCB|v=1", "id=" + rid, "phase=NOTE", "from=" + ME,
+                             "to=claude-code-cli,aya", "via=direct", "text=" + line]),
+    })
+
+
+def direct_route(op: str, key: str, *, value: str | None = None, count: int | None = None) -> tuple:
+    """(result, None) through the bridge; (None, reason) when the access rules refused it;
+    (None, None) when the caller should use the governed board route.
+
+    The last case covers a switch that is off (silent), a tripped breaker and a bridge failure
+    (both already said by bridge_client)."""
+    sys.path.insert(0, os.path.join(REPO, "scripts"))
+    import bridge_client                                          # noqa: E402
+
+    try:
+        return bridge_client.attempt(op, key, value=value, count=count, announce=breaker_row), None
+    except bridge_client.Refused as why:
+        return None, str(why)
+
+
+def refused_line(reason: str) -> str:
+    return ("REFUSED by the access rules: %s\nNot sent on the board route: it runs the same rules "
+            "and would refuse it again." % reason)
+
+
 def cmd_send(args) -> int:
     to = canonical(args.to)
-    rid = post(request_row("xadd", KEY % to, value=message(args.text)))
+    text = message(args.text)
+    direct, refused = direct_route("xadd", KEY % to, value=text)
+    if refused:
+        print(refused_line(refused))
+        return REFUSED_EXIT
+    if direct is not None:
+        print("sent to %s through the bridge as %s: no board row" % (to, direct.get("principal", "?")))
+        return 0
+    rid = post(request_row("xadd", KEY % to, value=text))
     print("sent to %s, request %s" % (to, rid))
     got = answer(rid, args.wait, since=args.since or stamp())
     print("worker: %s" % (got["payload"][:300] if got else not_yet(args.wait, rid)))
@@ -250,12 +304,26 @@ def cmd_send(args) -> int:
 
 
 def cmd_read(args) -> int:
+    direct, refused = direct_route("xrange", KEY % ME, count=args.count)
+    if refused:
+        print(refused_line(refused))
+        return REFUSED_EXIT
+    if direct is not None:
+        if isinstance(direct.get("value"), list):
+            return show(direct["value"])
+        # ok: true with no list of entries is not an empty inbox, and must not be printed as one.
+        print("BRIDGE ANSWER UNREADABLE: no list of entries. Using the board route.")
     rid = post(request_row("xrange", KEY % ME, count=args.count))
     got = answer(rid, args.wait, since=args.since or stamp())
     if not got:
         print(read_timeout(args.wait, rid))
         return 2
-    rows = entries_of(got["payload"])
+    return show(entries_of(got["payload"]))
+
+
+def show(rows: list) -> int:
+    """Print the entries newer than the bookmark and move it. One function for both routes, so the
+    bridge and the board cannot come to disagree about what "new" means."""
     last = seen().get("last_id") or ""
     fresh = [e for e in rows if str(e.get("id") or "") > last]
     for entry in fresh:

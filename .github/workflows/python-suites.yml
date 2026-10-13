@@ -138,6 +138,9 @@ on:
       - "cloud/bus-reconciler/redis_archive.py"
       - "cloud/bus-reconciler/archive.sh"
       - "tests/test_redis_archive.py"
+      - "scripts/bridge_client.py"
+      - "scripts/redis_inbox.py"
+      - "tests/test_bridge_client.py"
       - "scripts/sf360.py"
       - "tests/test_org_publish.py"
       - "scripts/org_publish.py"
@@ -236,6 +239,9 @@ on:
       - "cloud/bus-reconciler/redis_archive.py"
       - "cloud/bus-reconciler/archive.sh"
       - "tests/test_redis_archive.py"
+      - "scripts/bridge_client.py"
+      - "scripts/redis_inbox.py"
+      - "tests/test_bridge_client.py"
       - "scripts/roster_seed.py"
       - "tests/test_roster_seed.py"
       - "tests/test_image_layout.py"
@@ -1062,6 +1068,8 @@ jobs:
       # these four files ran in CI: PR 390's lock and one-answer tests and PR 392's after= tests were
       # green here only because nothing executed them. Each suite is offline (fake Redis, fake board,
       # fake bucket), proved by the empty network namespace.
+      # test_bridge_client (2026-10-13): the direct route's client. gcloud and the HTTP opener are
+      # fakes; the empty network namespace is what proves no token is minted and no socket opened.
       - name: "redis gov, git requests, live mode, archive: the governed path and its worker (no network)"
         run: |
           set -euo pipefail
@@ -1072,7 +1080,8 @@ jobs:
           for pair in "test_redis_gov:scripts/redis_gov.py" \
                       "test_git_requests:scripts/git_requests.py" \
                       "test_live_mode:cloud/bus-reconciler/serve_requests.py" \
-                      "test_redis_archive:cloud/bus-reconciler/redis_archive.py"; do
+                      "test_redis_archive:cloud/bus-reconciler/redis_archive.py" \
+                      "test_bridge_client:scripts/bridge_client.py"; do
             suite="${pair%%:*}"; code="${pair#*:}"
             if [ -f "tests/${suite}.py" ]; then
               sudo unshare -n -- "$python_bin" -B -m unittest "tests.${suite}" -v
