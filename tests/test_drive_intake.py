@@ -14,8 +14,10 @@ Offline by construction: every outside call is an injected adapter.
 """
 import importlib.util
 import json
+import re
 import sys
 import time
+import urllib.parse
 import unittest
 from pathlib import Path
 
@@ -275,6 +277,34 @@ class DuplicateTest(unittest.TestCase):
         self.assertFalse(di.tuple_ok(dict(a, recipient_id="somebody")))
         self.assertFalse(di.tuple_ok(dict(a, source_doc_id="short")))
         self.assertFalse(di.tuple_ok(dict(a, drive_revision="")))
+
+    def test_correlation_is_a_drive_task_and_not_a_studio_session(self):
+        """A session id in the doc is the author's text, not a binding.
+
+        correlate() keeps the same six fields. It does not grow a session id
+        from a line that looks like one, and decide() does not call a studio
+        controller or return a telephone binding.
+        """
+        session_id = "s-" + ("ab" * 16)
+        text = "session: %s\n%s" % (session_id, REQUEST)
+        bound = di.correlate(FILE, text, "r1", "claude-api")
+        plain = di.correlate(FILE, REQUEST, "r1", "claude-api")
+        self.assertEqual(
+            {"source_doc_id", "source_revision", "drive_revision", "request_id", "task_id", "recipient_id"},
+            set(bound))
+        self.assertEqual("OT-20261010", bound["request_id"])
+        self.assertEqual(FILE, bound["source_doc_id"])
+        self.assertNotIn(session_id, bound.values())
+        self.assertNotEqual(plain["task_id"], bound["task_id"])  # extra text changes the request, not a join
+        d = deps(docs=Docs(text=text))
+        out = di.decide(hint(), d)
+        self.assertEqual("dispatched", out["status"], out)
+        self.assertNotIn("session_id", out)
+        self.assertNotIn("telephone_doc", out)
+        self.assertEqual(set(bound), set(out["tuple"]))
+        self.assertNotIn(session_id, out["tuple"].values())
+        self.assertEqual(FILE, d.queue.puts[0][0]["source_doc_id"])
+        self.assertNotIn("session_id", d.queue.puts[0][0])
 
     def test_two_overlapping_passes_deliver_once(self):
         """Cursor on d150d84: push and poll both observed `intake` and each put to a worker."""
@@ -1322,11 +1352,13 @@ class WiringTest(unittest.TestCase):
         self.assertEqual("dispatched", out[0]["status"])
         self.assertEqual(5000.0, d.claims.last_poll())
         self.assertEqual(5000.0, d.claims.watermark())                    # a plain list: the watermark is now
+        self.assertFalse(d.claims.resume())                               # it finished, so the margin applies next
         self.assertEqual(set(), d.claims.pending())                       # finished: not kept
         d = deps(changes=lambda folder: {"hints": [{"file_id": FILE, "folder_id": folder}], "watermark": 4321.0,
                                          "complete": False}, now=5000.0)
         di.poll(d)
         self.assertEqual((5000.0, 4321.0), (d.claims.last_poll(), d.claims.watermark()))   # the feed's own watermark
+        self.assertTrue(d.claims.resume())                                # capped: the next poll starts at 4321
 
         def broken(folder):
             raise ConnectionError()
@@ -1576,6 +1608,294 @@ class FeedTest(unittest.TestCase):
         self.assertEqual(1760000000.0, drive_feed.epoch_of("2025-10-09T08:53:20.000Z"))
         self.assertIsNone(drive_feed.epoch_of("soon"))
         self.assertIsNone(drive_feed.epoch_of(""))
+
+    def test_a_capped_listing_is_resumed_at_the_last_doc_and_the_margin_does_not_refill_the_cap(self):
+        """150 docs, one per second, one page of 100. The margin is 600 s, so resuming ten minutes
+        behind the last doc returns the same first page forever and the other 50 are never listed."""
+        base = 1760000000.0
+        docs = [{"id": "doc-%03d" % i, "parents": [FOLDER],
+                 "modifiedTime": drive_feed.iso(base + i)} for i in range(150)]
+        calls = []
+
+        def fetch(method, url, body, headers):
+            calls.append(url)
+            return 200, json.dumps(drive_listing(url, docs)).encode()
+
+        store = di.MemoryClaims()
+        feed = drive_feed.DriveFolder(lambda: "tok", fetch, store, now=base + 10000, max_pages=1)
+        first = feed.changes(FOLDER)
+        self.assertFalse(first["complete"])
+        self.assertEqual("doc-099", first["hints"][-1]["file_id"])
+        self.assertEqual(drive_feed.epoch_of(docs[99]["modifiedTime"]), first["watermark"])
+        store.note_poll(base + 10000, first["watermark"], resume=True)
+        feed.now = base + 10120
+        second = feed.changes(FOLDER)
+        # The resume asks for the last doc's second AND after: the cursor is only good to the second.
+        resumed = "modifiedTime+%3E%3D+%27" + drive_feed.iso(base + 99).replace(":", "%3A")
+        self.assertIn(resumed, calls[-1])
+        self.assertNotIn(drive_feed.iso(base + 99 - 600).replace(":", "%3A"), calls[-1])
+        self.assertEqual(["doc-%03d" % i for i in range(99, 150)], [h["file_id"] for h in second["hints"]])
+        self.assertTrue(second["complete"])
+        self.assertIn("modifiedTime+%3E+%27", calls[0])                    # a first poll is still strictly after
+
+    def feed_over(self, docs, base, max_pages=1):
+        calls = []
+
+        def fetch(method, url, body, headers):
+            calls.append(url)
+            return 200, json.dumps(drive_listing(url, docs)).encode()
+
+        store = di.MemoryClaims()
+        return drive_feed.DriveFolder(lambda: "tok", fetch, store, now=base + 10000, max_pages=max_pages), store, calls
+
+    def poll_until_complete(self, feed, store, base, limit=20):
+        """Poll as main.poll() does: keep the watermark in WHOLE SECONDS, as Redis does, and resume."""
+        seen, polls = [], 0
+        while True:
+            polls += 1
+            self.assertLessEqual(polls, limit, "the cursor never reached the end")
+            listed = feed.changes(FOLDER)
+            seen.extend(h["file_id"] for h in listed["hints"])
+            store.note_poll(base + 10000, int(listed["watermark"]), resume=not listed["complete"])
+            if listed["complete"]:
+                return seen, polls
+
+    def test_docs_that_share_the_second_the_cap_fell_in_are_not_skipped(self):
+        """Copilot on ff15a56: the resume asked for strictly after the last doc's timestamp, so the
+        docs past the cap that shared that whole second were never listed by any later poll."""
+        base = 1760000000.0
+        stamps = [base + i for i in range(95)] + [base + 95] * 10 + [base + 200 + i for i in range(45)]
+        docs = [{"id": "doc-%03d" % i, "parents": [FOLDER], "modifiedTime": drive_feed.iso(stamp)}
+                for i, stamp in enumerate(stamps)]
+        feed, store, _calls = self.feed_over(docs, base)
+        seen, polls = self.poll_until_complete(feed, store, base)
+        self.assertEqual({d["id"] for d in docs}, set(seen))               # 100..104 share doc-099's second
+        self.assertEqual(2, polls)
+
+    def test_a_cap_that_fell_inside_one_second_reads_on_instead_of_asking_for_it_again(self):
+        """The other half: 250 docs inside one second, fractions and all. Resuming at that second
+        returned the same first page every poll; now the listing reads on until the second moves."""
+        base = 1760000000.0
+        docs = [{"id": "doc-%03d" % i, "parents": [FOLDER],
+                 "modifiedTime": drive_feed.iso(base)[:-1] + ".%03dZ" % (i * 3)} for i in range(250)]
+        docs += [{"id": "doc-late", "parents": [FOLDER], "modifiedTime": drive_feed.iso(base + 30)}]
+        feed, store, calls = self.feed_over(docs, base)
+        seen, polls = self.poll_until_complete(feed, store, base)
+        self.assertEqual({d["id"] for d in docs}, set(seen))
+        self.assertLessEqual(polls, 3)
+        # And a second holding more than a poll may ever list is said, never skipped past.
+        many = [{"id": "doc-%04d" % i, "parents": [FOLDER], "modifiedTime": drive_feed.iso(base)} for i in range(1200)]
+        feed, store, calls = self.feed_over(many, base)
+        store.note_poll(base + 10000, int(base), resume=True)
+        with self.assertRaises(RuntimeError) as raised:
+            feed.changes(FOLDER)
+        self.assertIn("share one second", str(raised.exception))
+        self.assertEqual(drive_feed.STUCK_FACTOR, len(calls))              # ten caps of one page, then it says so
+        self.assertEqual(int(base), int(store.watermark()))                # and the cursor did not move
+
+
+def drive_listing(url, docs):
+    """files.list as Drive answers it: the query's own operator and time, oldest first, a page at
+    a time, the page token an offset. Milliseconds compare as Drive compares them."""
+    query = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+    q = query["q"][0]
+    operator, since = re.search(r"modifiedTime (>=|>) '([^']+)'", q).groups()
+    after = drive_feed.epoch_of(since)
+    listed = sorted((f for f in docs if (drive_feed.epoch_of(f["modifiedTime"]) >= after if operator == ">="
+                                         else drive_feed.epoch_of(f["modifiedTime"]) > after)),
+                    key=lambda f: drive_feed.epoch_of(f["modifiedTime"]))
+    start = int(query.get("pageToken", ["0"])[0])
+    answer = {"files": listed[start:start + drive_feed.PAGE]}
+    if start + drive_feed.PAGE < len(listed):
+        answer["nextPageToken"] = str(start + drive_feed.PAGE)
+    return answer
+
+
+trail_spec = importlib.util.spec_from_file_location("drive_trail", REPO / "cloud" / "drive-intake" / "trail.py")
+trail_mod = importlib.util.module_from_spec(trail_spec)
+trail_spec.loader.exec_module(trail_mod)
+
+
+def worker_line(state, t, at, by="claude-api", detail="", rid="feedfeedfeedfeed"):
+    """A line the worker or the lane writes: the shared shape, by a worker, ending with its id."""
+    parts = [state, "task " + t["task_id"], "request " + t["request_id"], "rev " + t["source_revision"][:12],
+             "recipient " + by, "by " + by, at]
+    if detail:
+        parts.append(detail)
+    parts.append("id " + rid)
+    return " - ".join(parts)
+
+
+class TrailPageTest(unittest.TestCase):
+    """Step 4: the page reads the trail. Receipts and the answer lines, never the request."""
+
+    def trail_doc(self):
+        d = deps(ring=di.polled_ring)
+        out = di.decide(hint(), d)
+        self.assertEqual("dispatched", out["status"], out)
+        t = out["tuple"]
+        d.docs.text = (REQUEST + d.receipts.text()
+                       + worker_line("ACCEPTED", t, "2026-10-11T04:05:00Z", detail="attempt 1 - lease until 2026-10-11T04:15:00Z - model x", rid="aaaaaaaaaaaaaaaa") + "\n"
+                       + worker_line("SUCCEEDED", t, "2026-10-11T04:05:09Z", detail="model x - tokens in 1200 out 300 - 1 cents CAD", rid="bbbbbbbbbbbbbbbb") + "\n"
+                       + "> The answer.\n> FOR THE LAPTOP:\n> nothing\n")
+        d.docs.receipts = None
+        d.docs.revision = "r7"
+        return d, t
+
+    def test_the_parser_reads_every_writer_and_groups_the_answer_under_its_line(self):
+        d, t = self.trail_doc()
+        entries = trail_mod.parse(d.docs.text)
+        self.assertEqual(["REQUESTED", "DISPATCHED", "ACCEPTED", "SUCCEEDED"], [e["state"] for e in entries])
+        self.assertEqual(["drive-intake", "drive-intake", "claude-api", "claude-api"], [e["by"] for e in entries])
+        self.assertEqual("on fleet:inbox:claude-api, which the worker polls; no wake rung", entries[1]["detail"])
+        self.assertEqual("attempt 1 - lease until 2026-10-11T04:15:00Z - model x", entries[2]["detail"])
+        self.assertEqual("aaaaaaaaaaaaaaaa", entries[2]["id"])
+        self.assertEqual(di.receipt_id_for(t, "REQUESTED"), entries[0]["id"])
+        self.assertEqual(["The answer.", "FOR THE LAPTOP:", "nothing"], entries[3]["result"])
+        self.assertEqual([], entries[2]["result"])
+        self.assertEqual([t["task_id"]], trail_mod.tasks_of(entries))
+        self.assertEqual("SUCCEEDED", trail_mod.latest(entries, t["task_id"])["state"])
+        self.assertIsNone(trail_mod.latest(entries, "task-0000000000000000"))
+        # the request's own words are not in any entry
+        self.assertNotIn("broken telephone", json.dumps(entries))
+
+    def test_the_parser_ignores_prose_and_bounds_the_answer(self):
+        text = ("hello - task task-0123456789abcdef - request x\n"                       # not the shape
+                "RECEIPTS\n"
+                "SUCCEEDED - task task-0123456789abcdef - request R - rev abc - recipient claude-api - by claude-api - 2026-10-11T04:05:09Z - id cccccccccccccccc\n"
+                + "".join("> line %d\n" % i for i in range(205)))
+        entries = trail_mod.parse(text)
+        self.assertEqual(1, len(entries))
+        self.assertEqual("", entries[0]["detail"])
+        self.assertEqual(201, len(entries[0]["result"]))
+        self.assertEqual("[answer cut here at 200 lines]", entries[0]["result"][-1])
+        self.assertEqual([], trail_mod.parse("> an answer with no line above it\n"))
+        long_line = "SUCCEEDED - task task-0123456789abcdef - request R - rev abc - recipient claude-api - by claude-api - 2026-10-11T04:05:09Z - " + "d" * 900 + " - id cccccccccccccccc"
+        detail = trail_mod.parse("RECEIPTS\n" + long_line)[0]["detail"]
+        self.assertTrue(detail.startswith("d" * 400) and detail.endswith("[cut here at 400 of 900 characters]"), detail[-50:])
+        # the worker keeps an answer to 3000 characters, often as ONE line: kept whole, and a longer
+        # one is cut out loud (Cursor on e080da3: 400 silently was the one cut that did not say so)
+        one_line = "SUCCEEDED - task task-0123456789abcdef - request R - rev abc - recipient claude-api - by claude-api - 2026-10-11T04:05:09Z - id cccccccccccccccc\n> " + "a" * 3000 + "\n> " + "b" * 3500 + "\n"
+        result = trail_mod.parse("RECEIPTS\n" + one_line)[0]["result"]
+        self.assertEqual("a" * 3000, result[0])
+        self.assertTrue(result[1].startswith("b" * 3000) and result[1].endswith("[cut here at 3000 of 3500 characters]"), result[1][-50:])
+
+    def test_a_receipt_shaped_line_outside_the_receipts_section_is_not_returned(self):
+        outside = (
+            "SUCCEEDED - task task-0123456789abcdef - request OT-SECRET - rev abcdef012345 - "
+            "recipient claude-api - by claude-api - 2026-10-11T04:00:00Z - id 1111111111111111\n"
+            "> owner secret\n")
+        inside = (
+            "DISPATCHED - task task-fedcba9876543210 - request OT-20261010 - rev abcdef012345 - "
+            "recipient claude-api - by drive-intake - 2026-10-11T04:01:00Z - id 2222222222222222\n"
+            "> the real answer\n")
+        self.assertEqual([], trail_mod.parse(outside))                 # no RECEIPTS heading: nothing
+        for heading in ("RECEIPTS\n", "# RECEIPTS\n", "CONVERSPAN RECEIPTS:\n"):
+            entries = trail_mod.parse(outside + heading + inside)
+            self.assertEqual(["DISPATCHED"], [e["state"] for e in entries], heading)
+            self.assertEqual(["the real answer"], entries[0]["result"], heading)
+            self.assertEqual("2222222222222222", entries[0]["id"], heading)
+            dumped = json.dumps(entries)
+            self.assertNotIn("owner secret", dumped)
+            self.assertNotIn("OT-SECRET", dumped)
+            self.assertNotIn("1111111111111111", dumped)
+        d = deps(docs=Docs(text=outside + "\nRECEIPTS\n" + inside, revision="r9"))
+        out = di.trail_for_doc(d, FILE)
+        self.assertEqual(["DISPATCHED"], [e["state"] for e in out["entries"]])
+        self.assertEqual(["the real answer"], out["entries"][0]["result"])
+        dumped = json.dumps(out)
+        self.assertNotIn("owner secret", dumped)
+        self.assertNotIn("OT-SECRET", dumped)
+        self.assertNotIn("1111111111111111", dumped)
+
+    def test_the_route_wants_the_token_first_then_the_flag_then_a_file_id(self):
+        d, t = self.trail_doc()
+        self.assertEqual(401, di.handle("GET", "/trail?doc=" + FILE, {}, b"", d)[0])
+        self.assertEqual(401, di.handle("GET", "/trail?doc=" + FILE, {"Authorization": "Bearer nope"}, b"", d)[0])
+        off = deps(enabled=False)
+        self.assertEqual((200, {"enabled": False, "trail": None}),
+                         di.handle("GET", "/trail?doc=" + FILE, {"X-Drive-Intake-Poll-Token": "poll"}, b"", off))
+        self.assertEqual(0, off.docs.reads)
+        self.assertEqual(400, di.handle("GET", "/trail?doc=short", {"Authorization": "Bearer poll"}, b"", d)[0])
+        self.assertEqual(400, di.handle("GET", "/trail", {"Authorization": "Bearer poll"}, b"", d)[0])
+        status, out = di.handle("GET", "/trail?doc=" + FILE, {"Authorization": "Bearer poll"}, b"", d)
+        self.assertEqual(200, status)
+        self.assertEqual("ok", out["status"])
+        self.assertEqual((FILE, "r7", t["task_id"], "OT-20261010"), (out["doc"], out["revision"], out["task"], out["request"]))
+        self.assertEqual(["REQUESTED", "DISPATCHED", "ACCEPTED", "SUCCEEDED"], [e["state"] for e in out["entries"]])
+        self.assertEqual([t["task_id"]], out["tasks"])
+        self.assertNotIn("broken telephone", json.dumps(out))
+
+    def test_the_live_state_comes_from_redis_and_reads_unknown_when_it_cannot(self):
+        d, t = self.trail_doc()
+        d.claims.beats["fleet:worker:claim:" + t["task_id"]] = "done"
+        d.claims.beats["fleet:worker:woke:" + t["task_id"]] = "rung"
+        d.claims.pending_add(FILE)
+        laptop_up(d)
+        d.claims.beats["claude-api"] = 900.0
+        out = di.trail_for_doc(d, FILE)
+        self.assertEqual({"laptop": "online", "api_worker": "online", "intake": "dispatched", "pending": True,
+                          "worker_claim": "done", "doorbell": "rung"}, out["live"])
+        d.claims.beats["claude-api"] = 99.0
+        laptop_down(d)
+        d.claims.pending_remove(FILE)
+        del d.claims.beats["fleet:worker:claim:" + t["task_id"]]
+        out = di.trail_for_doc(d, FILE)
+        self.assertEqual({"laptop": "offline", "api_worker": "offline", "intake": "dispatched", "pending": False,
+                          "worker_claim": "none", "doorbell": "rung"}, out["live"])
+        d.claims.states[di.idempotency_key(t)] = "delivering:claude-api:1000:q"
+        self.assertEqual("delivering:claude-api", di.trail_for_doc(d, FILE)["live"]["intake"])
+
+        class Broken(di.MemoryClaims):
+            def worker_state(self, task_id):
+                raise ConnectionError()
+        d.claims = Broken()
+        self.assertEqual("unknown", di.trail_for_doc(d, FILE)["live"]["worker_claim"])
+        class NoHeartbeat(di.MemoryClaims):
+            def heartbeat(self, agent):
+                raise ConnectionError()
+        d.claims = NoHeartbeat()
+        out = di.trail_for_doc(d, FILE)
+        self.assertEqual(("unknown", "unknown"), (out["live"]["laptop"], out["live"]["api_worker"]))   # unreadable is not offline
+        self.assertEqual("unknown", di.liveness(NoHeartbeat(), "claude-api", 1000.0, 900))
+        self.assertEqual("offline", di.liveness(di.MemoryClaims(), "claude-api", 1000.0, 900))
+        self.assertEqual("online", di.liveness(di.MemoryClaims({"claude-api": 500.0}), "claude-api", 1000.0, 900))
+        self.assertEqual("offline", di.liveness(di.MemoryClaims({"claude-api": 50.0}), "claude-api", 1000.0, 900))
+        self.assertEqual("unknown", di.liveness(di.MemoryClaims({"claude-api": "soon"}), "claude-api", 1000.0, 900))
+        d.claims = None
+        self.assertEqual("unknown", di.trail_for_doc(d, FILE)["live"]["laptop"])
+
+    def test_a_doc_outside_the_folder_unreadable_or_without_a_request_is_said_so(self):
+        d, _t = self.trail_doc()
+        d.docs.folder = "elsewhere"
+        self.assertEqual("out_of_scope", di.trail_for_doc(d, FILE)["status"])
+
+        class Broken(Docs):
+            def read(self, file_id):
+                raise ConnectionError()
+        d.docs = Broken(REQUEST)
+        self.assertEqual("read_error", di.trail_for_doc(d, FILE)["status"])
+        d = deps(docs=Docs(text="\nRECEIPTS\n"))
+        out = di.trail_for_doc(d, FILE)
+        self.assertEqual(("ok", None, None, []), (out["status"], out["task"], out["request"], out["entries"]))
+        self.assertEqual("no_store", di.trail_for_doc(deps(docs=None), FILE)["status"])
+
+    def test_the_redis_adapter_reads_the_workers_keys_and_never_writes_them(self):
+        class Client:
+            def __init__(self):
+                self.kv, self.writes = {"fleet:worker:claim:task-1": b"accepted:1:1:0", "fleet:worker:woke:task-1": "rung"}, []
+
+            def get(self, key):
+                return self.kv.get(key)
+
+            def set(self, *a, **k):
+                self.writes.append(a)
+        c = Client()
+        claims = di.RedisClaims(c)
+        self.assertEqual("accepted:1:1:0", claims.worker_state("task-1"))
+        self.assertEqual("rung", claims.doorbell_state("task-1"))
+        self.assertIsNone(claims.worker_state("task-2"))
+        self.assertEqual([], c.writes)
 
 
 if __name__ == "__main__":

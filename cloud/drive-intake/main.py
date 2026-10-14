@@ -106,11 +106,25 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import importlib.util
 import json
 import os
 import re
 import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+
+def _load_trail():
+    """cloud/drive-intake/trail.py, beside this file: the one parser of the receipt shape."""
+    spec = importlib.util.spec_from_file_location(
+        "drive_intake_trail", os.path.join(os.path.dirname(os.path.abspath(__file__)), "trail.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+trail_module = _load_trail()
 
 MAX_BODY = 65536
 MAX_DOC = 400000          # a doc larger than this is refused, not truncated (PR 354's rule)
@@ -226,6 +240,11 @@ def correlate(file_id: str, text: str, drive_revision: str, recipient: str) -> d
     derived from exactly those three. The recipient rides along for the hops
     but is not identity - a request routed to a different worker on a later
     pass is the same request, not a second one.
+
+    That task is this service's task. It is not a studio session. The doc
+    text is the owner's request; a session id written into it would be the
+    author's claim, and this function does not read one. Nothing here calls
+    the studio controller.
     """
     revision = request_revision(text)
     found = REQUEST_LINE.search(strip_receipts(text) or "")
@@ -772,8 +791,9 @@ def poll(deps) -> list:
         return [{"status": "read_error", "task": None, "error": type(exc).__name__}]
     if isinstance(listed, dict):
         hints, watermark = list(listed.get("hints") or []), listed.get("watermark")
+        complete = bool(listed.get("complete", True))
     else:
-        hints, watermark = list(listed), None
+        hints, watermark, complete = list(listed), None, True
     try:
         pending = [{"file_id": f, "folder_id": ""} for f in sorted(deps.claims.pending() or ())]
     except Exception as exc:  # noqa: BLE001 - the unfinished cannot be found: nothing goes on record
@@ -798,7 +818,9 @@ def poll(deps) -> list:
     if not undecided:
         now = _now(deps)
         try:
-            deps.claims.note_poll(now, watermark if watermark is not None else now)
+            # resume: the listing was capped, so the next poll starts at this watermark.
+            # A finished listing stores where it got to and the next one looks back the margin.
+            deps.claims.note_poll(now, watermark if watermark is not None else now, resume=not complete)
         except Exception:  # noqa: BLE001 - health will read unknown; the intake itself is done
             pass
     return out
@@ -827,7 +849,8 @@ def poll_token_ok(secret: str, headers: dict) -> bool:
 
 
 def handle(method: str, path: str, headers: dict, body: bytes, deps) -> tuple:
-    path = path.split("?", 1)[0]
+    path, _sep, raw_query = path.partition("?")
+    query = urllib.parse.parse_qs(raw_query, keep_blank_values=False)
     headers = {str(k).lower(): v for k, v in (headers or {}).items()}
     if method == "GET" and path == "/healthz":
         now = _now(deps)
@@ -862,7 +885,92 @@ def handle(method: str, path: str, headers: dict, body: bytes, deps) -> tuple:
         if not deps.enabled:
             return 200, {"enabled": False, "intake": []}
         return 200, {"enabled": True, "intake": poll(deps)}
+    if method == "GET" and path == "/trail":
+        # The page's read (step 4): the same token as the poll, before anything else.
+        if not poll_token_ok(deps.poll_token, headers):
+            return 401, {"error": "bad poll token"}
+        if not deps.enabled:
+            return 200, {"enabled": False, "trail": None}
+        file_id = (query.get("doc") or [""])[0]
+        if not FILE_ID_OK.fullmatch(file_id):
+            return 400, {"error": "doc must be a Drive file id"}
+        return 200, trail_for_doc(deps, file_id)
     return 404, {"error": "not found"}
+
+
+API_HEARTBEAT = 900   # the worker beats once per tick (5 min); three ticks silent reads offline
+
+
+def liveness(store, agent: str, now: float, window: int) -> str:
+    """'online' inside the window, 'offline' when absent or stale, 'unknown' when the key cannot be read."""
+    try:
+        at = store.heartbeat(agent)
+    except Exception:  # noqa: BLE001
+        return "unknown"
+    if at is None:
+        return "offline"
+    try:
+        age = float(now) - float(at)
+    except (TypeError, ValueError):
+        return "unknown"
+    return "online" if 0 <= age <= window else "offline"
+
+
+def trail_for_doc(deps, file_id: str) -> dict:
+    """The doc's receipt trail and the live state behind it. Never the request's own words.
+
+    The doc is read every time (it is the record); what Redis adds is the claim's phase, whether
+    the doc is still pending a pass, the two heartbeats, the worker's claim and the doorbell
+    marker. Anything Redis cannot answer reads "unknown", never a guess.
+    """
+    out = {"enabled": True, "doc": file_id, "at": deps.at}
+    if deps.docs is None:
+        out["status"] = "no_store"
+        return out
+    try:
+        doc = deps.docs.read(file_id)
+    except Exception as exc:  # noqa: BLE001
+        out.update(status="read_error", error=type(exc).__name__)
+        return out
+    if not isinstance(doc, dict):
+        out.update(status="read_error", error="shape")
+        return out
+    if deps.folder_id and doc.get("folder_id") != deps.folder_id:
+        out["status"] = "out_of_scope"
+        return out
+    text = doc.get("text") or ""
+    if len(text) > MAX_DOC:
+        out.update(status="too_large", chars=len(text))
+        return out
+    entries = trail_module.parse(text)
+    revision = str(doc.get("revision_id") or "")
+    recipient = next((e["recipient"] for e in entries if e["state"] == REQUESTED and canonical(e["recipient"])),
+                     "claude-code-cli")
+    tuple_ = correlate(file_id, text, revision, recipient) if strip_receipts(text).strip() else None
+    out.update(status="ok", revision=revision, entries=entries, tasks=trail_module.tasks_of(entries),
+               task=tuple_["task_id"] if tuple_ else None, request=tuple_["request_id"] if tuple_ else None)
+    now = _now(deps)
+    live = {"laptop": "unknown", "api_worker": "unknown", "intake": "unknown", "pending": "unknown",
+            "worker_claim": "unknown", "doorbell": "unknown"}
+    if deps.claims is not None:
+        # A heartbeat the store cannot READ is unknown, not offline (Cursor on e080da3): the router's
+        # heartbeat_age treats unreadable as absent on purpose, so this reads the key itself first.
+        live["laptop"] = liveness(deps.claims, "claude-code-cli", now, deps.heartbeat_window)
+        live["api_worker"] = liveness(deps.claims, "claude-api", now, API_HEARTBEAT)
+        if tuple_:
+            for name, read in (("intake", lambda: deps.claims.state(idempotency_key(tuple_))),
+                               ("pending", lambda: file_id in (deps.claims.pending() or ())),
+                               ("worker_claim", lambda: deps.claims.worker_state(tuple_["task_id"])),
+                               ("doorbell", lambda: deps.claims.doorbell_state(tuple_["task_id"]))):
+                try:
+                    value = read()
+                except Exception:  # noqa: BLE001 - unreadable is unknown
+                    continue
+                live[name] = value if value is not None else "none"
+            if isinstance(live["intake"], str) and ":" in live["intake"]:
+                live["intake"] = live["intake"].split(":", 1)[0] + ":" + live["intake"].split(":")[1]
+    out["live"] = live
+    return out
 
 
 def no_ring(_tuple):
@@ -958,9 +1066,14 @@ class MemoryClaims:
     def watermark(self):
         return self.beats.get("watermark")
 
-    def note_poll(self, now, watermark=None):
+    def note_poll(self, now, watermark=None, resume=False):
         self.beats["poll"] = float(now)
         self.beats["watermark"] = float(now if watermark is None else watermark)
+        self.beats["resume"] = bool(resume)
+
+    def resume(self):
+        """True when the last listing was capped and the next poll must start at the watermark."""
+        return bool(self.beats.get("resume"))
 
     def pending(self):
         return set(self.beats.setdefault("pending", set()))
@@ -970,6 +1083,13 @@ class MemoryClaims:
 
     def pending_remove(self, file_id):
         self.beats.setdefault("pending", set()).discard(file_id)
+
+    # Read only, for the trail: what the worker and the lane wrote under their own keys.
+    def worker_state(self, task_id):
+        return self.beats.get("fleet:worker:claim:" + task_id)
+
+    def doorbell_state(self, task_id):
+        return self.beats.get("fleet:worker:woke:" + task_id)
 
 
 # Compare-and-set in one round trip, so two passes cannot both win a transition.
@@ -1052,10 +1172,20 @@ class RedisClaims:
         except (TypeError, ValueError):
             return None
 
-    def note_poll(self, now, watermark=None):
+    def note_poll(self, now, watermark=None, resume=False):
         self.client.set("fleet:intake:poll:last", "%d" % int(now), ex=CLAIM_TTL)
         self.client.set("fleet:intake:poll:watermark", "%d" % int(now if watermark is None else watermark),
                         ex=CLAIM_TTL)
+        if resume:
+            self.client.set("fleet:intake:poll:resume", "1", ex=CLAIM_TTL)
+        else:
+            self.client.delete("fleet:intake:poll:resume")
+
+    def resume(self):
+        raw = self.client.get("fleet:intake:poll:resume")
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", "replace")
+        return bool(raw)
 
     def watermark(self):
         """fleet:intake:poll:watermark - where the last poll got to (not when it ran)."""
@@ -1078,6 +1208,15 @@ class RedisClaims:
 
     def pending_remove(self, file_id):
         self.client.srem("fleet:intake:pending", file_id)
+
+    # Read only, for the trail: the worker's claim and the lane's doorbell marker.
+    def worker_state(self, task_id):
+        raw = self.client.get("fleet:worker:claim:" + task_id)
+        return raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
+
+    def doorbell_state(self, task_id):
+        raw = self.client.get("fleet:worker:woke:" + task_id)
+        return raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
 
 
 class InboxQueue:

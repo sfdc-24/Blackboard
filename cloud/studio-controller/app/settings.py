@@ -101,6 +101,12 @@ class Settings:
     pilot_seconds: int = 300
     # The owner's address: each pilot's summary is also sent here, once.
     pilot_notify: str = ""
+    # The telephone trail (step 4 of the broken-telephone fix): the private
+    # drive-intake service's URL and its poll token. Off when the URL is empty;
+    # off, the endpoint is 404 and nothing is read. On, a read still requires
+    # the doc id the server stored on that live session.
+    telephone_url: str = ""
+    telephone_token: str = ""
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -156,6 +162,8 @@ class Settings:
             advisor_enabled=_enabled(os.environ.get("STUDIO_ENABLE_ADVISOR", "false")),
             charter_enabled=_enabled(os.environ.get("STUDIO_ENABLE_CHARTER", "false")),
             price_table=os.environ.get("STUDIO_PRICE_TABLE", ""),
+            telephone_url=os.environ.get("STUDIO_TELEPHONE_URL", "").strip().rstrip("/"),
+            telephone_token=os.environ.get("STUDIO_TELEPHONE_TOKEN", ""),
             **_pilot_from_env(),
         )
 
