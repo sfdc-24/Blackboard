@@ -581,6 +581,13 @@ import test_redis_gov as gov_tests  # noqa: E402  (its FakeRedis has Redis's rea
 
 AYA = "aya-runtime@sfdc24.iam.gserviceaccount.com"
 CHAIR = "conference-chair@sfdc24.iam.gserviceaccount.com"
+# THE MAP MOST OF THESE TESTS RUN UNDER IS WRITTEN HERE, NOT READ FROM callers.json. For the pilot the committed
+# file admits the chair alone to /op and Aya's account for the probe only, so a fleet agent's road through this
+# endpoint (which is still code, and is what a later line would open) is tested with a fleet agent's line said
+# here. What the COMMITTED file does is the tests under THE COMMITTED FILE IS THE PILOT, with post(committed=True).
+A_FLEET_AGENT_AND_THE_CHAIR = ({AYA: "chatgpt-codex-desktop", CHAIR: "conference-chair"},
+                               {AYA: "fleet-agent", CHAIR: "chair"}, {CHAIR: ("claude",)})
+NOW = 1791993600.0                      # 2026-10-14 16:00:00Z: the day in the chair's key below (held by a test)
 
 
 class TheOpEndpoint(unittest.TestCase):
@@ -588,8 +595,23 @@ class TheOpEndpoint(unittest.TestCase):
     and the two layers the bridge adds - the HTTP surface and the caller-to-principal map - are
     the ones under test. What redis_gov allows is tests/test_redis_gov.py's business."""
 
+    def setUp(self):
+        saved = bridge_op.clock
+        self.now = NOW
+        bridge_op.clock = lambda: self.now
+        bridge_op._SPENT.clear()
+
+        def restore():
+            bridge_op.clock = saved
+            bridge_op._SPENT.clear()
+        self.addCleanup(restore)
+
     def post(self, body, claims=None, conn=None, connect=None, token="tok", path="/op",
-             callers=None, length=None, admitted=None):
+             callers=None, length=None, admitted=None, purposes=None, personas=None, committed=False):
+        given = (callers, purposes, personas)
+        callers, purposes, personas = (given if committed else
+                                       tuple(mine if mine is not None else usual
+                                             for mine, usual in zip(given, A_FLEET_AGENT_AND_THE_CHAIR)))
         handler = object.__new__(bridge.Handler)
         handler.path = path
         raw = body if isinstance(body, bytes) else __import__("json").dumps(body).encode("utf-8")
@@ -602,17 +624,23 @@ class TheOpEndpoint(unittest.TestCase):
         self.conn = conn if conn is not None else gov_tests.FakeRedis()
         saved_env = {k: os.environ.get(k) for k in ("BRIDGE_AUDIENCE", "BRIDGE_CALLERS")}
         os.environ.update({"BRIDGE_AUDIENCE": AUD, "BRIDGE_CALLERS": admitted or AYA})
-        saved_connect, saved_callers = bridge.connect, bridge_op.load_callers
+        saved_connect = bridge.connect
+        saved_readers = bridge_op.load_callers, bridge_op.load_purposes, bridge_op.load_personas
         bridge.connect = connect or (lambda: self.conn)
         if callers is not None:
             bridge_op.load_callers = lambda path=None: callers
+        if purposes is not None:
+            bridge_op.load_purposes = lambda path=None: purposes
+        if personas is not None:
+            bridge_op.load_personas = lambda path=None: personas
         log = io.StringIO()
         try:
             with Verifier(claims if claims is not None else {"email": AYA, "email_verified": True}), \
                     contextlib.redirect_stderr(log):
                 handler.do_POST()
         finally:
-            bridge.connect, bridge_op.load_callers = saved_connect, saved_callers
+            bridge.connect = saved_connect
+            bridge_op.load_callers, bridge_op.load_purposes, bridge_op.load_personas = saved_readers
             for k, v in saved_env.items():
                 os.environ.pop(k, None)
                 if v is not None:
@@ -620,6 +648,11 @@ class TheOpEndpoint(unittest.TestCase):
         self.assertEqual(1, len(sent), "exactly one response per request")
         self.log = log.getvalue()
         return sent[0]
+
+    @staticmethod
+    def said(out):
+        """The answer without the time the handler stamps on it."""
+        return {k: v for k, v in out.items() if k != "at"}
 
     @staticmethod
     def b64(text):
@@ -872,8 +905,14 @@ class TheOpEndpoint(unittest.TestCase):
         acl = redis_gov.load_acl()
         callers, purposes = bridge_op.load_callers(), bridge_op.load_purposes()
         self.assertTrue(callers, "callers.json maps nobody, so /op would refuse everyone")
-        self.assertEqual(set(callers), set(purposes))
-        self.assertEqual({AYA: bridge_op.FLEET, CHAIR: bridge_op.CHAIR}, purposes, "every line says what it is for")
+        # THE PILOT, pinned whole: one caller of /op, one persona, and Aya's account for the probe and no more.
+        # A second caller, a second persona or a fleet agent on /op fails HERE, in the PR that proposes it.
+        self.assertEqual({AYA: bridge_op.PROBE, CHAIR: bridge_op.CHAIR}, purposes, "every line says what it is for")
+        self.assertEqual({CHAIR: "conference-chair"}, callers, "an account admitted for the probe acts as nobody")
+        self.assertEqual({CHAIR: ("claude",)}, bridge_op.load_personas())
+        self.assertEqual((86400, 512), (redis_gov.ttl_for(acl, "conf:persona:20261014:claude"),
+                                        redis_gov.value_cap(acl, "conf:persona:20261014:claude")),
+                         "a persona's key lives a day and holds 512 bytes, by the access list")
 
         def may(who, op, key):
             try:
@@ -889,45 +928,70 @@ class TheOpEndpoint(unittest.TestCase):
                 for key in ("fleet:inbox:probe", "conf:side:20261013"):
                     self.assertTrue(may(who, "xadd", key), "%s cannot write %s" % (who, key))
                 continue
-            self.assertEqual({"read": ["conf:"], "write": ["conf:persona:"]}, acl["principals"][who],
+            self.assertEqual({"read": ["conf:persona:"], "write": ["conf:persona:"]}, acl["principals"][who],
                              "the chair's line is these two entries and no more")
-            self.assertTrue(may(who, "set", "conf:persona:20261014:claude"))
-            for key in ("conf:persona:20261014:claude", "conf:side:20261014", "conf:test:20261014:grok"):
-                self.assertTrue(may(who, "get", key), key)
+            for op in ("get", "set"):
+                self.assertTrue(may(who, op, "conf:persona:20261014:claude"), op)
             for op, key in (("set", "fleet:x"), ("xadd", "fleet:inbox:probe"), ("set", "conf:side:20261014"),
                             ("xadd", "conf:side:20261014"), ("set", "conf:x"), ("set", "conf:personas:x"),
                             ("set", "proj:x"), ("hput", "proj:milestones:x"), ("set", "v1:conf:room:x"),
                             ("set", "gov:x"), ("xadd", "gov:audit"), ("set", "probe:x"), ("set", "v1:bus:row:1"),
                             ("get", "fleet:inbox:grok"), ("xrange", "fleet:inbox:grok"), ("get", "proj:x"),
-                            ("xrange", "gov:audit"), ("get", "v1:conf:room:x")):
+                            ("xrange", "gov:audit"), ("get", "v1:conf:room:x"),
+                            # no broader READ either (Aya, AYA-PILOT-SOURCE-DIRECTION-20261014T0031Z)
+                            ("get", "conf:side:20261014"), ("xrange", "conf:side:20261014"),
+                            ("get", "conf:test:20261014:grok"), ("get", "conf:personas:x"), ("get", "conf:x")):
                 self.assertFalse(may(who, op, key), "the chair can %s %s" % (op, key))
 
-    def test_every_caller_the_deploy_admits_has_a_principal(self):
+    def test_every_caller_the_deploy_admits_has_a_line_that_says_what_it_is_for(self):
         import re
         admitted = re.search(r"BRIDGE_CALLERS=([^\s\\]+)", DEPLOY).group(1)
         for email in admitted.replace("${PROJECT}", "sfdc24").split(","):
-            self.assertIn(email.strip().lower(), bridge_op.load_callers(),
-                          "deploy.sh admits %s but callers.json gives it no principal" % email)
+            self.assertIn(email.strip().lower(), bridge_op.load_purposes(),
+                          "deploy.sh admits %s but callers.json has no line for it" % email)
+
+    def test_the_deploy_runs_one_instance_which_is_what_makes_the_hourly_ceiling_one_ceiling(self):
+        """take() counts in the instance's memory. Two instances would be two ceilings."""
+        self.assertEqual(1, DEPLOY.count("  --min-instances=0 --max-instances=1 --concurrency=4 \\"))
+        self.assertNotIn("--max-instances=2", DEPLOY)
 
     def test_a_line_says_a_principal_and_what_the_caller_is_for_or_it_maps_nobody(self):
         import json
         import tempfile
+        chair = {"principal": "conference-chair", "for": "chair"}
         lines = {
             "old@x": "grok",                                                # a bare string: a fleet agent, as before
             "agent@x": {"principal": "Grok", "for": "fleet-agent"},
-            " Chair@X ": {"principal": "conference-chair", "for": "chair"},
+            " Chair@X ": dict(chair, personas=["claude", "grok"]),
+            "probe@x": {"principal": "Grok", "for": "probe"},              # admitted for the probe: acts as nobody
             "other@x": {"principal": "grok", "for": "admin"},              # for nothing this file knows
-            "more@x": {"principal": "grok", "for": "chair", "note": "x"},  # a member too many
-            "none@x": {"for": "chair"}, "blank@x": {"principal": " ", "for": "chair"},
-            "num@x": {"principal": 7, "for": "chair"}, "list@x": ["grok"], "nul@x": None, "int@x": 7,
+            "more@x": dict(chair, personas=["claude"], note="x"),          # a member too many
+            "none@x": {"for": "chair", "personas": ["claude"]}, "blank@x": dict(chair, principal=" ", personas=["claude"]),
+            "num@x": dict(chair, principal=7, personas=["claude"]), "list@x": ["grok"], "nul@x": None, "int@x": 7,
             "forlist@x": {"principal": "grok", "for": ["chair"]},
+            # the chair's line names its personas, or it is nobody's line
+            "bare@x": chair, "empty@x": dict(chair, personas=[]), "text@x": dict(chair, personas="claude"),
+            "five@x": dict(chair, personas=["aa", "bb", "cc", "dd", "ee"]), "twice@x": dict(chair, personas=["claude", "claude"]),
+            "upper@x": dict(chair, personas=["Claude"]), "one@x": dict(chair, personas=["c"]),
+            "notstr@x": dict(chair, personas=[7]), "star@x": dict(chair, personas=["*"]),
+            "break@x": dict(chair, personas=["claude\n"]), "nul2@x": dict(chair, personas=None),
+            # and a list of personas makes nobody else the chair
+            "fleetp@x": {"principal": "grok", "for": "fleet-agent", "personas": ["claude"]},
+            "probep@x": {"principal": "grok", "for": "probe", "personas": ["claude"]},
+            "probeblank@x": {"principal": " ", "for": "probe"}, "probenum@x": {"principal": 7, "for": "probe"},
         }
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "callers.json")
             pathlib.Path(path).write_text(json.dumps({"callers": lines}), encoding="utf-8")
             self.assertEqual({"old@x": "grok", "agent@x": "grok", "chair@x": "conference-chair"}, bridge_op.load_callers(path))
-            self.assertEqual({"old@x": "fleet-agent", "agent@x": "fleet-agent", "chair@x": "chair"},
+            self.assertEqual({"old@x": "fleet-agent", "agent@x": "fleet-agent", "chair@x": "chair", "probe@x": "probe"},
                              bridge_op.load_purposes(path))
+            self.assertEqual({"chair@x": ("claude", "grok")}, bridge_op.load_personas(path))
+            four = os.path.join(tmp, "four.json")
+            pathlib.Path(four).write_text(json.dumps({"callers": {"c@x": dict(chair, personas=["aa", "bb", "cc", "dd"])}}),
+                                          encoding="utf-8")
+            self.assertEqual({"c@x": ("aa", "bb", "cc", "dd")}, bridge_op.load_personas(four), "four is the most")
+            self.assertEqual(4, bridge_op.MAX_PERSONAS)
 
     def test_a_missing_or_malformed_map_maps_nobody(self):
         import tempfile
@@ -963,9 +1027,9 @@ class TheOpEndpoint(unittest.TestCase):
         code, out = self.chair({"op": "get", "key": self.KEY}, conn=conn)
         self.assertEqual((200, True, "Converspan demo note 1", "claude", self.RID),
                          (code, out["found"], out["value"], out["author"], out["request"]))
-        code, out = self.chair({"op": "get", "key": "conf:side:20261014"}, conn=conn)
-        self.assertEqual((200, False), (code, out["found"]), "the chair may read conf:")
-        self.assertEqual([("claude", self.RID)] * 2, [(e["claimed_author"], e["request_id"]) for e in conn.audit()])
+        self.assertEqual([("claude", self.RID)], [(e["claimed_author"], e["request_id"]) for e in conn.audit()])
+        code, out = self.chair({"op": "get", "key": self.KEY})
+        self.assertEqual((200, False), (code, out["found"]), "its own key, not yet written")
 
     def test_the_chair_must_say_which_persona_and_which_request_on_every_op(self):
         for op in ({"op": "set", "key": self.KEY, "val": self.b64("v"), "enc": "b64"}, {"op": "get", "key": self.KEY}):
@@ -977,40 +1041,134 @@ class TheOpEndpoint(unittest.TestCase):
                 self.assertEqual(([], None), (self.conn.audit(), self.conn.get(self.KEY)), "nothing ran")
         self.assertIn("did not say which persona", self.log)
 
-    def test_the_chair_writes_only_the_key_of_the_persona_it_names_and_only_with_set(self):
+    def refused_at_the_door(self, body, **more):
+        """A 400 with "executed": false, no connection asked for, nothing changed and nothing audited."""
+        conn, connected, spent = gov_tests.FakeRedis(), [], list(bridge_op._SPENT)
+        conn.set(self.KEY, "kept")
+
+        def connect():
+            connected.append(1)
+            return conn
+        code, out = self.chair(body, conn=conn, connect=connect, **more)
+        self.assertEqual((400, {"error": "bad request", "executed": False}), (code, self.said(out)), body)
+        self.assertEqual(("kept", [], []), (conn.get(self.KEY), conn.audit(), connected), body)
+        self.assertEqual(spent, list(bridge_op._SPENT), "a request refused at the door spends none of the hour")
+
+    def test_the_chair_touches_only_the_key_of_the_persona_it_names_and_only_with_get_and_set(self):
+        """THE PILOT: `get` and `set`, one kind of key. A read is held to it exactly as a write is: on af67f96
+        the chair could read all of conf: and ask for hgetall and xrange."""
         write = {"val": self.b64("v"), "enc": "b64"}
-        for body in (dict(write, op="set", key="conf:persona:20261014:grok"),          # another persona's key
-                     dict(write, op="set", key=self.KEY, author="grok"),              # the same, the other way
-                     dict(write, op="set", key="conf:persona:20261014:claude:more"),
-                     dict(write, op="set", key="conf:persona:2026101:claude"),
-                     dict(write, op="set", key="conf:persona:claude"),
-                     dict(write, op="set", key="conf:side:20261014"), dict(write, op="set", key="fleet:inbox:grok"),
-                     dict(write, op="set", key="proj:x"), dict(write, op="set", key=self.KEY + ":"),
-                     dict(write, op="xadd", key=self.KEY), dict(write, op="hset", key=self.KEY, field="f"),
+        for ask in (dict(write, op="set"), {"op": "get"}):
+            for body in (dict(ask, key="conf:persona:20261014:grok"),          # another persona's key
+                         dict(ask, key=self.KEY, author="grok"),              # the same, the other way
+                         dict(ask, key="conf:persona:20261014:claude:more"),
+                         dict(ask, key="conf:persona:2026101:claude"), dict(ask, key="conf:persona:claude"),
+                         dict(ask, key="conf:side:20261014"), dict(ask, key="conf:test:20261014:claude"),
+                         dict(ask, key="fleet:inbox:grok"), dict(ask, key="proj:x"), dict(ask, key="gov:audit"),
+                         dict(ask, key=self.KEY + ":"), dict(ask, key=self.KEY + "\n"), dict(ask, key=" " + self.KEY),
+                         dict(ask, key=self.KEY + " "), dict(ask, key="v1:" + self.KEY)):
+                self.refused_at_the_door(body)
+        for body in (dict(write, op="xadd", key=self.KEY), dict(write, op="hset", key=self.KEY, field="f"),
                      dict(write, op="hput", key=self.KEY), {"op": "del", "key": self.KEY},
-                     {"op": "haudit", "key": self.KEY}, {"op": "flushall", "key": self.KEY}):
-            conn = gov_tests.FakeRedis()
-            conn.set(self.KEY, "kept")
-            code, out = self.chair(body, conn=conn)
-            self.assertEqual((400, "bad request", False), (code, out["error"], out["executed"]), body)
-            self.assertEqual(("kept", []), (conn.get(self.KEY), conn.audit()), body)
-        self.assertIn("not the key of the persona it names", self.log)
+                     {"op": "haudit", "key": self.KEY}, {"op": "flushall", "key": self.KEY},
+                     {"op": "hgetall", "key": self.KEY}, {"op": "xrange", "key": self.KEY},      # reads the list allows
+                     dict(write, op="SET", key=self.KEY), dict(write, op=" set", key=self.KEY), {"op": "get ", "key": self.KEY}):
+            self.refused_at_the_door(body)
+        self.assertIn("not an op the chair makes, or not today's key of a persona it may name", self.log)
+        self.assertEqual(("get", "set"), bridge_op.CHAIR_OPS)
 
-    def test_the_chair_reads_conf_and_nothing_else_and_its_refusal_is_audited_with_its_claims(self):
-        for key in ("fleet:inbox:grok", "proj:milestones:x", "gov:audit"):
-            code, out = self.chair({"op": "get", "key": key})
-            self.assertEqual((403, "refused", False, "conference-chair may not read that key", "claude", self.RID),
-                             (code, out["error"], out["executed"], out["reason"], out["author"], out["request"]), key)
-            [entry] = self.conn.audit()
-            self.assertEqual(("conference-chair", "0", "claude", self.RID),
-                             tuple(entry[k] for k in ("actor", "ok", "claimed_author", "request_id")))
+    def test_the_chair_names_only_a_persona_on_its_own_line(self):
+        grok = "conf:persona:20261014:grok"
+        for body in ({"op": "get", "key": grok, "author": "grok"},
+                     {"op": "set", "key": grok, "author": "grok", "val": self.b64("v"), "enc": "b64"}):
+            self.refused_at_the_door(body)                                   # as committed: claude and nobody else
+            self.refused_at_the_door(body, personas={})                      # and a chair with no list names nobody
+            self.refused_at_the_door(body, personas={AYA: ("grok",)})        # nor does another caller's list serve it
+            code, out = self.chair(body, personas={CHAIR: ("claude", "grok")})
+            self.assertEqual((200, "grok"), (code, out["author"]), "a second persona is one more name on that line")
+        for author in ("Claude", "claude\n", " claude", "owner", "*"):
+            self.refused_at_the_door({"op": "get", "key": self.KEY, "author": author})
 
-    def test_a_claim_of_the_wrong_shape_from_the_chair_is_refused_and_not_recorded(self):
-        code, out = self.chair({"op": "get", "key": self.KEY, "author": "Claude"})
-        self.assertEqual((403, "refused", False), (code, out["error"], out["executed"]))
-        self.assertNotIn("claimed_author", self.conn.audit()[-1])
+    def test_the_key_s_day_is_today_or_yesterday_in_utc_and_no_other(self):
+        self.assertEqual(("20261014", "20261013"), bridge_op.days(NOW), "NOW is the day these tests say it is")
+        self.assertEqual(("20270101", "20261231"), bridge_op.days(1798761600.0), "across a year's end")
+        write = {"op": "set", "val": self.b64("v"), "enc": "b64"}
+        for day, served in (("20261014", True), ("20261013", True), ("20261012", False), ("20261015", False),
+                            ("20251014", False), ("00000000", False)):
+            body = dict(write, key="conf:persona:%s:claude" % day)
+            if served:
+                self.assertEqual(200, self.chair(body)[0], day)
+                self.assertEqual(200, self.chair({"op": "get", "key": body["key"]})[0], day)
+            else:
+                self.refused_at_the_door(body)
+                self.refused_at_the_door({"op": "get", "key": body["key"]})
+            bridge_op._SPENT.clear()
+        # a write proposed a minute before midnight and confirmed a minute after it keeps its key
+        self.now = NOW + 8 * 3600 + 60                                       # 2026-10-15 00:01Z
+        self.assertEqual(200, self.chair(dict(write, key=self.KEY))[0])
+        self.now = NOW + 32 * 3600 + 60                                      # 2026-10-16 00:01Z
+        self.refused_at_the_door(dict(write, key=self.KEY))
+
+    def test_the_chair_s_writes_have_an_hourly_ceiling_and_past_it_nothing_runs(self):
+        """Refused with a 429, "executed": false, before the write; reads are not counted; an hour later it serves."""
+        write = {"op": "set", "key": self.KEY, "val": self.b64("v"), "enc": "b64"}
+        self.assertEqual(20, bridge_op.CHAIR_WRITES_PER_HOUR)
+        conn = gov_tests.FakeRedis()
+        for n in range(20):
+            self.now = NOW + n
+            self.assertEqual(200, self.chair(dict(write, val=self.b64("note %d" % n)), conn=conn)[0], n)
+        self.now = NOW + 20
+        code, out = self.chair(dict(write, val=self.b64("one too many")), conn=conn)
+        self.assertEqual((429, {"error": "quota", "executed": False}), (code, self.said(out)))
+        self.assertEqual(("note 19", 20), (conn.get(self.KEY), len(conn.audit())), "the write past the ceiling did not run")
+        self.assertIn("hourly ceiling of 20 writes", self.log)
+        self.assertNotIn("one too many", self.log)
+        self.assertEqual(200, self.chair({"op": "get", "key": self.KEY}, conn=conn)[0], "a read is not a write")
+        self.now = NOW + 3599
+        self.assertEqual(429, self.chair(write, conn=conn)[0], "the first write is still inside the hour")
+        self.now = NOW + 3600
+        self.assertEqual(200, self.chair(write, conn=conn)[0], "an hour after the first write, one more")
+        self.assertEqual(429, self.chair(write, conn=conn)[0], "and only one: the second is 3,599 seconds old")
+
+    def test_what_does_not_run_spends_none_of_the_hour_and_a_fleet_agent_has_no_ceiling_here(self):
+        write = {"op": "set", "key": self.KEY, "val": self.b64("v"), "enc": "b64"}
+
+        def down():
+            raise ConnectionError("no route")
+        self.assertEqual(503, self.chair(write, connect=down)[0])
+        self.assertEqual(403, self.chair(dict(write, expect="owner"))[0])
+        self.assertEqual(200, self.chair({"op": "get", "key": self.KEY})[0])
+        self.assertEqual([], list(bridge_op._SPENT))
+        self.assertEqual(200, self.chair(write)[0])
+        self.assertEqual([NOW], list(bridge_op._SPENT))
+        for _ in range(25):                     # a fleet agent's line, as this test's map says it
+            self.assertEqual(200, self.post({"op": "set", "key": "fleet:test:x", "val": self.b64("v"), "enc": "b64"})[0])
+        self.assertEqual([NOW], list(bridge_op._SPENT))
+
+    def test_take_counts_an_hour_and_forgets_what_is_older(self):
+        import collections
+        spent = collections.deque()
+        self.assertEqual([True] * 20 + [False] * 2, [bridge_op.take(100.0, spent) for _ in range(22)])
+        self.assertEqual(20, len(spent), "a refusal is not counted")
+        self.assertFalse(bridge_op.take(3699.9, spent))
+        self.assertTrue(bridge_op.take(3700.0, spent), "exactly an hour on, the oldest are forgotten")
+        self.assertEqual(1, len(spent))
+
+    def test_a_value_over_the_persona_key_s_cap_is_the_governor_s_refusal_audited_with_the_chair_s_claims(self):
+        """What the door lets through is still redis_gov's to refuse, and its refusal carries the claims."""
+        code, out = self.chair({"op": "set", "key": self.KEY, "val": self.b64("x" * 513), "enc": "b64"})
+        self.assertEqual((403, "refused", False, "the value is over 512 bytes", "claude", self.RID),
+                         (code, out["error"], out["executed"], out["reason"], out["author"], out["request"]))
+        [entry] = self.conn.audit()
+        self.assertEqual(("conference-chair", "0", "claude", self.RID),
+                         tuple(entry[k] for k in ("actor", "ok", "claimed_author", "request_id")))
+        self.assertIsNone(self.conn.get(self.KEY))
+        self.assertEqual(200, self.chair({"op": "set", "key": self.KEY, "val": self.b64("x" * 512), "enc": "b64"})[0])
+        self.assertEqual(86400, self.conn.ttls[self.KEY], "and what is written is gone in a day")
+
+    def test_a_request_id_of_the_wrong_shape_from_the_chair_is_refused_and_not_recorded(self):
         code, out = self.chair({"op": "get", "key": self.KEY, "request": "an id with spaces"})
-        self.assertEqual((403, "refused"), (code, out["error"]))
+        self.assertEqual((403, "refused", False), (code, out["error"], out["executed"]))
         self.assertNotIn("request_id", self.conn.audit()[-1])
 
     def test_a_fleet_agent_may_not_say_it_acts_for_anyone(self):
@@ -1033,18 +1191,73 @@ class TheOpEndpoint(unittest.TestCase):
 
     def test_what_a_caller_is_for_is_its_line_and_never_the_request(self):
         """The same verified account, mapped as a fleet agent, is not the chair for having said so."""
-        code, out = self.post({"op": "set", "key": self.KEY, "val": self.b64("v"), "enc": "b64", "author": "claude",
-                               "request": self.RID}, claims={"email": CHAIR, "email_verified": True}, admitted=CHAIR,
-                              callers={CHAIR: "grok"})
-        self.assertEqual(200, code, "this run kept the real purposes file, where that account IS the chair")
-        saved = bridge_op.load_purposes
-        bridge_op.load_purposes = lambda path=None: {CHAIR: bridge_op.FLEET}
-        try:
-            code, out = self.post({"op": "set", "key": self.KEY, "val": self.b64("v"), "enc": "b64", "author": "claude",
-                                   "request": self.RID}, claims={"email": CHAIR, "email_verified": True}, admitted=CHAIR)
-        finally:
-            bridge_op.load_purposes = saved
+        said = {"op": "set", "key": self.KEY, "val": self.b64("v"), "enc": "b64", "author": "claude", "request": self.RID}
+        as_chair = dict(claims={"email": CHAIR, "email_verified": True}, admitted=CHAIR)
+        code, out = self.post(said, callers={CHAIR: "grok"}, **as_chair)
+        self.assertEqual(200, code, "its line still says chair, whatever principal it is bound to")
+        code, out = self.post(said, purposes={CHAIR: bridge_op.FLEET}, **as_chair)
         self.assertEqual((400, "bad request"), (code, out["error"]))
+        code, out = self.post(said, purposes={}, **as_chair)
+        self.assertEqual((400, "bad request"), (code, out["error"]), "a caller with no stated purpose is not the chair")
+        self.assertIn("not the chair", self.log)
+
+    # --- THE COMMITTED FILE IS THE PILOT: callers.json as committed, through the real handler (Aya,
+    # AYA-PILOT-SOURCE-DIRECTION-20261014T0031Z: Aya probe-only; the chair get and set only, on the one synthetic
+    # key; no broader read and no grants).
+    def test_aya_s_account_keeps_the_probe_and_is_refused_on_op_before_anything_is_read(self):
+        connected = []
+
+        def connect():
+            connected.append(1)
+            return self.conn
+        for body in ({"op": "xadd", "key": "fleet:inbox:grok", "val": self.b64("hello"), "enc": "b64"},
+                     {"op": "get", "key": "fleet:x"}, {"op": "get", "key": self.KEY, "author": "claude", "request": self.RID},
+                     b"not json"):
+            code, out = self.post(body, committed=True, connect=connect)
+            self.assertEqual((403, {"error": "not authorised", "executed": False}), (code, self.said(out)), body)
+            self.assertEqual(([], []), (connected, self.conn.audit()), body)
+        self.assertIn("admitted for the probe only", self.log)
+        self.assertNotIn("no principal in callers.json", self.log, "it is not our misconfiguration, and is not logged as one")
+        conn = FakeRedis()
+        code, out = self.post(b"", path="/probe", conn=conn, committed=True)
+        self.assertEqual((200, "OK"), (code, out["status"]), "the probe is what it was before /op existed")
+
+    def test_a_probe_account_stays_refused_whatever_principal_some_other_map_gives_it(self):
+        """The refusal is the line's purpose, read first: it does not depend on the account being unmapped."""
+        code, out = self.post({"op": "get", "key": "fleet:x"}, callers={AYA: "owner"}, purposes={AYA: bridge_op.PROBE})
+        self.assertEqual((403, {"error": "not authorised", "executed": False}), (code, self.said(out)))
+        self.assertEqual([], self.conn.audit())
+
+    def test_the_chair_gets_and_sets_its_persona_s_key_and_that_is_all_the_file_opens(self):
+        note = "Converspan demo note 1"
+        code, out = self.chair({"op": "set", "key": self.KEY, "val": self.b64(note), "enc": "b64"}, committed=True)
+        self.assertEqual((200, "conference-chair", "claude", self.RID), (code, out["principal"], out["author"], out["request"]))
+        conn = self.conn
+        code, out = self.chair({"op": "get", "key": self.KEY}, conn=conn, committed=True)
+        self.assertEqual((200, note), (code, out["value"]))
+        self.assertEqual(86400, conn.ttls[self.KEY])
+        for body in ({"op": "get", "key": "conf:side:20261014"}, {"op": "xrange", "key": self.KEY},
+                     {"op": "get", "key": "conf:persona:20261014:grok", "author": "grok"},
+                     {"op": "set", "key": "fleet:inbox:grok", "val": self.b64("v"), "enc": "b64"}):
+            code, out = self.chair(body, conn=conn, committed=True)
+            self.assertEqual((400, {"error": "bad request", "executed": False}), (code, self.said(out)), body)
+        self.assertEqual(2, len(conn.audit()))
+
+    def test_the_statement_of_what_the_pilot_does_not_enforce_is_where_an_approver_reads(self):
+        """Aya: the residual must be explicit in the owner's pilot approval. So it is in the door's own docstring,
+        in the map and in the README, in the same words, and removing it from any one fails here."""
+        import json
+        said = "THE BRIDGE TRUSTS THE CHAIR'S IDENTITY"
+        whole = lambda text: " ".join(text.split())  # noqa: E731
+        readme = (ROOT / "cloud" / "redis-tool-bridge" / "README.md").read_text(encoding="utf-8")
+        callers = json.loads((ROOT / "cloud" / "redis-tool-bridge" / "callers.json").read_text(encoding="utf-8"))
+        self.assertIn(said, whole(bridge_op.__doc__))
+        self.assertIn("does not see the owner's confirmation and does not enforce it", whole(bridge_op.__doc__))
+        self.assertIn(said + " AND DOES NOT ENFORCE THE OWNER'S CONFIRMATION", callers["pilot"])
+        self.assertIn("the bridge trusts the chair's identity. It does not see the owner's confirmation and does not "
+                      "enforce it", whole(readme))
+        for text in (whole(bridge_op.__doc__), whole(readme)):
+            self.assertIn("may not be widened to real content", text)
 
     # --- op.py is a door, not a second governor
     def test_op_makes_no_redis_call_of_its_own(self):

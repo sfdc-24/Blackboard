@@ -493,20 +493,33 @@ class Outcomes(unittest.TestCase):
             self.go("xadd", {"ok": True})
 
     def test_the_client_and_the_service_read_every_kind_of_line_the_same(self):
-        """A line became an object when the chair was added. Two readers of one file that disagree is how an
-        agent comes to use an account the service will not map, or the reverse."""
+        """A line became an object when the chair was added, and the chair's line names its personas since the
+        pilot. Two readers of one file that disagree is how an agent comes to use an account the service will
+        not serve, or the reverse. AN ACCOUNT ADMITTED FOR THE PROBE ONLY IS IN NEITHER: the service refuses it
+        on /op, so this client must not try the bridge with it."""
+        chair = {"principal": "conference-chair", "for": "chair"}
         lines = {
             "old@x": "grok", "agent@x": {"principal": "Grok", "for": "fleet-agent"},
-            " Chair@X ": {"principal": "conference-chair", "for": "chair"},
-            "other@x": {"principal": "grok", "for": "admin"}, "more@x": {"principal": "grok", "for": "chair", "n": 1},
-            "none@x": {"for": "chair"}, "blank@x": {"principal": " ", "for": "chair"}, "num@x": {"principal": 7, "for": "chair"},
+            " Chair@X ": dict(chair, personas=["claude", "grok"]),
+            "probe@x": {"principal": "grok", "for": "probe"}, "probep@x": {"principal": "grok", "for": "probe", "personas": ["claude"]},
+            "other@x": {"principal": "grok", "for": "admin"}, "more@x": dict(chair, personas=["claude"], n=1),
+            "none@x": {"for": "chair", "personas": ["claude"]}, "blank@x": dict(chair, principal=" ", personas=["claude"]),
+            "num@x": dict(chair, principal=7, personas=["claude"]),
             "list@x": ["grok"], "nul@x": None, "int@x": 7, "forlist@x": {"principal": "grok", "for": ["chair"]}, " ": "grok",
+            "bare@x": chair, "empty@x": dict(chair, personas=[]), "text@x": dict(chair, personas="claude"),
+            "five@x": dict(chair, personas=["aa", "bb", "cc", "dd", "ee"]), "twice@x": dict(chair, personas=["claude", "claude"]),
+            "upper@x": dict(chair, personas=["Claude"]), "one@x": dict(chair, personas=["c"]), "notstr@x": dict(chair, personas=[7]),
+            "break@x": dict(chair, personas=["claude\n"]), "nul2@x": dict(chair, personas=None),
+            "fleetp@x": {"principal": "grok", "for": "fleet-agent", "personas": ["claude"]},
+            "four@x": dict(chair, personas=["aa", "bb", "cc", "dd"]),
         }
         path = os.path.join(self.tmp.name, "lines.json")
         pathlib.Path(path).write_text(json.dumps({"callers": lines}), encoding="utf-8")
-        self.assertEqual({"old@x": "grok", "agent@x": "grok", "chair@x": "conference-chair"}, bc.load_callers(path))
+        self.assertEqual({"old@x": "grok", "agent@x": "grok", "chair@x": "conference-chair", "four@x": "conference-chair"},
+                         bc.load_callers(path))
         self.assertEqual(bridge_op.load_callers(path), bc.load_callers(path))
         self.assertEqual(bridge_op.load_callers(), bc.load_callers(), "and the committed file")
+        self.assertEqual("probe", bridge_op.load_purposes(path)["probe@x"], "the service knows the line; neither uses it")
 
     def test_the_missing_callers_file_maps_nobody(self):
         self.assertEqual({}, bc.load_callers(os.path.join(self.tmp.name, "absent.json")))
@@ -950,19 +963,25 @@ class TheRealBoundary(Harness, unittest.TestCase):
 
     def test_the_committed_callers_file_means_the_same_to_both_sides(self):
         """callers.json is read by the client (may I use this account?) and by the service (who is this
-        caller?). With the file as committed, Aya's runtime account writes as her principal, end to end."""
+        caller?). AS COMMITTED FOR THE PILOT NO FLEET AGENT IS A CALLER OF /op: Aya's runtime account is admitted
+        for the probe only (conference docs/PERSONA-WRITE-CONFIRMATION-A1.md, section 12). So the client does
+        not ask with it, and the service refuses it should anything ask anyway. Neither half alone is enough."""
         conn = FakeRedis()
+        self.assertEqual({"conference-chair@sfdc24.iam.gserviceaccount.com": "conference-chair"}, bc.load_callers())
+        for me, account in ((AYA, AYA_SA), (ME, SA)):
+            out, said = self.attempt(BridgeSim(conn, principal="file", account=account), me=me, account=account,
+                                     callers=None, value="x",
+                                     caller=lambda *a: self.fail("called with an account the file does not bind"))
+            self.assertIsNone(out)
+            self.assertIn("would not be acting as itself", said[0])
+        # a client that believes otherwise, as a checkout from before the pilot would: the service's own answer
         sim = BridgeSim(conn, principal="file", account=AYA_SA)
-        out, said = self.attempt(sim, me=AYA, account=AYA_SA, callers=None, value="from aya")
-        self.assertEqual((True, AYA, AYA_SA), (out["ok"], out["principal"], out["caller"]), said)
-        ((_, entry),) = conn.data["fleet:inbox:grok"]
-        self.assertEqual(("from aya", AYA), (entry["text"], entry["by"]))
-        self.assertEqual("bridge:" + AYA_SA, conn.audit()[-1]["via"], "the audit names the verified account")
-        # and this agent's account is not in the committed file: the client does not even ask
-        out, said = self.attempt(BridgeSim(conn, principal="file"), callers=None, value="x",
-                                 caller=lambda *a: self.fail("called with an unbound account"))
-        self.assertIsNone(out)
-        self.assertIn("would not be acting as itself", said[0])
+        with self.assertRaises(bc.Denied) as denied:
+            self.attempt(sim, me=AYA, account=AYA_SA, callers={AYA_SA: AYA}, value="from aya")
+        self.assertEqual("HTTP 403 not authorised", str(denied.exception))
+        self.assertEqual(1, len(sim.requests))
+        self.assertIn("admitted for the probe only", sim.log.getvalue())
+        self.assertEqual(([], False), (conn.audit(), "fleet:inbox:grok" in conn.data))
 
     def test_a_field_named_id_cannot_ride_over_the_stream_id_through_the_bridge(self):
         """Aya on a743a94: PR 400 alone carried a governor whose read let a field named id overwrite the

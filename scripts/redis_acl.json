@@ -26,16 +26,18 @@
     "claude-mobile":         {"read": ["*"], "write": ["fleet:", "conf:", "proj:"]},
     "pi1-cli":               {"read": ["*"], "write": ["fleet:", "conf:", "proj:"]},
     "milestones-sync":       {"read": ["proj:milestones:"], "write": ["proj:milestones:"]},
-    "conference-chair":      {"read": ["conf:"], "write": ["conf:persona:"]}
+    "conference-chair":      {"read": ["conf:persona:"], "write": ["conf:persona:"]}
   },
   "ttl_seconds": {
     "conf:": 604800,
+    "conf:persona:": 86400,
     "fleet:": 2592000,
     "proj:": 2592000
   },
   "max_value_bytes": 2048,
   "value_bytes_by_prefix": {
-    "proj:milestones:": 8192
+    "proj:milestones:": 8192,
+    "conf:persona:": 512
   },
   "git": {
     "why": "Mr. Salam, 2026-10-08 ~14:00Z, directly to claude-code-cli: 'Cursor works out of Git but is the only representative from GIT we can count on, as such Cursor also needs access (read write) in Redis.' GitHub authenticates a comment's author, so a principal is bound to the bot's NUMERIC user id, never a login. See scripts/git_requests.py.",

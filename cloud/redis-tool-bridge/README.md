@@ -91,9 +91,18 @@ governed ops, after the source is verified"). **D1 has not been given. Nothing h
   `callers.json` is `"for": "chair"`. It states `author` (the persona) and `request` (its request id) on every
   op, or gets a 400; both go into the audit entry as `claimed_author` and `request_id`, beside the verified
   `actor`, and both come back in the answer. They are claims and are named as claims: nothing reads either as an
-  identity. Its ops are the three reads and `set`, and a `set` goes only to `conf:persona:<yyyymmdd>:<author>`.
-  Its principal, `conference-chair`, may read `conf:` and write `conf:persona:` and nothing else. A fleet agent
-  that states either member gets a 400. (Conference `docs/PERSONA-WRITE-CONFIRMATION-A1.md`.)
+  identity. A fleet agent that states either member gets a 400. (Conference
+  `docs/PERSONA-WRITE-CONFIRMATION-A1.md`.)
+- **The pilot (section 12 of that page): the chair is the only caller of `/op`.** It may `get` and `set` one key a
+  day for one listed persona, `conf:persona:<yyyymmdd>:<persona>`, the day being today or yesterday in UTC and
+  the persona one of those in its own line of `callers.json` (today: `claude`). Its principal may read and write
+  `conf:persona:` and nothing else; a value there is at most 512 bytes and expires in 24 hours; this instance
+  takes at most 20 chair writes an hour (in memory, per instance) and the deploy runs one instance. Aya's runtime
+  account's line says `"for": "probe"`: `/probe` as before, and a 403 on `/op`.
+- **What the pilot does not do: the bridge trusts the chair's identity. It does not see the owner's confirmation
+  and does not enforce it; the chair does.** Whoever holds the chair's identity can make these writes with no
+  confirmation. The short list above is all that bounds it, and the pilot may not be widened to real content
+  while that is so. Rollback stops new requests and undoes nothing: a write that landed stays until it expires.
 - A message through it costs no board row.
 
 | status | meaning |
