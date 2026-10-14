@@ -190,7 +190,8 @@ accounts - a share nobody but the owner can do.
    within one tick REQUESTED (recipient claude-api) and DISPATCHED in the doc,
    `/healthz` poll ok. Nothing else runs yet: the task waits on
    `fleet:inbox:claude-api`.
-2. `claude-api-worker/deploy.sh worker on`. The next tick: ACCEPTED, then
+2. `claude-api-worker/deploy.sh worker on` (it reads the job back and refuses
+   while any cost input below is unset). The next tick: ACCEPTED, then
    SUCCEEDED with the answer under it, one call in the Anthropic console,
    `fleet:spend:<day>` moved by one reservation; the tick after: `idle`.
 3. `claude-api-worker/deploy.sh lane on`, laptop ON with
@@ -202,8 +203,120 @@ accounts - a share nobody but the owner can do.
    outcome: some other writer already has that task's trail.
 
 **Rollback** is the flag, never a redeploy: `deploy.sh off`, `worker off`,
-`lane off`. A doc already claimed keeps its claim (30 days) and its receipts;
+`lane off`, `pilot off`. A doc already claimed keeps its claim (30 days) and its receipts;
 turning a flag back on resumes from the doc's own trail.
+
+**The cost inputs (#374), without which the worker calls nothing.** Five values
+are read as fail-closed: unset or zero, the job deploys and runs, and every
+task gets one QUEUED line a day ("no valid cap, reservation, price, exchange
+rate, model limit or authorization deadline; nothing called"). They are the
+owner's, set in the shell that runs `deploy`, never committed:
+`CLAUDE_API_WORKER_USD_PER_MTOK_IN` and `_OUT` (the price of the chosen model
+id, from the Claude pricing page), `CLAUDE_API_WORKER_MAX_INPUT_TOKENS` (the
+input size that price holds for: the pricing tier's bound, not the context
+window; a request larger than it is refused, and the reservation is the worst
+case at that bound), `FLEET_CAD_PER_USD` (a ceiling rate; every cost is rounded
+UP into CAD cents, so a high rate only over-reserves), and
+`CLAUDE_API_WORKER_AUTHORIZED_UNTIL_UTC` (his authorization deadline, `...Z`;
+no call at or after it, checked on Redis's clock inside the reservation). The
+cap stays `FLEET_SPEND_CAP_CENTS_CAD` (2500 unless he sets it). `deploy.sh cost`
+prints the inputs as deployed. `worker on` refuses while any is missing, and
+while any is a value the worker would read as nothing: a negative or
+non-numeric price or rate, `100000.0` for the input bound (the worker reads a
+whole number or zero), a deadline not written `YYYY-MM-DDTHH:MM:SSZ` or already
+passed, a zero cap or reservation, an input bound under 4096 (the instructions
+the worker sends with every request take about 1900 of it before a word of the
+request). It also refuses when the job cannot be read
+back at all.
+
+**One intake at a time.** #374 also ships `PHONE_DOC_INTAKE_ENABLED`, a second
+intake inside the worker job over the two originals only (owner request blocks
+between `BEGIN OWNER REQUEST` and `END OWNER REQUEST`). With both it and
+`DRIVE_INTAKE_ENABLED` on, one request becomes two tasks (the two intakes hash
+different revisions of the same words), two calls and two answers in the doc,
+and the pilot's inbox filter checkpoints the worker past the service's rows for
+good. So `drive-intake/deploy.sh on` reads the job back and refuses while the
+pilot is on, and `claude-api-worker/deploy.sh pilot on` refuses while the
+service's flag is on. Turn one off before the other goes on. Either verb also
+refuses when it cannot read the other side back: a denied or failed `describe`
+is not "off". Only a resource gcloud says does not exist counts as off.
+
+**What the read-back reads.** Every verb above that reads a job or a service
+back reads `gcloud run ... describe --format json`. Where the variables sit in
+that answer depends on the gcloud: on gcloud 584, `run jobs describe` answers
+in the v1 shape (`spec.template.spec.template.spec`), elsewhere in the v2 one
+(`template.template`). Both are read. Until 2026-10-11 only v2 was, so on this
+laptop every read-back of the real job read nothing: `cost` listed every input
+as missing on a job that had them all, and `drive-intake on` could not have
+seen a pilot. An answer the reader cannot place is now refused ("could not be
+read back"), as are a job with two containers, a variable listed twice, and a
+flag or pilot target that comes from a secret. One variable is one line: a
+line break, or any character that is not plain ASCII, is written as `\uXXXX`,
+so a value is matched whole, the way each service reads its own flag (exactly
+`on`). `readback` names the job's fields in both shapes for the same reason.
+
+**The pilot answers one reviewed request (#386).** With the pilot flag on, the
+worker reads `PHONE_DOC_PILOT_TARGET`: a JSON object of exactly five strings
+(`source_doc_id`, `source_revision`, `request_id`, `task_id`, `recipient_id`),
+handed over by the review that approved the request. Flag on and no usable
+target, and the job stops on every tick (`pilot_target_invalid`) and answers
+nothing. So the target is given to the verb, in the shell:
+
+    PHONE_DOC_PILOT_TARGET='{"source_doc_id":"...","source_revision":"...","request_id":"...","task_id":"task-...","recipient_id":"claude-api"}' \
+      bash cloud/claude-api-worker/deploy.sh pilot on
+    bash cloud/claude-api-worker/deploy.sh worker on      # only now can a pass call, and it reads that request only
+    bash cloud/claude-api-worker/deploy.sh pilot off      # the pilot, its target AND the worker, all off
+
+`pilot on` judges the target as the worker will (a doc that is one of the two
+originals, recipient `claude-api`, the id shapes) before anything is read or
+sent, refuses while drive-intake's flag or the lane's flag is on, sends the
+flag and the target in one update, and reads the job back: a job that does not
+hold that flag and that target, to the character, is turned off again. The
+target goes to gcloud in a `--flags-file` and never on a command line: on a
+Windows laptop `gcloud.cmd` breaks on a quote inside an argument and `cmd.exe`
+eats the carets of gcloud's `^@^` form (measured 2026-10-11 with
+`gcloud meta test --arg-dict`, which calls no API). `pilot on` before `worker
+on` is the order: with the worker on first, its passes read the whole inbox
+until the pilot goes on. `pilot off` takes the worker off with it for the same
+reason, in one update and with no read before it; `worker on` brings the
+ordinary worker back. `lane on` refuses while the pilot is on or a target is
+still set: the pilot and the lane together are `pilot_flags_invalid` on every
+tick. A `deploy` leaves no pilot behind: flag off, target empty.
+
+**Step 4: the trail on the call page (#376, site #309).** drive-intake answers
+`GET /trail?doc=<id>` (poll token, then flag, then id) with the doc's receipt
+lines, the answer under the terminal line, and a live line (laptop, api worker,
+intake phase, another pass due); the studio controller proxies it at
+`GET /v1/session/{id}/telephone?doc=` for the session that holds the call, and
+`/studio/?live=1&doc=<id>` shows it beside the call, polled every ten seconds.
+Deploy delta, after `drive-intake` is deployed: `cloud/drive-intake/deploy.sh studio`
+grants the studio controller's runtime account `run.invoker` on drive-intake and
+`secretAccessor` on `DRIVE_INTAKE_POLL_TOKEN`, and prints the two settings the
+next studio release must carry (`STUDIO_TELEPHONE_URL=<drive-intake URL>`,
+`STUDIO_TELEPHONE_TOKEN` from that secret). The studio release is this runbook's
+procedure above, his to run; the panel is inert until that release carries the
+URL. Nothing on the page is fetched without a live session, and the request
+itself never leaves the doc.
+
+**The proof: the acceptance gate.** The architecture doc's milestone 4 is one
+authorized, real, laptop-offline round trip, confirmed by readback. Read the
+trail from the terminal with `bash cloud/drive-intake/deploy.sh trail <doc id>`
+(the service's own reading of the doc; needs the flag on) after each hop. The
+verb exits non-zero and says "this is not a proof" on any HTTP refusal,
+including the 404 it gets until #376 is deployed:
+
+| hop | the line that proves it | written by |
+|---|---|---|
+| intake | `REQUESTED - task task-<16 hex> - ... - recipient claude-api` and `DISPATCHED ... on fleet:inbox:claude-api, which the worker polls; no wake rung` | drive-intake |
+| pickup | `ACCEPTED ... attempt 1 - lease until <UTC> - model <id>` | claude-api |
+| result | `SUCCEEDED ... model <id> - tokens in N out M - C cents CAD` with the `> ` answer lines under it (or FAILED / UNKNOWN that says why) | claude-api |
+| ledger | `fleet:spend:<Toronto day>` moved by the settled cents; the Claude console shows one call | - |
+| no duplicate | a second `trail` read shows the same task id and no second ACCEPTED; the next tick's line is `idle` | - |
+
+With the laptop on and `lane on`, the same doc routes to claude-code-cli
+instead: `CAW-WAKE-<task>` on the board, then ACCEPTED and SUCCEEDED by
+claude-code-cli from `scripts/redis_inbox.py accept | done`. Both are the gate;
+a passing suite, a green deploy or a heartbeat alone proves neither.
 
 **What a health line means.** drive-intake `/healthz`: `ok` only when the
 watch channel is live or the last poll is inside three ticks; `poll: unknown`

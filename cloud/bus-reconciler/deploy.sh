@@ -120,8 +120,11 @@ run_once() {
 
 readback() {
   # What is deployed, not what this script intended to deploy. The two are different facts.
+  # BOTH shapes: on gcloud 584 `run jobs describe` answers in the v1 one (spec.template.spec.template.spec,
+  # egress as an annotation), and the v2-only projection that stood here printed ONE line for the
+  # real job (measured 2026-10-11). A read-back that shows nothing is not a read-back.
   "$GCLOUD" run jobs describe "$JOB" --project "$PROJECT" --region "$REGION" \
-    --format='yaml(name,template.template.containers[0].image,template.template.serviceAccount,template.template.containers[0].env,template.template.vpcAccess)'
+    --format='yaml(metadata.name,spec.template.spec.template.spec.containers[0].image,spec.template.spec.template.spec.serviceAccountName,spec.template.spec.template.spec.containers[0].env,spec.template.metadata.annotations,name,template.template.containers[0].image,template.template.serviceAccount,template.template.containers[0].env,template.template.vpcAccess)'
 }
 
 off() {

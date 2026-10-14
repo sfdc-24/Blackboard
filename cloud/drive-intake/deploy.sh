@@ -25,7 +25,9 @@
 #   REDIS_HOST=<private address> bash cloud/drive-intake/deploy.sh deploy   # the service, flag OFF
 #   bash cloud/drive-intake/deploy.sh schedule  # the poll tick, every 2 minutes, OIDC
 #   bash cloud/drive-intake/deploy.sh readback  # what is actually deployed, printed; /healthz
-#   bash cloud/drive-intake/deploy.sh on | off  # the flag, and nothing else
+#   bash cloud/drive-intake/deploy.sh on | off  # the flag, and nothing else (on refuses while the worker's pilot intake is on)
+#   bash cloud/drive-intake/deploy.sh studio    # step 4, the grants half: the studio controller may call GET /trail
+#   bash cloud/drive-intake/deploy.sh trail <doc id>   # the doc's receipt trail as the service reads it: the proof
 
 set -euo pipefail
 
@@ -42,6 +44,15 @@ REPO="${REGION}-docker.pkg.dev/${PROJECT}/cloud-run-source-deploy"
 TAG="${TAG:-v1}"
 IMAGE="${REPO}/${NAME}:${TAG}"
 GCLOUD="${GCLOUD:-gcloud}"
+# The python that RUNS: python3 where it is one, python where only that name works (a Windows Store
+# stub answers to python3 and does nothing). Read-back verbs parse gcloud's JSON with it.
+PYTHON="${PYTHON:-}"
+if [ -z "$PYTHON" ]; then
+  for candidate in python3 python; do
+    if "$candidate" -c pass >/dev/null 2>&1; then PYTHON="$candidate"; break; fi
+  done
+fi
+PYTHON="${PYTHON:-python}"
 SCHED_JOB="${SCHED_JOB:-drive-intake-poll}"
 SCHEDULE="${SCHEDULE:-*/2 * * * *}"
 
@@ -68,6 +79,102 @@ POLL_SECONDS="${DRIVE_INTAKE_POLL_SECONDS:-120}"
 # put IS the hand-off and DISPATCHED is reachable without #359 (Cursor on 0bee083: a deploy with no
 # wake variables could never reach it). Set INBOX_WAKE_URL/INBOX_WAKE_SECRET instead once #359 lands.
 RING="${DRIVE_INTAKE_RING:-polled}"
+# Step 4 (PR 376): the studio controller reads GET /trail as its own identity plus the poll token.
+STUDIO_SERVICE="${STUDIO_SERVICE:-sfdc24-studio-controller}"
+# The other intake (#374's pilot, inside the worker job). `on` refuses while it is on.
+WORKER_JOB="${WORKER_JOB:-claude-api-worker}"
+# A Drive file id, the same shape main.py's FILE_ID_OK accepts; anything else never reaches curl.
+DOC_ID_OK='^[A-Za-z0-9_-]{10,128}$'
+# By name, as gcloud is. A curl found through PATH is whichever one the shell puts first, and Git
+# for Windows' bash puts its own in front of everything it is handed: a test that gives this script
+# a stand-in must be able to name it, or the real one runs and the request leaves the box.
+CURL="${CURL:-curl}"
+
+# The env of a deployed resource, one NAME=VALUE per line, read back from the job or the service
+# that RUNS, never from this shell. Python parses the JSON: no awk over yaml, no value split on a
+# comma.
+#
+# WHERE THE CONTAINERS ARE DEPENDS ON WHO ANSWERS. `gcloud run jobs describe --format json` on
+# gcloud 584 answers in the v1 shape, spec.template.spec.template.spec (measured on the real job,
+# 2026-10-11); the v2 API answers template.template; a service is spec.template.spec. Until that
+# day this reader knew only the v2 place: it read NOTHING from the real job, nothing read as
+# "off", and every test passed because the stand-in gcloud answered in the shape the reader
+# expected. So every known place is tried, and an answer with a container in none of them is
+# unreadable (below), never empty.
+#
+# ONE VARIABLE, ONE LINE, AND NO TWO VALUES THE SAME LINE. Every caller judges a line: grep -x, or
+# a split on the first "=". A value with a newline in it printed as two lines, so its second line
+# could pass for another variable or its first for the whole value; and a carriage return inside a
+# value was deleted with the line ends, so "on<CR>" read as "on" (Cursor on b975708). A backslash
+# and every character that is not printable ASCII is therefore written as \uXXXX. What a caller
+# matches is the value itself, to the character, which is how each service reads its own flag.
+# A resource these lines cannot speak for is not read at all (it is "unreadable", below): more than
+# one container or a name twice, where whose value runs is not a thing a line can say; and a flag
+# or the pilot target that comes from a secret instead of a literal, which no line here can show.
+# A variable with neither a value nor a source is an EMPTY literal and prints as NAME= (an API
+# that leaves out empty strings must not turn a cleared target into an unreadable job).
+#
+# ABSENT IS NOT THE SAME AS UNREADABLE. Only gcloud saying the resource is not there prints nothing
+# and returns 0, which a caller may read as "off". A denied describe, a transient failure, an answer
+# that is not JSON or a python that will not start returns non-zero, and every caller that turns a
+# flag on refuses on it: an interlock that cannot read the other side has not checked it.
+ENV_LINES_PY='
+import json, sys
+try:
+    doc = json.load(sys.stdin)
+    if not isinstance(doc, dict):
+        raise ValueError("not an object")
+except ValueError:
+    sys.exit(3)
+
+def one_line(text):
+    return "".join(ch if " " <= ch <= "~" and ch != "\\" else ("\\u%04x" if ord(ch) < 65536 else "\\U%08x") % ord(ch)
+                   for ch in str(text))
+
+def containers_of(doc):
+    for path in (("spec", "template", "spec", "template", "spec"), ("template", "template"),
+                 ("spec", "template", "spec"), ("template",)):
+        node = doc
+        for key in path:
+            node = node.get(key) if isinstance(node, dict) else None
+        found = node.get("containers") if isinstance(node, dict) else None
+        if isinstance(found, list) and found:
+            return found
+    sys.exit(3)
+
+containers = containers_of(doc)
+env = [item for container in containers for item in container.get("env") or []]
+names = [str(item.get("name", "")) for item in env]
+from_a_source = [bool(set(item) & {"valueSource", "valueFrom"}) for item in env]
+hidden = [name for sourced, name in zip(from_a_source, names)
+          if sourced and (name.endswith("_ENABLED") or name == "PHONE_DOC_PILOT_TARGET")]
+if len(containers) > 1 or len(set(names)) != len(names) or hidden:
+    sys.exit(3)
+for item, name, sourced in zip(env, names, from_a_source):
+    if not sourced:
+        print("%s=%s" % (one_line(name), one_line(item.get("value") or "")))
+'
+# env_lines jobs|services NAME
+env_lines() {
+  local json err status=0
+  err="$(mktemp)"
+  json="$("$GCLOUD" run "$1" describe "$2" --project "$PROJECT" --region "$REGION" --format json 2>"$err")" || status=$?
+  if [ "$status" -ne 0 ]; then
+    if grep -Eqi "cannot find|NOT_FOUND|could not be found" "$err" && ! grep -qi "denied" "$err"; then
+      rm -f "$err"
+      return 0
+    fi
+    cat "$err" >&2
+    rm -f "$err"
+    echo "could not read $1 $2 back (gcloud exit ${status}); nothing is assumed about it" >&2
+    return 1
+  fi
+  rm -f "$err"
+  # tr: a Windows python writes CRLF into the pipe, and grep -x NAME=on does not match a line that
+  # still ends in a carriage return, so the interlock read "on" as "off". Only line ends are left
+  # to remove: a carriage return INSIDE a value was already written as \u000d above.
+  printf "%s" "$json" | "$PYTHON" -c "$ENV_LINES_PY" | tr -d "\r"
+}
 
 # One grant, safe in either order. setup runs before tokens in the printed order, so the two
 # tokens do not exist yet when setup walks the list; tokens creates them afterwards. A grant that
@@ -118,7 +225,7 @@ tokens() {
     if "$GCLOUD" secrets describe "$secret" --project "$PROJECT" >/dev/null 2>&1; then
       echo "${secret} exists; not replaced (add a version by hand if you mean to rotate it)"
     else
-      python -c "import secrets,sys; sys.stdout.write(secrets.token_hex(32))" |
+      "$PYTHON" -c "import secrets,sys; sys.stdout.write(secrets.token_hex(32))" |
         "$GCLOUD" secrets create "$secret" --project "$PROJECT" --replication-policy automatic --data-file=-
       echo "${secret} created with one version"
     fi
@@ -186,14 +293,75 @@ readback() {
   echo "healthz:"
   # A user account's identity token (no --audiences: that flag is for service accounts) is accepted
   # by a private Cloud Run service when the account holds run.invoker, which the project owner does.
-  curl -s -H "Authorization: Bearer $("$GCLOUD" auth print-identity-token)" "${url}/healthz"; echo
+  "$CURL" -s -H "Authorization: Bearer $("$GCLOUD" auth print-identity-token)" "${url}/healthz"; echo
   echo "a scheduler with no lastAttemptTime has never attempted; poll reads unknown until the first tick"
 }
 
 flag() {
+  # One intake at a time: with the worker's pilot intake on as well, one request becomes two tasks,
+  # two calls and two answers, and the pilot's inbox filter checkpoints the worker past this
+  # service's rows for good. The job is read back, not assumed.
+  # A job that cannot be read back is not a job whose pilot is off: refuse on that too.
+  local other
+  if [ "$1" = on ]; then
+    if ! other="$(env_lines jobs "$WORKER_JOB")"; then
+      echo "refused: ${WORKER_JOB} could not be read back, so its pilot intake flag is unknown; one intake at a time" >&2
+      exit 2
+    fi
+    if grep -qx "PHONE_DOC_INTAKE_ENABLED=on" <<<"$other"; then
+      echo "refused: ${WORKER_JOB} has PHONE_DOC_INTAKE_ENABLED=on; one intake at a time (cloud/claude-api-worker/deploy.sh pilot off first)" >&2
+      exit 2
+    fi
+  fi
   "$GCLOUD" run services update "$SERVICE" --project "$PROJECT" --region "$REGION" \
     --update-env-vars "DRIVE_INTAKE_ENABLED=$1"
   echo "DRIVE_INTAKE_ENABLED=$1 on ${SERVICE}"
+}
+
+studio() {
+  # Step 4's deploy delta, the grants half. The studio controller calls GET /trail?doc= as ITS OWN
+  # identity (an OIDC token for this service's URL) and sends the poll token in its header, so its
+  # runtime account needs run.invoker here and secretAccessor on that one token. The studio release
+  # itself is the runbook's procedure (build from merged main, --no-traffic --tag, /health,
+  # update-traffic) and is NOT run here: the two settings it must carry are printed, the URL filled
+  # in, the token never (it rides from Secret Manager into the service as a secret).
+  local url sa
+  url="$(service_url)"
+  sa="$("$GCLOUD" run services describe "$STUDIO_SERVICE" --project "$PROJECT" --region "$REGION" \
+    --format 'value(spec.template.spec.serviceAccountName)')"
+  sa="${sa:-${PROJECT_NUMBER}-compute@developer.gserviceaccount.com}"
+  "$GCLOUD" run services add-iam-policy-binding "$SERVICE" --project "$PROJECT" --region "$REGION" \
+    --member "serviceAccount:${sa}" --role roles/run.invoker >/dev/null
+  "$GCLOUD" secrets add-iam-policy-binding DRIVE_INTAKE_POLL_TOKEN --project "$PROJECT" \
+    --member "serviceAccount:${sa}" --role roles/secretmanager.secretAccessor --condition None >/dev/null
+  echo "${sa} may invoke ${SERVICE} and read DRIVE_INTAKE_POLL_TOKEN"
+  echo "add these two to the studio release command, exactly (docs/CLOUD-FLEET-RUNBOOK.md, the studio release):"
+  echo "  --update-env-vars STUDIO_TELEPHONE_URL=${url} --update-secrets STUDIO_TELEPHONE_TOKEN=DRIVE_INTAKE_POLL_TOKEN:latest"
+}
+
+trail() {
+  # The doc's receipt trail as the deployed service reads it (GET /trail?doc=, PR 376): the proof of
+  # a round trip from the terminal, without opening the doc. With the flag off the service answers
+  # {"enabled": false, "trail": null}. The poll token is read from Secret Manager at this moment and
+  # rides in its own header, never printed; Authorization carries your own identity token, as
+  # readback sends it.
+  # The whole argument, in bash: grep answers per LINE, so "bad<newline>good-id" passed it.
+  # --fail-with-body: a 401, 403, 404 (the route is not deployed until #376 is) or 5xx prints what
+  # the service said and EXITS NON-ZERO. This verb is the proof; a refusal must not read as one.
+  local doc="${2:-}" url token status=0
+  if ! [[ "$doc" =~ $DOC_ID_OK ]]; then
+    echo "usage: deploy.sh trail <Drive file id>" >&2
+    exit 2
+  fi
+  url="$(service_url)"
+  token="$("$GCLOUD" secrets versions access latest --secret DRIVE_INTAKE_POLL_TOKEN --project "$PROJECT")"
+  "$CURL" -sS --fail-with-body -H "Authorization: Bearer $("$GCLOUD" auth print-identity-token)" \
+    -H "X-Drive-Intake-Poll-Token: ${token}" "${url}/trail?doc=${doc}" || status=$?
+  echo
+  if [ "$status" -ne 0 ]; then
+    echo "the trail was NOT read (curl exit ${status}): this is not a proof" >&2
+    exit 1
+  fi
 }
 
 case "${1:-}" in
@@ -205,5 +373,7 @@ case "${1:-}" in
   readback) readback ;;
   on) flag on ;;
   off) flag off ;;
-  *) sed -n '2,28p' "$0"; exit 2 ;;
+  studio) studio ;;
+  trail) trail "$@" ;;
+  *) sed -n '2,30p' "$0"; exit 2 ;;
 esac

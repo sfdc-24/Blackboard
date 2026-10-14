@@ -13,6 +13,23 @@
 #   per-call reservation      CLAUDE_API_WORKER_RESERVE_CENTS_CAD (5 covers a Haiku-class call)
 #   the model                 CLAUDE_API_WORKER_MODEL (the id is yours; the cheapest capable one)
 #   heartbeat window          DRIVE_INTAKE_HEARTBEAT_SECONDS (300)
+#   THE FIVE #374 MADE FAIL-CLOSED. Unset, the job deploys, `worker on` would succeed, and every task
+#   gets QUEUED "no valid cap, reservation, price..." in the doc: it CALLS NOTHING. So `worker on`
+#   reads the job back first and refuses while any of them is missing or unusable (`deploy.sh cost` shows).
+#     CLAUDE_API_WORKER_USD_PER_MTOK_IN / _OUT   the price of YOUR model id, from the Claude pricing page
+#     CLAUDE_API_WORKER_MAX_INPUT_TOKENS         the input size that price holds for (a tier bound, not the context window)
+#     FLEET_CAD_PER_USD                          a ceiling rate: every cost is rounded UP into CAD cents
+#     CLAUDE_API_WORKER_AUTHORIZED_UNTIL_UTC     his authorization deadline, ...Z; no call at or after it
+#   PHONE_DOC_INTAKE_ENABLED (#374) is a SECOND intake over the two originals, inside this job. Never
+#   on together with drive-intake's flag: `pilot on` and the intake's `on` refuse each other (below).
+#   THE PILOT ANSWERS ONE REVIEWED REQUEST (#386). PHONE_DOC_PILOT_TARGET names it: a JSON object of
+#   exactly five strings (source_doc_id, source_revision, request_id, task_id, recipient_id), taken
+#   from the review that approved the request. With the pilot flag on and no usable target the job
+#   stops on every tick (pilot_target_invalid) and answers nothing. So `pilot on` takes the target
+#   from this shell, judges it as the worker will, sets the flag and the target in ONE update and
+#   reads the job back. Never with the lane: `pilot on` and `lane on` refuse each other.
+#   `pilot off` turns the pilot, its target AND the worker off: with the pilot off, a worker left
+#   on reads the whole inbox, and an off verb must not widen what runs.
 #
 # WHAT IS THE OWNER'S
 #   1. The same Drive share as drive-intake: the two originals (Editor) and the folder (Viewer) with
@@ -25,7 +42,10 @@
 #   bash cloud/claude-api-worker/deploy.sh schedule  # the tick, every 5 minutes
 #   bash cloud/claude-api-worker/deploy.sh run       # execute once and wait (one pass)
 #   bash cloud/claude-api-worker/deploy.sh readback  # what is actually deployed, printed
-#   bash cloud/claude-api-worker/deploy.sh worker on|off   lane on|off      # the flags, nothing else
+#   bash cloud/claude-api-worker/deploy.sh cost      # the cost inputs as deployed; what `worker on` would refuse on
+#   bash cloud/claude-api-worker/deploy.sh worker on|off   lane on|off   # the flags, nothing else
+#   PHONE_DOC_PILOT_TARGET='{"source_doc_id":...}' bash cloud/claude-api-worker/deploy.sh pilot on   # ONE request; worker on comes after
+#   bash cloud/claude-api-worker/deploy.sh pilot off       # the pilot, its target and the worker, all off
 
 set -euo pipefail
 
@@ -42,6 +62,15 @@ REPO="${REGION}-docker.pkg.dev/${PROJECT}/cloud-run-source-deploy"
 TAG="${TAG:-v1}"
 IMAGE="${REPO}/${NAME}:${TAG}"
 GCLOUD="${GCLOUD:-gcloud}"
+# The python that RUNS: python3 where it is one, python where only that name works (a Windows Store
+# stub answers to python3 and does nothing). Read-back verbs parse gcloud's JSON with it.
+PYTHON="${PYTHON:-}"
+if [ -z "$PYTHON" ]; then
+  for candidate in python3 python; do
+    if "$candidate" -c pass >/dev/null 2>&1; then PYTHON="$candidate"; break; fi
+  done
+fi
+PYTHON="${PYTHON:-python}"
 SCHED_JOB="${SCHED_JOB:-claude-api-worker-tick}"
 SCHEDULE="${SCHEDULE:-*/5 * * * *}"
 # v2, not v1 namespaces. roles/run.invoker grants run.jobs.run, which is what v2 :run needs.
@@ -75,6 +104,94 @@ REASSIGN_SECONDS="${CLAUDE_API_WORKER_REASSIGN_SECONDS:-1800}"
 MAX_ATTEMPTS="${CLAUDE_API_WORKER_MAX_ATTEMPTS:-1}"
 FOLDER_ID="${DRIVE_INTAKE_FOLDER_ID:-1gZlJFDD2Wm419YOuolIXC3HXwzXOWYfP}"
 HEARTBEAT_SECONDS="${DRIVE_INTAKE_HEARTBEAT_SECONDS:-300}"
+# The other intake. `pilot on` refuses while this service has DRIVE_INTAKE_ENABLED=on.
+INTAKE_SERVICE="${INTAKE_SERVICE:-drive-intake}"
+
+# The env of a deployed resource, one NAME=VALUE per line, read back from the job or the service
+# that RUNS, never from this shell. Python parses the JSON: no awk over yaml, no value split on a
+# comma.
+#
+# WHERE THE CONTAINERS ARE DEPENDS ON WHO ANSWERS. `gcloud run jobs describe --format json` on
+# gcloud 584 answers in the v1 shape, spec.template.spec.template.spec (measured on the real job,
+# 2026-10-11); the v2 API answers template.template; a service is spec.template.spec. Until that
+# day this reader knew only the v2 place: it read NOTHING from the real job, nothing read as
+# "off", and every test passed because the stand-in gcloud answered in the shape the reader
+# expected. So every known place is tried, and an answer with a container in none of them is
+# unreadable (below), never empty.
+#
+# ONE VARIABLE, ONE LINE, AND NO TWO VALUES THE SAME LINE. Every caller judges a line: grep -x, or
+# a split on the first "=". A value with a newline in it printed as two lines, so its second line
+# could pass for another variable or its first for the whole value; and a carriage return inside a
+# value was deleted with the line ends, so "on<CR>" read as "on" (Cursor on b975708). A backslash
+# and every character that is not printable ASCII is therefore written as \uXXXX. What a caller
+# matches is the value itself, to the character, which is how each service reads its own flag.
+# A resource these lines cannot speak for is not read at all (it is "unreadable", below): more than
+# one container or a name twice, where whose value runs is not a thing a line can say; and a flag
+# or the pilot target that comes from a secret instead of a literal, which no line here can show.
+# A variable with neither a value nor a source is an EMPTY literal and prints as NAME= (an API
+# that leaves out empty strings must not turn a cleared target into an unreadable job).
+#
+# ABSENT IS NOT THE SAME AS UNREADABLE. Only gcloud saying the resource is not there prints nothing
+# and returns 0, which a caller may read as "off". A denied describe, a transient failure, an answer
+# that is not JSON or a python that will not start returns non-zero, and every caller that turns a
+# flag on refuses on it: an interlock that cannot read the other side has not checked it.
+ENV_LINES_PY='
+import json, sys
+try:
+    doc = json.load(sys.stdin)
+    if not isinstance(doc, dict):
+        raise ValueError("not an object")
+except ValueError:
+    sys.exit(3)
+
+def one_line(text):
+    return "".join(ch if " " <= ch <= "~" and ch != "\\" else ("\\u%04x" if ord(ch) < 65536 else "\\U%08x") % ord(ch)
+                   for ch in str(text))
+
+def containers_of(doc):
+    for path in (("spec", "template", "spec", "template", "spec"), ("template", "template"),
+                 ("spec", "template", "spec"), ("template",)):
+        node = doc
+        for key in path:
+            node = node.get(key) if isinstance(node, dict) else None
+        found = node.get("containers") if isinstance(node, dict) else None
+        if isinstance(found, list) and found:
+            return found
+    sys.exit(3)
+
+containers = containers_of(doc)
+env = [item for container in containers for item in container.get("env") or []]
+names = [str(item.get("name", "")) for item in env]
+from_a_source = [bool(set(item) & {"valueSource", "valueFrom"}) for item in env]
+hidden = [name for sourced, name in zip(from_a_source, names)
+          if sourced and (name.endswith("_ENABLED") or name == "PHONE_DOC_PILOT_TARGET")]
+if len(containers) > 1 or len(set(names)) != len(names) or hidden:
+    sys.exit(3)
+for item, name, sourced in zip(env, names, from_a_source):
+    if not sourced:
+        print("%s=%s" % (one_line(name), one_line(item.get("value") or "")))
+'
+# env_lines jobs|services NAME
+env_lines() {
+  local json err status=0
+  err="$(mktemp)"
+  json="$("$GCLOUD" run "$1" describe "$2" --project "$PROJECT" --region "$REGION" --format json 2>"$err")" || status=$?
+  if [ "$status" -ne 0 ]; then
+    if grep -Eqi "cannot find|NOT_FOUND|could not be found" "$err" && ! grep -qi "denied" "$err"; then
+      rm -f "$err"
+      return 0
+    fi
+    cat "$err" >&2
+    rm -f "$err"
+    echo "could not read $1 $2 back (gcloud exit ${status}); nothing is assumed about it" >&2
+    return 1
+  fi
+  rm -f "$err"
+  # tr: a Windows python writes CRLF into the pipe, and grep -x NAME=on does not match a line that
+  # still ends in a carriage return, so the interlock read "on" as "off". Only line ends are left
+  # to remove: a carriage return INSIDE a value was already written as \u000d above.
+  printf "%s" "$json" | "$PYTHON" -c "$ENV_LINES_PY" | tr -d "\r"
+}
 
 setup() {
   # The APIs the job calls (Docs, Drive) and the ones this script uses; enabling is idempotent.
@@ -143,10 +260,13 @@ readback() {
   # Check: the service account is claude-api-worker, not default; all five secrets present (three env,
   # two mounts); no env value rewritten into a C:/... path; egress private-ranges-only; both flags off
   # until you turn them on; the model id is the one you meant.
-  # The v2 job resource, the same projection cloud/bus-reconciler/deploy.sh reads back.
-  # spec.template.spec.template.spec is the Knative shape and prints empty here.
+  # BOTH shapes, because which one answers depends on the gcloud. On gcloud 584 the job comes back
+  # in the v1 shape (spec.template.spec.template.spec; egress is an annotation), and the v2-only
+  # projection that stood here printed one empty line for the real job (measured 2026-10-11): a
+  # read-back that shows nothing looks exactly like a job with nothing set. A key that is not in
+  # the answer prints nothing, so naming both costs nothing.
   "$GCLOUD" run jobs describe "$JOB" --project "$PROJECT" --region "$REGION" \
-    --format 'yaml(template.template.serviceAccount,template.template.containers[0].env,template.template.containers[0].image,template.template.vpcAccess,template.template.maxRetries)'
+    --format 'yaml(spec.template.spec.template.spec.serviceAccountName,spec.template.spec.template.spec.containers[0].env,spec.template.spec.template.spec.containers[0].image,spec.template.spec.template.spec.maxRetries,spec.template.metadata.annotations,template.template.serviceAccount,template.template.containers[0].env,template.template.containers[0].image,template.template.vpcAccess,template.template.maxRetries)'
   "$GCLOUD" scheduler jobs describe "$SCHED_JOB" --project "$PROJECT" --location "$REGION" \
     --format 'yaml(schedule,state,lastAttemptTime,status,httpTarget.uri)' || true
   "$GCLOUD" run jobs executions list --job "$JOB" --project "$PROJECT" --region "$REGION" --limit 5 || true
@@ -158,6 +278,232 @@ flag() {
   echo "$1=$2 on ${JOB}"
 }
 
+# What makes the worker call nothing, judged the way main.py judges it (call_reservation, _int_env,
+# _float_env, valid_prices, _utc_deadline_env): a value that is present but that the worker reads as
+# zero, None or past is as unset as an empty one. A negative or NaN price, 100000.0 for the input
+# bound (int() refuses it and the worker reads 0), a deadline ending +00:00 or a lowercase z, a
+# deadline already passed. Never looser than the worker; the deadline shape is stricter on purpose.
+# And an input bound under MIN_INPUT_BOUND: the worker checks every request against that bound, and
+# its own instructions plus its 1024 overhead are about 1900 of it before a word of any request, so
+# a small whole number passed here and still called nothing (Cursor on fb22006). A real tier bound
+# is tens of thousands; tests/test_telephone_deploy.py holds the floor above main.py's own.
+# The model id is on the list because an empty one is Unconfigured on every pass.
+COST_MISSING_PY='
+import math, re, sys, time
+from datetime import datetime
+
+DEADLINE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
+MIN_INPUT_BOUND = 4096
+
+def positive_int(raw, default=0):
+    try:
+        return int(raw or default) > 0
+    except ValueError:
+        return False
+
+def positive_price(raw):
+    try:
+        value = float(raw)
+    except ValueError:
+        return False
+    return math.isfinite(value) and value > 0
+
+def deadline(raw):
+    if not DEADLINE.fullmatch(raw):
+        return None
+    try:
+        return datetime.fromisoformat(raw[:-1] + "+00:00").timestamp()
+    except (OverflowError, ValueError):
+        return None
+
+def problems(env, now):
+    found = []
+    def bad(name, why):
+        found.append("%s (%s)" % (name, why))
+    if not env.get("CLAUDE_API_WORKER_MODEL", "").strip():
+        bad("CLAUDE_API_WORKER_MODEL", "empty")
+    for name in ("CLAUDE_API_WORKER_USD_PER_MTOK_IN", "CLAUDE_API_WORKER_USD_PER_MTOK_OUT", "FLEET_CAD_PER_USD"):
+        if not positive_price(env.get(name, "")):
+            bad(name, "not a finite number above zero")
+    for name in ("CLAUDE_API_WORKER_MAX_INPUT_TOKENS", "FLEET_SPEND_CAP_CENTS_CAD", "CLAUDE_API_WORKER_RESERVE_CENTS_CAD"):
+        if not positive_int(env.get(name, "")):
+            bad(name, "not a whole number above zero")
+        elif name == "CLAUDE_API_WORKER_MAX_INPUT_TOKENS" and int(env[name]) < MIN_INPUT_BOUND:
+            bad(name, "under %d, too small for the instructions the worker sends with every request" % MIN_INPUT_BOUND)
+    if "CLAUDE_API_WORKER_MAX_TOKENS" in env and not positive_int(env["CLAUDE_API_WORKER_MAX_TOKENS"], 1):
+        bad("CLAUDE_API_WORKER_MAX_TOKENS", "not a whole number above zero")
+    until = deadline(env.get("CLAUDE_API_WORKER_AUTHORIZED_UNTIL_UTC", ""))
+    if until is None:
+        bad("CLAUDE_API_WORKER_AUTHORIZED_UNTIL_UTC", "not YYYY-MM-DDTHH:MM:SSZ")
+    elif now >= until:
+        bad("CLAUDE_API_WORKER_AUTHORIZED_UNTIL_UTC", "already passed")
+    return found
+
+if __name__ == "__main__":
+    lines = (line.rstrip("\r\n") for line in sys.stdin)
+    print(", ".join(problems(dict(line.split("=", 1) for line in lines if "=" in line), time.time())))
+'
+# Prints what is missing or unusable; non-zero when the job could not be read back at all.
+cost_missing() {
+  local lines
+  lines="$(env_lines jobs "$JOB")" || return 1
+  printf "%s\n" "$lines" | "$PYTHON" -c "$COST_MISSING_PY" | tr -d "\r"
+}
+
+cost_readback() {
+  local lines missing
+  if ! lines="$(env_lines jobs "$JOB")" || ! missing="$(cost_missing)"; then
+    echo "${JOB} could not be read back; worker on refuses until it can be" >&2
+    exit 1
+  fi
+  grep -E "^(CLAUDE_API_WORKER_(MODEL|MAX_TOKENS|MAX_INPUT_TOKENS|AUTHORIZED_UNTIL_UTC|USD_PER_MTOK_IN|USD_PER_MTOK_OUT|RESERVE_CENTS_CAD)|FLEET_CAD_PER_USD|FLEET_SPEND_CAP_CENTS_CAD)=" <<<"$lines" || true
+  if [ -z "$missing" ]; then
+    echo "every cost input on ${JOB} is one the worker can use; worker on is allowed"
+  else
+    echo "missing or unusable on ${JOB}: ${missing}; worker on refuses until deploy runs with them set"
+  fi
+}
+
+worker_on() {
+  # Read the JOB back, not this shell: the job is what runs. Refuse rather than deploy a worker
+  # that writes QUEUED into the doc once a day per task and never calls (#374's fail-closed inputs).
+  local missing
+  if ! missing="$(cost_missing)"; then
+    echo "refused: ${JOB} could not be read back, so its cost inputs are unknown" >&2
+    exit 2
+  fi
+  if [ -n "$missing" ]; then
+    echo "refused: missing or unusable on ${JOB}, so the worker would call nothing: ${missing}" >&2
+    echo "export them and run: bash cloud/claude-api-worker/deploy.sh deploy, then worker on" >&2
+    exit 2
+  fi
+  flag CLAUDE_API_WORKER_ENABLED on
+}
+
+# The pilot's one request, judged as phone_intake.target_from_env judges it (#386): an object of
+# exactly these five strings, a doc that is one of the two originals, the recipient claude-api.
+# A target the worker would refuse prints the reason and nothing else. A good one is printed back
+# as one line with no space in it, which is what the job is given and what the read-back looks for.
+# Never looser than the worker: tests/test_telephone_deploy.py holds it against the worker's reader.
+PILOT_TARGET_PY='
+import json, re, sys
+
+FIELDS = ("source_doc_id", "source_revision", "request_id", "task_id", "recipient_id")
+DOC_IDS = ("1pKWJYbJzMqxSA9Vy_PSR93BU2OAAgP-N3WBEkCj7oj4", "17Q2vBYvxs8PIu-sXXWj67HAU_DL2RfB9-SoQbpeDoWQ")
+SHAPES = (("source_revision", r"[A-Za-z0-9_.:-]{1,128}"), ("request_id", r"[A-Za-z0-9_.:-]{8,128}"),
+          ("task_id", r"task-[0-9a-f]{16}"))
+
+def canonical(raw):
+    """The target as one line and no reason, or None and the reason."""
+    if not raw.strip():
+        return None, "empty"
+    try:
+        target = json.loads(raw)
+    except ValueError:
+        return None, "not JSON"
+    if not isinstance(target, dict) or set(target) != set(FIELDS):
+        return None, "not an object of exactly " + ", ".join(FIELDS)
+    if any(not isinstance(target[name], str) for name in FIELDS):
+        return None, "a field that is not a string"
+    if target["source_doc_id"] not in DOC_IDS:
+        return None, "source_doc_id is not one of the two originals"
+    if target["recipient_id"] != "claude-api":
+        return None, "recipient_id is not claude-api"
+    for name, shape in SHAPES:
+        if not re.fullmatch(shape, target[name]):
+            return None, name + " is not in the shape the worker accepts"
+    return json.dumps({name: target[name] for name in FIELDS}, separators=(",", ":")), ""
+
+if __name__ == "__main__":
+    line, why = canonical(sys.stdin.read())
+    if line is None:
+        sys.stderr.write("PHONE_DOC_PILOT_TARGET: %s\n" % why)
+        sys.exit(3)
+    if sys.argv[1:] == ["flags"]:
+        # What gcloud reads through --flags-file: the flag and its target, one update.
+        line = json.dumps({"--update-env-vars": {"PHONE_DOC_INTAKE_ENABLED": "on", "PHONE_DOC_PILOT_TARGET": line}})
+    print(line)
+'
+
+pilot_off() {
+  # One update and no read before it: an off verb that waits on a read-back can be refused by an
+  # outage. The worker goes off with the pilot. With the pilot off and its target cleared, a worker
+  # left on reads the whole inbox instead of the one request; with the target left behind it stops
+  # on every tick (pilot_flags_invalid). Neither is what off means. `worker on` brings it back.
+  "$GCLOUD" run jobs update "$JOB" --project "$PROJECT" --region "$REGION" \
+    --update-env-vars "PHONE_DOC_INTAKE_ENABLED=off,CLAUDE_API_WORKER_ENABLED=off,PHONE_DOC_PILOT_TARGET="
+  echo "PHONE_DOC_INTAKE_ENABLED=off, CLAUDE_API_WORKER_ENABLED=off and no pilot target on ${JOB}"
+}
+
+pilot_on() {
+  # The pilot is a SECOND intake over the two originals. With drive-intake's flag on as well, one
+  # request becomes two tasks (two revisions of the same words), two calls and two answers in the
+  # doc, and the pilot's inbox filter checkpoints the worker past the service's rows for good.
+  # A service that cannot be read back is not a service that is off: refuse on that too.
+  # And it answers ONE request (#386): no usable target, no flag. The flag and the target go in one
+  # update, and the job is read back after it.
+  # THE TARGET NEVER RIDES ON A COMMAND LINE. It is JSON: quotes and commas. Measured on a Windows
+  # laptop, 2026-10-11, with `gcloud meta test --arg-dict` (no API call): gcloud.cmd falls apart on a
+  # quote inside an argument ("'C:\Users\...\Cloud' is not recognized"), and cmd.exe eats the carets
+  # of gcloud's ^@^ form. --flags-file is gcloud's own answer (gcloud topic flags-file): the same
+  # value arrived whole through gcloud.cmd. cygpath, because a Windows gcloud does not know /tmp.
+  local target other mine held flags status=0
+  if ! target="$(printf "%s" "${PHONE_DOC_PILOT_TARGET:-}" | "$PYTHON" -c "$PILOT_TARGET_PY" | tr -d "\r")" || [ -z "$target" ]; then
+    echo "refused: pilot on needs PHONE_DOC_PILOT_TARGET in this shell, the one reviewed request as the worker reads it" >&2
+    exit 2
+  fi
+  if ! other="$(env_lines services "$INTAKE_SERVICE")"; then
+    echo "refused: ${INTAKE_SERVICE} could not be read back, so its intake flag is unknown; one intake at a time" >&2
+    exit 2
+  fi
+  if grep -qx "DRIVE_INTAKE_ENABLED=on" <<<"$other"; then
+    echo "refused: ${INTAKE_SERVICE} has DRIVE_INTAKE_ENABLED=on; one intake at a time (cloud/drive-intake/deploy.sh off first)" >&2
+    exit 2
+  fi
+  if ! mine="$(env_lines jobs "$JOB")"; then
+    echo "refused: ${JOB} could not be read back, so its lane flag is unknown; the pilot and the lane never run together" >&2
+    exit 2
+  fi
+  if grep -qx "CLAUDE_API_LANE_ENABLED=on" <<<"$mine"; then
+    echo "refused: ${JOB} has CLAUDE_API_LANE_ENABLED=on; with the pilot on as well the job stops on every tick (lane off first)" >&2
+    exit 2
+  fi
+  flags="$(mktemp)"
+  if command -v cygpath >/dev/null 2>&1; then
+    flags="$(cygpath -m "$flags")"
+  fi
+  printf "%s" "$target" | "$PYTHON" -c "$PILOT_TARGET_PY" flags | tr -d "\r" >"$flags"
+  "$GCLOUD" run jobs update "$JOB" --project "$PROJECT" --region "$REGION" --flags-file "$flags" || status=$?
+  rm -f "$flags"
+  # A failed update is not proof that nothing was written, so it is turned off again rather than
+  # left unknown. A clean one is not proof of what was written, so the job is read back: anything
+  # but this flag and this target, to the character, is turned off again too.
+  if [ "$status" -ne 0 ] || ! held="$(env_lines jobs "$JOB")" || ! grep -qx "PHONE_DOC_INTAKE_ENABLED=on" <<<"$held" ||
+      ! grep -qxF "PHONE_DOC_PILOT_TARGET=${target}" <<<"$held"; then
+    echo "${JOB} does not hold the target that was sent (gcloud exit ${status}), or could not be read back; the pilot goes off again" >&2
+    pilot_off >&2
+    exit 1
+  fi
+  echo "PHONE_DOC_INTAKE_ENABLED=on on ${JOB} for the one request ${target}"
+  grep -qx "CLAUDE_API_WORKER_ENABLED=on" <<<"$held" ||
+    echo "the worker is off: nothing is called until worker on, and the pass after it reads this request only"
+}
+
+lane_on() {
+  # The lane and the pilot never run together (#386): with both on, or with a pilot target still
+  # set, the job stops on every tick (pilot_flags_invalid) and neither does anything.
+  local mine
+  if ! mine="$(env_lines jobs "$JOB")"; then
+    echo "refused: ${JOB} could not be read back, so its pilot flag is unknown; the lane and the pilot never run together" >&2
+    exit 2
+  fi
+  if grep -Eqx "PHONE_DOC_INTAKE_ENABLED=on|PHONE_DOC_PILOT_TARGET=.+" <<<"$mine"; then
+    echo "refused: ${JOB} has the pilot on or its target still set; with the lane on as well the job stops on every tick (pilot off first)" >&2
+    exit 2
+  fi
+  flag CLAUDE_API_LANE_ENABLED on
+}
+
 case "${1:-}" in
   setup) setup ;;
   build) build ;;
@@ -165,7 +511,9 @@ case "${1:-}" in
   schedule) schedule ;;
   run) run_once ;;
   readback) readback ;;
-  worker) case "${2:-}" in on|off) flag CLAUDE_API_WORKER_ENABLED "$2" ;; *) echo "worker on|off" >&2; exit 2 ;; esac ;;
-  lane) case "${2:-}" in on|off) flag CLAUDE_API_LANE_ENABLED "$2" ;; *) echo "lane on|off" >&2; exit 2 ;; esac ;;
-  *) sed -n '2,28p' "$0"; exit 2 ;;
+  cost) cost_readback ;;
+  worker) case "${2:-}" in on) worker_on ;; off) flag CLAUDE_API_WORKER_ENABLED off ;; *) echo "worker on|off" >&2; exit 2 ;; esac ;;
+  lane) case "${2:-}" in on) lane_on ;; off) flag CLAUDE_API_LANE_ENABLED off ;; *) echo "lane on|off" >&2; exit 2 ;; esac ;;
+  pilot) case "${2:-}" in on) pilot_on ;; off) pilot_off ;; *) echo "pilot on|off" >&2; exit 2 ;; esac ;;
+  *) sed -n '2,48p' "$0"; exit 2 ;;
 esac
