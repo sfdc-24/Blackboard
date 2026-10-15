@@ -13,6 +13,47 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import cloud_context as cc                                               # noqa: E402
+
+
+class FlagValuesForTheChecker(unittest.TestCase):
+    """Gate 3 Step 3: Gemini must read the live config back; the allowlisted flags show their values,
+    and nothing else does (owner, 2026-10-15: "yes, option 1")."""
+
+    def service(self, env):
+        return {"name": "projects/sfdc24/locations/us-central1/services/drive-intake",
+                "template": {"containers": [{"image": "x", "env": env}]}}
+
+    def test_the_step3_flags_are_shown_and_everything_else_is_withheld(self):
+        text = cc.describe("service", self.service([
+            {"name": "DRIVE_INTAKE_ENABLED", "value": "on"},
+            {"name": "DRIVE_INTAKE_FOLDER_ID", "value": "1gZlJFDD2Wm419YOuolIXC3HXwzXOWYfP"},
+            {"name": "DRIVE_INTAKE_RECIPIENTS", "value": "claude-api"},
+            {"name": "DRIVE_INTAKE_FIRST_POLL", "value": "baseline"},
+            {"name": "REDIS_HOST", "value": "10.1.2.3"},
+            {"name": "INBOX_WAKE_URL", "value": "https://inbox-wake.example/wake"},
+            {"name": "DRIVE_INTAKE_POLL_TOKEN", "valueSource": {"secretKeyRef": {"secret": "projects/1/secrets/DRIVE_INTAKE_POLL_TOKEN"}}},
+        ]))
+        self.assertIn("DRIVE_INTAKE_ENABLED=on", text)
+        self.assertIn("DRIVE_INTAKE_FOLDER_ID=1gZlJFDD2Wm419YOuolIXC3HXwzXOWYfP", text)
+        self.assertIn("DRIVE_INTAKE_RECIPIENTS=claude-api", text)
+        self.assertIn("DRIVE_INTAKE_FIRST_POLL=baseline", text)
+        for hidden in ("10.1.2.3", "inbox-wake.example", "DRIVE_INTAKE_POLL_TOKEN="):
+            self.assertNotIn(hidden, text)
+
+    def test_an_allowlisted_name_with_an_unsafe_value_is_still_withheld(self):
+        for value in ("10.0.0.7", "a b", "x" * 65, "https://evil.example/", ""):
+            text = cc.describe("service", self.service([{"name": "INBOX_WAKE_AGENTS", "value": value}]))
+            self.assertIn("INBOX_WAKE_AGENTS=(withheld: not a plain flag value)", text, value)
+            if value:
+                self.assertNotIn(value, text.split("flag values")[1], value)
+        ref = cc.describe("service", self.service([{"name": "INBOX_WAKE_ENABLED",
+                                                    "valueSource": {"secretKeyRef": {"secret": "s"}}}]))
+        self.assertNotIn("flag values", ref, "a secret reference is never a shown flag")
+
+    def test_the_list_holds_no_secret_shaped_name(self):
+        for name in cc.SHOWN_ENV:
+            for bad in ("TOKEN", "SECRET", "KEY", "PASS", "HOST", "URL", "AUTH"):
+                self.assertNotIn(bad, name)
 import repo_context as rc                                                # noqa: E402
 
 ON = {"GEMINI_GITHUB_TOKEN": "tok", "GEMINI_PRIVATE_REPOS": "conference"}
