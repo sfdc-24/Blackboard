@@ -854,8 +854,13 @@ def handle(method: str, path: str, headers: dict, body: bytes, deps) -> tuple:
             return 401, {"error": "bad channel token"}
         if not deps.enabled:
             return 200, {"enabled": False, "intake": []}
-        return 200, {"enabled": True,
-                     "intake": [decide(h, deps) for h in hints_from_push(headers)]}
+        # A push with no file id is a CHANGES-CHANNEL push - the folder trigger: it says something
+        # changed, not what. So the changes feed is read, the same pass /poll runs. Decided as a file
+        # id it was bad_file_id, and the push was answered 200 with nothing done (Copilot on #362).
+        intake = []
+        for hint in hints_from_push(headers):
+            intake.extend(poll(deps) if hint.get("poll") else [decide(hint, deps)])
+        return 200, {"enabled": True, "intake": intake}
     if method == "POST" and path == "/poll":
         if not poll_token_ok(deps.poll_token, headers):
             return 401, {"error": "bad poll token"}

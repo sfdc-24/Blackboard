@@ -1283,6 +1283,27 @@ class AuthTest(unittest.TestCase):
         self.assertEqual([{"file_id": "", "poll": True}], hints)
         self.assertEqual("bad_file_id", di.decide(hints[0], deps())["status"])
 
+    def test_a_changes_channel_push_reads_the_feed_and_delivers(self):
+        """Copilot on #362: the folder trigger's push carries no file id; it was answered 200 with nothing done."""
+        d = deps(changes=lambda folder: [{"file_id": FILE, "folder_id": folder}])
+        push = {"x-goog-channel-token": "tok", "x-goog-resource-state": "change",
+                "x-goog-resource-uri": "https://www.googleapis.com/drive/v3/changes?pageToken=7&alt=json"}
+        code, out = di.handle("POST", "/hooks/drive", push, b"", d)
+        self.assertEqual(200, code)
+        self.assertEqual(["dispatched"], [r["status"] for r in out["intake"]], out)
+        self.assertEqual(1, len(d.queue.puts))
+        self.assertIsNotNone(d.claims.last_poll(), "the push's read of the feed goes on record as a poll")
+        again = di.handle("POST", "/hooks/drive", push, b"", d)[1]
+        self.assertEqual(["duplicate"], [r["status"] for r in again["intake"]], again)
+        self.assertEqual(1, len(d.queue.puts), "a second push of the same change is one task")
+
+    def test_a_changes_channel_push_with_no_feed_says_so(self):
+        d = deps(changes=None)
+        out = di.handle("POST", "/hooks/drive", {"x-goog-channel-token": "tok",
+                                                 "x-goog-resource-state": "change"}, b"", d)[1]
+        self.assertEqual(["no_store"], [r["status"] for r in out["intake"]], out)
+        self.assertEqual(0, d.docs.reads)
+
 
 class OfflineTest(unittest.TestCase):
     def test_the_module_opens_no_socket_on_import_and_names_no_credential(self):
