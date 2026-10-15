@@ -54,7 +54,14 @@ ROUTES = {
     "chatgpt-codex-desktop": ("github_actions", "inbox-wake-codex.yml"),
     "gemini": ("cloud_run_job", "gemini-waker"),
     "grok": ("http", "GROK_WAKE_URL"),
+    # Gate 3 Step 3 (CO-20261013-001): the claude-api worker is a Cloud Run job that reads
+    # fleet:inbox:claude-api on each execution; waking it is running it, the same v2 :run call.
+    "claude-api": ("cloud_run_job", "claude-api-worker"),
 }
+# WHO MAY BE WOKEN, named by the deploy: INBOX_WAKE_AGENTS, canonical ids separated by commas. Unset or
+# empty wakes NOBODY, and a name that is not a route is not honoured (the rest of the list still is).
+# Gate 3 Step 3 is "recipient claude-api only. No other folder, no other recipient."
+AGENTS_ENV = "INBOX_WAKE_AGENTS"
 
 
 class Unconfigured(Exception):
@@ -70,6 +77,13 @@ def canonical(agent: str):
     name = (agent or "").strip().lower()
     name = ALIASES.get(name, name)
     return name if name in ROUTES else None
+
+
+def agents_from_env(environ=None) -> frozenset:
+    """The recipients this deploy may wake (AGENTS_ENV). Fail closed: unset is nobody."""
+    environ = os.environ if environ is None else environ
+    names = [canonical(part) for part in (environ.get(AGENTS_ENV) or "").split(",") if part.strip()]
+    return frozenset(name for name in names if name)
 
 
 class MemorySeen:
@@ -164,6 +178,9 @@ def decide(message: dict, deps) -> dict:
     agent = canonical(message.get("to") or "")
     if not agent:
         return {"status": "unknown_agent", "woke": False}
+    if deps.agents is not None and agent not in deps.agents:
+        # Named, but not one this deploy may wake: nothing is claimed, so turning it on later wakes it.
+        return {"status": "not_allowed", "woke": False, "to": agent}
     mid = str(message.get("id") or "")
     if not ID_OK.fullmatch(mid):
         return {"status": "bad_id", "woke": False}
@@ -200,6 +217,8 @@ def sweep(deps) -> list:
         return [{"status": "no_store", "woke": False}]
     out = []
     for agent in ROUTES:
+        if deps.agents is not None and agent not in deps.agents:
+            continue                        # an inbox this deploy may not wake is not read either
         try:
             entries = deps.reader(agent) or []
         except Exception as exc:  # noqa: BLE001 - one inbox must not sink the others
@@ -320,15 +339,22 @@ def read_inbox(client, agent: str) -> list:
                 value = value.decode("utf-8", "replace")
             return value or ""
 
-        out.append({"id": str(entry_id), "text": field("text"), "by": field("by"),
-                    "at": field("at")})
+        # A drive-intake entry carries its task id, and drive-intake rings with THAT id. The sweep
+        # wakes under the same id, so one task is one claim (fleet:wake:seen:<agent>:<task id>)
+        # whichever finds it first; an entry without one is woken under its stream id, as before.
+        task_id = field("task_id")
+        out.append({"id": task_id if ID_OK.fullmatch(task_id) else str(entry_id),
+                    "text": field("text"), "by": field("by"), "at": field("at")})
     return out
 
 
 class Deps:
     def __init__(self, enabled=False, seen=None, wakers=None, reader=None,
-                 webhook_secret="", sweep_token=""):
+                 webhook_secret="", sweep_token="", agents=None):
         self.enabled = enabled
+        # The recipients this deploy may wake; None is every route (tests). deps_from_env always
+        # sets it from AGENTS_ENV, so a server with the variable unset wakes nobody.
+        self.agents = agents
         self.seen = seen
         self.wakers = wakers or Wakers()
         self.reader = reader
@@ -343,6 +369,7 @@ def deps_from_env() -> Deps:
         enabled=on,
         webhook_secret=os.environ.get("GITHUB_WEBHOOK_SECRET") or "",
         sweep_token=os.environ.get("INBOX_WAKE_SWEEP_TOKEN") or "",
+        agents=agents_from_env(),
         wakers=Wakers(
             github_token=os.environ.get("GITHUB_WAKE_TOKEN") or "",
             grok_url=os.environ.get("GROK_WAKE_URL") or "",

@@ -170,6 +170,94 @@ class RoutesAndIdempotency(unittest.TestCase):
         self.assertEqual([], rec.jobs)
 
 
+class ClaudeApiOnly(unittest.TestCase):
+    """Gate 3 Step 3 (CO-20261013-001): "recipient claude-api only. No other folder, no other recipient."""
+
+    def test_claude_api_is_woken_by_running_its_job_once(self):
+        d, rec = deps()
+        got = wake.decide({"id": "task-0123456789abcdef", "to": "claude-api", "by": "drive-intake"}, d)
+        self.assertEqual(("woke", "cloud_run_job", "claude-api-worker"), (got["status"], got["route"], got["target"]))
+        self.assertEqual("duplicate", wake.decide({"id": "task-0123456789abcdef", "to": "claude-api"}, d)["status"])
+        self.assertEqual(["claude-api-worker"], rec.jobs)
+
+    def test_a_deploy_that_names_claude_api_wakes_nobody_else(self):
+        d, rec = deps()
+        d.agents = wake.agents_from_env({"INBOX_WAKE_AGENTS": "claude-api"})
+        self.assertEqual(frozenset({"claude-api"}), d.agents)
+        for who in ("grok", "gemini", "claude-code-cli", "aya"):
+            got = wake.decide({"id": "m-1", "to": who, "text": "x"}, d)
+            self.assertEqual("not_allowed", got["status"], who)
+            self.assertFalse(got["woke"])
+        self.assertEqual(set(), d.seen.ids, "nothing is claimed for a recipient it may not wake")
+        self.assertEqual(([], [], []), (rec.github, rec.jobs, rec.http))
+        self.assertEqual("woke", wake.decide({"id": "m-1", "to": "claude-api"}, d)["status"])
+
+    def test_an_unset_or_wrong_list_wakes_nobody(self):
+        for environ in ({}, {"INBOX_WAKE_AGENTS": ""}, {"INBOX_WAKE_AGENTS": "nobody, *"}):
+            self.assertEqual(frozenset(), wake.agents_from_env(environ), environ)
+        self.assertEqual(frozenset({"claude-api"}), wake.agents_from_env({"INBOX_WAKE_AGENTS": "claude-api,nobody"}))
+        d, rec = deps()
+        d.agents = wake.agents_from_env({})
+        self.assertEqual("not_allowed", wake.decide({"id": "m-2", "to": "claude-api"}, d)["status"])
+        self.assertEqual([], rec.jobs)
+
+    def test_the_sweep_reads_only_the_inboxes_it_may_wake(self):
+        read = []
+
+        def reader(agent):
+            read.append(agent)
+            return [{"id": "task-0123456789abcdef", "text": "", "by": "drive-intake"}]
+        d, rec = deps(reader=reader)
+        d.agents = frozenset({"claude-api"})
+        out = wake.sweep(d)
+        self.assertEqual(["claude-api"], read)
+        self.assertEqual(["woke"], [item["status"] for item in out])
+        self.assertEqual(["claude-api-worker"], rec.jobs)
+
+    def test_a_drive_entry_is_swept_under_its_task_id_so_ring_and_sweep_are_one_wake(self):
+        class Stream:
+            def xrange(self, key, count=50):
+                assert key == "fleet:inbox:claude-api", key
+                return [(b"1700000000000-0", {b"task_id": b"task-0123456789abcdef", b"by": b"drive-intake",
+                                              b"text": b"hello"}),
+                        (b"1700000000001-0", {b"by": b"grok", b"text": b"no task id"})]
+        entries = wake.read_inbox(Stream(), "claude-api")
+        self.assertEqual(["task-0123456789abcdef", "1700000000001-0"], [e["id"] for e in entries])
+        d, rec = deps()
+        self.assertEqual("woke", wake.decide({"id": "task-0123456789abcdef", "to": "claude-api"}, d)["status"])
+        self.assertEqual("duplicate", wake.decide(dict(entries[0], to="claude-api"), d)["status"])
+        self.assertEqual(1, len(rec.jobs))
+
+
+class TheDriveIntakeRing(unittest.TestCase):
+    """drive-intake's WakeRing (cloud/drive-intake/main.py) posts to POST /wake: the two must agree on the
+    body, the signature and the answer, or every Drive request stays queued_not_rung."""
+
+    def test_the_ring_is_signed_routed_and_read_as_rung(self):
+        spec = importlib.util.spec_from_file_location("drive_intake_for_ring", REPO / "cloud" / "drive-intake" / "main.py")
+        intake = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(intake)
+        d, rec = deps(secret="shared")
+        d.agents = frozenset({"claude-api"})
+
+        def post(url, body, headers):
+            status, payload = wake.handle("POST", "/wake", headers, body, d)
+            self.assertEqual(200, status, payload)
+            return payload
+        ring = intake.WakeRing("https://inbox-wake.example/wake", "shared", post=post)
+        task = {"task_id": "task-0123456789abcdef", "recipient_id": "claude-api",
+                "request_id": "req-1", "source_doc_id": "doc-0123456789"}
+        ring(task)                                  # woke: no exception
+        ring(task)                                  # duplicate: still rung, no second wake
+        self.assertEqual(["claude-api-worker"], rec.jobs)
+        with self.assertRaises(RuntimeError):       # a recipient this deploy may not wake is not a ring
+            ring(dict(task, recipient_id="claude-code-cli"))
+        wrong = intake.WakeRing("https://inbox-wake.example/wake", "not the secret",
+                                post=lambda url, body, headers: wake.handle("POST", "/wake", headers, body, d)[1])
+        with self.assertRaises(RuntimeError):
+            wrong(dict(task, task_id="task-fedcba9876543210"))
+
+
 class SweepAndWebhook(unittest.TestCase):
     def test_sweep_wakes_only_what_is_new(self):
         def reader(agent):
