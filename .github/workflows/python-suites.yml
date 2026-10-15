@@ -1122,6 +1122,9 @@ jobs:
           if [ -f tests/test_redis_gov_verify.py ]; then
             python_bin="$(command -v python3)"
             sudo unshare -n -- "$python_bin" -B -m unittest tests.test_redis_gov_verify -v
+          else
+            echo "not on this branch; skipping"
+          fi
       - name: "inbox wake is default off and idempotent on message id (no network)"
         run: |
           set -euo pipefail

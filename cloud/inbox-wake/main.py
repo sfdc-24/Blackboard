@@ -323,11 +323,20 @@ def post_json(url: str, body: dict) -> None:
         resp.read()
 
 
+SWEEP_WINDOW = 50
+
+
 def read_inbox(client, agent: str) -> list:
-    """fleet:inbox:<agent> entries, the shape redis_gov's xadd writes."""
-    rows = client.xrange("fleet:inbox:" + agent, count=50)
+    """fleet:inbox:<agent> entries, the shape redis_gov's xadd writes: the NEWEST SWEEP_WINDOW, oldest
+    first. The worker keeps a cursor and deletes nothing, so a read from the start of the stream saw
+    the same oldest fifty for ever, every one a duplicate, and a missed ring on entry 51 was never
+    recovered (Copilot on #412). The sweep runs every 15 minutes; what it is for is a ring missed in
+    the last window, and a window of fifty newest covers that unless fifty tasks land in fifteen
+    minutes, which the 2-minute Drive poll and one folder do not produce."""
+    rows = list(client.xrevrange("fleet:inbox:" + agent, count=SWEEP_WINDOW) or ())
+    rows.reverse()
     out = []
-    for entry_id, fields in rows or ():
+    for entry_id, fields in rows:
         if isinstance(entry_id, bytes):
             entry_id = entry_id.decode("utf-8")
 

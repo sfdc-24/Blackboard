@@ -216,17 +216,38 @@ class ClaudeApiOnly(unittest.TestCase):
 
     def test_a_drive_entry_is_swept_under_its_task_id_so_ring_and_sweep_are_one_wake(self):
         class Stream:
-            def xrange(self, key, count=50):
+            def xrevrange(self, key, count=50):
                 assert key == "fleet:inbox:claude-api", key
-                return [(b"1700000000000-0", {b"task_id": b"task-0123456789abcdef", b"by": b"drive-intake",
-                                              b"text": b"hello"}),
-                        (b"1700000000001-0", {b"by": b"grok", b"text": b"no task id"})]
+                return [(b"1700000000001-0", {b"by": b"grok", b"text": b"no task id"}),
+                        (b"1700000000000-0", {b"task_id": b"task-0123456789abcdef", b"by": b"drive-intake",
+                                              b"text": b"hello"})]
         entries = wake.read_inbox(Stream(), "claude-api")
         self.assertEqual(["task-0123456789abcdef", "1700000000001-0"], [e["id"] for e in entries])
         d, rec = deps()
         self.assertEqual("woke", wake.decide({"id": "task-0123456789abcdef", "to": "claude-api"}, d)["status"])
         self.assertEqual("duplicate", wake.decide(dict(entries[0], to="claude-api"), d)["status"])
         self.assertEqual(1, len(rec.jobs))
+
+
+class TheSweepReadsTheNewest(unittest.TestCase):
+    def test_a_ring_missed_past_the_first_fifty_is_still_swept(self):
+        """Copilot on #412: XRANGE with no lower bound read the oldest 50 for ever."""
+        entries = [("1700000000%03d-0" % i, {"task_id": "task-%016x" % i, "by": "drive-intake"}) for i in range(120)]
+
+        class Stream:
+            def xrevrange(self, key, count=50):
+                return list(reversed(entries))[:count]
+        read = wake.read_inbox(Stream(), "claude-api")
+        self.assertEqual(wake.SWEEP_WINDOW, len(read))
+        self.assertEqual("task-%016x" % 119, read[-1]["id"], "the newest is read")
+        self.assertEqual("task-%016x" % 70, read[0]["id"], "oldest first within the window")
+        d, rec = deps(reader=lambda agent: read if agent == "claude-api" else [])
+        d.agents = frozenset({"claude-api"})
+        for item in read[:-1]:
+            d.seen.claim("claude-api:" + item["id"])     # every ring but the newest landed
+        out = wake.sweep(d)
+        self.assertEqual(["woke"], [o["status"] for o in out if o["status"] != "duplicate"])
+        self.assertEqual(["claude-api-worker"], rec.jobs)
 
 
 class TheImageCanRunAJob(unittest.TestCase):
