@@ -99,6 +99,89 @@ class APrivateRepositoryOnlyBehindTheSwitch(unittest.TestCase):
         self.assertNotIn("+secret_sauce", out)
 
 
+class MergeCommitAndReviewThreads(unittest.TestCase):
+    """Gate 3 Step 2's proof is a merge hash and 0 unresolved threads; the owner made Gemini its
+    checker, 2026-10-15 ("have Gemini check Step 2"), so its excerpt must carry both."""
+
+    def get(self, merged=True, private=False):
+        def get(path, token, timeout=20):
+            if "/files?" in path:
+                return [{"filename": "a.py", "status": "modified", "additions": 1, "deletions": 0,
+                         "patch": "@@ -1 +1 @@\n+x"}]
+            return {"title": "t", "state": "closed", "changed_files": 1,
+                    "merged_at": "2026-10-15T17:16:07Z" if merged else None,
+                    "merge_commit_sha": "e" * 40, "head": {"sha": "a" * 40},
+                    "base": {"sha": "b" * 40, "repo": {"private": private}}}
+        return get
+
+    def test_a_merged_pr_says_its_merge_commit_in_full(self):
+        out = rc.context_for("Blackboard #411", env={}, get=self.get())
+        self.assertIn("merged 2026-10-15T17:16:07Z as merge commit " + "e" * 40, out)
+
+    def test_an_unmerged_pr_names_no_merge_commit(self):
+        out = rc.context_for("Blackboard #411", env={}, get=self.get(merged=False))
+        self.assertIn("[closed, head", out)
+        self.assertNotIn("merge commit", out)
+
+    def test_the_threads_line_counts_the_unresolved(self):
+        seen = []
+
+        def threads(repo, number, token, timeout):
+            seen.append((repo, number))
+            return {"totalCount": 3, "nodes": [{"isResolved": True}, {"isResolved": False}, {"isResolved": True}]}
+        out = rc.context_for("Blackboard #362", env={}, get=self.get(), threads=threads)
+        self.assertEqual([("Blackboard", 362)], seen)
+        self.assertRegex(out, r"review threads: 3; unresolved: 1 \(read 20\d\d-\d\d-\d\d \d\d:\d\dZ\)")
+        self.assertLess(out.index("review threads"), out.index("COMPLETE"), "the line sits under the header")
+
+    def test_threads_past_the_first_page_are_said_not_read(self):
+        out = rc.context_for("Blackboard #362", env={}, get=self.get(),
+                             threads=lambda *a: {"totalCount": 150, "nodes": [{"isResolved": True}] * 100})
+        self.assertIn("review threads: 150; unresolved: 0 among the first 100 read, the other 50 NOT read", out)
+
+    def test_a_failed_thread_read_is_a_note_and_the_excerpt_goes_out(self):
+        def threads(*a):
+            raise ValueError("graphql errors")
+        out = rc.context_for("Blackboard #362", env={}, get=self.get(), threads=threads)
+        self.assertIn("review threads: not readable (ValueError).", out)
+        self.assertIn("+x", out)
+        for shape in ({"totalCount": "9", "nodes": []}, {"totalCount": 9}, {}):
+            out = rc.context_for("Blackboard #362", env={}, get=self.get(), threads=lambda *a, s=shape: s)
+            self.assertIn("review threads: not readable", out, shape)
+
+    def test_a_refused_private_pr_asks_for_no_threads(self):
+        seen = []
+        out = rc.context_for("Blackboard #362", env={}, get=self.get(private=True),
+                             threads=lambda *a: seen.append(a))
+        self.assertIn("not attached (the repository is not public)", out)
+        self.assertEqual([], seen)
+
+    def test_a_faked_get_makes_no_live_thread_request(self):
+        from unittest import mock
+        with mock.patch.object(rc, "_threads", side_effect=AssertionError("live call")):
+            out = rc.context_for("Blackboard #362", env={}, get=self.get())
+        self.assertNotIn("review threads", out)
+
+    def test_the_live_thread_read_posts_graphql_with_the_token_unredirected(self):
+        from unittest import mock
+        body = mock.MagicMock()
+        body.read.return_value = (b'{"data":{"repository":{"pullRequest":{"reviewThreads":'
+                                  b'{"totalCount":1,"nodes":[{"isResolved":true}]}}}}}')
+        body.__enter__.return_value = body
+        with mock.patch.object(rc._OPENER, "open", return_value=body) as opened:
+            got = rc._threads("Blackboard", 362, "tok")
+        self.assertEqual({"totalCount": 1, "nodes": [{"isResolved": True}]}, got)
+        req = opened.call_args[0][0]
+        self.assertEqual(("POST", rc.GRAPHQL), (req.get_method(), req.full_url))
+        self.assertEqual("Bearer tok", req.unredirected_hdrs.get("Authorization"))
+        self.assertNotIn("Authorization", req.headers)
+        self.assertIn(b'"n": 362', req.data)
+        body.read.return_value = b'{"errors":[{"message":"x"}]}'
+        with mock.patch.object(rc._OPENER, "open", return_value=body):
+            with self.assertRaises(ValueError):
+                rc._threads("Blackboard", 362, "tok")
+
+
 SERVICE = {"name": "projects/sfdc24/locations/us-central1/services/conference-gateway",
            "latestReadyRevision": "projects/x/revisions/conference-gateway-00019-k6c",
            "conditions": [{"type": "Ready", "state": "CONDITION_SUCCEEDED", "message": ""}],

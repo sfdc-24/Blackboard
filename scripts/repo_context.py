@@ -54,6 +54,11 @@ WHAT IT DOES
   - It never writes, never logs the token, and never fails the answer: an error
     becomes a one-line note in the context, or no context at all.
   - What it returns is DATA from the repository, and the prompt says so.
+  - A merged PR's header carries its merge commit and merge time, and every PR it reads gets one
+    line on its review threads: how many, and how many are unresolved, read through GitHub's
+    GraphQL API (REST does not say whether a thread is resolved). Gate 3 Step 2 (CO-20261013-001)
+    is proved by exactly those two facts, and the owner made Gemini its checker, 2026-10-15:
+    "have Gemini check Step 2". A failed thread read is a note; the excerpt still goes out.
 """
 import json
 import os
@@ -64,6 +69,9 @@ import urllib.parse
 import urllib.request
 
 API = "https://api.github.com"
+GRAPHQL = API + "/graphql"
+THREADS_QUERY = ("query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){pullRequest(number:$n)"
+                 "{reviewThreads(first:100){totalCount nodes{isResolved}}}}}")
 OWNER = "sfdc-24"
 # The names a row uses for a PUBLIC repository, lower-cased, to the repository itself.
 REPOS = {
@@ -168,12 +176,53 @@ def _get(path: str, token: str, timeout: float = TIMEOUT):
     return json.loads(raw.decode("utf-8", "replace"))
 
 
+def _threads(repo: str, number: int, token: str, timeout: float = TIMEOUT) -> dict:
+    """The PR's reviewThreads object from GraphQL: {"totalCount": n, "nodes": [{"isResolved": b}]}."""
+    body = json.dumps({"query": THREADS_QUERY, "variables": {"o": OWNER, "r": repo, "n": number}}).encode()
+    req = urllib.request.Request(GRAPHQL, data=body, method="POST", headers={
+        "Accept": "application/vnd.github+json", "Content-Type": "application/json",
+        "User-Agent": "sfdc24-gemini-waker"})
+    if token:
+        req.add_unredirected_header("Authorization", "Bearer " + token)   # never copied onto a redirect
+    with _OPENER.open(req, timeout=timeout) as r:
+        raw = r.read(MAX_RESPONSE_BYTES + 1)
+    if len(raw) > MAX_RESPONSE_BYTES:
+        raise TooLarge()
+    answer = json.loads(raw.decode("utf-8", "replace"))
+    if answer.get("errors"):
+        raise ValueError("graphql errors")
+    return answer["data"]["repository"]["pullRequest"]["reviewThreads"]
+
+
+def threads_line(repo: str, number: int, token: str, threads, deadline: float) -> str:
+    """One line: the review threads, and how many are unresolved, with the time they were read."""
+    left = deadline - time.monotonic()
+    if left <= 0:
+        return "review threads: not read (the %.0f s read budget was spent)." % DEADLINE_SECONDS
+    try:
+        got = threads(repo, number, token, min(TIMEOUT, left))
+        total = got["totalCount"]
+        nodes = got["nodes"]
+        if not isinstance(total, int) or not isinstance(nodes, list):
+            raise ValueError("shape")
+        open_ = sum(1 for n in nodes if not (n or {}).get("isResolved"))
+    except urllib.error.HTTPError as e:
+        return "review threads: not readable (HTTP %s)." % e.code
+    except Exception as e:  # noqa: BLE001 - the excerpt goes out without this line's facts
+        return "review threads: not readable (%s)." % type(e).__name__
+    at = time.strftime("%Y-%m-%d %H:%MZ", time.gmtime())
+    if len(nodes) < total:
+        return ("review threads: %d; unresolved: %d among the first %d read, the other %d NOT read "
+                "(read %s)." % (total, open_, len(nodes), total - len(nodes), at))
+    return "review threads: %d; unresolved: %d (read %s)." % (total, open_, at)
+
+
 def _shas(pr) -> tuple:
     return ((pr.get("head") or {}).get("sha") or "", (pr.get("base") or {}).get("sha") or "")
 
 
 def _one(repo: str, number: int, token: str, room: int, get, deadline: float,
-         allow_private: bool = False) -> str:
+         allow_private: bool = False, threads=None) -> str:
     base = "/repos/%s/%s/pulls/%d" % (OWNER, repo, number)
 
     def fetch(path):
@@ -210,6 +259,9 @@ def _one(repo: str, number: int, token: str, room: int, get, deadline: float,
     except Exception as e:  # noqa: BLE001 - context is optional; the answer must not fail on it
         return "%s #%d: not readable (%s)." % (repo, number, type(e).__name__)
     out = _render(repo, number, pr, files, before, room)
+    if threads is not None:
+        head, _, rest = out.partition("\n")
+        out = head + "\n" + threads_line(repo, number, token, threads, deadline) + ("\n" + rest if rest else "")
     if private:
         out = ("PRIVATE REPOSITORY - your reply is posted to the board; quote only what the answer "
                "needs.\n" + out)
@@ -278,6 +330,8 @@ def _render(repo, number, pr, files, shas, room) -> str:
     if omitted:
         reasons.append("%d patch(es) were left out to fit" % omitted)
     state = "merged" if pr.get("merged_at") else str(pr.get("state") or "?")
+    if pr.get("merged_at") and pr.get("merge_commit_sha"):
+        state = "merged %s as merge commit %s" % (pr["merged_at"], pr["merge_commit_sha"])
     header = "%s #%d: %s [%s, head %s, base %s, %d files]" % (
         repo, number, str(pr.get("title") or "")[:160], state, shas[0][:12], shas[1][:12],
         changed if isinstance(changed, int) else len(files))
@@ -289,13 +343,17 @@ def _render(repo, number, pr, files, shas, room) -> str:
     return "\n".join([header, marker] + listed) + "".join(patches)
 
 
-def context_for(text: str, env=None, get=None) -> str:
-    """The repository context for a row, framed as data, or "" when the row names no PR it may read."""
+def context_for(text: str, env=None, get=None, threads=None) -> str:
+    """The repository context for a row, framed as data, or "" when the row names no PR it may read.
+    The thread count is read live only with the live GET; a caller that fakes `get` and passes no
+    `threads` gets no thread line, and no request is made for one."""
     env = os.environ if env is None else env
     found = refs(text, env)
     if not found:
         return ""
     token = (env.get("GEMINI_GITHUB_TOKEN") or "").strip()
+    if threads is None and get is None:
+        threads = _threads
     get = get or _get
     allowed = private_allowed(env)
     deadline = time.monotonic() + DEADLINE_SECONDS
@@ -305,7 +363,8 @@ def context_for(text: str, env=None, get=None) -> str:
             parts.append("%s #%d: not attached (the context budget was spent on the PR before it)."
                          % (repo, number))
             continue
-        part = _one(repo, number, token, room, get, deadline, allow_private=repo.lower() in allowed)
+        part = _one(repo, number, token, room, get, deadline, allow_private=repo.lower() in allowed,
+                    threads=threads)
         parts.append(part)
         room -= len(part)
     return ("REPOSITORY CONTEXT, fetched read-only by your adapter for the pull requests this row "
