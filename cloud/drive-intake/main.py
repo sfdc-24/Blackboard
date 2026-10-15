@@ -175,6 +175,18 @@ def enabled_from_env(environ=None) -> bool:
     return environ.get("DRIVE_INTAKE_ENABLED") == "on"
 
 
+def recipients_from_env(environ=None):
+    """DRIVE_INTAKE_RECIPIENTS: the workers this deploy may hand a request to, canonical ids separated by
+    commas, or None when the variable is absent (every worker, as before). Gate 3 Step 3 is "recipient
+    claude-api only. No other folder, no other recipient." Present but naming nobody known is NOBODY:
+    a list that fails to parse never falls open to every worker."""
+    environ = os.environ if environ is None else environ
+    raw = environ.get("DRIVE_INTAKE_RECIPIENTS")
+    if raw is None:
+        return None
+    return frozenset(name for name in (canonical(part) for part in raw.split(",") if part.strip()) if name)
+
+
 def canonical(agent):
     name = (agent or "").strip().lower()
     name = ALIASES.get(name, name)
@@ -518,12 +530,20 @@ def decide(hint: dict, deps) -> dict:
     wants_cli = needs_cli_tools(text)
     now = _now(deps)
     alive = heartbeat_age(deps.claims, now, window=deps.heartbeat_window)
+    allowed = deps.recipients
     if addressed:
         recipient, state = canonical(addressed.group(1)), REQUESTED
+        if allowed is not None and recipient not in allowed:
+            # Addressed to a worker this deploy may not hand work to: refused and said, never rerouted.
+            return {"status": "not_allowed", "task": None, "to": recipient}
         if recipient == "claude-code-cli" and alive is None:
             state = QUEUED if wants_cli else REQUESTED
     else:
+        if allowed is not None and "claude-code-cli" not in allowed:
+            alive = None                    # the laptop's heartbeat routes nothing it may not be handed
         recipient, state = pick_worker(wants_cli, alive, deps.api_worker)
+        if allowed is not None and recipient not in allowed:
+            state = BLOCKED                 # no worker it may hand this to: a receipt, not a reroute
 
     tuple_ = correlate(file_id, text, drive_revision, recipient)
     if not tuple_ok(tuple_):
@@ -750,7 +770,7 @@ def hints_from_push(headers: dict) -> list:
 # A decide() result after which a later pass has nothing left to do for this doc as it stands. An
 # edit re-lists the doc anyway. Everything else is unfinished and the doc is kept for the next poll.
 FINISHED = frozenset(("dispatched", "duplicate", "disabled", "bad_file_id", "out_of_scope", "no_revision",
-                      "too_large", "no_request", "bad_recipient", "bad_correlation"))
+                      "too_large", "no_request", "bad_recipient", "bad_correlation", "not_allowed", "baseline"))
 
 
 def poll(deps) -> list:
@@ -766,14 +786,32 @@ def poll(deps) -> list:
         return []
     if deps.changes is None or deps.claims is None:
         return [{"status": "no_store", "task": None}]
+    # THE FIRST POLL IS A BASELINE when the deploy says so (DRIVE_INTAKE_FIRST_POLL=baseline; Gate 3 Step 3:
+    # "must not backfill old documents in that folder on its first poll"). With no poll and no floor on
+    # record, the folder is NOT listed: the floor is set to now, the poll goes on record, and only docs
+    # modified after it are ever listed (DriveFolder.changes reads the floor). Without it the first poll
+    # looks a day back and turns every doc there into a task.
+    try:
+        first = deps.baseline and deps.claims.watermark() is None and deps.claims.floor() is None
+    except Exception as exc:  # noqa: BLE001 - an unknown history is not an empty one
+        return [{"status": "pending_unreadable", "task": None, "error": type(exc).__name__}]
+    if first:
+        now = _now(deps)
+        try:
+            deps.claims.set_floor(now)
+            deps.claims.note_poll(now, now)
+        except Exception as exc:  # noqa: BLE001 - not on record: the next poll is the baseline again
+            return [{"status": "baseline_error", "task": None, "error": type(exc).__name__}]
+        return [{"status": "baseline", "task": None, "floor": int(now)}]
     try:
         listed = deps.changes(deps.folder_id) or []
     except Exception as exc:  # noqa: BLE001
         return [{"status": "read_error", "task": None, "error": type(exc).__name__}]
     if isinstance(listed, dict):
         hints, watermark = list(listed.get("hints") or []), listed.get("watermark")
+        complete = bool(listed.get("complete", True))
     else:
-        hints, watermark = list(listed), None
+        hints, watermark, complete = list(listed), None, True
     try:
         pending = [{"file_id": f, "folder_id": ""} for f in sorted(deps.claims.pending() or ())]
     except Exception as exc:  # noqa: BLE001 - the unfinished cannot be found: nothing goes on record
@@ -798,7 +836,9 @@ def poll(deps) -> list:
     if not undecided:
         now = _now(deps)
         try:
-            deps.claims.note_poll(now, watermark if watermark is not None else now)
+            # resume: the listing was capped, so the next poll starts at this watermark.
+            # A finished listing stores where it got to and the next one looks back the margin.
+            deps.claims.note_poll(now, watermark if watermark is not None else now, resume=not complete)
         except Exception:  # noqa: BLE001 - health will read unknown; the intake itself is done
             pass
     return out
@@ -963,9 +1003,20 @@ class MemoryClaims:
     def watermark(self):
         return self.beats.get("watermark")
 
-    def note_poll(self, now, watermark=None):
+    def note_poll(self, now, watermark=None, resume=False):
         self.beats["poll"] = float(now)
         self.beats["watermark"] = float(now if watermark is None else watermark)
+        self.beats["resume"] = bool(resume)
+
+    def resume(self):
+        """True when the last listing was capped and the next poll must start at the watermark."""
+        return bool(self.beats.get("resume"))
+
+    def floor(self):
+        return self.beats.get("floor")
+
+    def set_floor(self, at):
+        self.beats.setdefault("floor", float(at))
 
     def pending(self):
         return set(self.beats.setdefault("pending", set()))
@@ -1057,10 +1108,34 @@ class RedisClaims:
         except (TypeError, ValueError):
             return None
 
-    def note_poll(self, now, watermark=None):
+    def note_poll(self, now, watermark=None, resume=False):
         self.client.set("fleet:intake:poll:last", "%d" % int(now), ex=CLAIM_TTL)
         self.client.set("fleet:intake:poll:watermark", "%d" % int(now if watermark is None else watermark),
                         ex=CLAIM_TTL)
+        if resume:
+            self.client.set("fleet:intake:poll:resume", "1", ex=CLAIM_TTL)
+        else:
+            self.client.delete("fleet:intake:poll:resume")
+
+    def resume(self):
+        raw = self.client.get("fleet:intake:poll:resume")
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", "replace")
+        return bool(raw)
+
+    def floor(self):
+        """fleet:intake:poll:floor - the baseline: no doc modified before it is ever listed."""
+        raw = self.client.get("fleet:intake:poll:floor")
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", "replace")
+        try:
+            return float(raw) if raw is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def set_floor(self, at):
+        """Set once (NX): a second baseline never moves the floor."""
+        self.client.set("fleet:intake:poll:floor", "%d" % int(at), nx=True, ex=CLAIM_TTL)
 
     def watermark(self):
         """fleet:intake:poll:watermark - where the last poll got to (not when it ran)."""
@@ -1152,8 +1227,11 @@ class Deps:
                  changes=None, ring=None, folder_id="", channel_token="", poll_token="",
                  api_worker="", now=None, at="", channel_expires_at=None,
                  heartbeat_window=DEFAULT_HEARTBEAT, renew_warn=DEFAULT_RENEW_WARN,
-                 at_provider=None, poll_tick=DEFAULT_POLL_TICK):
+                 at_provider=None, poll_tick=DEFAULT_POLL_TICK, recipients=None, baseline=False):
         self.enabled = enabled
+        self.baseline = baseline          # the first poll lists nothing and sets the floor (poll)
+        # The workers this deploy may hand a request to (recipients_from_env); None is every worker.
+        self.recipients = recipients
         self.at_provider = at_provider
         self.poll_tick = poll_tick
         self.docs = docs
@@ -1248,6 +1326,8 @@ def deps_from_env(environ=None, client=None, docs=None, feed=None, post=None) ->
         poll_token=environ.get("DRIVE_INTAKE_POLL_TOKEN") or "",
         api_worker=environ.get("DRIVE_INTAKE_API_WORKER") or "",
         at_provider=utc_now_iso,
+        recipients=recipients_from_env(environ),
+        baseline=(environ.get("DRIVE_INTAKE_FIRST_POLL") or "").strip().lower() == "baseline",
         heartbeat_window=_int_env(environ, "DRIVE_INTAKE_HEARTBEAT_SECONDS", DEFAULT_HEARTBEAT),
         poll_tick=_int_env(environ, "DRIVE_INTAKE_POLL_SECONDS", DEFAULT_POLL_TICK),
     )
@@ -1268,7 +1348,8 @@ def main():  # pragma: no cover - the server loop
             import gdocs  # noqa: PLC0415
             import drive_feed  # noqa: PLC0415
             docs = gdocs.GoogleDocs()
-            post = drive_feed.http_post
+            # inbox-wake is private: the ring carries an ID token as well as its signature.
+            post = lambda url, body, headers: drive_feed.private_post(url, body, headers, gdocs._fetch)  # noqa: E731
             if client is not None:
                 feed = drive_feed.DriveFolder(gdocs.metadata_token, gdocs._fetch, RedisClaims(client)).changes
         except Exception as exc:  # noqa: BLE001

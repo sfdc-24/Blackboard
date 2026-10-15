@@ -28,6 +28,7 @@
 !/cloud/redis-tool-bridge
 !/cloud/drive-intake
 !/cloud/claude-api-worker
+!/cloud/inbox-wake
 
 !/scripts
 /scripts/*
