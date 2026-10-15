@@ -1254,6 +1254,8 @@ class ChannelTest(unittest.TestCase):
 
 
 class AuthTest(unittest.TestCase):
+    CHANGE = {"x-goog-channel-token": "tok", "x-goog-resource-state": "change"}
+
     def test_an_empty_secret_refuses_rather_than_skips(self):
         self.assertFalse(di.channel_token_ok("", ""))
         self.assertFalse(di.bearer_ok("", "Bearer "))
@@ -1282,6 +1284,46 @@ class AuthTest(unittest.TestCase):
         hints = di.hints_from_push({"x-goog-resource-state": "change"})
         self.assertEqual([{"file_id": "", "poll": True}], hints)
         self.assertEqual("bad_file_id", di.decide(hints[0], deps())["status"])
+
+    def test_an_idless_changes_push_polls_and_dispatches_its_doc_once(self):
+        d = deps(changes=lambda folder: [{"file_id": FILE, "folder_id": folder}], now=5000.0)
+        code, body = di.handle("POST", "/hooks/drive", self.CHANGE, b"", d)
+        self.assertEqual(200, code)
+        self.assertEqual(["dispatched"], [r["status"] for r in body["intake"]])
+        self.assertEqual(1, len(d.queue.puts))
+        self.assertEqual(5000.0, d.claims.last_poll())
+
+    def test_an_idless_push_burst_is_one_poll_then_rechecks_after_the_gap(self):
+        listed = []
+        d = deps(changes=lambda folder: listed.append(folder) or [], now=5000.0)
+        self.assertEqual([], di.handle("POST", "/hooks/drive", self.CHANGE, b"", d)[1]["intake"])
+        d.now = 5009.0
+        self.assertEqual([{"status": "poll_recent", "task": None}],
+                         di.handle("POST", "/hooks/drive", self.CHANGE, b"", d)[1]["intake"])
+        d.now = 5010.0
+        self.assertEqual([], di.handle("POST", "/hooks/drive", self.CHANGE, b"", d)[1]["intake"])
+        self.assertEqual(2, len(listed))
+
+    def test_a_failed_idless_push_poll_is_retried_and_a_named_push_does_not_poll(self):
+        attempts = []
+
+        def changes(folder):
+            attempts.append(folder)
+            if len(attempts) == 1:
+                raise ConnectionError("offline fake failure")
+            return [{"file_id": FILE, "folder_id": folder}]
+
+        d = deps(changes=changes, now=5000.0)
+        self.assertEqual("read_error", di.handle("POST", "/hooks/drive", self.CHANGE, b"", d)[1]["intake"][0]["status"])
+        self.assertIsNone(d.claims.last_poll())
+        self.assertEqual("dispatched", di.handle("POST", "/hooks/drive", self.CHANGE, b"", d)[1]["intake"][0]["status"])
+        self.assertEqual(2, len(attempts))
+
+        named = dict(self.CHANGE, **{"x-goog-resource-uri":
+                                    "https://www.googleapis.com/drive/v3/files/%s?alt=json" % FILE})
+        separate = deps(changes=lambda folder: self.fail("a named-file push must not list changes"))
+        self.assertEqual("dispatched", di.handle("POST", "/hooks/drive", named, b"", separate)[1]["intake"][0]["status"])
+        self.assertIsNone(separate.claims.last_poll())
 
 
 class OfflineTest(unittest.TestCase):

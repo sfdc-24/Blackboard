@@ -804,6 +804,25 @@ def poll(deps) -> list:
     return out
 
 
+PUSH_POLL_MIN = 10  # coalesce a burst of changes-channel notifications into one feed listing
+
+
+def intake_from_push(headers: dict, deps) -> list:
+    """Decide a named file, or poll the changes feed when a push names no file."""
+    out = []
+    for hint in hints_from_push(headers):
+        if not hint.get("poll"):
+            out.append(decide(hint, deps))
+            continue
+        try:
+            last = deps.claims.last_poll() if deps.claims is not None else None
+            recent = last is not None and 0 <= _now(deps) - float(last) < PUSH_POLL_MIN
+        except Exception:  # noqa: BLE001 - an unreadable poll mark is not evidence of a recent poll
+            recent = False
+        out.extend([{"status": "poll_recent", "task": None}] if recent else poll(deps))
+    return out
+
+
 def poll_health(last_poll, now, tick=DEFAULT_POLL_TICK) -> dict:
     """The poll is the channel when no watch is registered. No poll on record is unknown, not ok."""
     if last_poll is None:
@@ -854,8 +873,7 @@ def handle(method: str, path: str, headers: dict, body: bytes, deps) -> tuple:
             return 401, {"error": "bad channel token"}
         if not deps.enabled:
             return 200, {"enabled": False, "intake": []}
-        return 200, {"enabled": True,
-                     "intake": [decide(h, deps) for h in hints_from_push(headers)]}
+        return 200, {"enabled": True, "intake": intake_from_push(headers, deps)}
     if method == "POST" and path == "/poll":
         if not poll_token_ok(deps.poll_token, headers):
             return 401, {"error": "bad poll token"}
