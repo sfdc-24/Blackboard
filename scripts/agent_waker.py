@@ -798,6 +798,12 @@ def post_reply(me: str, cfg: dict, text: str, to: str, answers: str, verbose: bo
     ok = "VERIFIED on the board" in out
     if verbose or not ok:
         print("    " + out.strip()[-400:].replace("\n", "\n    "))
+    elif "SPILL_UNCONFIRMED" in out:
+        # The row landed, but the whole reply it points to (full=) did not: the board then carries a
+        # summary and a pointer to nothing. fleet_agent says so; a verified row hid it, and every long
+        # Gemini answer from 2026-10-14 to 10-15 was unreadable while the log said only "posted"
+        # (waker-gemini could write gemini_waker.json and no other object in the bucket).
+        print("    " + " ".join(line.strip() for line in out.splitlines() if "SPILL_UNCONFIRMED" in line)[:300])
     return ok
 
 
