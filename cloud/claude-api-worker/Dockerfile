@@ -20,6 +20,7 @@ COPY scripts/bus.py /app/bus.py
 COPY scripts/append.py /app/append.py
 COPY scripts/signature.py /app/signature.py
 COPY scripts/board_row.py /app/board_row.py
+COPY scripts/state_store.py /app/state_store.py
 COPY scripts/agent_roster.json /app/agent_roster.json
 COPY cloud/drive-intake/main.py /app/drive_intake.py
 COPY cloud/claude-api-worker/gdocs.py /app/gdocs.py
