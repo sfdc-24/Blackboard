@@ -45,8 +45,11 @@ GCLOUD="${GCLOUD:-gcloud}"
 SCHED_JOB="${SCHED_JOB:-drive-intake-poll}"
 SCHEDULE="${SCHEDULE:-*/2 * * * *}"
 
-# The four, and only four, secrets this service may read.
-SECRETS=(REDIS_AUTH_STRING REDIS_CA_CERT DRIVE_INTAKE_POLL_TOKEN DRIVE_INTAKE_CHANNEL_TOKEN)
+# The four secrets this service may read, and the ring's HMAC once inbox-wake is wired (Gate 3 Step 3).
+SECRETS=(REDIS_AUTH_STRING REDIS_CA_CERT DRIVE_INTAKE_POLL_TOKEN DRIVE_INTAKE_CHANNEL_TOKEN INBOX_WAKE_SECRET)
+# The ring into inbox-wake (cloud/inbox-wake/deploy.sh). Set: drive-intake rings it, signed with
+# INBOX_WAKE_SECRET and carrying its own ID token. Unset: the polled ring below, as before.
+WAKE_URL="${INBOX_WAKE_URL:-}"
 
 # Passed in, never written here: the private address is topology and this repository is public.
 REDIS_HOST="${REDIS_HOST:-}"
@@ -139,11 +142,16 @@ build() {
 
 deploy() {
   : "${REDIS_HOST:?set REDIS_HOST to the Memorystore private address; it is not committed here}"
+  local wake_secret="" wake_env=""
+  if [ -n "$WAKE_URL" ]; then
+    wake_secret=",INBOX_WAKE_SECRET=INBOX_WAKE_SECRET:latest"
+    wake_env=",INBOX_WAKE_URL=${WAKE_URL}"
+  fi
   "$GCLOUD" run deploy "$SERVICE" --project "$PROJECT" --region "$REGION" \
     --image "$IMAGE" --service-account "$SA" \
     --no-allow-unauthenticated --min-instances 0 --max-instances 2 \
-    --set-secrets "${CA_PATH}=REDIS_CA_CERT:latest,${AUTH_PATH}=REDIS_AUTH_STRING:latest,DRIVE_INTAKE_POLL_TOKEN=DRIVE_INTAKE_POLL_TOKEN:latest,DRIVE_INTAKE_CHANNEL_TOKEN=DRIVE_INTAKE_CHANNEL_TOKEN:latest" \
-    --set-env-vars "DRIVE_INTAKE_ENABLED=off,REDIS_CONNECT=true,REDIS_HOST=${REDIS_HOST},REDIS_PORT=${REDIS_PORT},DRIVE_INTAKE_FOLDER_ID=${FOLDER_ID},DRIVE_INTAKE_API_WORKER=${API_WORKER},DRIVE_INTAKE_RECIPIENTS=${RECIPIENTS},DRIVE_INTAKE_FIRST_POLL=${FIRST_POLL},DRIVE_INTAKE_HEARTBEAT_SECONDS=${HEARTBEAT_SECONDS},DRIVE_INTAKE_POLL_SECONDS=${POLL_SECONDS},DRIVE_INTAKE_RING=${RING}" \
+    --set-secrets "${CA_PATH}=REDIS_CA_CERT:latest,${AUTH_PATH}=REDIS_AUTH_STRING:latest,DRIVE_INTAKE_POLL_TOKEN=DRIVE_INTAKE_POLL_TOKEN:latest,DRIVE_INTAKE_CHANNEL_TOKEN=DRIVE_INTAKE_CHANNEL_TOKEN:latest${wake_secret}" \
+    --set-env-vars "DRIVE_INTAKE_ENABLED=off,REDIS_CONNECT=true,REDIS_HOST=${REDIS_HOST},REDIS_PORT=${REDIS_PORT},DRIVE_INTAKE_FOLDER_ID=${FOLDER_ID},DRIVE_INTAKE_API_WORKER=${API_WORKER},DRIVE_INTAKE_RECIPIENTS=${RECIPIENTS},DRIVE_INTAKE_FIRST_POLL=${FIRST_POLL},DRIVE_INTAKE_HEARTBEAT_SECONDS=${HEARTBEAT_SECONDS},DRIVE_INTAKE_POLL_SECONDS=${POLL_SECONDS},DRIVE_INTAKE_RING=${RING}${wake_env}" \
     --network "$NETWORK" --subnet "$SUBNET" --vpc-egress "$EGRESS" \
     --cpu 1 --memory 512Mi --timeout 60
   "$GCLOUD" run services add-iam-policy-binding "$SERVICE" --project "$PROJECT" --region "$REGION" \

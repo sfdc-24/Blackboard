@@ -385,9 +385,19 @@ def deps_from_env() -> Deps:
     return deps
 
 
-def _metadata_token() -> str:
-    import state_store  # noqa: PLC0415 - present on the Cloud Run image path, not required for tests
-    return state_store.metadata_token()[0]
+METADATA_TOKEN = "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token"
+
+
+def _metadata_token(opener=None) -> str:
+    """The service identity's access token, from the metadata server. The image carries main.py and
+    redis_dual only (Dockerfile): the state_store this used to import is not in it, so every Cloud Run
+    job wake - claude-api's, gemini's - would have failed with ImportError (Gate 3 Step 3)."""
+    req = urllib.request.Request(METADATA_TOKEN, headers={"Metadata-Flavor": "Google"})
+    with (opener or urllib.request.urlopen)(req, timeout=10) as resp:
+        token = json.loads(resp.read().decode("utf-8")).get("access_token") or ""
+    if not token:
+        raise Unconfigured("metadata server gave no access token")
+    return token
 
 
 def _redis_client():

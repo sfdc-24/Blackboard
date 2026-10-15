@@ -1611,6 +1611,36 @@ class Step3ClaudeApiOnly(unittest.TestCase):
         self.assertEqual(["dispatched"], [r["status"] for r in di.poll(d)])
 
 
+class PrivateRingTest(unittest.TestCase):
+    """Gate 3 Step 3: inbox-wake stays private; the ring carries an ID token for its origin."""
+
+    def test_the_ring_carries_an_identity_token_for_the_service_origin(self):
+        asked, sent = [], []
+
+        def fetch(method, url, body, headers):
+            asked.append((method, url, headers))
+            return 200, b"id-token-for-wake"
+
+        def post(url, body, headers):
+            sent.append((url, body, headers))
+            return b'{"woke": [{"status": "woke"}]}'
+        out = drive_feed.private_post("https://inbox-wake-abc-uc.a.run.app/wake", b"{}",
+                                      {"X-Hub-Signature-256": "sha256=x"}, fetch, post=post)
+        self.assertEqual(b'{"woke": [{"status": "woke"}]}', out)
+        self.assertIn("audience=https%3A%2F%2Finbox-wake-abc-uc.a.run.app", asked[0][1])
+        self.assertNotIn("%2Fwake", asked[0][1], "the audience is the origin, not the path")
+        self.assertEqual("Google", asked[0][2]["Metadata-Flavor"])
+        self.assertEqual("Bearer id-token-for-wake", sent[0][2]["Authorization"])
+        self.assertEqual("sha256=x", sent[0][2]["X-Hub-Signature-256"], "the signature is kept")
+
+    def test_no_token_is_no_ring(self):
+        with self.assertRaises(drive_feed.Unconfigured):
+            drive_feed.private_post("https://inbox-wake.example/wake", b"{}", {},
+                                    lambda *a: (404, b""), post=lambda *a: self.fail("posted"))
+        with self.assertRaises(drive_feed.Unconfigured):
+            drive_feed.audience_of("http://plain.example/wake")
+
+
 class FeedTest(unittest.TestCase):
     """The poll's question to Drive, and its bookkeeping."""
 

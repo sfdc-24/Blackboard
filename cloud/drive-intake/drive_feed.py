@@ -98,6 +98,36 @@ def hints_from(files: list, folder_id: str) -> list:
     return out
 
 
+IDENTITY = ("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity"
+            "?audience=%s")
+
+
+def audience_of(url: str) -> str:
+    """A Cloud Run service's audience is its own origin: scheme and host, no path."""
+    parts = urllib.parse.urlsplit(url or "")
+    if parts.scheme != "https" or not parts.netloc:
+        raise Unconfigured("not an https service url")
+    return "%s://%s" % (parts.scheme, parts.netloc)
+
+
+def identity_token(audience: str, fetch) -> str:
+    """An ID token for `audience` from the metadata server: the service identity, never a key."""
+    status, raw = fetch("GET", IDENTITY % urllib.parse.quote(audience, safe=""), None, {"Metadata-Flavor": "Google"})
+    token = (raw.decode("utf-8") if isinstance(raw, bytes) else str(raw or "")).strip()
+    if status != 200 or not token:
+        raise Unconfigured("metadata server gave no identity token (%s)" % status)
+    return token
+
+
+def private_post(url, body, headers, fetch, post=None):
+    """POST to a PRIVATE Cloud Run service (inbox-wake is not public): its run.invoker check needs an ID
+    token for the service's own origin, beside the ring's own signature. Gate 3 Step 3."""
+    sender = post or http_post
+    signed = dict(headers or {})
+    signed["Authorization"] = "Bearer " + identity_token(audience_of(url), fetch)
+    return sender(url, body, signed)
+
+
 def http_post(url, body, headers):  # pragma: no cover - the ring's one socket, kept out of main.py
     """POST and return the raw answer; the caller reads the readout. Used by WakeRing in main()."""
     import urllib.request  # noqa: PLC0415

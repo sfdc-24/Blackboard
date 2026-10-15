@@ -229,6 +229,63 @@ class ClaudeApiOnly(unittest.TestCase):
         self.assertEqual(1, len(rec.jobs))
 
 
+class TheImageCanRunAJob(unittest.TestCase):
+    def test_the_metadata_token_needs_nothing_the_image_does_not_carry(self):
+        source = (REPO / "cloud" / "inbox-wake" / "main.py").read_text(encoding="utf-8")
+        docker = (REPO / "cloud" / "inbox-wake" / "Dockerfile").read_text(encoding="utf-8")
+        self.assertNotIn("import state_store", source)
+        for module in ("redis_dual",):
+            self.assertIn("/app/%s.py" % module, docker)
+
+        class Answer:
+            def __init__(self, raw):
+                self.raw = raw
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                return self.raw
+        seen = []
+
+        def opener(req, timeout=None):
+            seen.append((req.full_url, req.get_header("Metadata-flavor")))
+            return Answer(b'{"access_token": "tok", "expires_in": 3599}')
+        self.assertEqual("tok", wake._metadata_token(opener))
+        self.assertEqual("Google", seen[0][1])
+        with self.assertRaises(wake.Unconfigured):
+            wake._metadata_token(lambda req, timeout=None: Answer(b"{}"))
+
+
+class TheDeployScript(unittest.TestCase):
+    """cloud/inbox-wake/deploy.sh (Gate 3 Step 3): private, flag off, claude-api only, and every variable
+    main.py reads is set by it or is knowingly optional."""
+    OPTIONAL = {"GITHUB_WAKE_TOKEN", "GROK_WAKE_URL", "INBOX_WAKE_SWEEP_TOKEN", "PORT"}
+
+    def setUp(self):
+        self.script = (REPO / "cloud" / "inbox-wake" / "deploy.sh").read_text(encoding="utf-8")
+
+    def test_private_off_and_claude_api_only(self):
+        self.assertIn("--no-allow-unauthenticated", self.script)
+        self.assertNotIn("allUsers", self.script)
+        self.assertNotIn("--allow-unauthenticated", self.script.replace("--no-allow-unauthenticated", ""))
+        self.assertIn("INBOX_WAKE_ENABLED=off,", self.script)
+        self.assertIn('AGENTS="${INBOX_WAKE_AGENTS:-claude-api}"', self.script)
+        self.assertIn('EGRESS="private-ranges-only"', self.script)
+        self.assertIn("run jobs add-iam-policy-binding", self.script)
+        self.assertNotIn("projects add-iam-policy-binding", self.script, "no project-wide grant")
+
+    def test_every_variable_main_reads_is_set_or_optional(self):
+        import re
+        source = (REPO / "cloud" / "inbox-wake" / "main.py").read_text(encoding="utf-8")
+        read = set(re.findall(r'environ\.get\(\s*"([A-Z0-9_]+)"', source)) | {wake.AGENTS_ENV}
+        missing = sorted(name for name in read - self.OPTIONAL if name + "=" not in self.script)
+        self.assertEqual([], missing)
+
+
 class TheDriveIntakeRing(unittest.TestCase):
     """drive-intake's WakeRing (cloud/drive-intake/main.py) posts to POST /wake: the two must agree on the
     body, the signature and the answer, or every Drive request stays queued_not_rung."""

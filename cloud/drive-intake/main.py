@@ -1348,7 +1348,8 @@ def main():  # pragma: no cover - the server loop
             import gdocs  # noqa: PLC0415
             import drive_feed  # noqa: PLC0415
             docs = gdocs.GoogleDocs()
-            post = drive_feed.http_post
+            # inbox-wake is private: the ring carries an ID token as well as its signature.
+            post = lambda url, body, headers: drive_feed.private_post(url, body, headers, gdocs._fetch)  # noqa: E731
             if client is not None:
                 feed = drive_feed.DriveFolder(gdocs.metadata_token, gdocs._fetch, RedisClaims(client)).changes
         except Exception as exc:  # noqa: BLE001
