@@ -62,6 +62,10 @@ EGRESS="private-ranges-only"
 
 FOLDER_ID="${DRIVE_INTAKE_FOLDER_ID:-1gZlJFDD2Wm419YOuolIXC3HXwzXOWYfP}"
 API_WORKER="${DRIVE_INTAKE_API_WORKER:-claude-api}"
+# Gate 3 Step 3: "recipient claude-api only". A request addressed to anyone else is refused, not rerouted.
+RECIPIENTS="${DRIVE_INTAKE_RECIPIENTS:-claude-api}"
+# Gate 3 Step 3: no backfill. The first poll lists nothing and sets the floor; only later docs are read.
+FIRST_POLL="${DRIVE_INTAKE_FIRST_POLL:-baseline}"
 HEARTBEAT_SECONDS="${DRIVE_INTAKE_HEARTBEAT_SECONDS:-300}"
 POLL_SECONDS="${DRIVE_INTAKE_POLL_SECONDS:-120}"
 # The ring. "polled": the worker polls its inbox and the laptop lane rings the laptop itself, so the
@@ -139,7 +143,7 @@ deploy() {
     --image "$IMAGE" --service-account "$SA" \
     --no-allow-unauthenticated --min-instances 0 --max-instances 2 \
     --set-secrets "${CA_PATH}=REDIS_CA_CERT:latest,${AUTH_PATH}=REDIS_AUTH_STRING:latest,DRIVE_INTAKE_POLL_TOKEN=DRIVE_INTAKE_POLL_TOKEN:latest,DRIVE_INTAKE_CHANNEL_TOKEN=DRIVE_INTAKE_CHANNEL_TOKEN:latest" \
-    --set-env-vars "DRIVE_INTAKE_ENABLED=off,REDIS_CONNECT=true,REDIS_HOST=${REDIS_HOST},REDIS_PORT=${REDIS_PORT},DRIVE_INTAKE_FOLDER_ID=${FOLDER_ID},DRIVE_INTAKE_API_WORKER=${API_WORKER},DRIVE_INTAKE_HEARTBEAT_SECONDS=${HEARTBEAT_SECONDS},DRIVE_INTAKE_POLL_SECONDS=${POLL_SECONDS},DRIVE_INTAKE_RING=${RING}" \
+    --set-env-vars "DRIVE_INTAKE_ENABLED=off,REDIS_CONNECT=true,REDIS_HOST=${REDIS_HOST},REDIS_PORT=${REDIS_PORT},DRIVE_INTAKE_FOLDER_ID=${FOLDER_ID},DRIVE_INTAKE_API_WORKER=${API_WORKER},DRIVE_INTAKE_RECIPIENTS=${RECIPIENTS},DRIVE_INTAKE_FIRST_POLL=${FIRST_POLL},DRIVE_INTAKE_HEARTBEAT_SECONDS=${HEARTBEAT_SECONDS},DRIVE_INTAKE_POLL_SECONDS=${POLL_SECONDS},DRIVE_INTAKE_RING=${RING}" \
     --network "$NETWORK" --subnet "$SUBNET" --vpc-egress "$EGRESS" \
     --cpu 1 --memory 512Mi --timeout 60
   "$GCLOUD" run services add-iam-policy-binding "$SERVICE" --project "$PROJECT" --region "$REGION" \

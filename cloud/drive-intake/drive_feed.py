@@ -147,6 +147,12 @@ class DriveFolder:
                 since = since_for(mark, now, self.lookback, self.margin)
         else:
             since = since_for(mark, now, self.lookback, self.margin)
+        # The baseline (main.poll's first poll): nothing modified before it is listed, whatever the
+        # watermark or the look back says.
+        floor = getattr(self.store, "floor", None)
+        low = floor() if callable(floor) else None
+        if low is not None:
+            since = max(since, min(float(low), now))
         query = query_for(folder_id, since)
         self.last_query = query
         files, page_token, complete = [], "", True

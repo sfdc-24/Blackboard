@@ -1522,6 +1522,95 @@ class WiringTest(unittest.TestCase):
         self.assertEqual(di.DEFAULT_POLL_TICK, off.poll_tick)
 
 
+class Step3ClaudeApiOnly(unittest.TestCase):
+    """Gate 3 Step 3 (CO-20261013-001): "recipient claude-api only. No other folder, no other recipient." """
+
+    def only(self, **over):
+        over.setdefault("baseline", True)
+        return deps(recipients=di.recipients_from_env({"DRIVE_INTAKE_RECIPIENTS": "claude-api"}), **over)
+
+    def test_the_list_parses_and_never_falls_open(self):
+        self.assertIsNone(di.recipients_from_env({}))
+        self.assertEqual(frozenset({"claude-api"}), di.recipients_from_env({"DRIVE_INTAKE_RECIPIENTS": "claude-api"}))
+        self.assertEqual(frozenset(), di.recipients_from_env({"DRIVE_INTAKE_RECIPIENTS": "nobody, *"}))
+        self.assertEqual(frozenset(), di.recipients_from_env({"DRIVE_INTAKE_RECIPIENTS": ""}))
+
+    def test_a_request_to_the_laptop_is_refused_not_rerouted(self):
+        d = self.only(docs=Docs(text="to: claude-code-cli\n" + REQUEST))
+        laptop_up(d)
+        out = di.decide(hint(), d)
+        self.assertEqual(("not_allowed", "claude-code-cli"), (out["status"], out["to"]))
+        self.assertEqual([], d.queue.puts)
+
+    def test_an_unaddressed_request_goes_to_claude_api_even_with_the_laptop_up(self):
+        d = self.only()
+        laptop_up(d)
+        out = di.decide(hint(), d)
+        self.assertEqual("dispatched", out["status"], out)
+        self.assertEqual(["claude-api"], [t["recipient_id"] for t, _, _ in d.queue.puts])
+
+    def test_work_that_needs_the_laptop_is_blocked_and_said(self):
+        text = REQUEST + "\nThis one is laptop only: open the local repo.\n"
+        self.assertTrue(di.needs_cli_tools(text))
+        d = self.only(docs=Docs(text=text))
+        out = di.decide(hint(), d)
+        self.assertEqual("blocked", out["status"], out)
+        self.assertEqual([], d.queue.puts)
+
+    def test_the_first_poll_is_a_baseline_and_lists_nothing(self):
+        listed = []
+
+        def feed(folder):
+            listed.append(folder)
+            return [{"file_id": FILE, "folder_id": folder}]
+        d = self.only(changes=feed, now=5000.0)
+        first = di.poll(d)
+        self.assertEqual(["baseline"], [r["status"] for r in first], first)
+        self.assertEqual([], listed, "the folder is not listed on the baseline")
+        self.assertEqual([], d.queue.puts)
+        self.assertEqual(5000.0, d.claims.floor())
+        d.now = 5120.0
+        second = di.poll(d)
+        self.assertEqual(["dispatched"], [r["status"] for r in second], second)
+        self.assertEqual(1, len(listed))
+
+    def test_the_floor_is_set_once(self):
+        d = self.only(changes=lambda folder: [], now=5000.0)
+        di.poll(d)
+        d.claims.beats.pop("watermark")         # the watermark aged out; the floor did not
+        d.now = 9000.0
+        self.assertEqual([], di.poll(d))
+        self.assertEqual(5000.0, d.claims.floor())
+
+    def test_the_feed_never_lists_before_the_floor(self):
+        class Store:
+            def watermark(self):
+                return None                     # no watermark: the bounded look back of a day
+
+            def floor(self):
+                return 7200.0
+        asked = []
+        folder = drive_feed.DriveFolder(lambda: "tok", lambda method, url, body, headers: (
+            asked.append(url) or (200, b'{"files": []}')), Store(), now=90000.0)
+        folder.changes(FOLDER)
+        self.assertIn(drive_feed.iso(7200.0), folder.last_query, folder.last_query)
+
+    def test_a_deploy_names_claude_api_only(self):
+        script = (REPO / "cloud" / "drive-intake" / "deploy.sh").read_text(encoding="utf-8")
+        self.assertIn('RECIPIENTS="${DRIVE_INTAKE_RECIPIENTS:-claude-api}"', script)
+        self.assertIn("DRIVE_INTAKE_RECIPIENTS=${RECIPIENTS}", script)
+        self.assertIn('FIRST_POLL="${DRIVE_INTAKE_FIRST_POLL:-baseline}"', script)
+        self.assertIn("DRIVE_INTAKE_FIRST_POLL=${FIRST_POLL}", script)
+        d = di.deps_from_env({"DRIVE_INTAKE_RECIPIENTS": "claude-api", "DRIVE_INTAKE_FIRST_POLL": "baseline"},
+                             client=None, docs=None)
+        self.assertEqual((frozenset({"claude-api"}), True), (d.recipients, d.baseline))
+        self.assertFalse(di.deps_from_env({}, client=None, docs=None).baseline)
+
+    def test_without_the_baseline_the_first_poll_lists_as_before(self):
+        d = self.only(changes=lambda folder: [{"file_id": FILE, "folder_id": folder}], baseline=False)
+        self.assertEqual(["dispatched"], [r["status"] for r in di.poll(d)])
+
+
 class FeedTest(unittest.TestCase):
     """The poll's question to Drive, and its bookkeeping."""
 
