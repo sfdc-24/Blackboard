@@ -27,6 +27,10 @@ DOCS = "https://docs.googleapis.com/v1/documents/"
 DRIVE = "https://www.googleapis.com/drive/v3/files/"
 METADATA = ("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token"
             "?scopes=https://www.googleapis.com/auth/documents,https://www.googleapis.com/auth/drive.readonly")
+# drive-intake's G4 rename (Drive files.update, name only) needs the drive scope; readonly cannot rename.
+# Kept apart from METADATA so read and append never carry it.
+RENAME_METADATA = ("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token"
+                   "?scopes=https://www.googleapis.com/auth/drive")
 TIMEOUT = 30
 
 
@@ -72,9 +76,9 @@ def append_request(block: str, expected_revision: str) -> dict:
     return request
 
 
-def metadata_token(fetch=None) -> str:
+def metadata_token(fetch=None, url=None) -> str:
     fetch = fetch or _fetch
-    status, raw = fetch("GET", METADATA, None, {"Metadata-Flavor": "Google"})
+    status, raw = fetch("GET", url or METADATA, None, {"Metadata-Flavor": "Google"})
     if status != 200:
         raise Unconfigured("metadata server answered %s" % status)
     try:
@@ -89,13 +93,15 @@ def metadata_token(fetch=None) -> str:
 class GoogleDocs:
     """read(file_id) / append(file_id, expected_revision, receipt_id, block) / has(file_id, receipt_id)."""
 
-    def __init__(self, token_provider=None, fetch=None, with_folder=True):
+    def __init__(self, token_provider=None, fetch=None, with_folder=True, rename_token_provider=None):
         self.token_provider = token_provider or metadata_token
         self.fetch = fetch or _fetch
         self.with_folder = with_folder
+        self.rename_token_provider = rename_token_provider or (
+            lambda: metadata_token(self.fetch, RENAME_METADATA))
 
-    def _call(self, method, url, body=None):
-        token = self.token_provider()
+    def _call(self, method, url, body=None, token_provider=None):
+        token = (token_provider or self.token_provider)()
         if not token:
             raise Unconfigured("no access token")
         headers = {"Authorization": "Bearer " + token}
@@ -118,10 +124,19 @@ class GoogleDocs:
         out = {"text": extract_text(doc.get("body") or {}), "revision_id": str(doc.get("revisionId") or ""),
                "folder_id": ""}
         if self.with_folder:
-            meta = self._call("GET", DRIVE + urllib.parse.quote(file_id) + "?fields=parents")
+            meta = self._call("GET", DRIVE + urllib.parse.quote(file_id) + "?fields=parents,name,createdTime")
             parents = meta.get("parents") or []
             out["folder_id"] = str(parents[0]) if parents else ""
+            # drive-intake's task filter: G1 reads the title, G3 the creation time. Absent means a NOTE.
+            out["title"] = str(meta.get("name") or "")
+            out["created_time"] = str(meta.get("createdTime") or "")
         return out
+
+    def rename(self, file_id: str, title: str) -> str:
+        """drive-intake G4: set the doc's name, and nothing else, then return the name Drive reports."""
+        answer = self._call("PATCH", DRIVE + urllib.parse.quote(file_id) + "?fields=name", {"name": title},
+                            token_provider=self.rename_token_provider)
+        return str(answer.get("name") or "")
 
     def append(self, file_id: str, expected_revision: str, receipt_id: str, block: str) -> str:
         answer = self._call("POST", DOCS + urllib.parse.quote(file_id) + ":batchUpdate",
