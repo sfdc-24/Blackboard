@@ -112,6 +112,19 @@ import re
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+
+def _load_task_filter():
+    """cloud/drive-intake/task_filter.py, beside this file (in the image: /app/task_filter.py)."""
+    import importlib.util  # noqa: PLC0415
+    here = os.path.dirname(os.path.abspath(__file__))
+    spec = importlib.util.spec_from_file_location("drive_intake_task_filter", os.path.join(here, "task_filter.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+tf = _load_task_filter()
+
 MAX_BODY = 65536
 MAX_DOC = 400000          # a doc larger than this is refused, not truncated (PR 354's rule)
 MAX_GIST = 900
@@ -225,6 +238,16 @@ def gist(text: str, limit: int = MAX_GIST) -> dict:
     if len(body) <= limit:
         return {"text": body, "chars": len(body), "full": True}
     return {"text": body[:limit], "chars": len(body), "full": False}
+
+
+def task_gist(text: str, verdict) -> dict:
+    """The gist, plus what the task filter decided: the action, and live or dry_run (G5).
+    A worker that sees mode=dry_run validates only: no dial, no spend."""
+    out = gist(text)
+    if verdict:
+        out.update({"action": verdict.get("action", ""), "mode": verdict.get("mode", tf.DRY_RUN),
+                    "prefix": verdict.get("prefix", "")})
+    return out
 
 
 def needs_cli_tools(text: str) -> bool:
@@ -523,6 +546,15 @@ def decide(hint: dict, deps) -> dict:
     if not strip_receipts(text).strip():
         return {"status": "no_request", "task": None}
 
+    # THE TASK FILTER (owner's spec, 2026-10-16 08:28 ET), fail-closed: G1 title prefix, G2 the action
+    # and TASK-OK lines, the CONFIRM half of G5. Anything that fails is a NOTE: no claim, no receipt,
+    # no inbox, no ring. Age (G3), consumed (G4) and the dial limits (G5) are judged at admission below.
+    verdict = None
+    if deps.filter_tasks:
+        verdict = tf.classify(doc, strip_receipts(text), _now(deps), deps.confirm_token, fresh=False)
+        if verdict.get("kind") != tf.TASK:
+            return {"status": "note", "task": None, "reason": verdict.get("reason", "")}
+
     # Who it is for. An address that names nobody we know is refused, not rerouted.
     addressed = TO_LINE.search(strip_receipts(text))
     if addressed and canonical(addressed.group(1)) is None:
@@ -556,6 +588,11 @@ def decide(hint: dict, deps) -> dict:
         return {"status": "duplicate", "task": tuple_["task_id"], "tuple": tuple_, "by": "doc"}
     trail_via = "q" if QUEUED in trail else "b" if BLOCKED in trail else ""
 
+    if verdict is not None:
+        admitted = _admit(deps, key, file_id, doc, text, trail, now, verdict)
+        if admitted is not None:
+            return admitted
+
     # The claim is a state the request moves through, forward only.
     try:
         current = deps.claims.state(key)
@@ -581,7 +618,7 @@ def decide(hint: dict, deps) -> dict:
         tuple_["recipient_id"] = bound
 
     out = {"status": state.lower(), "state": state, "task": tuple_["task_id"], "tuple": tuple_,
-           "gist": gist(text)}
+           "gist": task_gist(text, verdict)}
     if state in (QUEUED, BLOCKED):
         wait = WAIT_QUEUED if state == QUEUED else WAIT_BLOCKED
         if current != wait and not _advance(deps, key, current, wait):
@@ -649,7 +686,7 @@ def decide(hint: dict, deps) -> dict:
                 out["tuple"] = tuple_
             if holder is None:
                 try:
-                    deps.queue.put(tuple_, gist(text), deps.at)
+                    deps.queue.put(tuple_, task_gist(text, verdict), deps.at)
                 except Unconfigured:
                     raise
                 except Exception as exc:  # noqa: BLE001 - it may have landed anyway
@@ -722,7 +759,52 @@ def decide(hint: dict, deps) -> dict:
         _advance(deps, key, current, DONE)
         out["status"] = DISPATCHED.lower()
         out["state"] = DISPATCHED
+        if verdict is not None:
+            out["consumed"] = _consume(deps, file_id, tuple_["task_id"], verdict.get("rename", True))
     return out
+
+
+def _admit(deps, key, file_id, doc, text, trail, now, verdict):
+    """G3, G4 and the dial limits of G5, judged ONCE: when nothing has been claimed or written for this
+    request yet. A later pass finishing a delivery already under way is not re-judged on age, or a
+    receipt owed for eleven minutes would strand a task half-delivered. None means admitted."""
+    try:
+        if deps.claims.state(key) is not None or trail:
+            return None
+        if deps.claims.processed_has(file_id):
+            return {"status": "consumed", "task": None}
+    except Exception as exc:  # noqa: BLE001 - an unreadable store is not an empty one
+        return {"status": "claim_error", "task": None, "error": type(exc).__name__}
+    fresh = tf.classify(doc, strip_receipts(text), now, deps.confirm_token, fresh=True)
+    if fresh.get("kind") != tf.TASK:
+        return {"status": "note", "task": None, "reason": fresh.get("reason", "")}
+    if verdict.get("costly") and verdict.get("mode") == tf.LIVE:
+        try:
+            reserved = deps.claims.live_reserve(verdict["action"], now, tf.MIN_GAP_SECONDS, tf.DAY_MAX,
+                                                tf.toronto_day(now))
+        except Exception as exc:  # noqa: BLE001 - no reservation, no live task
+            return {"status": "rate_error", "task": None, "error": type(exc).__name__}
+        if reserved != "ok":
+            return {"status": "rate_limited", "task": None, "reason": reserved}
+    return None
+
+
+def _consume(deps, file_id, task_id, rename=True) -> str:
+    """G4: remember the doc, then rename it CONSUMED <task id> <timestamp>. The set is the guard; the
+    rename is for people and for any title watcher, so a failed rename is said, not fatal."""
+    try:
+        deps.claims.processed_add(file_id)
+    except Exception as exc:  # noqa: BLE001
+        return "processed_error:" + type(exc).__name__
+    if not rename:
+        return "recorded_not_renamed"      # a title watcher consumes this kind (task_filter.PREFIXES)
+    if deps.renamer is None:
+        return "no_renamer"
+    try:
+        deps.renamer(file_id, tf.consumed_title(task_id, deps.at))
+    except Exception as exc:  # noqa: BLE001
+        return "rename_failed:" + type(exc).__name__
+    return "renamed"
 
 
 def channel_health(expires_at, now, warn=DEFAULT_RENEW_WARN) -> dict:
@@ -770,7 +852,8 @@ def hints_from_push(headers: dict) -> list:
 # A decide() result after which a later pass has nothing left to do for this doc as it stands. An
 # edit re-lists the doc anyway. Everything else is unfinished and the doc is kept for the next poll.
 FINISHED = frozenset(("dispatched", "duplicate", "disabled", "bad_file_id", "out_of_scope", "no_revision",
-                      "too_large", "no_request", "bad_recipient", "bad_correlation", "not_allowed", "baseline"))
+                      "too_large", "no_request", "bad_recipient", "bad_correlation", "not_allowed", "baseline",
+                      "note", "consumed", "rate_limited"))
 
 
 def poll(deps) -> list:
@@ -1027,6 +1110,36 @@ class MemoryClaims:
     def pending_remove(self, file_id):
         self.beats.setdefault("pending", set()).discard(file_id)
 
+    def processed_has(self, file_id):
+        return file_id in self.beats.setdefault("processed", set())
+
+    def processed_add(self, file_id):
+        self.beats.setdefault("processed", set()).add(file_id)
+
+    def live_reserve(self, action, now, gap, day_max, day):
+        """'ok', 'gap' or 'day_cap', decided and recorded in one step, like RATE_LUA."""
+        last = self.beats.get("live_last:" + action)
+        if last is not None and now - last < gap:
+            return "gap"
+        count = self.beats.get("live_day:%s:%s" % (action, day), 0)
+        if count >= day_max:
+            return "day_cap"
+        self.beats["live_last:" + action] = float(now)
+        self.beats["live_day:%s:%s" % (action, day)] = count + 1
+        return "ok"
+
+
+# G5's limits in one round trip: the gap since the last live task of this action, then the day's count,
+# and both recorded only when both pass. KEYS[1] last, KEYS[2] day count; ARGV now, gap, max, ttl.
+RATE_LUA = ("local last = tonumber(redis.call('get', KEYS[1]) or '') "
+            "if last and tonumber(ARGV[1]) - last < tonumber(ARGV[2]) then return 'gap' end "
+            "local n = tonumber(redis.call('get', KEYS[2]) or '0') "
+            "if n >= tonumber(ARGV[3]) then return 'day_cap' end "
+            "redis.call('set', KEYS[1], ARGV[1], 'EX', ARGV[4]) "
+            "redis.call('incr', KEYS[2]) redis.call('expire', KEYS[2], ARGV[4]) "
+            "return 'ok'")
+RATE_TTL = 259200   # three days: long enough to read back the day just gone
+
 
 # Compare-and-set in one round trip, so two passes cannot both win a transition.
 CAS_LUA = ("if redis.call('get', KEYS[1]) == ARGV[1] then "
@@ -1159,6 +1272,20 @@ class RedisClaims:
     def pending_remove(self, file_id):
         self.client.srem("fleet:intake:pending", file_id)
 
+    # fleet:intake:processed - G4: every doc ever dispatched under the task filter. Never admitted again.
+    def processed_has(self, file_id):
+        return bool(self.client.sismember("fleet:intake:processed", file_id))
+
+    def processed_add(self, file_id):
+        self.client.sadd("fleet:intake:processed", file_id)
+        self.client.expire("fleet:intake:processed", CLAIM_TTL)
+
+    def live_reserve(self, action, now, gap, day_max, day):
+        raw = self.client.eval(RATE_LUA, 2, "fleet:intake:live:%s:last" % action,
+                               "fleet:intake:live:%s:day:%s" % (action, day),
+                               "%d" % int(now), int(gap), int(day_max), RATE_TTL)
+        return raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+
 
 class InboxQueue:
     """One task onto fleet:inbox:<recipient>, carrying the whole tuple unchanged, read back by task id."""
@@ -1213,6 +1340,10 @@ class InboxQueue:
             "request_id": tuple_["request_id"], "task_id": tuple_["task_id"],
             "recipient_id": tuple_["recipient_id"],
         }
+        # The task filter's verdict rides with the task: mode=dry_run means validate only (G5).
+        for name in ("action", "mode", "prefix"):
+            if gist_.get(name):
+                fields[name] = str(gist_[name])
         flat = []
         for name, value in fields.items():
             flat.extend((name, value))
@@ -1227,8 +1358,14 @@ class Deps:
                  changes=None, ring=None, folder_id="", channel_token="", poll_token="",
                  api_worker="", now=None, at="", channel_expires_at=None,
                  heartbeat_window=DEFAULT_HEARTBEAT, renew_warn=DEFAULT_RENEW_WARN,
-                 at_provider=None, poll_tick=DEFAULT_POLL_TICK, recipients=None, baseline=False):
+                 at_provider=None, poll_tick=DEFAULT_POLL_TICK, recipients=None, baseline=False,
+                 filter_tasks=False, confirm_token="", renamer=None):
         self.enabled = enabled
+        # The task filter (task_filter.py). deps_from_env ALWAYS turns it on and no env var turns it off;
+        # the False default exists only so the routing tests below can drive decide() with bare docs.
+        self.filter_tasks = filter_tasks
+        self.confirm_token = confirm_token
+        self.renamer = renamer
         self.baseline = baseline          # the first poll lists nothing and sets the floor (poll)
         # The workers this deploy may hand a request to (recipients_from_env); None is every worker.
         self.recipients = recipients
@@ -1301,7 +1438,7 @@ def _int_env(environ, name, default):
         return default
 
 
-def deps_from_env(environ=None, client=None, docs=None, feed=None, post=None) -> "Deps":
+def deps_from_env(environ=None, client=None, docs=None, feed=None, post=None, renamer=None) -> "Deps":
     """The service's dependencies from its environment and the adapters handed in. Pure: no socket
     is opened here, so a test can read exactly what a deploy would wire."""
     environ = os.environ if environ is None else environ
@@ -1330,6 +1467,9 @@ def deps_from_env(environ=None, client=None, docs=None, feed=None, post=None) ->
         baseline=(environ.get("DRIVE_INTAKE_FIRST_POLL") or "").strip().lower() == "baseline",
         heartbeat_window=_int_env(environ, "DRIVE_INTAKE_HEARTBEAT_SECONDS", DEFAULT_HEARTBEAT),
         poll_tick=_int_env(environ, "DRIVE_INTAKE_POLL_SECONDS", DEFAULT_POLL_TICK),
+        filter_tasks=True,       # fail-closed, always: there is deliberately no switch for this
+        confirm_token=environ.get("DRIVE_INTAKE_CONFIRM_TOKEN") or "",
+        renamer=renamer,
     )
 
 
@@ -1337,7 +1477,7 @@ def main():  # pragma: no cover - the server loop
     import sys  # noqa: PLC0415
     here = os.path.dirname(os.path.abspath(__file__))
     sys.path.insert(0, here)
-    client = docs = feed = post = None
+    client = docs = feed = post = renamer = None
     if enabled_from_env():
         try:
             import redis_dual  # noqa: PLC0415 - beside this file in the image
@@ -1348,13 +1488,14 @@ def main():  # pragma: no cover - the server loop
             import gdocs  # noqa: PLC0415
             import drive_feed  # noqa: PLC0415
             docs = gdocs.GoogleDocs()
+            renamer = docs.rename
             # inbox-wake is private: the ring carries an ID token as well as its signature.
             post = lambda url, body, headers: drive_feed.private_post(url, body, headers, gdocs._fetch)  # noqa: E731
             if client is not None:
                 feed = drive_feed.DriveFolder(gdocs.metadata_token, gdocs._fetch, RedisClaims(client)).changes
         except Exception as exc:  # noqa: BLE001
             print("drive-intake no docs: %s" % type(exc).__name__)
-    Handler.deps = deps_from_env(client=client, docs=docs, feed=feed, post=post)
+    Handler.deps = deps_from_env(client=client, docs=docs, feed=feed, post=post, renamer=renamer)
     # Unset, this listens on every interface, which Cloud Run requires. The loopback smoke sets
     # 127.0.0.1 so that run opens nothing else.
     bind = os.environ.get("DRIVE_INTAKE_BIND") or ""

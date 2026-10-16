@@ -1085,7 +1085,7 @@ class GoogleDocsTest(unittest.TestCase):
             if method == "GET" and "docs.googleapis.com" in url:
                 return 200, json.dumps(doc).encode()
             if method == "GET" and "googleapis.com/drive" in url:
-                return 200, b'{"parents": ["FOLDER1"]}'
+                return 200, b'{"parents": ["FOLDER1"], "name": "TASK: x", "createdTime": "2026-10-16T12:00:00Z"}'
             if method == "POST":
                 sent = json.loads(body)
                 if sent["writeControl"]["requiredRevisionId"] != doc["revisionId"]:
@@ -1095,13 +1095,27 @@ class GoogleDocsTest(unittest.TestCase):
                 return 200, b'{"writeControl": {"requiredRevisionId": "r2"}}'
             raise AssertionError(url)
         g = gd.GoogleDocs(token_provider=lambda: "tok", fetch=fetch)
-        self.assertEqual({"text": "hello\n", "revision_id": "r1", "folder_id": "FOLDER1"}, g.read(FILE))
+        self.assertEqual({"text": "hello\n", "revision_id": "r1", "folder_id": "FOLDER1", "title": "TASK: x",
+                          "created_time": "2026-10-16T12:00:00Z"}, g.read(FILE))
         self.assertFalse(g.has(FILE, "abcd"))
         self.assertEqual("r2", g.append(FILE, "r1", "abcd", "ACCEPTED - task x - id abcd"))
         self.assertTrue(g.has(FILE, "abcd"))
         with self.assertRaises(gd.RevisionConflict):
             g.append(FILE, "r1", "efgh", "stale")
         self.assertTrue(all(FILE in url for _, url, _, _ in calls))
+
+    def test_rename_sets_only_the_name_with_its_own_drive_scoped_token(self):
+        calls = []
+
+        def fetch(method, url, body, headers):
+            calls.append((method, url, json.loads(body) if body else None, headers["Authorization"]))
+            return 200, b'{"name": "CONSUMED task-1 t"}'
+        g = gd.GoogleDocs(token_provider=lambda: "read", rename_token_provider=lambda: "rename", fetch=fetch)
+        self.assertEqual("CONSUMED task-1 t", g.rename(FILE, "CONSUMED task-1 t"))
+        self.assertEqual([("PATCH", gd.DRIVE + FILE + "?fields=name", {"name": "CONSUMED task-1 t"}, "Bearer rename")],
+                         calls)
+        self.assertIn("auth/drive", gd.RENAME_METADATA)
+        self.assertNotIn("auth/drive", gd.METADATA.replace("auth/drive.readonly", ""))
 
     def test_no_token_refuses_before_any_call(self):
         g = gd.GoogleDocs(token_provider=lambda: "", fetch=lambda *a: self.fail("called"))
