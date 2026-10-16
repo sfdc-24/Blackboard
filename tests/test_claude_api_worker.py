@@ -82,6 +82,23 @@ class Receipts:
         return "".join(b if b.startswith("\n") else "\n" + b for _, _, b in self.lines) + ("\n" if self.lines else "")
 
 
+class MultiDocs:
+    """Several docs in the folder, one Receipts for all: only the doc that is run ever gets a line."""
+
+    def __init__(self, texts, receipts):
+        self.texts, self.receipts = texts, receipts
+
+    def read(self, file_id):
+        return {"text": self.texts[file_id] + self.receipts.text(), "revision_id": self.receipts.revision,
+                "folder_id": FOLDER}
+
+    def append(self, *args):
+        return self.receipts.append(*args)
+
+    def has(self, *args):
+        return self.receipts.has(*args)
+
+
 class Inbox:
     def __init__(self, entries=()):
         self.entries = list(entries)         # oldest first, like a stream
@@ -123,6 +140,15 @@ def entry(text=REQUEST, when=NOW - 60, recipient=wk.WORKER, task_id=None):
               "text": di.gist(text)["text"], "chars": "40", "full": "1",
               "source_doc_id": FILE, "source_revision": t["source_revision"],
               "request_id": t["request_id"], "task_id": task_id or t["task_id"], "recipient_id": recipient}
+    return ("%d-0" % int(when * 1000), fields)
+
+
+def multi_entry(file_id, text, when):
+    t = di.correlate(file_id, text, "r1", wk.WORKER)
+    fields = {"by": "drive-intake", "at": "2026-10-11T04:00:00Z", "kind": "drive_request",
+              "text": di.gist(text)["text"], "chars": "40", "full": "1",
+              "source_doc_id": file_id, "source_revision": t["source_revision"],
+              "request_id": t["request_id"], "task_id": t["task_id"], "recipient_id": wk.WORKER}
     return ("%d-0" % int(when * 1000), fields)
 
 
@@ -283,6 +309,49 @@ class GateTest(unittest.TestCase):
         d = deps()
         laptop_up(d, age=301.0)
         self.assertEqual("succeeded", wk.run_once(d)["considered"][0]["status"])
+
+    def test_addressed_only_with_the_laptop_off_skips_an_unaddressed_doc_with_nothing_written(self):
+        d = deps(addressed_only=True)
+        out = wk.run_once(d)
+        self.assertEqual("not_addressed", out["considered"][0]["status"], out)
+        self.assertEqual([], d.model.calls)
+        self.assertEqual([], d.receipts.lines)
+        self.assertEqual({}, d.claims.states)
+
+    def test_addressed_only_skips_an_unaddressed_doc_even_after_thirty_minutes(self):
+        d = deps(addressed_only=True)
+        laptop_up(d)
+        d.inbox = Inbox([entry(when=NOW - 1801)])
+        self.assertEqual("not_addressed", wk.run_once(d)["considered"][0]["status"])
+        self.assertEqual([], d.model.calls)
+
+    def test_addressed_only_skips_a_doc_naming_another_worker(self):
+        d = deps(text="to: codex" + chr(10) + REQUEST, addressed_only=True)
+        self.assertEqual("not_addressed", wk.run_once(d)["considered"][0]["status"])
+        self.assertEqual([], d.model.calls)
+
+    def test_addressed_only_runs_the_doc_that_names_claude_api(self):
+        d = deps(text="to: claude-api" + chr(10) + REQUEST, addressed_only=True)
+        self.assertEqual("succeeded", wk.run_once(d)["considered"][0]["status"])
+        self.assertEqual(1, len(d.model.calls))
+
+    def test_addressed_only_passes_a_backlog_to_reach_the_named_doc_in_one_pass(self):
+        named = "to: claude-api" + chr(10) + "GATE3-RUN" + chr(10) + "request: G3-RUN-1" + chr(10) + "One bounded ask." + chr(10)
+        texts = [REQUEST + "draft %d" % i + chr(10) for i in range(3)] + [named]
+        d = deps(addressed_only=True)
+        ids = [FILE[:-1] + c for c in "ABCD"]
+        docs = {f: t + intake_lines(di.correlate(f, t, "r1", wk.WORKER)) for f, t in zip(ids, texts)}
+        d.docs = d.receipts = MultiDocs(docs, d.receipts)
+        d.inbox = Inbox([multi_entry(f, t, NOW - 600 + i) for i, (f, t) in enumerate(zip(ids, texts))])
+        out = wk.run_once(d)
+        self.assertEqual(["not_addressed"] * 3 + ["succeeded"], [c["status"] for c in out["considered"]], out)
+        self.assertEqual(1, len(d.model.calls))
+
+    def test_addressed_only_flag_is_exactly_on(self):
+        for value in (None, "", "ON", "1", "true", " on"):
+            env = {} if value is None else {"CLAUDE_API_WORKER_ADDRESSED_ONLY": value}
+            self.assertFalse(wk.addressed_only_from_env(env), repr(value))
+        self.assertTrue(wk.addressed_only_from_env({"CLAUDE_API_WORKER_ADDRESSED_ONLY": "on"}))
 
     def test_a_task_the_laptop_already_accepted_in_the_doc_is_not_run(self):
         t = task_tuple()
