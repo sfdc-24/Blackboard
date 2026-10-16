@@ -404,6 +404,15 @@ def consider(entry_id, fields: dict, deps) -> dict:
         return {"status": "not_mine", "task": fields.get("task_id") or None, "ran": False}
     task_id = tuple_["task_id"]
     out = {"status": "", "task": task_id, "ran": False}
+    # drive-intake's task filter (PR 419) puts its verdict on the entry. mode=dry_run is the owner's G5:
+    # no CONFIRM token matched, so validate only - no spend. An action other than "task" (a LOU CALL GO's
+    # rehearsal_call) is a dialer's job, never a model call. Entries from before the filter carry neither.
+    if fields.get("mode") == "dry_run":
+        out["status"] = "dry_run"
+        return out
+    if fields.get("action") and fields.get("action") != "task":
+        out.update(status="not_a_task", action=str(fields.get("action")))
+        return out
     try:
         if deps.claims.done(task_id):
             out["status"] = "done"

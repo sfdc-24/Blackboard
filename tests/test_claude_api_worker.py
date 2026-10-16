@@ -347,6 +347,28 @@ class GateTest(unittest.TestCase):
         self.assertEqual(["not_addressed"] * 3 + ["succeeded"], [c["status"] for c in out["considered"]], out)
         self.assertEqual(1, len(d.model.calls))
 
+    def test_a_dry_run_task_is_never_a_call_even_when_named(self):
+        d = deps(text="to: claude-api" + chr(10) + REQUEST)
+        entry_id, fields = d.inbox.entries[0]
+        fields.update(action="task", mode="dry_run", prefix="TASK:")
+        out = wk.run_once(d)
+        self.assertEqual("dry_run", out["considered"][0]["status"], out)
+        self.assertEqual([], d.model.calls)
+        self.assertEqual([], d.receipts.lines)
+        self.assertEqual({}, d.claims.states)
+
+    def test_a_live_task_named_runs(self):
+        d = deps(text="to: claude-api" + chr(10) + REQUEST, addressed_only=True)
+        d.inbox.entries[0][1].update(action="task", mode="live", prefix="TASK:")
+        self.assertEqual("succeeded", wk.run_once(d)["considered"][0]["status"])
+        self.assertEqual(1, len(d.model.calls))
+
+    def test_a_rehearsal_call_is_never_a_model_call(self):
+        d = deps(text="to: claude-api" + chr(10) + REQUEST)
+        d.inbox.entries[0][1].update(action="rehearsal_call", mode="live", prefix="LOU CALL GO")
+        self.assertEqual("not_a_task", wk.run_once(d)["considered"][0]["status"])
+        self.assertEqual([], d.model.calls)
+
     def test_addressed_only_flag_is_exactly_on(self):
         for value in (None, "", "ON", "1", "true", " on"):
             env = {} if value is None else {"CLAUDE_API_WORKER_ADDRESSED_ONLY": value}
