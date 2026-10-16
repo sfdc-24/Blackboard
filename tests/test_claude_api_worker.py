@@ -1217,5 +1217,18 @@ class GoogleDocsTest(unittest.TestCase):
         self.assertEqual("t", gd.metadata_token(fetch=lambda m, u, b, h: (200, b'{"access_token": "t"}')))
 
 
+class ImageTest(unittest.TestCase):
+    # Gate 3 Step 5, 2026-10-16 23:31Z: image main-195252b died at import because drive_intake.py loads
+    # task_filter.py from beside itself and this Dockerfile never copied it. Every sibling it loads must ride along.
+    def test_the_image_carries_what_the_contract_loads(self):
+        import re  # noqa: PLC0415
+        contract = (REPO / "cloud" / "drive-intake" / "main.py").read_text(encoding="utf-8")
+        dockerfile = (REPO / "cloud" / "claude-api-worker" / "Dockerfile").read_text(encoding="utf-8")
+        siblings = re.findall(r'os\.path\.join\(here, "([^"]+\.py)"\)', contract)
+        self.assertIn("task_filter.py", siblings)
+        for name in siblings:
+            self.assertIn("COPY cloud/drive-intake/%s /app/%s" % (name, name), dockerfile)
+
+
 if __name__ == "__main__":
     unittest.main()
