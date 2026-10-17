@@ -79,7 +79,15 @@ async def room_session_id(room, fallback: str) -> str:
         return fallback
 
 
-server = AgentServer()
+def server_options(environ=None) -> dict:
+    """Cloud Run probes $PORT (deploy.sh sets 8081, the SDK's own health port). One idle process is
+    enough for one Lou at a time on a 1 GiB instance; the SDK's default keeps several warm."""
+    environ = os.environ if environ is None else environ
+    return {"port": int(environ.get("PORT") or 8081),
+            "num_idle_processes": int(environ.get("LOU_IDLE_PROCESSES") or 1)}
+
+
+server = AgentServer(**server_options())
 
 
 @server.rtc_session(agent_name=AGENT_NAME)

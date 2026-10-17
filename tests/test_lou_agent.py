@@ -171,6 +171,21 @@ class TranscriptTest(unittest.TestCase):
                 tools.transcript_key(room, session)
 
 
+class ImageTest(unittest.TestCase):
+    def test_the_image_carries_every_module_the_agent_imports(self):
+        dockerfile = (LOU / "Dockerfile").read_text(encoding="utf-8")
+        for name in ("lou_tools.py", "lou_agent.py", "requirements.txt"):
+            self.assertIn("COPY cloud/lou-agent/%s /app/%s" % (name, name), dockerfile)
+        self.assertIn("COPY scripts/redis_dual.py /app/redis_dual.py", dockerfile)
+        self.assertIn("COPY scripts/redis_dual.settings.json /app/redis_dual.settings.json", dockerfile)
+
+    def test_the_deploy_keeps_the_prompt_and_keys_out_of_the_image(self):
+        deploy = (LOU / "deploy.sh").read_text(encoding="utf-8")
+        for secret in ("LIVEKIT_URL=LOU_LIVEKIT_URL:latest", "OPENAI_API_KEY=OPENAI_API_KEY:latest",
+                       "=LOU_INSTRUCTIONS:latest", "--ingress internal", "--min-instances 1 --max-instances 1"):
+            self.assertIn(secret, deploy)
+
+
 class ModelTest(unittest.TestCase):
     def test_the_builder_lous_model_and_voice_are_the_defaults(self):
         """cowork-chrome, 2026-10-17: the Builder Lou runs GPT-Live 1 with voice Marin."""
@@ -242,6 +257,12 @@ class SdkTest(unittest.TestCase):
         self.assertEqual("RM_XgPGs9mjFt8r", asyncio.run(agent.room_session_id(Room("RM_XgPGs9mjFt8r"), "t1")))
         self.assertEqual("t1", asyncio.run(agent.room_session_id(Room(fail=True), "t1")))
         self.assertEqual("t1", asyncio.run(agent.room_session_id(Room(""), "t1")))
+
+    def test_the_server_listens_where_cloud_run_probes(self):
+        agent = importlib.import_module("lou_agent")
+        self.assertEqual({"port": 8081, "num_idle_processes": 1}, agent.server_options({}))
+        self.assertEqual({"port": 9000, "num_idle_processes": 2},
+                         agent.server_options({"PORT": "9000", "LOU_IDLE_PROCESSES": "2"}))
 
     def test_the_gpt_live_model_takes_the_tool(self):
         from livekit.plugins import openai  # noqa: PLC0415
