@@ -167,6 +167,8 @@ on:
       - "tests/fixtures/wa_outbox_rows.json"
       - "scripts/agent_waker.py"
       - "tests/test_agent_waker.py"
+      - "scripts/cloud_context.py"
+      - "tests/test_gemini_wider_read.py"
       - "scripts/board_row.py"
       - "tests/test_board_row.py"
       - "tools/board_governor/board_facts.py"
@@ -337,6 +339,8 @@ on:
       - "tests/fixtures/wa_outbox_rows.json"
       - "scripts/agent_waker.py"
       - "tests/test_agent_waker.py"
+      - "scripts/cloud_context.py"
+      - "tests/test_gemini_wider_read.py"
       - "scripts/board_row.py"
       - "tests/test_board_row.py"
       - "tools/board_governor/board_facts.py"
@@ -428,6 +432,7 @@ jobs:
                    tests/test_wa_outbox_cloud.py \
                    tests/test_pi1_wake.py \
                    tests/test_gemini_cloud_waker.py \
+                   tests/test_gemini_wider_read.py \
                    tests/test_soak_report.py \
                    tests/test_studio_controller.py \
                    tests/test_studio_auth.py \
@@ -892,6 +897,19 @@ jobs:
             echo "not on this branch; skipping"
           fi
 
+      # Gemini's read-only cloud context (scripts/cloud_context.py): values withheld, logs redacted,
+      # and the past-state reads a checker's re-check needs (Gate 3 Step 1b). Every API is faked.
+      - name: "gemini cloud context: values withheld, logs redacted, past state (no network)"
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_gemini_wider_read.py ]; then
+            python_bin="$(command -v python3)"
+            # Loopback only: the redirect test serves on 127.0.0.1, and a new namespace starts with lo down.
+            sudo unshare -n -- sh -c 'ip link set lo up && exec "$0" -B tests/test_gemini_wider_read.py' "$python_bin"
+          else
+            echo "not on this branch; skipping"
+          fi
+
       # The soak judge, which is the evidence cutover step 8 would be decided
       # on - step 8 being Mr Salam disabling the laptop scheduler. A judge that
       # cannot fail is worse than no judge, so every criterion here is tested by
@@ -1273,6 +1291,7 @@ jobs:
              && [ ! -f tests/test_board_watcher.py ] \
              && [ ! -f tests/test_wa_outbox_cloud.py ] \
              && [ ! -f tests/test_gemini_cloud_waker.py ] \
+             && [ ! -f tests/test_gemini_wider_read.py ] \
              && [ ! -f tests/test_soak_report.py ] \
              && [ ! -f tests/test_studio_controller.py ] \
              && [ ! -f tests/test_studio_auth.py ] \
