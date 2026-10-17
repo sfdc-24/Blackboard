@@ -378,9 +378,20 @@ def cmd_post(args):
     return append_and_verify(rid, row, fitted, spill)
 
 
+# What append_and_verify prints, and what agent_waker.post_reply looks for, when the row landed but
+# its long text could not be CONFIRMED in the store. Unconfirmed, not "not stored": a write that
+# landed followed by a read-back that was refused or timed out leaves the object there and this
+# process unable to say so (Aya on ddd3275). agent_waker restates the literal (it runs this file as
+# a subprocess and imports nothing from it); tests/test_board_row.py holds the two to the same words.
+FULLTEXT_UNCONFIRMED_MARK = "POSTED, FULLTEXT_UNCONFIRMED"
+
+
 def append_and_verify(rid, row, fitted=None, spill=None):
     """Append one row, commit its spill if it has one, and prove it landed by reading it back.
-    0 only on a verified row. The one append path for post and request, so they cannot drift."""
+    0 only on a verified row whose long text, if any, was read back from the store. 3 when the row
+    landed but that text could not be confirmed there (it may or may not be stored). 1 when the row
+    could not be found or the board could not be read. The one append path for post and request, so
+    they cannot drift."""
     fitted = fitted or {}
     # tries=1 is not a tuning choice. The v1 bus does not dedup, and a
     # googleusercontent 404 on the redirect hop can be raised client-side AFTER
@@ -401,13 +412,16 @@ def append_and_verify(rid, row, fitted=None, spill=None):
     # The spill is off the post: the append above did not wait on the store. Commit now, so a
     # reader that resolves the pointer after this process returns finds the bytes. A failure is
     # said; it does not pretend the append failed, and it does not overwrite an object that landed.
+    spill_problem = None
     if fitted.get("deferred"):
         try:
+            # commit() returns only after it has read the object back and matched its sha256.
             board_row.commit(fitted, spill)
             print("  long text (%d chars) stored whole at %s; the row carries the pointer"
                   % (fitted["chars"], fitted["pointer"]))
         except Exception as exc:  # noqa: BLE001
-            print("  SPILL_UNCONFIRMED: %s: %s" % (type(exc).__name__, exc))
+            spill_problem = "%s: %s" % (type(exc).__name__, exc)
+            print("  SPILL_UNCONFIRMED: %s" % spill_problem)
             print("  The row is already posted. The object name is the row id plus the sha256, so "
                   "a later commit of the same text reuses it and cannot overwrite a different one.")
 
@@ -419,6 +433,17 @@ def append_and_verify(rid, row, fitted=None, spill=None):
     _, recs = rows_frame(data)
     hit = [r for r in recs if str(r.get("Row_ID", "")) == rid]
     if hit:
+        if spill_problem:
+            # The row landed but its long text was not read back from the store. That is not a
+            # verified post: until 2026-10-13 this printed VERIFIED and returned 0, the waker
+            # trusted the word, and two reviews reached the board as pointers nobody could open.
+            # Exit 3 is "the row is on the board, its full text is unconfirmed". The text may be
+            # there (a write that landed and a read-back that was refused or timed out) or may
+            # not; this process cannot tell which, so it claims neither. Never post the row again.
+            print("  %s: Row_ID=%s is on the board; its full text could not be confirmed in the "
+                  "store (%s). The full= pointer may or may not resolve. Do NOT post the row again."
+                  % (FULLTEXT_UNCONFIRMED_MARK, rid, spill_problem))
+            return 3
         print("  VERIFIED on the board: Row_ID=%s Source_Tag=%s Target_Surface=%s"
               % (rid, hit[-1].get("Source_Tag"), hit[-1].get("Target_Surface")))
         return 0
