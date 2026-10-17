@@ -187,6 +187,8 @@ on:
       - "cloud/claude-api-worker/deploy.sh"
       - "tests/test_telephone_deploy.py"
       - "tests/test_telephone_smoke.py"
+      - "cloud/lou-agent/**"
+      - "tests/test_lou_agent.py"
       - ".github/workflows/python-suites.yml"
   push:
     branches: [main]
@@ -355,6 +357,8 @@ on:
       - "cloud/claude-api-worker/deploy.sh"
       - "tests/test_telephone_deploy.py"
       - "tests/test_telephone_smoke.py"
+      - "cloud/lou-agent/**"
+      - "tests/test_lou_agent.py"
       - ".github/workflows/python-suites.yml"
 
 permissions:
@@ -447,7 +451,7 @@ jobs:
                    tests/test_claude_api_lane.py \
                    tests/test_phone_intake.py \
                    tests/test_telephone_deploy.py \
-                   tests/test_telephone_smoke.py; do
+                   tests/test_telephone_smoke.py \n                   tests/test_lou_agent.py; do
             if [ -f "$t" ]; then echo "present : $t"; else echo "absent  : $t"; fi
           done
 
@@ -552,6 +556,22 @@ jobs:
       # for a task the doc already shows answered or taken, no call before ACCEPTED reads back,
       # no call without a reservation under the day cap, an answer kept before its receipt, an
       # edited request superseded, a timeout UNKNOWN and never re-run. Offline by construction.
+      # Lou as code (cloud/lou-agent): T1 get_weather and T6 the transcript. The SDK is installed
+      # first, in its own venv, so the SdkTest drives a real livekit-agents AgentSession with a fake
+      # model; the run itself is under unshare -n like every suite here.
+      - name: "Lou code agent: SDK install"
+        if: ${{ hashFiles('tests/test_lou_agent.py') != '' }}
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/lou-agent-env"
+          "$RUNNER_TEMP/lou-agent-env/bin/python" -m pip install -r cloud/lou-agent/requirements.txt
+
+      - name: "Lou code agent: weather, transcript and the SDK firing the tool (no network)"
+        if: ${{ hashFiles('tests/test_lou_agent.py') != '' }}
+        run: |
+          set -euo pipefail
+          sudo unshare -n -- "$RUNNER_TEMP/lou-agent-env/bin/python" -m unittest tests.test_lou_agent -v
+
       - name: claude-api worker gate, cap, acceptance and receipts (no network)
         run: |
           set -euo pipefail

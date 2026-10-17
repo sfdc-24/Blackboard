@@ -1,4 +1,4 @@
-"""Lou as code: a LiveKit Agents worker (livekit-agents 1.8.8) on the OpenAI realtime model, with tools that fire.
+"""Lou as code: a LiveKit Agents worker (livekit-agents 1.8.8) on OpenAI GPT-Live, with tools that fire.
 
 Why code: the no-code Agent Builder never starts a function tool (zero "Function tools started" events, seen
 twice in the LiveKit Console). In code the realtime session calls @function_tool methods. The Builder agent
@@ -71,23 +71,35 @@ class Lou(Agent):
         return await asyncio.to_thread(tools.weather_now, location)
 
 
+async def room_session_id(room, fallback: str) -> str:
+    """LiveKit's id for this session of the room (RM_...). The room name is reused across calls; this is not."""
+    try:
+        return str(await asyncio.wait_for(room.sid, timeout=5)) or fallback
+    except Exception:  # noqa: BLE001 - no sid means the start time keys the transcript, never a dropped one
+        return fallback
+
+
 server = AgentServer()
 
 
 @server.rtc_session(agent_name=AGENT_NAME)
 async def entrypoint(ctx: JobContext):
     started = time.time()
-    session = AgentSession(llm=openai.realtime.RealtimeModel(
-        model=os.environ.get("LOU_REALTIME_MODEL", "gpt-realtime"),
+    # The Builder Lou's model and voice (cowork-chrome, 2026-10-17): GPT-Live 1, voice Marin.
+    session = AgentSession(llm=openai.realtime.GPTLiveModel(
+        model=os.environ.get("LOU_REALTIME_MODEL", "gpt-live-1"),
         voice=os.environ.get("LOU_VOICE", "marin")))
+    call = {"session": "t%d" % int(started)}   # replaced by LiveKit's room session id once connected
 
     async def save_transcript(reason: str = ""):
-        record = tools.transcript_record(ctx.room.name, session.history.to_dict(), started, time.time(), AGENT_NAME)
+        record = tools.transcript_record(ctx.room.name, call["session"], session.history.to_dict(), started,
+                                         time.time(), AGENT_NAME)
         where = await asyncio.to_thread(tools.save_transcript, record, redis_client())
         log.info("transcript saved to %s (%d turns, %s)", where, record["turns"], reason or "ended")
 
     ctx.add_shutdown_callback(save_transcript)
     await ctx.connect()
+    call["session"] = await room_session_id(ctx.room, call["session"])
     await ctx.wait_for_participant()   # on an outbound call, the callee; Lou speaks only once someone is there
     await session.start(agent=Lou(instructions()), room=ctx.room)
     await session.generate_reply(instructions=OPENER)
