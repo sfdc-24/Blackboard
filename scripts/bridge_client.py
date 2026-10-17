@@ -207,16 +207,40 @@ def config(environ=None):
 
 def load_callers(path=None) -> dict:
     """{service-account email: principal} from the bridge's own callers.json. A missing or malformed
-    file maps NOBODY, so the bridge is not used: stricter, never looser."""
+    file maps NOBODY, so the bridge is not used: stricter, never looser.
+
+    A line is a bare principal or {"principal", "for": "fleet-agent"} for a fleet agent, {"principal",
+    "for": "chair", "personas": [...]} for the conference chair, or {"principal", "for": "probe"} for an
+    account admitted for the probe only, which the service refuses on /op and which is therefore NOT
+    returned here: this client does not try the bridge with it. Read by the SAME rule as the service
+    (cloud/redis-tool-bridge/op.py, load_callers): a line the service would not serve, this does not map
+    either. tests/test_bridge_client.py holds the two readers equal."""
     try:
         with open(path or CALLERS_FILE, encoding="utf-8") as fh:
             callers = json.load(fh)["callers"]
         if not isinstance(callers, dict):
             return {}
-        return {str(k).strip().lower(): str(v).strip().lower() for k, v in callers.items()
-                if str(k).strip() and str(v).strip()}
     except (OSError, ValueError, KeyError, TypeError):
         return {}
+    out = {}
+    for email, line in callers.items():
+        if isinstance(line, str):
+            who = line
+        elif isinstance(line, dict) and set(line) == {"principal", "for"} and line["for"] == "fleet-agent":
+            who = line["principal"]
+        elif isinstance(line, dict) and set(line) == {"principal", "for", "personas"} and line["for"] == "chair":
+            who, named = line["principal"], line["personas"]
+            if not isinstance(named, list) or not 1 <= len(named) <= 4 or len(set(map(str, named))) != len(named) \
+                    or not all(isinstance(name, str) and re.fullmatch(r"[a-z][a-z0-9-]{1,31}", name) for name in named):
+                continue
+        else:
+            continue                    # a probe-only account among them: the service refuses it on /op
+        if not isinstance(who, str):
+            continue
+        email, who = str(email).strip().lower(), who.strip().lower()
+        if email and who:
+            out[email] = who
+    return out
 
 
 def mint(url: str, account: str, run=subprocess.run, which=shutil.which) -> str:

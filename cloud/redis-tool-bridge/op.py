@@ -64,35 +64,139 @@ THE BODY
     bound principal is not the expected one, the answer is 403 "principal mismatch" and nothing is
     executed. Without it a client configured with another agent's service account would write under
     that agent's name and learn of it only from the answer, after the fact.
+
+    "author" AND "request" ARE FOR THE CONFERENCE CHAIR AND FOR NOBODY ELSE
+    (conference docs/PERSONA-WRITE-CONFIRMATION-A1.md, rows 6 and 7 and section 10.6)
+    The chair writes under its OWN verified identity for a persona that holds no identity at all. So it
+    must say, every time, which persona ("author") and under which request id ("request"); both go into
+    the audit entry as CLAIMS beside the verified actor (redis_gov.said), and both come back in the answer,
+    so the chair can tell the acknowledgment of ITS request from any other 200. What a caller is FOR is
+    its line in callers.json, never the request:
+        a fleet agent     may not state either member: a 400. Its own name is already the verified one.
+        the chair         must state both on every op: a 400 without them.
+        a probe account   is admitted to the service for /probe and is refused here: a 403.
+
+    THE PILOT (conference docs/PERSONA-WRITE-CONFIRMATION-A1.md, section 12; Aya,
+    AYA-PILOT-SOURCE-DIRECTION-20261014T0031Z). For the pilot the chair is the ONLY caller of this endpoint,
+    and all it may do is `get` and `set` ONE synthetic key a day for ONE listed persona:
+        the op            get or set. Nothing else, whatever the access list would allow.
+        the key           conf:persona:<yyyymmdd>:<author>, where the day is today or yesterday in UTC and
+                          the author is on the list in the chair's own line of callers.json.
+        the ceiling       CHAIR_WRITES_PER_HOUR sets an hour, per instance: a 429 past it.
+    Each is refused before any connection, with "executed": false. The value's cap and its 24 hours are
+    the access list's, for the prefix.
+
+    WHAT THIS DOES NOT DO, AND MUST BE SAID WHEREVER THE PILOT IS APPROVED: THE BRIDGE TRUSTS THE CHAIR'S
+    IDENTITY. It does not see the owner's confirmation and does not enforce it; the chair does. Whoever
+    holds the chair's identity can make these writes with no confirmation at all. What bounds that is the
+    list above and nothing else, which is why the list is this short, and why the pilot may not be widened
+    to real content while this is so.
 """
 from __future__ import annotations
 
+import collections
+import datetime
 import json
 import os
+import re
+import time
 
 # A value is at most 8 KB (proj:milestones:) and travels base64, so about 11 KB; 16 KB bounds the
 # read without refusing a legitimate write. main.py reads no more than this for /op.
 MAX_BODY_BYTES = 16384
 CALLERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "callers.json")
-MEMBERS = ("op", "key", "field", "val", "enc", "count", "after", "expect")
+MEMBERS = ("op", "key", "field", "val", "enc", "count", "after", "expect", "author", "request")
 # The ops that change nothing a caller owns. A failure inside one of these changed nothing; a failure
 # inside any other op is an unknown outcome. Restated from redis_gov.OPS_READ and held equal by a test.
 READS = ("get", "hgetall", "xrange")
+# What a caller is FOR: its line in callers.json says, and a line that says anything else maps nobody.
+FLEET, CHAIR, PROBE = "fleet-agent", "chair", "probe"
+PURPOSES = (FLEET, CHAIR, PROBE)
+CHAIR_OPS = ("get", "set")
+CHAIR_WRITES_PER_HOUR = 20              # per instance, in memory: a ceiling on a flood, not a record (take())
+MAX_PERSONAS = 4                        # as the chair's own cast
+# The one kind of key the chair touches: a persona's own, for one day. Its day, and the author it states.
+_PERSONA = re.compile(r"[a-z][a-z0-9-]{1,31}")
+_PERSONA_KEY = re.compile(r"conf:persona:([0-9]{8}):([a-z][a-z0-9-]{1,31})")
+clock = time.time                       # the door's clock; a test puts its own here
+_SPENT = collections.deque()            # when this instance's chair writes were made, oldest first
 
 
-def load_callers(path=None) -> dict:
-    """{verified email: principal}, lower-cased. A missing or malformed file maps NOBODY: the same
-    direction as redis_gov.load_acl, where an absent rule makes access stricter, never looser."""
+def _lines(path=None) -> dict:
+    """{verified email: (principal, what the caller is for, the personas it may name)}, lower-cased.
+
+    A line is one of three, and a line that is none of them maps NOBODY:
+        "principal"                                             a fleet agent, as every line was at first
+        {"principal": ..., "for": "fleet-agent" | "probe"}      a fleet agent; or an account admitted for the
+                                                                probe only, which /op refuses
+        {"principal": ..., "for": "chair", "personas": [...]}   the conference chair, and the personas it may
+                                                                name: one to MAX_PERSONAS names, each once
+    Nothing rides in on an extra member, and a list of personas on a line that is not the chair's is one."""
     try:
         with open(path or CALLERS_FILE, encoding="utf-8") as fh:
             data = json.load(fh)
         callers = data["callers"]
         if not isinstance(callers, dict):
             return {}
-        return {str(k).strip().lower(): str(v).strip().lower() for k, v in callers.items()
-                if str(k).strip() and str(v).strip()}
     except (OSError, ValueError, KeyError, TypeError):
         return {}
+    out = {}
+    for email, line in callers.items():
+        personas = ()
+        if isinstance(line, str):
+            who, purpose = line, FLEET
+        elif isinstance(line, dict) and set(line) == {"principal", "for"} and line["for"] in (FLEET, PROBE):
+            who, purpose = line["principal"], line["for"]
+        elif isinstance(line, dict) and set(line) == {"principal", "for", "personas"} and line["for"] == CHAIR:
+            who, purpose, named = line["principal"], CHAIR, line["personas"]
+            if not isinstance(named, list) or not 1 <= len(named) <= MAX_PERSONAS or len(set(map(str, named))) != len(named) \
+                    or not all(isinstance(name, str) and _PERSONA.fullmatch(name) for name in named):
+                continue
+            personas = tuple(named)
+        else:
+            continue
+        if not isinstance(who, str):
+            continue
+        email, who = str(email).strip().lower(), who.strip().lower()
+        if email and who:
+            out[email] = (who, purpose, personas)
+    return out
+
+
+def load_callers(path=None) -> dict:
+    """{verified email: principal} for the callers that may use /op, lower-cased. An account admitted for the
+    probe only is NOT here: it acts as nobody. A missing or malformed file maps NOBODY: the same direction as
+    redis_gov.load_acl, where an absent rule makes access stricter, never looser."""
+    return {email: who for email, (who, purpose, _) in _lines(path).items() if purpose != PROBE}
+
+
+def load_purposes(path=None) -> dict:
+    """{verified email: what that caller is for}, every line. The same file, the same strictness."""
+    return {email: purpose for email, (_, purpose, _) in _lines(path).items()}
+
+
+def load_personas(path=None) -> dict:
+    """{the chair's verified email: the personas it may name}."""
+    return {email: personas for email, (_, purpose, personas) in _lines(path).items() if purpose == CHAIR}
+
+
+def days(now: float) -> tuple:
+    """Today and yesterday in UTC, as a persona key carries a day. Yesterday: a write proposed a minute before
+    midnight is confirmed a minute after it, under the key it was shown with."""
+    return tuple((datetime.datetime.fromtimestamp(now, datetime.timezone.utc) - datetime.timedelta(days=back))
+                 .strftime("%Y%m%d") for back in (0, 1))
+
+
+def take(now: float, spent) -> bool:
+    """May the chair make one more write in this hour? `spent` holds the times of the ones made. THE BOUND IS
+    PER INSTANCE AND IN MEMORY: it is a ceiling on a flood, kept honest by deploy.sh's one instance, and it is
+    forgotten when the instance restarts. It is not a record and not a total."""
+    while spent and now - spent[0] >= 3600.0:
+        spent.popleft()
+    if len(spent) >= CHAIR_WRITES_PER_HOUR:
+        return False
+    spent.append(now)
+    return True
 
 
 def parse(raw: bytes) -> tuple:
@@ -121,7 +225,8 @@ def parse(raw: bytes) -> tuple:
     return out, None
 
 
-def handle(caller: str, raw: bytes, connect, log, callers=None, gov=None, acl=None) -> tuple:
+def handle(caller: str, raw: bytes, connect, log, callers=None, gov=None, acl=None, purposes=None,
+           personas=None, now=None, spent=None) -> tuple:
     """(status, body) for one /op request from an ALREADY VERIFIED caller.
 
     caller   the email main.verify_caller returned: verified, and on BRIDGE_CALLERS.
@@ -129,7 +234,13 @@ def handle(caller: str, raw: bytes, connect, log, callers=None, gov=None, acl=No
              connection.
     log      a callable taking one line. No value, no key content and no body ever goes to it.
     """
-    who = (load_callers() if callers is None else callers).get(str(caller or "").strip().lower())
+    email = str(caller or "").strip().lower()
+    purpose = (load_purposes() if purposes is None else purposes).get(email, FLEET)
+    if purpose == PROBE:
+        # Admitted to the service, for the probe. Not our misconfiguration and not a caller of this endpoint.
+        log("op by %s: this account is admitted for the probe only" % caller)
+        return 403, {"error": "not authorised", "executed": False}
+    who = (load_callers() if callers is None else callers).get(email)
     if not who:
         log("REFUSING /op: %s is on the caller allowlist and has no principal in callers.json"
             % caller)
@@ -143,6 +254,25 @@ def handle(caller: str, raw: bytes, connect, log, callers=None, gov=None, acl=No
         # BEFORE the connection, so "nothing was executed" is true by construction.
         log("op by %s: principal mismatch (bound to %s; the client expected another)" % (caller, who))
         return 403, {"error": "principal mismatch", "executed": False, "principal": who}
+    # WHO THE CALLER SAYS IT ACTS FOR. Decided by what the caller is FOR, which is its line in callers.json
+    # and never the request. Every refusal here is before the connection, so "executed": false is true.
+    op = request["op"].strip().lower()[:16]
+    author, asked = request["author"], request["request"]
+    if purpose == CHAIR:
+        if not author or not asked:
+            log("op by %s: the chair did not say which persona and which request" % caller)
+            return 400, {"error": "bad request", "executed": False}
+        # The op and the key as they were SENT, not as redis_gov would tidy them: the chair sends them exact.
+        named = _PERSONA_KEY.fullmatch(request["key"])
+        listed = (load_personas() if personas is None else personas).get(email, ())
+        if request["op"] not in CHAIR_OPS or named is None or named.group(2) != author or author not in listed \
+                or named.group(1) not in days(clock() if now is None else now):
+            log("op by %s: not an op the chair makes, or not today's key of a persona it may name" % caller)
+            return 400, {"error": "bad request", "executed": False}
+    elif author or asked:
+        log("op by %s: author or request stated by a caller that is not the chair" % caller)
+        return 400, {"error": "bad request", "executed": False}
+    stated = {name: value for name, value in (("author", author), ("request", asked)) if value}
     if gov is None:
         import redis_gov as gov
     try:
@@ -150,20 +280,25 @@ def handle(caller: str, raw: bytes, connect, log, callers=None, gov=None, acl=No
     except Exception as error:  # noqa: BLE001 - the TYPE only: a client's message can quote a secret
         log("op by %s: redis unreachable (%s)" % (caller, type(error).__name__))
         return 503, {"error": "redis unreachable", "executed": False}
+    if purpose == CHAIR and op == "set" and not take(clock() if now is None else now, _SPENT if spent is None else spent):
+        # After every other refusal, so only a write that would have run counts; before the write, so
+        # "executed": false is true.
+        log("op by %s: the chair's hourly ceiling of %d writes is reached" % (caller, CHAIR_WRITES_PER_HOUR))
+        return 429, {"error": "quota", "executed": False}
     result = gov.execute(conn, gov.load_acl() if acl is None else acl, who,
                          ("bridge:%s" % caller)[:120], request["op"], request["key"],
                          field=request["field"], raw_value=request["val"], enc=request["enc"],
-                         count=request["count"], after=request["after"])
-    op = request["op"].strip().lower()[:16]
+                         count=request["count"], after=request["after"],
+                         claimed_author=author, request_id=asked)
     if result.get("ok"):
         log("op by %s as %s: %s ok" % (caller, who, op))
-        return 200, dict(result, caller=caller, principal=who)
+        return 200, dict(result, caller=caller, principal=who, **stated)
     if "refused" in result:
         log("op by %s as %s: %s refused" % (caller, who, op))
         # A refusal is redis_gov deciding NOT to act, so nothing ran. `audit` is passed through as
         # it came: "ok", or "FAILED:<type>" when the refusal itself could not be recorded.
-        return 403, {"error": "refused", "reason": str(result["refused"]), "executed": False,
-                     "audit": result.get("audit", ""), "caller": caller, "principal": who}
+        return 403, dict({"error": "refused", "reason": str(result["refused"]), "executed": False,
+                          "audit": result.get("audit", ""), "caller": caller, "principal": who}, **stated)
     kind = str(result.get("error") or "unknown")
     if op in READS:
         log("op by %s as %s: %s failed (%s)" % (caller, who, op, kind))

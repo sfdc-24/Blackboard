@@ -87,6 +87,22 @@ governed ops, after the source is verified"). **D1 has not been given. Nothing h
   TTL, the value cap and the audit are one tested implementation, not two.
 - The caller is whoever `verify_caller` verified (signature, audience, allowlist), mapped to a principal
   by `callers.json`. The body cannot name who it acts as. `gov:audit` records `via = bridge:<email>`.
+- **The conference chair is the one caller that acts for someone else**, and it must say for whom. Its line in
+  `callers.json` is `"for": "chair"`. It states `author` (the persona) and `request` (its request id) on every
+  op, or gets a 400; both go into the audit entry as `claimed_author` and `request_id`, beside the verified
+  `actor`, and both come back in the answer. They are claims and are named as claims: nothing reads either as an
+  identity. A fleet agent that states either member gets a 400. (Conference
+  `docs/PERSONA-WRITE-CONFIRMATION-A1.md`.)
+- **The pilot (section 12 of that page): the chair is the only caller of `/op`.** It may `get` and `set` one key a
+  day for one listed persona, `conf:persona:<yyyymmdd>:<persona>`, the day being today or yesterday in UTC and
+  the persona one of those in its own line of `callers.json` (today: `claude`). Its principal may read and write
+  `conf:persona:` and nothing else; a value there is at most 512 bytes and expires in 24 hours; this instance
+  takes at most 20 chair writes an hour (in memory, per instance) and the deploy runs one instance. Aya's runtime
+  account's line says `"for": "probe"`: `/probe` as before, and a 403 on `/op`.
+- **What the pilot does not do: the bridge trusts the chair's identity. It does not see the owner's confirmation
+  and does not enforce it; the chair does.** Whoever holds the chair's identity can make these writes with no
+  confirmation. The short list above is all that bounds it, and the pilot may not be widened to real content
+  while that is so. Rollback stops new requests and undoes nothing: a write that landed stays until it expires.
 - A message through it costs no board row.
 
 | status | meaning |
@@ -114,8 +130,10 @@ principal; it can only make the bridge refuse, before anything runs, when the ca
 different one. That is what stops a client configured with another agent's account from writing under
 that agent's name.
 
-**Not built here** (the rest of Phase 3a): the hourly canary, the negative controls against a deployed
-bridge, and any second caller. **Built as source, deployed nowhere and off by default** (Phase 3b):
+**Not built here** (the rest of Phase 3a): the hourly canary and the negative controls against a deployed
+bridge. **A second caller's line is in `callers.json` as source: the conference chair's. It admits nobody by
+itself.** The deploy's `BRIDGE_CALLERS` does not name it and it holds no `run.invoker`; both are the owner's
+(D2), and neither is in this repository's power to give. **Built as source, deployed nowhere and off by default** (Phase 3b):
 the client, `scripts/bridge_client.py`, which `scripts/redis_inbox.py` sends through, with its breaker
 and its journal of writes whose outcome is unknown. Adding a caller is one line in `callers.json` after its service
 account exists and the owner has approved it (D2).

@@ -430,6 +430,68 @@ class EveryActionIsAudited(unittest.TestCase):
         self.assertEqual("", read_entry["old"])
 
 
+class WhoACallerSaysItActsFor(unittest.TestCase):
+    """redis_gov.said: two CLAIMS recorded beside the verified actor, for the conference chair, which writes
+    under its own identity for a persona that has none (conference docs/PERSONA-WRITE-CONFIRMATION-A1.md)."""
+
+    KEY, RID = "conf:persona:20261014:claude", "CLAUDE-TOOL-set-20261014T160000Z-a1b2c3d4"
+
+    def chair(self, conn, op, key, val="", author="claude", rid=None):
+        return gov.execute(conn, ACL, "conference-chair", "bridge:conference-chair@x", op, key, raw_value=val,
+                           claimed_author=author, request_id=self.RID if rid is None else rid)
+
+    def test_absent_an_entry_is_exactly_what_it_always_was(self):
+        conn = FakeRedis()
+        run(conn, "grok", "set", "fleet:x", val="1")
+        run(conn, "grok", "get", "fleet:x")
+        run(conn, "grok", "set", "gov:x", val="1")
+        for entry in conn.audit():
+            self.assertEqual({"at", "actor", "raw_tag", "via", "op", "key", "field", "ok", "reason", "old_sha", "old_len",
+                              "old", "new_sha", "new_len", "new", "acl"}, set(entry))
+
+    def test_a_write_a_read_and_a_refusal_each_record_both_beside_the_verified_actor(self):
+        conn = FakeRedis()
+        self.assertTrue(self.chair(conn, "set", self.KEY, "note")["ok"])
+        self.assertTrue(self.chair(conn, "get", self.KEY)["ok"])
+        self.assertIn("refused", self.chair(conn, "set", "fleet:x", "v"))
+        self.assertEqual(["1", "1", "0"], [e["ok"] for e in conn.audit()])
+        for entry in conn.audit():
+            self.assertEqual(("conference-chair", "claude", self.RID, "bridge:conference-chair@x"),
+                             (entry["actor"], entry["claimed_author"], entry["request_id"], entry["via"]))
+            self.assertTrue(all(isinstance(v, str) for v in entry.values()), "every value a string")
+        self.assertEqual("note", conn.get(self.KEY))
+
+    def test_a_claim_is_never_an_identity(self):
+        """Saying it acts for the owner gives the chair nothing the chair does not have."""
+        conn = FakeRedis()
+        result = self.chair(conn, "set", "fleet:inbox:grok", "v", author="owner")
+        self.assertEqual("conference-chair may not write under that key", result["refused"])
+        self.assertEqual(("conference-chair", "owner", "0"), tuple(conn.audit()[-1][k] for k in ("actor", "claimed_author", "ok")))
+        self.assertIsNone(conn.get("fleet:inbox:grok"))
+
+    def test_a_claim_of_the_wrong_shape_is_refused_before_anything_runs_and_is_not_recorded(self):
+        for author, rid in (("Claude", None), ("c", None), ("x" * 33, None), ("cl aude", None), ("claude\n", None),
+                            ("1claude", None), (7, None), (["claude"], None), ("claude", "id with space"),
+                            ("claude", "x" * 121), ("claude", "id\n"), ("claude", "-id"), ("claude", 7)):
+            conn = FakeRedis()
+            result = self.chair(conn, "set", self.KEY, "note", author=author, rid=rid)
+            self.assertIn("refused", result, (author, rid))
+            self.assertIsNone(conn.get(self.KEY), (author, rid))
+            [entry] = conn.audit()
+            self.assertEqual("0", entry["ok"])
+            self.assertNotIn("claimed_author", entry, "a refused claim is not written into the audit")
+            self.assertNotIn("request_id", entry)
+
+    def test_one_of_the_two_alone_is_recorded_alone(self):
+        conn = FakeRedis()
+        gov.execute(conn, ACL, "grok", "REQ-1", "set", "fleet:x", raw_value="1", request_id="REQ-1")
+        entry = conn.audit()[-1]
+        self.assertEqual("REQ-1", entry["request_id"])
+        self.assertNotIn("claimed_author", entry)
+        self.assertEqual({}, gov.said())
+        self.assertEqual({"claimed_author": "claude"}, gov.said("claude"))
+
+
 class TheWriteAndItsAuditStayTogether(unittest.TestCase):
     """Redis does NOT roll back an EXEC. These are the cases that would otherwise lie."""
 
