@@ -110,6 +110,26 @@ def drop_lock(conn, me):
         pass
 
 
+def wait_for_lock(conn, me, ttl, stop, interval):
+    """A LIVE run that finds the lock held WAITS for it, until `stop`, instead of exiting.
+
+    2026-10-16, Gate 3 Step 4: the scheduled live runs overlap by about two minutes at each hand-over.
+    bus-requests-chpc6 started at 04:58Z while bus-requests-nddgr still held the lock until 04:59:46Z,
+    exited 0 as designed, and so nothing answered the board from 05:00Z until the next run at 08:58Z. A
+    waiter never runs beside the holder: it takes the lock only with the same SET NX as take_lock, so the
+    one-worker rule is unchanged. None once `me` holds it; else who still held it at `stop`."""
+    holder = "(not checked)"
+    while datetime.datetime.now(datetime.timezone.utc) < stop:
+        try:
+            holder = take_lock(conn, me, ttl)
+        except Exception as error:                                       # noqa: BLE001 - Redis unsure: wait
+            holder = "(unknown: %s)" % type(error).__name__
+        if holder is None:
+            return None
+        time.sleep(interval)
+    return holder
+
+
 def guarded(append, renew):
     """The appender, renewing the lock before every board write and stopping the pass if it is lost."""
     if renew is None:
@@ -182,6 +202,13 @@ def main() -> int:
         # request's run marker either, so nothing would have been answered anyway.
         log.error("could not take the worker lock (%s): not running", type(error).__name__)
         return 1
+    if holder is not None and until is not None:
+        # A live run is the hand-over: wait for the holder to finish, then take over (wait_for_lock).
+        log.info("another worker holds %s (%s): waiting for it, up to %s", WORKER_LOCK_KEY, holder,
+                 until.strftime("%H:%M:%SZ"))
+        holder = wait_for_lock(conn, me, lock_ttl, until, interval)
+        if holder is None:
+            log.info("took %s over from the previous worker", WORKER_LOCK_KEY)
     if holder is not None:
         # Not an error: the worker that holds it is answering. Exit 0 so this does not read as a failure.
         log.warning("another worker holds %s (%s): this execution does not run. One worker at a time - "
