@@ -445,8 +445,10 @@ class Finding3TheFooterStatesTheAccessTheSwitchesGive(unittest.TestCase):
         self.assertIn("Cloud Run describe and Logging reads", posted)
 
     def test_an_agent_with_no_adapter_reads_still_says_so(self):
+        # Grok was this test's example until it gained redis_requests (#365); an agent config with no
+        # read and no write is the case the line exists for.
         import agent_waker as aw
-        self.assertIn("no shell, no repo, no cloud CLI", aw.hands_note("grok", aw.AGENTS["grok"], env={}))
+        self.assertIn("no shell, no repo, no cloud CLI", aw.hands_note("grok", {}, env={}))
 
 
 class Finding4TheSmallerItems(unittest.TestCase):
@@ -510,6 +512,245 @@ class Finding4TheSmallerItems(unittest.TestCase):
         self.assertTrue(filters)
         for f in filters:
             self.assertIn('resource.labels.location="%s"' % cc.REGION, f)
+
+
+# ------------------------------------------------------------------ a PAST state, for a re-check
+# Gate 3 Step 1b (owner, 2026-10-17): Gemini re-checks a run of 2026-10-15 15:53Z. Its first re-check
+# could only FAIL: it saw the current revision and the last two hours, and no flag value. The shapes
+# below are the REAL API's, read 2026-10-17 14:45Z (worker pool revision conference-chair-pool-00034-s48,
+# service revision drive-intake-00006-4vc, and the pool's log entries); the values are fake except
+# names, the commit label and the image digest the check is about.
+
+POOL = {"name": "projects/sfdc24/locations/us-central1/workerPools/conference-chair-pool",
+        "latestReadyRevision": "projects/sfdc24/locations/us-central1/workerPools/conference-chair-pool/"
+                               "revisions/conference-chair-pool-00035-hhh",
+        "conditions": [{"type": "Ready", "state": "CONDITION_SUCCEEDED", "message": ""}],
+        "template": {"containers": [{"image": "img@sha256:" + "8" * 64, "env": []}]}}
+CHAIR = {"name": "projects/sfdc24/locations/us-central1/services/conference-chair",
+         "template": {"containers": [{"image": "img", "env": []}]}}
+DIGEST = "sha256:e078a2c35ba9ea77b6ed2c023a8ae3789ff50cebb1b2a1e619492d1547281fb7"
+REVISION = {
+    "name": "projects/sfdc24/locations/us-central1/workerPools/conference-chair-pool/revisions/"
+            "conference-chair-pool-00034-s48",
+    "uid": "u", "generation": "34", "labels": {"commit": "d157cda4c941", "package": "wp1-chair"},
+    "createTime": "2026-10-15T15:52:44.487270Z", "updateTime": "2026-10-15T15:52:44Z",
+    "launchStage": "BETA", "vpcAccess": {"egress": "PRIVATE_RANGES_ONLY",
+                                         "networkInterfaces": [{"network": "default", "subnetwork": "default"}]},
+    "serviceAccount": "chair@sfdc24.iam.gserviceaccount.com",
+    "containers": [{"name": "chair", "image": "us-central1-docker.pkg.dev/sfdc24/x/conference-chair@" + DIGEST,
+                    "env": [{"name": "REDIS_HOST", "value": "10.54.72.180"},
+                            {"name": "LIVEKIT_API_SECRET",
+                             "valueSource": {"secretKeyRef": {"secret": "projects/1/secrets/LIVEKIT_API_SECRET",
+                                                              "version": "latest"}}},
+                            {"name": "CONF_REDIS_CHECK", "value": "1"},
+                            {"name": "CONF_REDIS_CHECK_ROOMS", "value": "conf-synthetic-gate3-20261014"},
+                            {"name": "CONF_REDIS_CHECK_OWNER", "value": "7414c1ce0e4f55bf"}],
+                    "resources": {"limits": {"cpu": "2", "memory": "2Gi"}}}],
+    "executionEnvironment": "EXECUTION_ENVIRONMENT_GEN2",
+    "conditions": [{"type": "Ready", "state": "CONDITION_SUCCEEDED", "message": "",
+                    "lastTransitionTime": "2026-10-15T15:53:00Z", "revisionReason": "RETIRED"}],
+    "observedGeneration": "34", "logUri": "https://console.cloud.google.com/logs?x=y",
+    "creator": "abdus@sfdc24.com", "etag": "e"}
+# The real entries carry no severity at all (the chair writes plain text to stdout).
+CHECK_LOGS = [
+    {"insertId": "a", "labels": {"commit": "d157cda4c941", "instanceId": "i", "package": "wp1-chair"},
+     "logName": "projects/sfdc24/logs/run.googleapis.com%2Fstderr", "receiveTimestamp": "x",
+     "resource": {"type": "cloud_run_worker_pool", "labels": {"worker_pool_name": "conference-chair-pool"}},
+     "textPayload": "INFO:conference.chair:redis check 10: ok in 29 ms", "timestamp": "2026-10-15T15:53:47.002914Z"},
+    {"insertId": "b", "labels": {}, "logName": "l", "receiveTimestamp": "x", "resource": {},
+     "textPayload": "INFO:conference.chair:redis round: Redis check 10. Proved, read and said: Grok, Claude, "
+                    "Codex, Gemini. 4 of 4 proved. These are reads the chair made for each voice.",
+     "timestamp": "2026-10-15T15:54:09.960909Z"},
+]
+NOW = 1792248000.0          # 2026-10-17T14:40:00Z
+ASK = ('@Gemini STEP 1B RE-CHECK ASK. (a) conference-chair-pool in sfdc24 us-central1, revision '
+       'conference-chair-pool-00034-s48: its commit label and its image digest. (b) Pool logs, worker_pool_name '
+       'conference-chair-pool, 2026-10-15 15:53:20Z to 15:55:30Z. Look for "redis check 10: ok", the round, and '
+       '"Redis check 10. Proved, read and said: Grok, Claude, Codex, Gemini. 4 of 4 proved." (c) CONF_REDIS_CHECK=1.')
+
+
+def past_call(calls, revision=REVISION, entries=CHECK_LOGS, fail=None):
+    def call(url, token, body=None, timeout=15):
+        calls.append((url, body))
+        if url.endswith("/workerPools?pageSize=100"):
+            return {"workerPools": [POOL]}
+        if url.endswith("/services?pageSize=100"):
+            return {"services": [CHAIR]}
+        if url.endswith("/jobs?pageSize=100"):
+            return {}
+        if "/revisions/" in url:
+            if fail:
+                raise fail
+            return revision
+        if url == cc.LOGGING:
+            return {"entries": entries}
+        raise AssertionError(url)
+    return call
+
+
+class APastStateForARecheck(unittest.TestCase):
+    def context(self, text, calls=None, **kw):
+        from unittest import mock
+        with mock.patch.object(cc.time, "time", return_value=NOW):
+            return cc.context_for(text, token="t", call=past_call([] if calls is None else calls, **kw))
+
+    def test_the_step1b_recheck_sees_the_revision_digest_flags_and_the_window_lines(self):
+        calls = []
+        out = self.context(ASK, calls)
+        self.assertIn("worker pool revision conference-chair-pool-00034-s48", out)
+        self.assertIn("  image: us-central1-docker.pkg.dev/sfdc24/x/conference-chair@" + DIGEST, out)
+        self.assertIn("  created: 2026-10-15T15:52:44.487270Z", out)
+        self.assertIn("  labels: commit=d157cda4c941, package=wp1-chair", out)
+        self.assertIn("CONF_REDIS_CHECK=1, CONF_REDIS_CHECK_ROOMS=conf-synthetic-gate3-20261014", out)
+        self.assertIn("2026-10-15T15:53:47 DEFAULT INFO:conference.chair:redis check 10: ok in 29 ms", out)
+        self.assertIn("4 of 4 proved.", out)
+        self.assertIn("  logs from 2026-10-15T15:53:20Z to 2026-10-15T15:55:30Z, every severity", out)
+        for hidden in ("10.54.72.180", "7414c1ce0e4f55bf", "abdus@sfdc24.com"):
+            self.assertNotIn(hidden, out, hidden)
+        revision_urls = [u for u, _ in calls if "/revisions/" in u]
+        self.assertEqual([cc.RUN + "/workerPools/conference-chair-pool/revisions/conference-chair-pool-00034-s48"],
+                         revision_urls)
+
+    def test_the_window_filter_is_bounded_every_severity_oldest_first_and_narrowed_by_the_quotes(self):
+        calls = []
+        self.context(ASK, calls)
+        bodies = [b for u, b in calls if u == cc.LOGGING]
+        self.assertEqual(1, len(bodies))
+        f = bodies[0]["filter"]
+        self.assertIn('timestamp>="2026-10-15T15:53:20Z" AND timestamp<="2026-10-15T15:55:30Z"', f)
+        self.assertNotIn("severity", f)
+        self.assertIn('resource.labels.worker_pool_name="conference-chair-pool"', f)
+        self.assertIn('(textPayload:"redis check 10: ok" OR textPayload:"Redis check 10. Proved, read and said: '
+                      'Grok, Claude, Codex, Gemini. 4 of 4 proved.")', f)
+        self.assertEqual("timestamp asc", bodies[0]["orderBy"])
+
+    def test_no_window_keeps_the_two_hour_warning_read(self):
+        calls = []
+        self.context("conference-chair-pool logs please", calls)
+        f = [b for u, b in calls if u == cc.LOGGING][0]["filter"]
+        self.assertIn("severity>=WARNING", f)
+        self.assertNotIn("timestamp<=", f)
+
+    def test_a_window_reads_logs_even_without_the_word_logs(self):
+        calls = []
+        self.context("conference-chair-pool 2026-10-15T15:53:20Z to 2026-10-15T15:55:30Z", calls)
+        self.assertTrue(any(u == cc.LOGGING for u, _ in calls))
+
+    def test_both_window_forms_parse(self):
+        want = ("2026-10-15T15:53:20Z", "2026-10-15T15:55:30Z")
+        self.assertEqual(want, cc.window("2026-10-15 15:53:20Z to 15:55:30Z", now=NOW))
+        self.assertEqual(want, cc.window("2026-10-15T15:53:20Z to 2026-10-15T15:55:30Z", now=NOW))
+        self.assertEqual(("2026-10-15T15:53:00Z", "2026-10-15T15:55:00Z"),
+                         cc.window("2026-10-15 15:53Z to 15:55Z", now=NOW))
+        self.assertIsNone(cc.window("by 2026-10-18 14:27Z, whichever first", now=NOW))
+
+    def test_a_window_that_cannot_be_a_check_is_refused_and_says_why(self):
+        self.assertEqual("over 15 minutes", cc.window("2026-10-15 15:00:00Z to 15:15:01Z", now=NOW))
+        self.assertEqual(("2026-10-15T15:00:00Z", "2026-10-15T15:15:00Z"),
+                         cc.window("2026-10-15 15:00:00Z to 15:15:00Z", now=NOW))
+        self.assertEqual("it ends before it starts", cc.window("2026-10-15 15:55Z to 15:53Z", now=NOW))
+        self.assertEqual("it ends before it starts", cc.window("2026-10-15 15:55Z to 15:55Z", now=NOW))
+        self.assertEqual("it ends in the future", cc.window("2026-10-17 14:35Z to 14:41Z", now=NOW))
+        self.assertEqual(("2026-10-17T14:35:00Z", "2026-10-17T14:40:00Z"),
+                         cc.window("2026-10-17 14:35Z to 14:40Z", now=NOW))
+        self.assertEqual("it starts over 30 days ago, past log retention",
+                         cc.window("2026-09-17 14:39Z to 14:45Z", now=NOW))
+        self.assertEqual(("2026-09-17T14:40:00Z", "2026-09-17T14:45:00Z"),
+                         cc.window("2026-09-17 14:40Z to 14:45Z", now=NOW))
+        self.assertEqual("it starts over 30 days ago, past log retention",
+                         cc.window("2026-09-17 14:39:59Z to 14:45Z", now=NOW))
+        self.assertEqual(("2026-10-15T23:55:00Z", "2026-10-16T00:05:00Z"),
+                         cc.window("2026-10-15 23:55Z to 2026-10-16 00:05Z", now=NOW), "a window across midnight")
+        self.assertEqual("not a date and time", cc.window("2026-13-15 15:53Z to 15:55Z", now=NOW))
+        out = self.context("conference-chair-pool 2026-10-15 15:00Z to 16:00Z")
+        self.assertIn("logs: the stated window is refused (over 15 minutes)", out)
+
+    def test_a_quote_can_never_reach_the_filter(self):
+        self.assertEqual(["a", "b"], cc.phrases('x "a" OR severity>=DEFAULT OR "b" y'))
+        self.assertEqual(["ok"], cc.phrases('"ok" and an unclosed "quote'))
+        self.assertEqual([], cc.phrases('"back\\slash" "new\nline" "%s"' % ("x" * 121)))
+        self.assertEqual(["x" * 120], cc.phrases('"%s"' % ("x" * 120)))
+        self.assertEqual(["1", "2", "3", "4"], cc.phrases('"1" "2" "3" "4" "5" "1"'))
+        self.assertEqual(["a"], cc.phrases('"a" "a"'))
+        for p in cc.phrases(ASK + ' "x\\" OR 1"'):
+            self.assertNotIn('"', p)
+            self.assertNotIn("\\", p)
+
+    def test_a_revision_is_named_only_of_a_named_resource_and_never_guessed(self):
+        calls = []
+        self.context("revision conference-chair-pool-00034-s48 alone", calls)
+        self.assertFalse(any("/revisions/" in u for u, _ in calls), "the pool itself was not named")
+        calls = []
+        self.context("conference-chair-pool, which revision ran?", calls)
+        self.assertFalse(any("/revisions/" in u for u, _ in calls), "no revision was named")
+
+    def test_a_resource_name_is_never_read_as_a_revision_of_a_shorter_one(self):
+        found = [("service", CHAIR), ("worker pool", POOL)]
+        self.assertEqual([], cc.revisions_named("conference-chair and conference-chair-pool", found, found))
+        self.assertEqual([("worker pool", "conference-chair-pool", "conference-chair-pool-00034-s48")],
+                         cc.revisions_named("conference-chair conference-chair-pool conference-chair-pool-00034-s48",
+                                            found, found))
+        self.assertEqual([("service", "conference-chair", "conference-chair-00017-c2x")],
+                         cc.revisions_named("conference-chair conference-chair-00017-c2x", found, found))
+
+    def test_at_most_two_revisions_and_only_whole_words(self):
+        found = [("worker pool", POOL)]
+        text = ("conference-chair-pool-00001-aaa conference-chair-pool-00002-bbb conference-chair-pool-00003-ccc "
+                "conference-chair-pool-00001-aaa xconference-chair-pool-00009-zzz conference-chair-pool-")
+        self.assertEqual(["conference-chair-pool-00001-aaa", "conference-chair-pool-00002-bbb"],
+                         [r for _, _, r in cc.revisions_named(text, found, found)])
+        self.assertEqual(2, cc.MAX_REVISIONS)
+        self.assertEqual(["conference-chair-pool-00001-aaa", "conference-chair-pool-00002-bbb"],
+                         [r for _, _, r in cc.revisions_named(
+                             "conference-chair-pool- conference-chair-poolx-00007-q conference-chair-pool-00001-aaa "
+                             "conference-chair-pool-00001-aaa conference-chair-pool-00002-bbb", found, found)],
+                         "a trailing dash, a longer word and a repeat are not revisions")
+
+    def test_a_job_has_no_revisions(self):
+        found = [("job", JOB)]
+        self.assertEqual([], cc.revisions_named("bus-requests bus-requests-xktq4", found, found))
+
+    def test_a_revision_the_api_does_not_have_is_one_line(self):
+        err = urllib.error.HTTPError("u", 404, "not found", {}, None)
+        out = self.context("conference-chair-pool conference-chair-pool-00099-zzz", fail=err)
+        self.assertIn("worker pool revision conference-chair-pool-00099-zzz\n  state: not attached (HTTP 404)", out)
+        out = self.context("conference-chair-pool conference-chair-pool-00099-zzz", fail=urllib.error.URLError("x"))
+        self.assertIn("conference-chair-pool-00099-zzz\n  state: not attached (URLError)", out)
+
+    def test_a_malformed_revision_is_described_without_a_crash(self):
+        out = self.context("conference-chair-pool conference-chair-pool-00034-s48",
+                           revision={"containers": ["x"], "labels": "x", "conditions": "x"})
+        self.assertIn("  image: ?", out)
+        self.assertIn("  labels: none", out)
+        self.assertIn("  service account: default compute", out)
+        out = cc.describe_revision("worker pool", dict(REVISION, labels={"commit": "d157cda4c941",
+                                                                          "who": "abdus@sfdc24.com"}))
+        self.assertIn("  labels: commit=d157cda4c941, who=[email]", out)
+
+    def test_a_window_with_no_lines_says_so(self):
+        out = self.context(ASK, entries=[])
+        self.assertIn('logs: no lines from 2026-10-15T15:53:20Z to 2026-10-15T15:55:30Z, lines holding "redis check 10: ok"',
+                      out)
+
+    def test_window_log_lines_are_redacted_and_capped(self):
+        out = self.context("conference-chair-pool 2026-10-15 15:53Z to 15:55Z",
+                           entries=[LOG] + [dict(CHECK_LOGS[0])] * 20)
+        self.assertNotIn("10.54.72.180", out)
+        self.assertIn("2026-10-08T17:00:00 ERROR", out)
+        self.assertEqual(cc.MAX_LOG_LINES, out.count("redis check 10: ok") + 1)
+
+    def test_the_check_owner_is_never_shown(self):
+        self.assertIn("CONF_REDIS_CHECK", cc.SHOWN_ENV)
+        self.assertIn("CONF_REDIS_CHECK_ROOMS", cc.SHOWN_ENV)
+        self.assertNotIn("CONF_REDIS_CHECK_OWNER", cc.SHOWN_ENV)
+        out = cc.describe_revision("worker pool", REVISION)
+        self.assertIn("CONF_REDIS_CHECK_OWNER", out.split("flag values")[0], "its name is listed")
+        self.assertNotIn("7414c1ce0e4f55bf", out)
+
+    def test_it_still_never_writes(self):
+        calls = []
+        self.context(ASK, calls)
+        self.assertEqual({cc.LOGGING}, {u for u, body in calls if body is not None})
 
 
 if __name__ == "__main__":
