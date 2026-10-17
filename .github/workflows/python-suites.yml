@@ -904,7 +904,8 @@ jobs:
           set -euo pipefail
           if [ -f tests/test_gemini_wider_read.py ]; then
             python_bin="$(command -v python3)"
-            sudo unshare -n -- "$python_bin" -B tests/test_gemini_wider_read.py
+            # Loopback only: the redirect test serves on 127.0.0.1, and a new namespace starts with lo down.
+            sudo unshare -n -- sh -c 'ip link set lo up && exec "$0" -B tests/test_gemini_wider_read.py' "$python_bin"
           else
             echo "not on this branch; skipping"
           fi
