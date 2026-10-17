@@ -949,12 +949,63 @@ def poll_token_ok(secret: str, headers: dict) -> bool:
     return hmac.compare_digest(secret, headers.get(POLL_TOKEN_HEADER, "") or "")
 
 
+def watch_expiry(deps):
+    """The channel's expiry: the registered watch's record when there is one, else the deploy's setting."""
+    if deps.watch is not None:
+        try:
+            found = deps.watch.expires_at()
+            if found is not None:
+                return found
+        except Exception:  # noqa: BLE001 - an unreadable record is an unknown channel, never an ok one
+            return None
+    return deps.channel_expires_at
+
+
+def _channel_known(deps, channel_id) -> bool:
+    try:
+        return bool(deps.watch.channel_ok(channel_id))
+    except Exception:  # noqa: BLE001 - the record cannot be read: do the work, the claim collapses repeats
+        return True
+
+
+def push_pass(deps) -> list:
+    """A changes-channel push with a watch registered: the changes feed from the stored token, then decide().
+
+    PUSH AND RECONCILE (Gemini's delta, 2026-10-16). Whatever this pass cannot finish stays pending for
+    the scheduled poll, and a resolver that fails falls back to that poll at once: a push can only make a
+    task sooner, never lose one.
+    """
+    if deps.claims is None:
+        return [{"status": "no_store", "task": None}]
+    try:
+        hints = deps.watch.resolve(deps.folder_id)
+    except Exception as exc:  # noqa: BLE001
+        return [{"status": "push_resolve_error", "task": None, "error": type(exc).__name__}] + poll(deps)
+    out = []
+    for raw in hints:
+        try:
+            result = decide(raw, deps)
+            result["via"] = "push"
+            out.append(result)
+            if result.get("status") in FINISHED:
+                deps.claims.pending_remove(raw["file_id"])
+            else:
+                deps.claims.pending_add(raw["file_id"])
+        except Exception as exc:  # noqa: BLE001 - one hint's failure must not lose the others
+            try:
+                deps.claims.pending_add(raw["file_id"])
+            except Exception:  # noqa: BLE001
+                pass
+            out.append({"status": "decide_error", "task": None, "error": type(exc).__name__, "via": "push"})
+    return out
+
+
 def handle(method: str, path: str, headers: dict, body: bytes, deps) -> tuple:
     path = path.split("?", 1)[0]
     headers = {str(k).lower(): v for k, v in (headers or {}).items()}
     if method == "GET" and path == "/healthz":
         now = _now(deps)
-        health = channel_health(deps.channel_expires_at, now, deps.renew_warn)
+        health = channel_health(watch_expiry(deps), now, deps.renew_warn)
         try:
             last_poll = deps.claims.last_poll() if deps.claims is not None else None
         except Exception:  # noqa: BLE001 - unreadable is unknown
@@ -977,13 +1028,36 @@ def handle(method: str, path: str, headers: dict, body: bytes, deps) -> tuple:
             return 401, {"error": "bad channel token"}
         if not deps.enabled:
             return 200, {"enabled": False, "intake": []}
+        # A registered watch (drive_watch.py) answers only its own channel, current or previous. An
+        # unknown channel holding our token is an old one Drive still pings: 200, so it stops retrying.
+        if deps.watch is not None and not _channel_known(deps, headers.get("x-goog-channel-id", "")):
+            return 200, {"enabled": True, "intake": [], "ignored": "unknown channel"}
         # A push with no file id is a CHANGES-CHANNEL push - the folder trigger: it says something
         # changed, not what. So the changes feed is read, the same pass /poll runs. Decided as a file
         # id it was bad_file_id, and the push was answered 200 with nothing done (Copilot on #362).
         intake = []
         for hint in hints_from_push(headers):
-            intake.extend(poll(deps) if hint.get("poll") else [decide(hint, deps)])
+            if not hint.get("poll"):
+                intake.append(decide(hint, deps))
+            elif deps.watch is not None:
+                intake.extend(push_pass(deps))
+            else:
+                intake.extend(poll(deps))
         return 200, {"enabled": True, "intake": intake}
+    if method == "POST" and path == "/watch/renew":
+        # The scheduler, daily, with the poll token. Opens the next channel before the current one ends.
+        if not poll_token_ok(deps.poll_token, headers):
+            return 401, {"error": "bad poll token"}
+        if not deps.enabled:
+            return 200, {"enabled": False}
+        if deps.watch is None:
+            return 200, {"enabled": True, "watch": "not_configured"}
+        try:
+            result = deps.watch.renew(deps.push_url, deps.channel_token, deps.renew_warn,
+                                      force="force=1" in (headers.get("x-drive-intake-renew") or ""))
+        except Exception as exc:  # noqa: BLE001 - Drive's reason (never a secret) is the readout
+            return 200, {"enabled": True, "watch": "renew_failed", "error": str(exc)[:160]}
+        return 200, {"enabled": True, "watch": result}
     if method == "POST" and path == "/poll":
         if not poll_token_ok(deps.poll_token, headers):
             return 401, {"error": "bad poll token"}
@@ -1359,8 +1433,12 @@ class Deps:
                  api_worker="", now=None, at="", channel_expires_at=None,
                  heartbeat_window=DEFAULT_HEARTBEAT, renew_warn=DEFAULT_RENEW_WARN,
                  at_provider=None, poll_tick=DEFAULT_POLL_TICK, recipients=None, baseline=False,
-                 filter_tasks=False, confirm_token="", renamer=None):
+                 filter_tasks=False, confirm_token="", renamer=None, watch=None, push_url=""):
         self.enabled = enabled
+        # The push channel (drive_watch.DriveWatch) and the public address Drive pings. None keeps the
+        # poll-only behaviour, exactly as before the watch existed.
+        self.watch = watch
+        self.push_url = push_url
         # The task filter (task_filter.py). deps_from_env ALWAYS turns it on and no env var turns it off;
         # the False default exists only so the routing tests below can drive decide() with bare docs.
         self.filter_tasks = filter_tasks
@@ -1438,7 +1516,8 @@ def _int_env(environ, name, default):
         return default
 
 
-def deps_from_env(environ=None, client=None, docs=None, feed=None, post=None, renamer=None) -> "Deps":
+def deps_from_env(environ=None, client=None, docs=None, feed=None, post=None, renamer=None,
+                  watch=None) -> "Deps":
     """The service's dependencies from its environment and the adapters handed in. Pure: no socket
     is opened here, so a test can read exactly what a deploy would wire."""
     environ = os.environ if environ is None else environ
@@ -1470,6 +1549,9 @@ def deps_from_env(environ=None, client=None, docs=None, feed=None, post=None, re
         filter_tasks=True,       # fail-closed, always: there is deliberately no switch for this
         confirm_token=environ.get("DRIVE_INTAKE_CONFIRM_TOKEN") or "",
         renamer=renamer,
+        # DRIVE_INTAKE_WATCH=on registers the watch; anything else is the poll alone.
+        watch=watch if (environ.get("DRIVE_INTAKE_WATCH") or "") == "on" else None,
+        push_url=environ.get("DRIVE_INTAKE_PUSH_URL") or "",
     )
 
 
@@ -1477,7 +1559,7 @@ def main():  # pragma: no cover - the server loop
     import sys  # noqa: PLC0415
     here = os.path.dirname(os.path.abspath(__file__))
     sys.path.insert(0, here)
-    client = docs = feed = post = renamer = None
+    client = docs = feed = post = renamer = watch = None
     if enabled_from_env():
         try:
             import redis_dual  # noqa: PLC0415 - beside this file in the image
@@ -1493,9 +1575,11 @@ def main():  # pragma: no cover - the server loop
             post = lambda url, body, headers: drive_feed.private_post(url, body, headers, gdocs._fetch)  # noqa: E731
             if client is not None:
                 feed = drive_feed.DriveFolder(gdocs.metadata_token, gdocs._fetch, RedisClaims(client)).changes
+                import drive_watch  # noqa: PLC0415
+                watch = drive_watch.DriveWatch(gdocs.metadata_token, gdocs._fetch, client)
         except Exception as exc:  # noqa: BLE001
             print("drive-intake no docs: %s" % type(exc).__name__)
-    Handler.deps = deps_from_env(client=client, docs=docs, feed=feed, post=post, renamer=renamer)
+    Handler.deps = deps_from_env(client=client, docs=docs, feed=feed, post=post, renamer=renamer, watch=watch)
     # Unset, this listens on every interface, which Cloud Run requires. The loopback smoke sets
     # 127.0.0.1 so that run opens nothing else.
     bind = os.environ.get("DRIVE_INTAKE_BIND") or ""

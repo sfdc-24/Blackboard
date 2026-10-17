@@ -26,6 +26,8 @@
 #   bash cloud/drive-intake/deploy.sh schedule  # the poll tick, every 2 minutes, OIDC
 #   bash cloud/drive-intake/deploy.sh readback  # what is actually deployed, printed; /healthz
 #   bash cloud/drive-intake/deploy.sh on | off  # the flag, and nothing else
+#   bash cloud/drive-intake/deploy.sh watch     # PUSH: the Drive watch, its daily renewal, the first channel
+#   bash cloud/drive-intake/deploy.sh unwatch   # back to the poll alone
 
 set -euo pipefail
 
@@ -44,6 +46,8 @@ IMAGE="${REPO}/${NAME}:${TAG}"
 GCLOUD="${GCLOUD:-gcloud}"
 SCHED_JOB="${SCHED_JOB:-drive-intake-poll}"
 SCHEDULE="${SCHEDULE:-*/2 * * * *}"
+RENEW_JOB="${RENEW_JOB:-drive-intake-watch-renew}"
+RENEW_SCHEDULE="${RENEW_SCHEDULE:-17 9 * * *}"
 
 # The four secrets this service may read, and the ring's HMAC once inbox-wake is wired (Gate 3 Step 3).
 SECRETS=(REDIS_AUTH_STRING REDIS_CA_CERT DRIVE_INTAKE_POLL_TOKEN DRIVE_INTAKE_CHANNEL_TOKEN INBOX_WAKE_SECRET)
@@ -208,6 +212,39 @@ flag() {
   echo "DRIVE_INTAKE_ENABLED=$1 on ${SERVICE}"
 }
 
+# PUSH (the fast-handoff POC, drive_watch.py). Drive's push notification carries no OIDC token, so the
+# service must answer an unauthenticated caller: allUsers gets run.invoker. That does not open the work:
+# /hooks/drive still needs the channel token AND a channel on record, /poll and /watch/renew the poll
+# token, and each answers 401 without. /healthz carries no doc and no secret. The poll keeps running as
+# the reconcile path; unwatch takes the service back to it alone.
+watch() {
+  local url token verb=create header_flag
+  url="$(service_url)"
+  "$GCLOUD" run services add-iam-policy-binding "$SERVICE" --project "$PROJECT" --region "$REGION"     --member allUsers --role roles/run.invoker >/dev/null
+  "$GCLOUD" run services update "$SERVICE" --project "$PROJECT" --region "$REGION"     --update-env-vars "DRIVE_INTAKE_WATCH=on,DRIVE_INTAKE_PUSH_URL=${url}/hooks/drive"
+  token="$("$GCLOUD" secrets versions access latest --secret DRIVE_INTAKE_POLL_TOKEN --project "$PROJECT")"
+  "$GCLOUD" scheduler jobs describe "$RENEW_JOB" --project "$PROJECT" --location "$REGION" >/dev/null 2>&1 && verb=update
+  header_flag="--headers"
+  if [ "$verb" = update ]; then
+    header_flag="--update-headers"
+  fi
+  "$GCLOUD" scheduler jobs "$verb" http "$RENEW_JOB" --project "$PROJECT" --location "$REGION"     --schedule "$RENEW_SCHEDULE" --http-method POST --uri "${url}/watch/renew"     --oidc-service-account-email "$INVOKER" --oidc-token-audience "$url"     "$header_flag" "X-Drive-Intake-Poll-Token=${token}" --attempt-deadline 60s >/dev/null
+  echo "scheduler ${RENEW_JOB} ${verb}d: ${RENEW_SCHEDULE} -> POST ${url}/watch/renew"
+  # The first channel now, not at tomorrow's tick. The readout is Drive's own answer.
+  echo "first renewal:"
+  curl -s -X POST -H "X-Drive-Intake-Poll-Token: ${token}" "${url}/watch/renew"; echo
+  token=""
+  echo "healthz:"
+  curl -s "${url}/healthz"; echo
+}
+
+unwatch() {
+  "$GCLOUD" run services update "$SERVICE" --project "$PROJECT" --region "$REGION"     --update-env-vars "DRIVE_INTAKE_WATCH=off"
+  "$GCLOUD" scheduler jobs pause "$RENEW_JOB" --project "$PROJECT" --location "$REGION" || true
+  "$GCLOUD" run services remove-iam-policy-binding "$SERVICE" --project "$PROJECT" --region "$REGION"     --member allUsers --role roles/run.invoker >/dev/null || true
+  echo "watch off: the poll alone; Drive's channel expires on its own within seven days"
+}
+
 case "${1:-}" in
   setup) setup ;;
   tokens) tokens ;;
@@ -217,5 +254,7 @@ case "${1:-}" in
   readback) readback ;;
   on) flag on ;;
   off) flag off ;;
-  *) sed -n '2,28p' "$0"; exit 2 ;;
+  watch) watch ;;
+  unwatch) unwatch ;;
+  *) sed -n '2,30p' "$0"; exit 2 ;;
 esac
