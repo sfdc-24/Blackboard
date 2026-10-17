@@ -176,7 +176,7 @@ DOCTRINE = (
     "reasoning, decided, drafted or explained, in plain prose, at most %d characters. Then, under "
     "the heading FOR THE LAPTOP:, list what needs claude-code-cli's tools, one item per line, or "
     "write 'nothing'. Never say you did, ran, checked, opened or sent anything; you cannot. "
-    "Address the owner as Mr. Salam."
+    "Address the owner as Abdus."
 )
 
 

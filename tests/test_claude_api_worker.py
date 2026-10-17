@@ -217,7 +217,8 @@ class RunTest(unittest.TestCase):
         self.assertNotIn("REQUESTED - task", prompt)
         self.assertIn("Never say you did", system)
         self.assertIn("FOR THE LAPTOP", system)
-        self.assertIn("Mr. Salam", system)
+        self.assertIn("Address the owner as Abdus.", system)   # his ruling of 2026-10-12
+        self.assertNotIn("Mr. Salam", system)
 
     def test_a_second_pass_does_nothing_from_the_marker_and_nothing_from_the_doc_when_the_marker_is_gone(self):
         d = deps()
