@@ -32,7 +32,9 @@ WHAT ONE RUN DOES
 WHAT IT NEVER DOES
     No write outside gov:archive:* in Redis; no delete, no trim; no object overwritten; no message text on
     the board (the row carries counts, ids and hashes, never an entry). Off unless REDIS_ARCHIVE_ENABLED=on;
-    REDIS_ARCHIVE_DRY_RUN=1 reads and reports and writes nothing anywhere.
+    REDIS_ARCHIVE_DRY_RUN=1 reads and reports: it writes no object, ledger, cursor, pending range or board
+    row. It DOES take gov:archive:lock (one key, at most LOCK_SECONDS) and release it, so a dry run never
+    overlaps a real one - it is not zero-write (Aya, 2026-10-12).
 
     python -B redis_archive.py            # one run (the hourly job)
     python -B redis_archive.py verify <ledger object>   # every object the ledger names, re-hashed
@@ -335,7 +337,9 @@ def gcs_get(bucket: str, token_provider):
 
 
 def verify(get, ledger_name: str) -> dict:
-    """Re-read the ledger and every object it names; each must hash to what the ledger says."""
+    """Re-read the ledger and every object it names WITH a hash; each must hash to what the ledger says.
+    A `superseded` object is listed without a hash (it was never committed), so it is not checked here,
+    and this is not a restore test: it proves the archive is what the ledger says, not that it restores."""
     ledger = json.loads(get(ledger_name).decode("utf-8"))
     checked, bad = 0, []
     for s in ledger.get("streams", []):
