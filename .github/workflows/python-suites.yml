@@ -451,7 +451,8 @@ jobs:
                    tests/test_claude_api_lane.py \
                    tests/test_phone_intake.py \
                    tests/test_telephone_deploy.py \
-                   tests/test_telephone_smoke.py \n                   tests/test_lou_agent.py; do
+                   tests/test_telephone_smoke.py \
+                   tests/test_lou_agent.py; do
             if [ -f "$t" ]; then echo "present : $t"; else echo "absent  : $t"; fi
           done
 
