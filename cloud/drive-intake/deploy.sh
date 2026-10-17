@@ -220,15 +220,20 @@ flag() {
 watch() {
   local url token verb=create header_flag
   url="$(service_url)"
-  "$GCLOUD" run services add-iam-policy-binding "$SERVICE" --project "$PROJECT" --region "$REGION"     --member allUsers --role roles/run.invoker >/dev/null
-  "$GCLOUD" run services update "$SERVICE" --project "$PROJECT" --region "$REGION"     --update-env-vars "DRIVE_INTAKE_WATCH=on,DRIVE_INTAKE_PUSH_URL=${url}/hooks/drive"
+  "$GCLOUD" run services add-iam-policy-binding "$SERVICE" --project "$PROJECT" --region "$REGION" \
+    --member allUsers --role roles/run.invoker >/dev/null
+  "$GCLOUD" run services update "$SERVICE" --project "$PROJECT" --region "$REGION" \
+    --update-env-vars "DRIVE_INTAKE_WATCH=on,DRIVE_INTAKE_PUSH_URL=${url}/hooks/drive"
   token="$("$GCLOUD" secrets versions access latest --secret DRIVE_INTAKE_POLL_TOKEN --project "$PROJECT")"
   "$GCLOUD" scheduler jobs describe "$RENEW_JOB" --project "$PROJECT" --location "$REGION" >/dev/null 2>&1 && verb=update
   header_flag="--headers"
   if [ "$verb" = update ]; then
     header_flag="--update-headers"
   fi
-  "$GCLOUD" scheduler jobs "$verb" http "$RENEW_JOB" --project "$PROJECT" --location "$REGION"     --schedule "$RENEW_SCHEDULE" --http-method POST --uri "${url}/watch/renew"     --oidc-service-account-email "$INVOKER" --oidc-token-audience "$url"     "$header_flag" "X-Drive-Intake-Poll-Token=${token}" --attempt-deadline 60s >/dev/null
+  "$GCLOUD" scheduler jobs "$verb" http "$RENEW_JOB" --project "$PROJECT" --location "$REGION" \
+    --schedule "$RENEW_SCHEDULE" --http-method POST --uri "${url}/watch/renew" \
+    --oidc-service-account-email "$INVOKER" --oidc-token-audience "$url" \
+    "$header_flag" "X-Drive-Intake-Poll-Token=${token}" --attempt-deadline 60s >/dev/null
   echo "scheduler ${RENEW_JOB} ${verb}d: ${RENEW_SCHEDULE} -> POST ${url}/watch/renew"
   # The first channel now, not at tomorrow's tick. The readout is Drive's own answer.
   echo "first renewal:"
@@ -239,9 +244,11 @@ watch() {
 }
 
 unwatch() {
-  "$GCLOUD" run services update "$SERVICE" --project "$PROJECT" --region "$REGION"     --update-env-vars "DRIVE_INTAKE_WATCH=off"
+  "$GCLOUD" run services update "$SERVICE" --project "$PROJECT" --region "$REGION" \
+    --update-env-vars "DRIVE_INTAKE_WATCH=off"
   "$GCLOUD" scheduler jobs pause "$RENEW_JOB" --project "$PROJECT" --location "$REGION" || true
-  "$GCLOUD" run services remove-iam-policy-binding "$SERVICE" --project "$PROJECT" --region "$REGION"     --member allUsers --role roles/run.invoker >/dev/null || true
+  "$GCLOUD" run services remove-iam-policy-binding "$SERVICE" --project "$PROJECT" --region "$REGION" \
+    --member allUsers --role roles/run.invoker >/dev/null || true
   echo "watch off: the poll alone; Drive's channel expires on its own within seven days"
 }
 
