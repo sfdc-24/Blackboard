@@ -50,9 +50,18 @@ def _in_region(result, region) -> bool:
     return any(n and (n == region or n.startswith(region)) for n in names)
 
 
-def _first(results, place):
-    exact = [r for r in results if str(r.get("name") or "").strip().lower() == place.lower()]
-    return (exact or results or [None])[0]
+def _same_name(a, b) -> bool:
+    """'london' is London; 'Londonderry' and 'St Johns Island' are not London or St Johns."""
+    a, b = str(a or "").strip().casefold(), str(b or "").strip().casefold()
+    return a == b
+
+
+def _first(results, place, region=""):
+    """The first result that IS the place asked for (and in the region, when one was named). A near name is
+    never taken: the search returns Londonderry for 'London', and the caller would hear the wrong town's
+    weather. None, so Lou asks which town instead (Aya on be319c7: London, Nova Scotia gave Londonderry)."""
+    return next((r for r in results if _same_name(r.get("name"), place) and (not region or _in_region(r, region))),
+                None)
 
 
 def find_place(location, fetch, default_country=DEFAULT_COUNTRY):
@@ -63,12 +72,7 @@ def find_place(location, fetch, default_country=DEFAULT_COUNTRY):
         return None
     place, region = parts[0], (parts[1] if len(parts) > 1 else "")
     home = _geocode(fetch, place, default_country) if default_country else []
-    if region:
-        hit = next((r for r in home if _in_region(r, region)), None)
-        if hit is None:
-            hit = next((r for r in _geocode(fetch, place) if _in_region(r, region)), None)
-        return hit
-    return _first(home, place) or _first(_geocode(fetch, place), place)
+    return _first(home, place, region) or _first(_geocode(fetch, place), place, region)
 
 
 def weather_now(location, fetch=None, default_country=None) -> str:
@@ -81,7 +85,7 @@ def weather_now(location, fetch=None, default_country=None) -> str:
     try:
         top = find_place(asked, fetch, default_country)
         if top is None:
-            return "I couldn't find a place called %s." % asked
+            return "I couldn't find a place called %s. Which town or city do you mean?" % asked
         now = fetch(FORECAST_URL + "?" + urllib.parse.urlencode({
             "latitude": top["latitude"], "longitude": top["longitude"],
             "current": "temperature_2m,apparent_temperature,weather_code,wind_speed_10m", "timezone": "auto"}))

@@ -78,9 +78,22 @@ deploy() {
 readback() {
   "$GCLOUD" run services describe "$SERVICE" --project "$PROJECT" --region "$REGION" \
     --format 'yaml(spec.template.spec.serviceAccountName,spec.template.spec.containers[0].image,spec.template.metadata.annotations,status.latestReadyRevisionName)'
-  echo "the worker's own word (registered means LiveKit accepted it):"
-  "$GCLOUD" logging read "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"${SERVICE}\" AND textPayload:\"registered worker\"" \
-    --project "$PROJECT" --limit 3 --format 'value(timestamp,textPayload)' || true
+  # Bound to the ready revision and the image this script deploys: a service-wide log query can return an
+  # old revision's 'registered' line and pass a deploy that never came up (Aya on be319c7).
+  local rev image lines
+  rev="$("$GCLOUD" run services describe "$SERVICE" --project "$PROJECT" --region "$REGION" \
+    --format 'value(status.latestReadyRevisionName)' | tr -d '\r')"
+  if [ -z "$rev" ]; then echo "STOPPED: ${SERVICE} has no ready revision"; return 1; fi
+  image="$("$GCLOUD" run revisions describe "$rev" --project "$PROJECT" --region "$REGION" \
+    --format 'value(spec.containers[0].image)' | tr -d '\r')"
+  echo "ready revision ${rev} runs ${image:-nothing}"
+  if [ "$image" != "$IMAGE" ]; then echo "STOPPED: ${rev} is not running ${IMAGE}"; return 1; fi
+  echo "the worker's own word from ${rev} only (registered means LiveKit accepted it):"
+  lines="$("$GCLOUD" logging read "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"${SERVICE}\" AND resource.labels.revision_name=\"${rev}\" AND textPayload:\"registered worker\"" \
+    --project "$PROJECT" --limit 3 --format 'value(timestamp,textPayload)' | tr -d '\r')" || lines=""
+  if [ -z "$lines" ]; then echo "NOT YET: no 'registered worker' line from ${rev}"; return 1; fi
+  echo "$lines"
+  echo "READBACK OK: ${rev} on ${IMAGE} registered with LiveKit"
 }
 
 off() {

@@ -3,6 +3,8 @@
 The ways this goes wrong, each with a test that fails when the guard is removed:
   - the weather answer is read from the wrong keys (fixtures are the REAL open-meteo answers)
   - London resolves to England for a Canadian caller, or a named region is ignored (Codex, 2159d7c)
+  - a near name is taken for the place asked: London, Nova Scotia gives Londonderry (Aya, be319c7)
+  - the readback passes on an old revision's log line, or on a revision running another image (Aya, be319c7)
   - a bad place, a dead network or a malformed answer raises mid-call instead of giving Lou a sentence
   - two calls in the reused room, or two distinct keys, land on one transcript (Codex and cowork-chrome)
   - Redis failing drops the transcript instead of writing the file
@@ -23,7 +25,7 @@ sys.path.insert(0, str(LOU))
 tools = importlib.import_module("lou_tools")
 
 
-# Captured from the live API (open-meteo geocoding, count=10), 2026-10-16 23:45Z and 2026-10-17 02:40Z.
+# Captured from the live API (open-meteo geocoding, count=10), 2026-10-16 23:45Z, 2026-10-17 02:40Z and 04:34Z.
 def _r(name, admin1, country, code, lat, lon):
     return {"name": name, "admin1": admin1, "country": country, "country_code": code, "latitude": lat, "longitude": lon}
 
@@ -40,6 +42,9 @@ GEO = {
                       _r("Paris", "Yukon", "Canada", "CA", 63.81447, -138.65434)],
     ("Paris", ""): [_r("Paris", "Ile-de-France Region", "France", "FR", 48.85341, 2.3488),
                     _r("Paris", "Texas", "United States", "US", 33.66094, -95.55551)],
+    ("St Johns", "CA"): [_r("St Johns Island", "Newfoundland and Labrador", "Canada", "CA", 56.6938, -60.93394)],
+    ("St. John's", "CA"): [_r("St. John's", "Newfoundland and Labrador", "Canada", "CA", 47.56494, -52.70931),
+                           _r("St. John's Island", "Newfoundland and Labrador", "Canada", "CA", 47.39995, -55.64832)],
 }
 FORECAST = {"latitude": 43.57767, "longitude": -79.66636, "timezone": "America/Toronto",
             "current_units": {"time": "iso8601", "interval": "seconds", "temperature_2m": "°C",
@@ -94,8 +99,25 @@ class WeatherTest(unittest.TestCase):
         self.assertEqual("51.50853", lat_asked(seen))
 
     def test_a_region_with_no_such_place_is_not_guessed(self):
-        self.assertEqual("I couldn't find a place called London, Yukon.",
+        self.assertEqual("I couldn't find a place called London, Yukon. Which town or city do you mean?",
                          tools.weather_now("London, Yukon", fetch=fake_fetch()))
+
+    def test_a_near_name_is_never_the_answer_lou_asks_instead(self):
+        """Aya on be319c7: London, Nova Scotia picked Londonderry, Nova Scotia (the region matched, the city did not)."""
+        for asked in ("London, Nova Scotia", "St Johns"):
+            seen = []
+            said = tools.weather_now(asked, fetch=fake_fetch(seen=seen))
+            self.assertEqual("I couldn't find a place called %s. Which town or city do you mean?" % asked, said)
+            self.assertEqual([], [u for u in seen if u.startswith(tools.FORECAST_URL)], asked)
+
+    def test_the_exact_name_is_found_among_near_ones(self):
+        seen = []
+        said = tools.weather_now("St. John's", fetch=fake_fetch(seen=seen))
+        self.assertEqual("47.56494", lat_asked(seen))
+        self.assertIn("St. John's, Newfoundland and Labrador", said)
+        seen = []   # the search ignores case, and so does the match
+        tools.weather_now("london", fetch=fake_fetch(geo={("london", "CA"): GEO[("London", "CA")]}, seen=seen))
+        self.assertEqual("42.98339", lat_asked(seen))
 
     def test_no_feels_like_when_it_is_the_same(self):
         same = json.loads(json.dumps(FORECAST))
@@ -109,7 +131,7 @@ class WeatherTest(unittest.TestCase):
         self.assertEqual("I couldn't reach the weather service just now.", tools.weather_now("Mississauga", fetch=dead))
         self.assertEqual("I couldn't reach the weather service just now.",
                          tools.weather_now("Mississauga", fetch=fake_fetch(forecast={"current": {}})))
-        self.assertEqual("I couldn't find a place called Nowhereville.",
+        self.assertEqual("I couldn't find a place called Nowhereville. Which town or city do you mean?",
                          tools.weather_now("Nowhereville", fetch=fake_fetch()))
         self.assertEqual("I need a town or city to check the weather.", tools.weather_now("  ", fetch=fake_fetch()))
 
@@ -184,6 +206,67 @@ class ImageTest(unittest.TestCase):
         for secret in ("LIVEKIT_URL=LOU_LIVEKIT_URL:latest", "OPENAI_API_KEY=OPENAI_API_KEY:latest",
                        "=LOU_INSTRUCTIONS:latest", "--ingress internal", "--min-instances 1 --max-instances 1"):
             self.assertIn(secret, deploy)
+
+
+def _bash():
+    import shutil  # noqa: PLC0415
+    for candidate in ("C:/Program Files/Git/bin/bash.exe", shutil.which("bash")):
+        if candidate and Path(candidate).exists() and "system32" not in str(candidate).lower():
+            return candidate
+    return None
+
+
+IMAGE = "us-central1-docker.pkg.dev/sfdc24/cloud-run-source-deploy/lou-agent:v2"
+# A stand-in gcloud: the ready revision, the image it runs, and Logging, which answers a service-wide query
+# with whatever revision logged last, but a revision-bound query only for the revision that logged.
+STUB = """#!/usr/bin/env bash
+case "$*" in
+  *"value(status.latestReadyRevisionName)"*) echo "$FAKE_REV" ;;
+  *"run revisions describe"*) echo "$FAKE_IMAGE" ;;
+  *"logging read"*revision_name*) case "$*" in *"$FAKE_LOGGED_REV"*) echo "2026-10-17T04:40:00Z registered worker" ;; esac ;;
+  *"logging read"*) echo "2026-10-17T04:40:00Z registered worker" ;;
+  *) echo "describe" ;;
+esac
+"""
+
+
+class ReadbackTest(unittest.TestCase):
+    """Aya on be319c7: the readback's log query was service-wide, so an old revision's line could pass a new deploy."""
+
+    def readback(self, rev, image, logged_rev):
+        import os  # noqa: PLC0415
+        import subprocess  # noqa: PLC0415
+        bash = _bash()
+        if not bash:
+            self.skipTest("no bash on this box")
+        with tempfile.TemporaryDirectory() as d:
+            stub = Path(d) / "gcloud"
+            stub.write_text(STUB, encoding="utf-8", newline="\n")
+            stub.chmod(0o755)
+            env = dict(os.environ, GCLOUD=stub.as_posix(), IMAGE=IMAGE, FAKE_REV=rev, FAKE_IMAGE=image,
+                       FAKE_LOGGED_REV=logged_rev)
+            return subprocess.run([bash, "cloud/lou-agent/deploy.sh", "readback"], cwd=str(REPO), env=env,
+                                  capture_output=True, text=True, timeout=60)
+
+    def test_only_the_old_revision_logged_is_not_a_pass(self):
+        run = self.readback("lou-agent-00002-new", IMAGE, "lou-agent-00001-old")
+        self.assertNotEqual(0, run.returncode, run.stdout + run.stderr)
+        self.assertIn("NOT YET: no 'registered worker' line from lou-agent-00002-new", run.stdout)
+
+    def test_a_revision_on_another_image_is_not_a_pass(self):
+        run = self.readback("lou-agent-00002-new", IMAGE.replace(":v2", ":v1"), "lou-agent-00002-new")
+        self.assertNotEqual(0, run.returncode, run.stdout + run.stderr)
+        self.assertIn("STOPPED: lou-agent-00002-new is not running " + IMAGE, run.stdout)
+
+    def test_no_ready_revision_is_not_a_pass(self):
+        run = self.readback("", IMAGE, "lou-agent-00002-new")
+        self.assertNotEqual(0, run.returncode, run.stdout + run.stderr)
+        self.assertIn("STOPPED: lou-agent has no ready revision", run.stdout)
+
+    def test_the_ready_revision_on_the_image_that_registered_passes(self):
+        run = self.readback("lou-agent-00002-new", IMAGE, "lou-agent-00002-new")
+        self.assertEqual(0, run.returncode, run.stdout + run.stderr)
+        self.assertIn("READBACK OK: lou-agent-00002-new on " + IMAGE, run.stdout)
 
 
 class ModelTest(unittest.TestCase):
