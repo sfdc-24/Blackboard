@@ -4,7 +4,8 @@ The ways this goes wrong, each with a test that fails when the guard is removed:
   - the weather answer is read from the wrong keys (fixtures are the REAL open-meteo answers)
   - London resolves to England for a Canadian caller, or a named region is ignored (Codex, 2159d7c)
   - a near name is taken for the place asked: London, Nova Scotia gives Londonderry (Aya, be319c7)
-  - the readback passes on an old revision's log line, or on a revision running another image (Aya, be319c7)
+  - the readback passes on an old revision's log line or digest, or on an old revision still ready when the
+    new one failed (Aya, be319c7 and b7884cb)
   - a bad place, a dead network or a malformed answer raises mid-call instead of giving Lou a sentence
   - two calls in the reused room, or two distinct keys, land on one transcript (Codex and cowork-chrome)
   - Redis failing drops the transcript instead of writing the file
@@ -216,24 +217,30 @@ def _bash():
     return None
 
 
-IMAGE = "us-central1-docker.pkg.dev/sfdc24/cloud-run-source-deploy/lou-agent:v2"
-# A stand-in gcloud: the ready revision, the image it runs, and Logging, which answers a service-wide query
-# with whatever revision logged last, but a revision-bound query only for the revision that logged.
+IMAGE = "us-central1-docker.pkg.dev/sfdc24/cloud-run-source-deploy/lou-agent:v1"
+NEW = "sha256:" + "b" * 64
+OLD = "sha256:" + "a" * 64
+# A stand-in gcloud, in the shapes the real one answered on 2026-10-17 05:00Z (drive-intake-00005-v9s):
+# status.imageDigest is the full reference ending @sha256:..., image_summary.digest is the bare sha256:...
+# Logging answers a revision-bound query only for the revision that logged. Deploy's arguments are kept.
 STUB = """#!/usr/bin/env bash
 case "$*" in
-  *"value(status.latestReadyRevisionName)"*) echo "$FAKE_REV" ;;
-  *"run revisions describe"*) echo "$FAKE_IMAGE" ;;
-  *"logging read"*revision_name*) case "$*" in *"$FAKE_LOGGED_REV"*) echo "2026-10-17T04:40:00Z registered worker" ;; esac ;;
-  *"logging read"*) echo "2026-10-17T04:40:00Z registered worker" ;;
+  *"artifacts docker images describe"*) echo "$FAKE_BUILT" ;;
+  *"run deploy"*) echo "$*" > "$FAKE_DEPLOY_ARGS" ;;
+  *"value(status.latestReadyRevisionName)"*) echo "$FAKE_READY" ;;
+  *"run revisions describe"*) case "$*" in *"$FAKE_READY"*) echo "$FAKE_RAN" ;; esac ;;
+  *"logging read"*revision_name*) case "$*" in *"$FAKE_LOGGED_REV"*) echo "2026-10-17T05:00:00Z registered worker" ;; esac ;;
+  *"logging read"*) echo "2026-10-17T05:00:00Z registered worker" ;;
   *) echo "describe" ;;
 esac
 """
 
 
-class ReadbackTest(unittest.TestCase):
-    """Aya on be319c7: the readback's log query was service-wide, so an old revision's line could pass a new deploy."""
+class DeployScriptTest(unittest.TestCase):
+    """Aya on be319c7 and b7884cb: the readback must prove THIS deploy. A service-wide log query returned an old
+    revision's line, and the reused v1 tag plus 'whatever is ready' passed the old revision when the new one failed."""
 
-    def readback(self, rev, image, logged_rev):
+    def run_script(self, verb, **fake):
         import os  # noqa: PLC0415
         import subprocess  # noqa: PLC0415
         bash = _bash()
@@ -243,30 +250,61 @@ class ReadbackTest(unittest.TestCase):
             stub = Path(d) / "gcloud"
             stub.write_text(STUB, encoding="utf-8", newline="\n")
             stub.chmod(0o755)
-            env = dict(os.environ, GCLOUD=stub.as_posix(), IMAGE=IMAGE, FAKE_REV=rev, FAKE_IMAGE=image,
-                       FAKE_LOGGED_REV=logged_rev)
-            return subprocess.run([bash, "cloud/lou-agent/deploy.sh", "readback"], cwd=str(REPO), env=env,
-                                  capture_output=True, text=True, timeout=60)
+            args = Path(d) / "deploy-args"
+            env = dict(os.environ, GCLOUD=stub.as_posix(), IMAGE=IMAGE, REDIS_HOST="10.0.0.3",
+                       FAKE_DEPLOY_ARGS=args.as_posix(), FAKE_BUILT="", FAKE_READY="", FAKE_RAN="", FAKE_LOGGED_REV="nothing-logged")
+            env.update(fake)
+            run = subprocess.run([bash, "cloud/lou-agent/deploy.sh", verb], cwd=str(REPO), env=env,
+                                 capture_output=True, text=True, timeout=60)
+            run.deploy_args = args.read_text(encoding="utf-8") if args.exists() else ""
+            return run
 
-    def test_only_the_old_revision_logged_is_not_a_pass(self):
-        run = self.readback("lou-agent-00002-new", IMAGE, "lou-agent-00001-old")
-        self.assertNotEqual(0, run.returncode, run.stdout + run.stderr)
-        self.assertIn("NOT YET: no 'registered worker' line from lou-agent-00002-new", run.stdout)
+    def readback(self, ready, ran, logged, revision="lou-agent-d20261017-050000", digest=NEW):
+        return self.run_script("readback", REVISION=revision, DIGEST=digest, FAKE_READY=ready,
+                               FAKE_RAN=ran and IMAGE.rsplit(":", 1)[0] + "@" + ran, FAKE_LOGGED_REV=logged)
 
-    def test_a_revision_on_another_image_is_not_a_pass(self):
-        run = self.readback("lou-agent-00002-new", IMAGE.replace(":v2", ":v1"), "lou-agent-00002-new")
-        self.assertNotEqual(0, run.returncode, run.stdout + run.stderr)
-        self.assertIn("STOPPED: lou-agent-00002-new is not running " + IMAGE, run.stdout)
-
-    def test_no_ready_revision_is_not_a_pass(self):
-        run = self.readback("", IMAGE, "lou-agent-00002-new")
-        self.assertNotEqual(0, run.returncode, run.stdout + run.stderr)
-        self.assertIn("STOPPED: lou-agent has no ready revision", run.stdout)
-
-    def test_the_ready_revision_on_the_image_that_registered_passes(self):
-        run = self.readback("lou-agent-00002-new", IMAGE, "lou-agent-00002-new")
+    def test_deploy_pins_the_digest_and_names_the_revision(self):
+        run = self.run_script("deploy", FAKE_BUILT=NEW)
         self.assertEqual(0, run.returncode, run.stdout + run.stderr)
-        self.assertIn("READBACK OK: lou-agent-00002-new on " + IMAGE, run.stdout)
+        self.assertIn("--image us-central1-docker.pkg.dev/sfdc24/cloud-run-source-deploy/lou-agent@" + NEW,
+                      run.deploy_args)
+        self.assertRegex(run.deploy_args, r"--revision-suffix d\d{8}-\d{6} ")
+        self.assertRegex(run.stdout, r"REVISION=lou-agent-d\d{8}-\d{6} DIGEST=" + NEW)
+
+    def test_deploy_without_a_built_digest_deploys_nothing(self):
+        run = self.run_script("deploy", FAKE_BUILT="")
+        self.assertNotEqual(0, run.returncode)
+        self.assertIn("STOPPED: no digest for " + IMAGE, run.stdout)
+        self.assertEqual("", run.deploy_args)
+
+    def test_the_new_revision_failed_and_the_old_one_is_still_ready(self):
+        """Aya's case on b7884cb: same tag, the old revision ready and registered, the new one never ready."""
+        run = self.readback(ready="lou-agent-00001-old", ran=OLD, logged="lou-agent-00001-old")
+        self.assertNotEqual(0, run.returncode, run.stdout + run.stderr)
+        self.assertIn("STOPPED: lou-agent-d20261017-050000 is not the ready revision (ready: lou-agent-00001-old)",
+                      run.stdout)
+
+    def test_only_an_old_revision_logged_is_not_a_pass(self):
+        run = self.readback(ready="lou-agent-d20261017-050000", ran=NEW, logged="lou-agent-00001-old")
+        self.assertNotEqual(0, run.returncode, run.stdout + run.stderr)
+        self.assertIn("NOT YET: no 'registered worker' line from lou-agent-d20261017-050000", run.stdout)
+
+    def test_the_revision_on_another_digest_is_not_a_pass(self):
+        run = self.readback(ready="lou-agent-d20261017-050000", ran=OLD, logged="lou-agent-d20261017-050000")
+        self.assertNotEqual(0, run.returncode, run.stdout + run.stderr)
+        self.assertIn("STOPPED: lou-agent-d20261017-050000 is not running " + NEW, run.stdout)
+
+    def test_no_revision_or_digest_named_is_not_a_pass(self):
+        for revision, digest in (("", NEW), ("lou-agent-d20261017-050000", "")):
+            run = self.readback(ready="lou-agent-d20261017-050000", ran=NEW, logged="lou-agent-d20261017-050000",
+                                revision=revision, digest=digest)
+            self.assertNotEqual(0, run.returncode, run.stdout + run.stderr)
+            self.assertIn("STOPPED: set REVISION and DIGEST to what deploy printed", run.stdout)
+
+    def test_that_revision_ready_on_that_digest_and_registered_passes(self):
+        run = self.readback(ready="lou-agent-d20261017-050000", ran=NEW, logged="lou-agent-d20261017-050000")
+        self.assertEqual(0, run.returncode, run.stdout + run.stderr)
+        self.assertIn("READBACK OK: lou-agent-d20261017-050000 on " + NEW, run.stdout)
 
 
 class ModelTest(unittest.TestCase):
