@@ -110,6 +110,26 @@ def drop_lock(conn, me):
         pass
 
 
+def wait_for_lock(conn, me, ttl, stop, interval):
+    """A LIVE run that finds the lock held WAITS for it, until `stop`, instead of exiting.
+
+    2026-10-16, Gate 3 Step 4: the scheduled live runs overlap by about two minutes at each hand-over.
+    bus-requests-chpc6 started at 04:58Z while bus-requests-nddgr still held the lock until 04:59:46Z,
+    exited 0 as designed, and so nothing answered the board from 05:00Z until the next run at 08:58Z. A
+    waiter never runs beside the holder: it takes the lock only with the same SET NX as take_lock, so the
+    one-worker rule is unchanged. None once `me` holds it; else who still held it at `stop`."""
+    holder = "(not checked)"
+    while datetime.datetime.now(datetime.timezone.utc) < stop:
+        try:
+            holder = take_lock(conn, me, ttl)
+        except Exception as error:                                       # noqa: BLE001 - Redis unsure: wait
+            holder = "(unknown: %s)" % type(error).__name__
+        if holder is None:
+            return None
+        time.sleep(interval)
+    return holder
+
+
 def guarded(append, renew):
     """The appender, renewing the lock before every board write and stopping the pass if it is lost."""
     if renew is None:
@@ -172,7 +192,8 @@ def main() -> int:
     env = load_env()
     execution = os.environ.get("CLOUD_RUN_EXECUTION", "")
     me = execution or "local-%d" % os.getpid()
-    until = _loop_until(os.environ.get("LOOP_UNTIL", ""))
+    until = live_deadline(_loop_until(os.environ.get("LOOP_UNTIL", "")), datetime.datetime.now(datetime.timezone.utc),
+                          int(os.environ.get("LOOP_MAX_MINUTES", "240")))
     interval = max(5, min(60, int(os.environ.get("LOOP_INTERVAL", "10"))))
     lock_ttl = ONE_PASS_LOCK_SECONDS if until is None else max(LIVE_LOCK_SECONDS, interval * 6)
     try:
@@ -182,6 +203,13 @@ def main() -> int:
         # request's run marker either, so nothing would have been answered anyway.
         log.error("could not take the worker lock (%s): not running", type(error).__name__)
         return 1
+    if holder is not None and until is not None:
+        # A live run is the hand-over: wait for the holder to finish, then take over (wait_for_lock).
+        log.info("another worker holds %s (%s): waiting for it, up to %s", WORKER_LOCK_KEY, holder,
+                 until.strftime("%H:%M:%SZ"))
+        holder = wait_for_lock(conn, me, lock_ttl, until, interval)
+        if holder is None:
+            log.info("took %s over from the previous worker", WORKER_LOCK_KEY)
     if holder is not None:
         # Not an error: the worker that holds it is answering. Exit 0 so this does not read as a failure.
         log.warning("another worker holds %s (%s): this execution does not run. One worker at a time - "
@@ -210,9 +238,7 @@ def live(conn, env, execution, me, until, interval, lock_ttl) -> int:
     # whatever this loop intends (the job's default spec is 5 minutes - see REQUESTS.md).
     import git_requests                                                  # noqa: PLC0415
     git_every = git_requests.poll_seconds(os.environ.get("GITHUB_READ_TOKEN") or None)
-    started = datetime.datetime.now(datetime.timezone.utc)
-    hard_stop = started + datetime.timedelta(minutes=int(os.environ.get("LOOP_MAX_MINUTES", "240")))
-    stop = min(until, hard_stop)
+    stop = until                                     # already capped by LOOP_MAX_MINUTES, in main (live_deadline)
     log.info("live mode: every %ds, GitHub every %ds, until %s", interval, git_every, stop.strftime("%H:%M:%SZ"))
     last_git, passes = None, 0
     while datetime.datetime.now(datetime.timezone.utc) < stop:
@@ -245,6 +271,16 @@ def live(conn, env, execution, me, until, interval, lock_ttl) -> int:
         time.sleep(interval)
     log.info("live mode ended after %d passes", passes)
     return 0
+
+
+def live_deadline(until, started, max_minutes):
+    """The ONE end of a live run: LOOP_UNTIL, but never more than LOOP_MAX_MINUTES after the run started.
+    Computed once, before any wait for the lock, and used by both the wait and the loop. Aya on e4e98fc: the
+    cap used to start only once the lock was taken, so a run that waited 90 s under a one-minute cap still
+    started its loop after the cap had passed. None for a single pass."""
+    if until is None:
+        return None
+    return min(until, started + datetime.timedelta(minutes=max_minutes))
 
 
 def _loop_until(text):

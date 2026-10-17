@@ -367,5 +367,97 @@ class LiveMode(unittest.TestCase):
         self.assertEqual(6, calls["n"])
 
 
+class TheHandOver(unittest.TestCase):
+    """2026-10-16, Gate 3 Step 4: bus-requests-chpc6 started at 04:58Z while bus-requests-nddgr held the lock
+    until 04:59:46Z, exited 0, and nothing answered the board until the next run at 08:58Z."""
+
+    def run_main_releasing(self, conn, env, one_pass, release_after_sleeps, holder="bus-requests-nddgr"):
+        clock, FakeDT, sleep = frozen_clock(START)
+        sleeps = {"n": 0}
+
+        def sleep_and_maybe_release(seconds):
+            sleep(seconds)
+            sleeps["n"] += 1
+            if sleeps["n"] == release_after_sleeps and conn.data.get(sr.WORKER_LOCK_KEY) == holder:
+                conn.data.pop(sr.WORKER_LOCK_KEY)                     # the old run ends and drops its lock
+        with mock.patch.object(sr.datetime, "datetime", FakeDT), \
+                mock.patch.object(sr, "one_pass", side_effect=one_pass), \
+                mock.patch.object(sr.time, "sleep", side_effect=sleep_and_maybe_release), \
+                mock.patch.object(sr.redis_dual, "client", return_value=conn), \
+                mock.patch.dict(sr.os.environ, env), \
+                mock.patch("bus.load_env", return_value={}):
+            return sr.main(), clock
+
+    def test_the_next_live_run_waits_for_the_lock_and_takes_over(self):
+        conn, passes = LockRedis(held="bus-requests-nddgr"), []
+
+        def one_pass(*a, **k):
+            self.assertEqual("bus-requests-chpc6", conn.data.get(sr.WORKER_LOCK_KEY), "never beside the holder")
+            passes.append(1)
+        env = {"LOOP_UNTIL": "2026-10-11T22:05:00Z", "LOOP_INTERVAL": "10", "CLOUD_RUN_EXECUTION": "bus-requests-chpc6"}
+        code, _ = self.run_main_releasing(conn, env, one_pass, release_after_sleeps=9)   # 90 s of overlap
+        self.assertEqual(0, code)
+        self.assertGreater(len(passes), 20, "it answered for the rest of its window")
+        self.assertIsNone(conn.get(sr.WORKER_LOCK_KEY), "and released the lock at the end")
+
+    def test_a_holder_that_never_lets_go_means_no_pass_at_all(self):
+        conn, passes = LockRedis(held="bus-requests-nddgr"), []
+        env = {"LOOP_UNTIL": "2026-10-11T22:02:00Z", "LOOP_INTERVAL": "10", "CLOUD_RUN_EXECUTION": "bus-requests-chpc6"}
+        code, clock = self.run_main_releasing(conn, env, lambda *a, **k: passes.append(1), release_after_sleeps=10 ** 6)
+        self.assertEqual((0, []), (code, passes))
+        self.assertEqual("bus-requests-nddgr", conn.get(sr.WORKER_LOCK_KEY))
+        self.assertGreaterEqual(clock["t"], START + datetime.timedelta(minutes=2), "it waited to its own end")
+
+    def test_a_one_pass_run_still_does_not_wait(self):
+        conn, passes = LockRedis(held="bus-requests-nddgr"), []
+        env = {"LOOP_UNTIL": "", "CLOUD_RUN_EXECUTION": "bus-requests-once"}
+        code, clock = self.run_main_releasing(conn, env, lambda *a, **k: passes.append(1), release_after_sleeps=1)
+        self.assertEqual((0, [], START), (code, passes, clock["t"]))
+
+    def test_a_redis_error_while_waiting_is_waited_through(self):
+        conn = LockRedis(held="bus-requests-nddgr")
+        calls = {"n": 0}
+        real_set = conn.set
+
+        def flaky_set(key, value, nx=False, ex=None):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise ConnectionError("redis blinked")
+            return real_set(key, value, nx=nx, ex=ex)
+        conn.set = flaky_set
+        passes = []
+        env = {"LOOP_UNTIL": "2026-10-11T22:03:00Z", "LOOP_INTERVAL": "10", "CLOUD_RUN_EXECUTION": "bus-requests-chpc6"}
+        code, _ = self.run_main_releasing(conn, env, lambda *a, **k: passes.append(1), release_after_sleeps=3)
+        self.assertEqual(0, code)
+        self.assertTrue(passes, "it took over once the holder let go")
+
+    # Aya on e4e98fc: the wait used raw LOOP_UNTIL, and LOOP_MAX_MINUTES only started once the lock was taken.
+    CAPPED = {"LOOP_UNTIL": "2026-10-11T23:00:00Z", "LOOP_MAX_MINUTES": "1", "LOOP_INTERVAL": "10",
+              "CLOUD_RUN_EXECUTION": "bus-requests-chpc6"}
+
+    def test_a_lock_held_past_the_cap_ends_the_wait_at_the_cap(self):
+        conn, passes = LockRedis(held="bus-requests-nddgr"), []
+        code, clock = self.run_main_releasing(conn, self.CAPPED, lambda *a, **k: passes.append(1),
+                                              release_after_sleeps=10 ** 6)
+        self.assertEqual((0, []), (code, passes))
+        self.assertLess(clock["t"], START + datetime.timedelta(minutes=2), "not to LOOP_UNTIL, an hour on")
+
+    def test_a_lock_released_after_the_cap_is_never_taken(self):
+        conn, passes = LockRedis(held="bus-requests-nddgr"), []
+        code, _ = self.run_main_releasing(conn, self.CAPPED, lambda *a, **k: passes.append(1),
+                                          release_after_sleeps=9)                       # freed at 90 s
+        self.assertEqual((0, []), (code, passes))
+        self.assertNotIn("bus-requests-chpc6", [s[1] for s in conn.sets], "it never took the lock after its own end")
+
+    def test_the_cap_counts_from_the_start_not_from_the_take_over(self):
+        conn, times = LockRedis(held="bus-requests-nddgr"), []
+        code, _ = self.run_main_releasing(conn, dict(self.CAPPED, LOOP_MAX_MINUTES="2"),
+                                          lambda *a, **k: times.append(sr.datetime.datetime.now()),
+                                          release_after_sleeps=6)                       # freed at 60 s
+        self.assertEqual(0, code)
+        self.assertTrue(times, "it took over inside its window")
+        self.assertLess(max(times), START + datetime.timedelta(minutes=2), "and stopped two minutes after START")
+
+
 if __name__ == "__main__":
     unittest.main()
