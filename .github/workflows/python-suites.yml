@@ -175,6 +175,8 @@ on:
       - "cloud/drive-intake/main.py"
       - "cloud/drive-intake/drive_feed.py"
       - "cloud/drive-intake/task_filter.py"
+      - "cloud/drive-intake/drive_watch.py"
+      - "tests/test_drive_intake_watch.py"
       - "cloud/drive-intake/Dockerfile"
       - "cloud/claude-api-worker/gdocs.py"
       - "tests/test_drive_intake.py"
@@ -343,6 +345,8 @@ on:
       - "cloud/drive-intake/main.py"
       - "cloud/drive-intake/drive_feed.py"
       - "cloud/drive-intake/task_filter.py"
+      - "cloud/drive-intake/drive_watch.py"
+      - "tests/test_drive_intake_watch.py"
       - "cloud/drive-intake/Dockerfile"
       - "cloud/claude-api-worker/gdocs.py"
       - "tests/test_drive_intake.py"
@@ -443,6 +447,7 @@ jobs:
                    tests/test_board_governor.py \
                    tests/test_drive_intake.py \
                    tests/test_drive_intake_task_filter.py \
+                   tests/test_drive_intake_watch.py \
                    tests/test_claude_api_worker.py \
                    tests/test_claude_api_lane.py \
                    tests/test_phone_intake.py \
@@ -542,7 +547,7 @@ jobs:
           set -euo pipefail
           if [ -f tests/test_drive_intake.py ]; then
             python_bin="$(command -v python3)"
-            sudo unshare -n -- "$python_bin" -m unittest tests.test_drive_intake tests.test_drive_intake_task_filter -v
+            sudo unshare -n -- "$python_bin" -m unittest tests.test_drive_intake tests.test_drive_intake_task_filter tests.test_drive_intake_watch -v
           else
             echo "not on this branch; skipping"
           fi
