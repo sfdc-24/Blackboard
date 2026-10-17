@@ -167,12 +167,14 @@ class DriveWatch:
         return out
 
     # -- the resolver ----------------------------------------------------------------------------
-    def resolve(self, folder_id: str) -> list:
-        """decide() hints for the docs in the folder that changed since the stored token."""
+    def resolve(self, folder_id: str):
+        """(hints, next token): the docs in the folder that changed since the stored token, and where the
+        feed got to. WRITES NOTHING (Aya on bddafa3): the caller advances the token with advance() only once
+        every hint is durable in the pending set, so a crash between the read and the decide loses no push."""
         page = self.page_token()
         if not page:
             raise Unconfigured("no page token on record (renew first)")
-        hints, seen = [], set()
+        hints, seen, next_token = [], set(), page
         for _ in range(MAX_PAGES):
             query = urllib.parse.urlencode({"pageToken": page, "fields": CHANGE_FIELDS, "pageSize": "100",
                                             "supportsAllDrives": "true", "includeItemsFromAllDrives": "true"})
@@ -186,10 +188,15 @@ class DriveWatch:
                 seen.add(file_id)
                 hints.append({"file_id": file_id, "folder_id": folder_id})
             if answer.get("newStartPageToken"):
-                self.client.set(PAGE_KEY, str(answer["newStartPageToken"]), ex=KEY_TTL)
+                next_token = str(answer["newStartPageToken"])
                 break
             page = str(answer.get("nextPageToken") or "")
             if not page:
                 break
-            self.client.set(PAGE_KEY, page, ex=KEY_TTL)
-        return hints
+            next_token = page
+        return hints, next_token
+
+    def advance(self, token: str) -> None:
+        """Move the feed's cursor. Called after the hints it covers are pending, never before."""
+        if token:
+            self.client.set(PAGE_KEY, token, ex=KEY_TTL)

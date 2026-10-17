@@ -964,8 +964,8 @@ def watch_expiry(deps):
 def _channel_known(deps, channel_id) -> bool:
     try:
         return bool(deps.watch.channel_ok(channel_id))
-    except Exception:  # noqa: BLE001 - the record cannot be read: do the work, the claim collapses repeats
-        return True
+    except Exception:  # noqa: BLE001 - FAIL CLOSED (Aya on bddafa3): an unreadable record is not our channel;
+        return False   # the scheduled poll still finds the change, so nothing is lost by refusing here
 
 
 def push_pass(deps) -> list:
@@ -978,9 +978,20 @@ def push_pass(deps) -> list:
     if deps.claims is None:
         return [{"status": "no_store", "task": None}]
     try:
-        hints = deps.watch.resolve(deps.folder_id)
+        hints, next_token = deps.watch.resolve(deps.folder_id)
     except Exception as exc:  # noqa: BLE001
         return [{"status": "push_resolve_error", "task": None, "error": type(exc).__name__}] + poll(deps)
+    # DURABLE BEFORE THE CURSOR MOVES (Aya on bddafa3). Every hint goes into the pending set first; only then
+    # does the feed's token advance. A crash after this leaves the docs pending, and the next poll decides them.
+    try:
+        for raw in hints:
+            deps.claims.pending_add(raw["file_id"])
+    except Exception as exc:  # noqa: BLE001 - the cursor stays put, so the next push re-reads the same changes
+        return [{"status": "pending_unwritable", "task": None, "error": type(exc).__name__}] + poll(deps)
+    try:
+        deps.watch.advance(next_token)
+    except Exception:  # noqa: BLE001 - an unmoved cursor only re-reads changes; the claim collapses repeats
+        pass
     out = []
     for raw in hints:
         try:

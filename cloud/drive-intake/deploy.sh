@@ -247,9 +247,22 @@ unwatch() {
   "$GCLOUD" run services update "$SERVICE" --project "$PROJECT" --region "$REGION" \
     --update-env-vars "DRIVE_INTAKE_WATCH=off"
   "$GCLOUD" scheduler jobs pause "$RENEW_JOB" --project "$PROJECT" --location "$REGION" || true
+  # The removal fails both when it cannot be done and when there is nothing to remove, so its exit code
+  # says nothing. The policy read afterwards is the answer (Aya on bddafa3: never claim a rollback unread).
   "$GCLOUD" run services remove-iam-policy-binding "$SERVICE" --project "$PROJECT" --region "$REGION" \
-    --member allUsers --role roles/run.invoker >/dev/null || true
-  echo "watch off: the poll alone; Drive's channel expires on its own within seven days"
+    --member allUsers --role roles/run.invoker >/dev/null 2>&1 || true
+  local policy
+  if ! policy="$("$GCLOUD" run services get-iam-policy "$SERVICE" --project "$PROJECT" --region "$REGION" \
+      --format 'value(bindings.members)')"; then
+    echo "FAILED: could not read ${SERVICE}'s policy, so the allUsers removal is unconfirmed"
+    return 1
+  fi
+  case "$policy" in
+    *allUsers*)
+      echo "FAILED: allUsers still holds run.invoker on ${SERVICE}; the watch flag is off but the service is public"
+      return 1 ;;
+  esac
+  echo "watch off: the poll alone, allUsers removed (read back); Drive's channel expires on its own within seven days"
 }
 
 case "${1:-}" in

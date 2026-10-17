@@ -160,10 +160,14 @@ class ResolveTest(unittest.TestCase):
             change("binned", trashed=True), change("gone", removed=True), change(FILE)]},
             "101": {"newStartPageToken": "102", "changes": [change("second-doc-id-1234")]}}), Redis()
         redis.data[dw.PAGE_KEY] = "100"
-        hints = watch(drive, redis).resolve(FOLDER)
+        w = watch(drive, redis)
+        hints, token = w.resolve(FOLDER)
         self.assertEqual([FILE, "second-doc-id-1234"], [h["file_id"] for h in hints])
-        self.assertEqual("102", redis.data[dw.PAGE_KEY])
+        self.assertEqual("102", token)
         self.assertIn("pageToken=101", drive.calls[-1][1])
+        self.assertEqual("100", redis.data[dw.PAGE_KEY], "resolve writes nothing (Aya on bddafa3)")
+        w.advance(token)
+        self.assertEqual("102", redis.data[dw.PAGE_KEY])
 
     def test_no_token_on_record_is_an_error_not_an_empty_feed(self):
         with self.assertRaises(dw.Unconfigured):
@@ -221,6 +225,57 @@ class HookTest(unittest.TestCase):
         self.assertEqual(["push_resolve_error", "dispatched"], [r["status"] for r in out["intake"]], out)
         self.assertEqual(1, len(self.d.queue.puts))
 
+    def test_the_hints_are_pending_before_the_cursor_moves(self):
+        """Aya on bddafa3: the cursor advanced before the hints were durable, so a crash lost the push."""
+        order = []
+        claims, redis = self.d.claims, self.redis
+        real_add, real_set = claims.pending_add, redis.set
+
+        def add(file_id):
+            order.append(("pending", file_id))
+            return real_add(file_id)
+
+        def put(key, value, ex=None, nx=False):
+            if key == dw.PAGE_KEY:
+                order.append(("cursor", value))
+            return real_set(key, value, ex=ex, nx=nx)
+        claims.pending_add, redis.set = add, put
+        di.handle("POST", "/hooks/drive", push(self.channel), b"", self.d)
+        self.assertEqual([("pending", FILE), ("cursor", "101")], order[:2])
+
+    def test_a_crash_after_the_cursor_moved_leaves_the_doc_for_the_poll(self):
+        def crash(hint, deps):
+            raise RuntimeError("the process died here")
+        original = di.decide
+        di.decide = crash
+        try:
+            out = di.handle("POST", "/hooks/drive", push(self.channel), b"", self.d)[1]
+        finally:
+            di.decide = original
+        self.assertEqual(["decide_error"], [r["status"] for r in out["intake"]])
+        self.assertEqual("101", self.redis.data[dw.PAGE_KEY])
+        self.assertIn(FILE, self.d.claims.pending(), "the doc is pending, so the next poll decides it")
+        self.d.changes = lambda folder: []
+        polled = di.handle("POST", "/poll", {"authorization": "Bearer poll"}, b"", self.d)[1]
+        self.assertEqual(["dispatched"], [r["status"] for r in polled["intake"]], polled)
+
+    def test_an_unwritable_pending_set_keeps_the_cursor_and_polls(self):
+        def refuse(file_id):
+            raise ConnectionError("redis down")
+        self.d.claims.pending_add = refuse
+        out = di.handle("POST", "/hooks/drive", push(self.channel), b"", self.d)[1]
+        self.assertEqual("pending_unwritable", out["intake"][0]["status"])
+        self.assertEqual("100", self.redis.data[dw.PAGE_KEY], "the cursor did not move")
+
+    def test_an_unreadable_channel_record_fails_closed(self):
+        """Aya on bddafa3: an exception reading the record used to count as a known channel."""
+        def broken(channel_id):
+            raise ConnectionError("redis down")
+        self.d.watch.channel_ok = broken
+        out = di.handle("POST", "/hooks/drive", push(self.channel), b"", self.d)[1]
+        self.assertEqual("unknown channel", out.get("ignored"))
+        self.assertEqual(0, self.d.docs.reads)
+
     def test_a_wrong_channel_token_is_still_401(self):
         bad = push(self.channel)
         bad["x-goog-channel-token"] = "nope"
@@ -243,6 +298,53 @@ class HookTest(unittest.TestCase):
         self.d.channel_expires_at = None
         out = di.handle("GET", "/healthz", {}, b"", self.d)[1]
         self.assertEqual(("ok", dw.CHANNEL_SECONDS), (out["channel"], out["seconds_left"]))
+
+
+def _bash():
+    import shutil  # noqa: PLC0415
+    for candidate in ("C:/Program Files/Git/bin/bash.exe", shutil.which("bash")):
+        if candidate and Path(candidate).exists() and "system32" not in str(candidate).lower():
+            return candidate
+    return None
+
+
+class UnwatchTest(unittest.TestCase):
+    """Aya on bddafa3: unwatch ignored a failed allUsers removal and still claimed the rollback."""
+
+    def run_unwatch(self, members, policy_fails=False):
+        import subprocess  # noqa: PLC0415
+        import tempfile  # noqa: PLC0415
+        bash = _bash()
+        if not bash:
+            self.skipTest("no bash on this box")
+        with tempfile.TemporaryDirectory() as d:
+            stub = Path(d) / "gcloud"
+            stub.write_text("#!/usr/bin/env bash\n"
+                            "case \"$*\" in\n"
+                            "  *get-iam-policy*) [ \"$FAKE_POLICY_FAILS\" = 1 ] && exit 1; echo \"$FAKE_MEMBERS\" ;;\n"
+                            "  *remove-iam-policy-binding*) exit 1 ;;\n"
+                            "  *) exit 0 ;;\n"
+                            "esac\n", encoding="utf-8", newline="\n")
+            stub.chmod(0o755)
+            env = dict(__import__("os").environ, GCLOUD=stub.as_posix(), FAKE_MEMBERS=members,
+                       FAKE_POLICY_FAILS="1" if policy_fails else "0")
+            return subprocess.run([bash, "cloud/drive-intake/deploy.sh", "unwatch"], cwd=str(REPO), env=env,
+                                  capture_output=True, text=True, timeout=60)
+
+    def test_allUsers_still_present_is_a_failure(self):
+        run = self.run_unwatch("serviceAccount:drive-intake-poller@sfdc24.iam.gserviceaccount.com;allUsers")
+        self.assertNotEqual(0, run.returncode, run.stdout + run.stderr)
+        self.assertIn("FAILED: allUsers still holds run.invoker", run.stdout)
+
+    def test_an_unreadable_policy_is_a_failure_not_a_success(self):
+        run = self.run_unwatch("", policy_fails=True)
+        self.assertNotEqual(0, run.returncode, run.stdout + run.stderr)
+        self.assertIn("FAILED: could not read", run.stdout)
+
+    def test_allUsers_gone_is_the_read_back_success(self):
+        run = self.run_unwatch("serviceAccount:drive-intake-poller@sfdc24.iam.gserviceaccount.com")
+        self.assertEqual(0, run.returncode, run.stdout + run.stderr)
+        self.assertIn("allUsers removed (read back)", run.stdout)
 
 
 class WiringTest(unittest.TestCase):
