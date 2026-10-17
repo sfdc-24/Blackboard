@@ -9,8 +9,9 @@
 # minutes. `off` takes it to zero instances and so zero cost at rest.
 #
 # WHAT IS THE OWNER'S AND NOT THIS SCRIPT'S
-#   1. Lou's LiveKit project keys, as three secrets: LOU_LIVEKIT_URL (wss://...3p1vbksold1...livekit.cloud),
-#      LOU_LIVEKIT_API_KEY, LOU_LIVEKIT_API_SECRET. The fleet's LIVEKIT_URL is ANOTHER project.
+#   1. Lou's LiveKit keys, as three secrets: LOU_LIVEKIT_URL, LOU_LIVEKIT_API_KEY, LOU_LIVEKIT_API_SECRET.
+#      Lou lives in project "Blackboard" (p_3p1vbksold1, wss://blackboard-c5gn7crt.livekit.cloud), where its
+#      trunk, number and dispatch rule are: the SAME project as the fleet's LIVEKIT_URL, with Lou's OWN key.
 #   2. The v4 prompt, as the secret LOU_INSTRUCTIONS (the repository is public, so it is never here).
 #   3. The Memorystore private address, passed as REDIS_HOST.
 #
