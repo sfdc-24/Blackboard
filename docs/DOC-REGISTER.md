@@ -29,6 +29,7 @@ carries a status banner is shifted down by two lines.
 | AGENCY-DOCTRINE.md | CANON | Decision rights (clause 4 lists six carve-outs) and evidence. Stale: the "Today:" notes that name the laptop `board_waker.py` (lines 61–63, 188–190) and the `inference_report.py` step (line 232), both laptop tasks. |
 | PRODUCT.md | CANON | The four beats (sheet L-90). |
 | REDIS-ACCESS.md | CANON | How every agent reads and writes Redis: the access list, the one row the worker answers, the tool that builds it, the waker's REDIS-OP line, the heartbeat, and what is proved live versus by test. |
+| REDIS-PRIMARY.md | PLAN | Redis as the fleet's primary channel and the board as doorbell and record: per-agent direct paths first (moving early doubles board rows), the DING and LEDGER rows, decisions D1–D5, phases with exit tests. Not built until a phase says so. |
 | POKA-YOKE.md | CANON | Repo lessons L-91 onward. Stale lines: 19 ("highest was L-90") and 34–42. L-91 is now enforced on main, and site #13 merged. |
 | ACCEPTANCE-CHECKLIST.md | CANON | Client-gating checklist. |
 | CLOUD-FLEET-RUNBOOK.md | CANON, STALE | What runs where. Stale lines: 50–66 and 76–77 (the r3 rollback chain), 141 (row count). Cloud Run traffic read 2026-09-26 11:55Z: `sfdc24-studio-controller-r6-d2256e0` at 100%, promoted 04:21Z (board row `CODEX-R6-D2256E0-PROMOTED-20260926T0421Z`); the ADR addendum (03:23Z) and the Converspan note predate that and name r5b. |
