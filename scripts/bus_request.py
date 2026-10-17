@@ -38,17 +38,15 @@ it: "don't widen the stopgap". On 2026-10-08 he decided the trade differently, d
 claude-code-cli: "Everyone gets read write access, you control the Redis access rights and make
 actions auditable so there is governance."
 
-So `redis-op` exists, bounded by GOVERNANCE rather than by identity (scripts/redis_gov.py): every fleet
-agent may read everything and write the governed namespaces; one controller owns the access list
-(scripts/redis_acl.json); every operation, allowed or refused, is audited in gov:audit with the raw
-tag, the board row, and the old and new values; and the namespaces other things depend on - the board
-mirror the comparison gate checks, the roster, the chair's projection, the audit itself - are refused
-for writes in code, whatever the access list says. The identity is still a claim, and the audit says
-so by recording the raw tag beside the principal. Per-agent identity is the redis-tool-bridge (OIDC)
-for the agents that have a Google identity at all; until then, this is the path every agent can reach.
+The ACL governs operations, but its broad read grants do not make a shared RESULT row private.
+Until a board request has an authenticated identity, it may only append to or read the documented
+public conf:side:YYYYMMDD stream. Other keys, including every agent inbox, are refused before a run
+marker or Redis operation. Authenticated Git comment requests retain their existing path.
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import datetime
 import hashlib
 import json
@@ -57,6 +55,7 @@ import secrets
 import time
 
 import redis_gov
+import redis_keys
 
 # The board's ten cells, as scripts/append.py writes them.
 ROW_ID, TS, SOURCE, TARGET, ACTION, PAYLOAD, CATEGORY, PROJECT, GIST, SUBGIST = range(10)
@@ -68,11 +67,12 @@ WORKER_TAG = "bus-reconciler"
 
 # Who MAY ask. Not who DID ask: see the module docstring. This bounds the claim, never the identity.
 SENDERS = ("aya", "chatgpt-codex-desktop", "claude-code-cli", "owner", "whatsapp")
-# What may be asked. The probe selects no key, command or TTL. redis-op selects a key and an op -
-# inside scripts/redis_gov.py's grammar, its access list and its protected namespaces, every use
-# audited. It is listed TOGETHER with its branch in handle(), never without it: listed alone, a
+# What may be asked. The probe selects no key, command or TTL. A board redis-op selects only the
+# public side stream, then redis_gov checks the ACL and audits it. It is listed TOGETHER with its
+# branch in handle(), never without it: listed alone, a
 # redis-op request would fall into the synthetic-probe path and be answered "OK" for nothing done.
 ACTIONS = ("redis-synthetic-probe", "redis-op")
+MAX_REQUEST_PAYLOAD = 1500  # scripts/board_row.py's limit; direct board rows get the same bound
 
 # A request id is the only thing taken from the row, so its grammar is closed and narrow.
 _REQ_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{3,63}$")
@@ -159,21 +159,39 @@ def read_ts(text):
     return value if value.tzinfo else value.replace(tzinfo=datetime.timezone.utc)
 
 
+def board_ten_cells(row):
+    """The ten semantic cells, accepting only blank sheet-width padding after column J.
+
+    The live sheet currently reads as twelve columns. Keep its blank K:L cells out of request
+    parsing, while a nonblank extra cell or a structured value in a semantic cell fails closed.
+    """
+    if (not isinstance(row, list) or len(row) < 10
+            or any(cell is not None and not isinstance(cell, str) for cell in row[:10])
+            or any(str(cell if cell is not None else "").strip() for cell in row[10:])):
+        return None
+    return row[:10]
+
+
 def parse_request(row):
     """A request row as a dict, or None when the row is not one this worker may act on."""
     if not isinstance(row, list) or len(row) <= PAYLOAD:
         return None
     if str(row[ACTION] or "").strip().upper() != REQUEST_ACTION:
         return None
-    payload = str(row[PAYLOAD] or "")
-    req_id = field(payload, "req") or field(payload, "id") or str(row[ROW_ID] or "").strip()
+    ten_cells = board_ten_cells(row)
+    cells = ten_cells if ten_cells is not None else row
+    payload = str(cells[PAYLOAD] or "")
+    req_id = field(payload, "req") or field(payload, "id") or str(cells[ROW_ID] or "").strip()
     return {
         "req_id": req_id,
-        "claimed_sender": str(row[SOURCE] or "").strip().lower(),
+        "claimed_sender": str(cells[SOURCE] or "").strip().lower(),
         "action": (field(payload, "do") or "").strip().lower(),
-        "row_id": str(row[ROW_ID] or "").strip(),
-        "at": read_ts(row[TS]),
-        # redis-op only. Taken verbatim and judged by scripts/redis_gov.py, never used here.
+        "row_id": str(cells[ROW_ID] or "").strip(),
+        "target": str(cells[TARGET] or "").strip(),
+        "ten_cells_with_blank_padding": ten_cells is not None,
+        "payload": payload,
+        "at": read_ts(cells[TS]),
+        # redis-op only. The board policy checks these before redis_gov receives them.
         "op": field(payload, "op"),
         "key": field(payload, "key"),
         "field": field(payload, "field"),
@@ -187,6 +205,7 @@ def parse_request(row):
         "cid": field(payload, "cid"),
         "head": field(payload, "head"),
         "repeated": repeated_keys(payload),
+        "nameless": nameless_segments(payload),
         # Where the row came from: "git" only for a row git_requests built from an authenticated
         # comment (its type says so; no cell can), "board" for everything else.
         "channel": getattr(row, "channel", "board"),
@@ -206,6 +225,66 @@ def repeated_keys(payload) -> list:
             out.append(name)
         seen.add(name)
     return out
+
+
+def nameless_segments(payload) -> int:
+    """Segments after the BCB envelope with no field name: what a pipe inside a raw value leaves
+    behind. A request carrying one is AMBIGUOUS on every channel, the Git one included (the third
+    adversarial check on #367): the value was cut at the pipe before this worker read it, and an OK
+    for the part before the pipe is an OK for a value nobody asked for."""
+    parts = str(payload or "").split("|")
+    return sum(1 for part in parts[1:] if "=" not in part and part.strip() != "")
+
+
+def board_shared_request(req) -> bool:
+    """Accept only a canonical request for the documented public side stream.
+
+    Rebuilding the producer's exact payload also rejects unknown, reordered, duplicated, truncated,
+    or misleading fields. In particular a claimed Source_Tag is never authority to name an inbox.
+    This gate is called before the Redis run marker and before redis_gov.execute().
+    """
+    key = req.get("key") or ""
+    op = (req.get("op") or "").strip().lower()
+    if (not req.get("ten_cells_with_blank_padding")
+            or len(req.get("payload") or "") > MAX_REQUEST_PAYLOAD
+            or not _REQ_ID.fullmatch(req.get("req_id") or "")
+            or req.get("target") != WORKER_TAG
+            or req.get("row_id") != req.get("req_id") or req.get("repeated") or req.get("nameless")
+            or not redis_keys.public_side_allowed(op, key)):
+        return False
+    prefix = ("BCB|v=1|id=%s|req=%s|do=redis-op|op=%s|key=%s"
+              % (req["req_id"], req["req_id"], op, key))
+    if op == "xadd":
+        value = req.get("val") or ""
+        if (req.get("field") or req.get("count") or req.get("after") or req.get("enc") != "b64"
+                or not value):
+            return False
+        try:
+            decoded = base64.b64decode(value, validate=True)
+            decoded.decode("utf-8")
+        except (ValueError, UnicodeDecodeError, binascii.Error):
+            return False
+        if base64.b64encode(decoded).decode("ascii") != value:
+            return False
+        prefix += "|val=%s|enc=b64" % value
+    elif op == "xrange":
+        if req.get("field") or req.get("val") or req.get("enc"):
+            return False
+        count = req.get("count") or ""
+        if count:
+            if (len(count) > 2 or not count.isascii() or not count.isdecimal()
+                    or str(int(count)) != count or not 1 <= int(count) <= redis_gov.MAX_RANGE):
+                return False
+            prefix += "|count=%s" % count
+        after = req.get("after") or ""
+        if after:
+            if (not re.fullmatch(r"[0-9]{1,20}-[0-9]{1,20}", after)
+                    or any(int(p) > 2 ** 64 - 1 for p in after.split("-"))):
+                return False
+            prefix += "|after=%s" % after
+    else:
+        return False
+    return req.get("payload") == prefix + "|from=%s|to=%s" % (req["claimed_sender"], WORKER_TAG)
 
 
 def recognised(req, acl) -> bool:
@@ -294,8 +373,7 @@ def refusals(req, now, already, acl=None) -> list:
         # unrecognised value stays in the run's diagnostics, where nothing publishes it.
         out.append("the claimed sender is not one this worker answers")
     if req["action"] not in ACTIONS:
-        out.append("the action %r is not allowlisted; the only one is %s"
-                   % (req["action"], ", ".join(ACTIONS)))
+        out.append("the action is not allowlisted; allowed actions: %s" % ", ".join(ACTIONS))
     if req["at"] is None:
         out.append("the row has no readable timestamp, so staleness cannot be judged")
     elif (now - req["at"]).total_seconds() > STALE_MINUTES * 60:
@@ -310,9 +388,19 @@ def refusals(req, now, already, acl=None) -> list:
     # is a claim anyone can append (Cursor on 237562f), so for git the board only silences a repeat notice.
     if req["req_id"] in already and req.get("channel", "board") != "git":
         out.append("already answered: a RESULT row for this request id is on the board")
-    if req.get("action") == "redis-op" and req.get("repeated"):
-        out.append("ambiguous: the field(s) %s appear more than once"
-                   % ", ".join(safe(k)[:20] for k in req["repeated"][:5]))
+    if (req.get("action") == "redis-op" and req.get("channel", "board") != "git"
+            and not board_shared_request(req)):
+        # No key, field, value, or malformed payload fragment is echoed in a board row or log.
+        out.append(redis_keys.BOARD_REDIS_REFUSAL)
+    if (req.get("action") == "redis-op" and req.get("channel", "board") == "git"
+            and req.get("repeated")):
+        out.append("ambiguous: a field appears more than once")
+    if (req.get("action") == "redis-op" and req.get("channel", "board") == "git"
+            and req.get("nameless")):
+        out.append("ambiguous: %d segment(s) with no field name; send the value as base64 with enc=b64"
+                   % req["nameless"])
+    # The canonical board gate above also refuses raw or truncated values. The Git channel retains
+    # its existing value grammar, including its repeated-field refusal.
     return out
 
 
@@ -675,8 +763,8 @@ HEARTBEAT_TTL_SECONDS = 3600
 def heartbeat(conn, state, now=None, **fields) -> bool:
     """PY-02 (Grok's poka-yoke audit, 2026-10-08): where the worker says when it last ran, so a poster
     can check before sending instead of posting into a worker that is not coming. One JSON string at
-    gov:worker:heartbeat - under gov:, which no agent may write, and which every agent may READ with
-    a redis-op get. It expires an hour after the last run: an absent key means "no run in the last
+    gov:worker:heartbeat - under gov:, which no board request may read or write. It expires an hour
+    after the last run: an absent key means "no run in the last
     hour", never "running". Never raises: a heartbeat must not cost the run it reports."""
     value = dict(fields, state=state, at=stamp(now))
     try:

@@ -1,5 +1,10 @@
 # The Aya diagnostic chain: configured, missing, and the deploy that has not been run
 
+> **2026-10-11:** this page describes the 2026-10-06 design, a probe-only chain. Since 2026-10-08 the
+> same worker also performs governed Redis reads and writes (`do=redis-op`) under the access list,
+> audited in `gov:audit`; the protocol every agent uses is in
+> [docs/REDIS-ACCESS.md](../../docs/REDIS-ACCESS.md). Where the two disagree, that page is current.
+
 **Status:** Reviewable. **Nothing deployed, no IAM applied, no grant widened.** Dual-run off,
 production mailboxes untouched.<br>
 **Date:** 2026-10-06 · Claude (`claude-code-cli`), Redis control lead<br>
