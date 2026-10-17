@@ -192,7 +192,8 @@ def main() -> int:
     env = load_env()
     execution = os.environ.get("CLOUD_RUN_EXECUTION", "")
     me = execution or "local-%d" % os.getpid()
-    until = _loop_until(os.environ.get("LOOP_UNTIL", ""))
+    until = live_deadline(_loop_until(os.environ.get("LOOP_UNTIL", "")), datetime.datetime.now(datetime.timezone.utc),
+                          int(os.environ.get("LOOP_MAX_MINUTES", "240")))
     interval = max(5, min(60, int(os.environ.get("LOOP_INTERVAL", "10"))))
     lock_ttl = ONE_PASS_LOCK_SECONDS if until is None else max(LIVE_LOCK_SECONDS, interval * 6)
     try:
@@ -237,9 +238,7 @@ def live(conn, env, execution, me, until, interval, lock_ttl) -> int:
     # whatever this loop intends (the job's default spec is 5 minutes - see REQUESTS.md).
     import git_requests                                                  # noqa: PLC0415
     git_every = git_requests.poll_seconds(os.environ.get("GITHUB_READ_TOKEN") or None)
-    started = datetime.datetime.now(datetime.timezone.utc)
-    hard_stop = started + datetime.timedelta(minutes=int(os.environ.get("LOOP_MAX_MINUTES", "240")))
-    stop = min(until, hard_stop)
+    stop = until                                     # already capped by LOOP_MAX_MINUTES, in main (live_deadline)
     log.info("live mode: every %ds, GitHub every %ds, until %s", interval, git_every, stop.strftime("%H:%M:%SZ"))
     last_git, passes = None, 0
     while datetime.datetime.now(datetime.timezone.utc) < stop:
@@ -272,6 +271,16 @@ def live(conn, env, execution, me, until, interval, lock_ttl) -> int:
         time.sleep(interval)
     log.info("live mode ended after %d passes", passes)
     return 0
+
+
+def live_deadline(until, started, max_minutes):
+    """The ONE end of a live run: LOOP_UNTIL, but never more than LOOP_MAX_MINUTES after the run started.
+    Computed once, before any wait for the lock, and used by both the wait and the loop. Aya on e4e98fc: the
+    cap used to start only once the lock was taken, so a run that waited 90 s under a one-minute cap still
+    started its loop after the cap had passed. None for a single pass."""
+    if until is None:
+        return None
+    return min(until, started + datetime.timedelta(minutes=max_minutes))
 
 
 def _loop_until(text):

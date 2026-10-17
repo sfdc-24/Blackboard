@@ -431,6 +431,33 @@ class TheHandOver(unittest.TestCase):
         self.assertEqual(0, code)
         self.assertTrue(passes, "it took over once the holder let go")
 
+    # Aya on e4e98fc: the wait used raw LOOP_UNTIL, and LOOP_MAX_MINUTES only started once the lock was taken.
+    CAPPED = {"LOOP_UNTIL": "2026-10-11T23:00:00Z", "LOOP_MAX_MINUTES": "1", "LOOP_INTERVAL": "10",
+              "CLOUD_RUN_EXECUTION": "bus-requests-chpc6"}
+
+    def test_a_lock_held_past_the_cap_ends_the_wait_at_the_cap(self):
+        conn, passes = LockRedis(held="bus-requests-nddgr"), []
+        code, clock = self.run_main_releasing(conn, self.CAPPED, lambda *a, **k: passes.append(1),
+                                              release_after_sleeps=10 ** 6)
+        self.assertEqual((0, []), (code, passes))
+        self.assertLess(clock["t"], START + datetime.timedelta(minutes=2), "not to LOOP_UNTIL, an hour on")
+
+    def test_a_lock_released_after_the_cap_is_never_taken(self):
+        conn, passes = LockRedis(held="bus-requests-nddgr"), []
+        code, _ = self.run_main_releasing(conn, self.CAPPED, lambda *a, **k: passes.append(1),
+                                          release_after_sleeps=9)                       # freed at 90 s
+        self.assertEqual((0, []), (code, passes))
+        self.assertNotIn("bus-requests-chpc6", [s[1] for s in conn.sets], "it never took the lock after its own end")
+
+    def test_the_cap_counts_from_the_start_not_from_the_take_over(self):
+        conn, times = LockRedis(held="bus-requests-nddgr"), []
+        code, _ = self.run_main_releasing(conn, dict(self.CAPPED, LOOP_MAX_MINUTES="2"),
+                                          lambda *a, **k: times.append(sr.datetime.datetime.now()),
+                                          release_after_sleeps=6)                       # freed at 60 s
+        self.assertEqual(0, code)
+        self.assertTrue(times, "it took over inside its window")
+        self.assertLess(max(times), START + datetime.timedelta(minutes=2), "and stopped two minutes after START")
+
 
 if __name__ == "__main__":
     unittest.main()
