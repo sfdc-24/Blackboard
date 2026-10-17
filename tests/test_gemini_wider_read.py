@@ -188,7 +188,7 @@ SERVICE = {"name": "projects/sfdc24/locations/us-central1/services/conference-ga
            "template": {"serviceAccount": "gw@sfdc24.iam.gserviceaccount.com",
                         "vpcAccess": {"egress": "PRIVATE_RANGES_ONLY"},
                         "containers": [{"image": "us-docker.pkg.dev/x/gw:1",
-                                        "env": [{"name": "REDIS_HOST", "value": "10.54.72.180"},
+                                        "env": [{"name": "REDIS_HOST", "value": "10.200.0.9"},
                                                 {"name": "LIVEKIT_API_SECRET",
                                                  "valueSource": {"secretKeyRef": {
                                                      "secret": "projects/1/secrets/LIVEKIT_API_SECRET"}}}]}]}}
@@ -196,7 +196,7 @@ JOB = {"name": "projects/sfdc24/locations/us-central1/jobs/bus-requests",
        "latestCreatedExecution": {"name": "projects/x/executions/bus-requests-xktq4"},
        "template": {"template": {"containers": [{"image": "img:gov-4d13e97", "env": []}]}}}
 LOG = {"timestamp": "2026-10-08T17:00:00.123Z", "severity": "ERROR",
-       "textPayload": "connect to 10.54.72.180:6378 failed for abdus@sfdc24.com with Bearer abc.def "
+       "textPayload": "connect to 10.200.0.9:6378 failed for abdus@sfdc24.com with Bearer abc.def "
                       "key AIzaSyA1234567890abcdefghijklmnopqrstu url https://x.test/cb?code=zzz"}
 
 
@@ -227,7 +227,7 @@ class CloudStateIsReadOnlyValuesWithheldLogsRedacted(unittest.TestCase):
         self.assertIn("conference-gateway-00019-k6c", out)
         self.assertIn("REDIS_HOST", out)
         self.assertIn("LIVEKIT_API_SECRET <- secret LIVEKIT_API_SECRET", out)
-        self.assertNotIn("10.54.72.180", out, "an env value reached the context")
+        self.assertNotIn("10.200.0.9", out, "an env value reached the context")
 
     def test_logs_only_when_asked_and_always_redacted(self):
         calls = []
@@ -235,7 +235,7 @@ class CloudStateIsReadOnlyValuesWithheldLogsRedacted(unittest.TestCase):
         self.assertNotIn("logs, WARNING", quiet)
         self.assertFalse(any(u == cc.LOGGING for u, _ in calls))
         out = cc.context_for("why did bus-requests fail? show the logs", token="t", call=fake_call([]))
-        for leaked in ("10.54.72.180", "abdus@sfdc24.com", "abc.def", "AIzaSyA1234567890", "code=zzz"):
+        for leaked in ("10.200.0.9", "abdus@sfdc24.com", "abc.def", "AIzaSyA1234567890", "code=zzz"):
             self.assertNotIn(leaked, out, leaked)
         self.assertIn("[ip]", out)
         self.assertIn("[email]", out)
@@ -538,13 +538,13 @@ REVISION = {
                                          "networkInterfaces": [{"network": "default", "subnetwork": "default"}]},
     "serviceAccount": "chair@sfdc24.iam.gserviceaccount.com",
     "containers": [{"name": "chair", "image": "us-central1-docker.pkg.dev/sfdc24/x/conference-chair@" + DIGEST,
-                    "env": [{"name": "REDIS_HOST", "value": "10.54.72.180"},
+                    "env": [{"name": "REDIS_HOST", "value": "10.200.0.9"},
                             {"name": "LIVEKIT_API_SECRET",
                              "valueSource": {"secretKeyRef": {"secret": "projects/1/secrets/LIVEKIT_API_SECRET",
                                                               "version": "latest"}}},
                             {"name": "CONF_REDIS_CHECK", "value": "1"},
                             {"name": "CONF_REDIS_CHECK_ROOMS", "value": "conf-synthetic-gate3-20261014"},
-                            {"name": "CONF_REDIS_CHECK_OWNER", "value": "7414c1ce0e4f55bf"}],
+                            {"name": "CONF_REDIS_CHECK_OWNER", "value": "0f1e2d3c4b5a6978"}],
                     "resources": {"limits": {"cpu": "2", "memory": "2Gi"}}}],
     "executionEnvironment": "EXECUTION_ENVIRONMENT_GEN2",
     "conditions": [{"type": "Ready", "state": "CONDITION_SUCCEEDED", "message": "",
@@ -605,7 +605,7 @@ class APastStateForARecheck(unittest.TestCase):
         self.assertIn("2026-10-15T15:53:47 DEFAULT INFO:conference.chair:redis check 10: ok in 29 ms", out)
         self.assertIn("4 of 4 proved.", out)
         self.assertIn("  logs from 2026-10-15T15:53:20Z to 2026-10-15T15:55:30Z, every severity", out)
-        for hidden in ("10.54.72.180", "7414c1ce0e4f55bf", "abdus@sfdc24.com"):
+        for hidden in ("10.200.0.9", "0f1e2d3c4b5a6978", "abdus@sfdc24.com"):
             self.assertNotIn(hidden, out, hidden)
         revision_urls = [u for u, _ in calls if "/revisions/" in u]
         self.assertEqual([cc.RUN + "/workerPools/conference-chair-pool/revisions/conference-chair-pool-00034-s48"],
@@ -735,7 +735,7 @@ class APastStateForARecheck(unittest.TestCase):
     def test_window_log_lines_are_redacted_and_capped(self):
         out = self.context("conference-chair-pool 2026-10-15 15:53Z to 15:55Z",
                            entries=[LOG] + [dict(CHECK_LOGS[0])] * 20)
-        self.assertNotIn("10.54.72.180", out)
+        self.assertNotIn("10.200.0.9", out)
         self.assertIn("2026-10-08T17:00:00 ERROR", out)
         self.assertEqual(cc.MAX_LOG_LINES, out.count("redis check 10: ok") + 1)
 
@@ -745,7 +745,7 @@ class APastStateForARecheck(unittest.TestCase):
         self.assertNotIn("CONF_REDIS_CHECK_OWNER", cc.SHOWN_ENV)
         out = cc.describe_revision("worker pool", REVISION)
         self.assertIn("CONF_REDIS_CHECK_OWNER", out.split("flag values")[0], "its name is listed")
-        self.assertNotIn("7414c1ce0e4f55bf", out)
+        self.assertNotIn("0f1e2d3c4b5a6978", out)
 
     def test_it_still_never_writes(self):
         calls = []
