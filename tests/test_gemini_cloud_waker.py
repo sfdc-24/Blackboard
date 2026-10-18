@@ -987,7 +987,8 @@ class APostThatOutlivesItsTimeout(unittest.TestCase):
 
         def hang(args, **kw):
             attempts.append(args)
-            raise subprocess.TimeoutExpired(args, kw.get("timeout"))
+            raise subprocess.TimeoutExpired(args, kw.get("timeout"),
+                                           output=b"  appending Row_ID=GEMINI-WAKE-SLOW-1\n")
 
         store = MemStore({"watermark": "2026-09-29T07:00:00Z", "answered_ids": []})
         saved = (aw.read_since, aw.load_env, aw.log)
@@ -1036,12 +1037,175 @@ class APostThatOutlivesItsTimeout(unittest.TestCase):
         from contextlib import redirect_stdout
 
         def hang(args, **kw):
-            raise subprocess.TimeoutExpired(args, kw.get("timeout"))
+            raise subprocess.TimeoutExpired(args, kw.get("timeout"),
+                                           output=b"  appending Row_ID=GEMINI-WAKE-SLOW-1\n")
         buf = io.StringIO()
         with mock.patch.object(aw.subprocess, "run", side_effect=hang), redirect_stdout(buf):
             self.assertFalse(aw.post_reply("gemini", {"project": "FLEET"}, "t", "grok;ALL", "X", False,
                                            phase="RESULT"))
         self.assertIn("NOT CONFIRMED after 400 s", buf.getvalue())
+
+
+class _RequestingWaker(_ClaimingWaker):
+    """A waker whose reply carries a REDIS-OP line: it reserves the request side effect under the
+    posting claim BEFORE its request append, then posts the reply - the cloud hook's order."""
+
+    def __init__(self, calls, spawn=None, posts=None, requests=None):
+        super().__init__(calls, spawn=spawn, posts=posts)
+        self.requests = requests if requests is not None else []
+
+    def main(self, argv):
+        path = os.path.join(os.environ["BLACKBOARD_STATE_DIR"], ".gemini_waker_state.json")
+        with open(path, encoding="utf-8") as fh:
+            state = json.load(fh)
+        claim = getattr(self, "claim_answer", lambda _rid: True)
+        reserve = getattr(self, "reserve_redis_side_effect", lambda _rid: False)
+        rid = "A"
+        if rid not in (state.get("answered_ids") or []) and rid not in (state.get("unknown_ids") or []):
+            if claim(rid):
+                self.calls.append(rid)
+                if reserve(rid):
+                    self.requests.append(rid)        # the request append is on the wire here
+                    if (self.spawn is not None and not self.spawn.get("done")
+                            and self.spawn.get("when") == "during-request"):
+                        self.spawn["done"] = True
+                        self.spawn["go"]()
+                if self.post_reply("gemini", {}, "x", "whatsapp;ALL", rid, False):
+                    state.setdefault("answered_ids", []).append(rid)
+        state["watermark"] = "2026-09-24T03:00:00Z"
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(state, fh)
+        return 0
+
+
+class TheRequestAppendIsFenced(unittest.TestCase):
+    """Copilot on #365 asked for the Redis write to be inside the same durable claim lifecycle as the
+    reply; Aya's supplement to #367 drew it. The posting claim is taken before the request append,
+    the reply append renews it, a second run during either defers, and a live posting claim is
+    never quarantined - only a dead one."""
+
+    def test_the_request_is_appended_under_the_posting_claim_and_the_reply_still_posts(self):
+        store = MemStore({"watermark": "2026-09-24T02:00:00Z", "answered_ids": []})
+        calls, posts, requests = [], [], []
+        w = _RequestingWaker(calls, posts=posts, requests=requests)
+        w.reply_on_board = lambda rid: False
+        main.run(store=store, waker=w, now="2026-09-24T05:00:00Z")
+        self.assertEqual((["A"], ["A"], ["A"]), (calls, requests, posts))
+        self.assertIn("A", store.state.get("answered_ids") or [])
+        self.assertEqual(store.state.get("claim_phase") or "", "", "the claim is released after the reply")
+
+    def test_the_lease_taken_at_reserve_covers_both_appends_and_what_runs_between(self):
+        # 460 s covered one append; the request may take 400 s, then okf_land, then the reply append.
+        store = MemStore({"watermark": "2026-09-24T02:00:00Z", "answered_ids": []})
+        seen = []
+
+        class Recording(_RequestingWaker):
+            def main(self, argv):
+                orig = self.reserve_redis_side_effect
+
+                def reserve(rid):
+                    ok = orig(rid)
+                    seen.append(store.state.get("claim_until"))
+                    return ok
+                self.reserve_redis_side_effect = reserve
+                return super().main(argv)
+        w = Recording([], posts=[], requests=[])
+        w.reply_on_board = lambda rid: False
+        main.run(store=store, waker=w, now="2026-09-24T05:00:00Z")
+        self.assertEqual(["2026-09-24T05:15:20Z"], seen, "2 * 400 s + 120 s from the reserve")
+
+    def test_a_second_run_during_the_request_append_defers_and_quarantines_nothing(self):
+        from datetime import datetime, timedelta, timezone
+        start = datetime(2026, 9, 24, 5, 0, tzinfo=timezone.utc)
+        clock = {"now": start}
+
+        def now():
+            return clock["now"]
+
+        store = MemStore({"watermark": "2026-09-24T02:00:00Z", "answered_ids": []})
+        calls, posts, requests = [], [], []
+        spawn = {"when": "during-request"}
+
+        def go():
+            clock["now"] = start + timedelta(seconds=200)      # inside the first run's 460 s lease
+            other = _RequestingWaker(calls, posts=posts, requests=requests)
+            other.reply_on_board = lambda rid: False
+            try:
+                main.run(store=store, waker=other, now=now, lease_seconds=600)
+            except state_store.Conflict:
+                pass
+
+        spawn["go"] = go
+        first = _RequestingWaker(calls, spawn=spawn, posts=posts, requests=requests)
+        first.reply_on_board = lambda rid: False
+        main.run(store=store, waker=first, now=now, lease_seconds=600)
+        self.assertEqual(calls, ["A"], "the second run called the model: %r" % (calls,))
+        self.assertEqual(requests, ["A"], "the request was appended twice: %r" % (requests,))
+        self.assertEqual(posts, ["A"], "the reply was appended twice: %r" % (posts,))
+        self.assertIn("A", store.state.get("answered_ids") or [])
+        self.assertNotIn("A", store.state.get("unknown_ids") or [], "a live posting claim was quarantined")
+
+    def test_a_live_posting_claim_of_another_run_is_left_alone_not_quarantined(self):
+        store = MemStore({"watermark": "2026-09-24T02:00:00Z", "answered_ids": [],
+                          "inflight": "A", "claim_owner": "other-run",
+                          "claim_until": "2026-09-24T05:00:00Z", "claim_phase": "posting"})
+        calls, posts = [], []
+        w = _RequestingWaker(calls, posts=posts)
+        w.reply_on_board = lambda rid: False
+        main.run(store=store, waker=w, now="2026-09-24T04:00:00Z")         # the lease is live
+        self.assertEqual(([], []), (calls, posts))
+        self.assertNotIn("A", store.state.get("unknown_ids") or [])
+        self.assertEqual("posting", store.state.get("claim_phase"), "left to its owner")
+        # Dead, the same claim is reconciled as before: no reply means quarantine.
+        main.run(store=store, waker=w, now="2026-09-24T06:00:00Z")
+        self.assertIn("A", store.state.get("unknown_ids") or [])
+        self.assertEqual(([], []), (calls, posts))
+
+    def test_outside_the_runner_the_adapter_has_no_claim_and_refuses(self):
+        self.assertFalse(aw.reserve_redis_side_effect("A"))
+
+    def test_reply_not_sent_after_request_reservation_keeps_unknown_and_prevents_replay(self):
+        """The final reply's preflight says nothing about an earlier Redis request append."""
+        class RequestThenNoReply(_RequestingWaker):
+            def post_reply(self, me, cfg, text, to, answers, verbose, phase="DONE"):
+                return aw.NOT_SENT
+
+        store = MemStore({"watermark": "2026-09-24T02:00:00Z", "answered_ids": []})
+        calls, posts, requests = [], [], []
+        w = RequestThenNoReply(calls, posts=posts, requests=requests)
+        w.reply_on_board = lambda rid: False
+        main.run(store=store, waker=w, now="2026-09-24T05:00:00Z")
+        self.assertEqual((["A"], ["A"], []), (calls, requests, posts))
+        self.assertEqual(("A", "posting"), (store.state.get("inflight"), store.state.get("claim_phase")))
+        main.run(store=store, waker=w, now="2026-09-24T05:10:00Z")
+        self.assertEqual((["A"], ["A"], []), (calls, requests, posts), "no second dispatch")
+        main.run(store=store, waker=w, now="2026-09-24T05:20:00Z")
+        self.assertEqual((["A"], ["A"], []), (calls, requests, posts))
+        self.assertIn("A", store.state.get("unknown_ids") or [], "expired uncertain posting is held")
+
+    def test_a_reply_the_tool_never_appended_releases_the_claim_so_the_next_run_asks_again(self):
+        """A positively established final-reply preflight refusal may release an ordinary claim.
+        A timeout with missing captured output is not such proof, and a reserved Redis request is
+        never released by the final reply's refusal."""
+        class NotSentOnce(_ClaimingWaker):
+            def post_reply(self, me, cfg, text, to, answers, verbose, phase="DONE"):
+                if not getattr(self, "sent_once", False):
+                    self.sent_once = True
+                    return aw.NOT_SENT
+                return super().post_reply(me, cfg, text, to, answers, verbose, phase=phase)
+        store = MemStore({"watermark": "2026-09-24T02:00:00Z", "answered_ids": []})
+        calls, posts = [], []
+        w = NotSentOnce(calls, posts=posts)
+        w.reply_on_board = lambda rid: False
+        main.run(store=store, waker=w, now="2026-09-24T05:00:00Z")
+        self.assertEqual((["A"], []), (calls, posts))
+        self.assertEqual("", store.state.get("claim_phase") or "", "the claim is released")
+        self.assertEqual("", store.state.get("inflight") or "")
+        self.assertNotIn("A", store.state.get("unknown_ids") or [], "not quarantined: nothing was sent")
+        self.assertNotIn("A", store.state.get("answered_ids") or [])
+        main.run(store=store, waker=w, now="2026-09-24T05:10:00Z")
+        self.assertEqual((["A", "A"], ["A"]), (calls, posts), "the next run asks again and posts")
+        self.assertIn("A", store.state.get("answered_ids") or [])
 
 
 if __name__ == "__main__":

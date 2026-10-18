@@ -1371,6 +1371,13 @@ class ScopeAndManifest(unittest.TestCase):
 
 
 class ThroughTheWorker(unittest.TestCase):
+    """A haudit request written onto the board. On #367 the worker answers board rows only for the
+    public conf:side:YYYYMMDD stream (Source_Tag is not authenticated identity), so a haudit row is
+    refused BEFORE the run marker and Redis, flag on or off, and its RESULT row carries the one
+    key-free refusal sentence. What this class protects holds either way: no key, no stored value
+    and no digest on the board, and nothing fetched. Opening haudit to the board again is part of
+    the owner's narrow-or-broad decision on #367."""
+
     def setUp(self):
         self._env = patch.dict(os.environ, {}, clear=False)
         self._env.start()
@@ -1400,8 +1407,8 @@ class ThroughTheWorker(unittest.TestCase):
         rows = []
         out = br.handle([self._row(gen, expected, "cid-worker-off")], conn, now=self.now,
                         append=rows.append)
-        self.assertEqual("REFUSED", out["answered"][0]["status"])
-        self.assertIn("withheld", rows[0]["payload"])
+        self.assertEqual(([], 1), (out["answered"], len(out["refused"])))
+        self.assertIn(br.redis_keys.BOARD_REDIS_REFUSAL, rows[0]["payload"])
         self.assertNotIn(key, rows[0]["payload"])
         self.assertNotIn(SECRET, rows[0]["payload"])
         self.assertNotIn(spec(mapping)["sha256"], rows[0]["payload"])
@@ -1412,8 +1419,8 @@ class ThroughTheWorker(unittest.TestCase):
         rows = []
         out = br.handle([self._row(gen, expected, "cid-worker-on", req="REQ-AUDIT02")], conn,
                         now=self.now, append=rows.append)
-        self.assertEqual("REFUSED", out["answered"][0]["status"])
-        self.assertIn("withheld", rows[0]["payload"])
+        self.assertEqual(([], 1), (out["answered"], len(out["refused"])))
+        self.assertIn(br.redis_keys.BOARD_REDIS_REFUSAL, rows[0]["payload"])
         self.assertNotIn(key, rows[0]["payload"])
         self.assertNotIn(spec(mapping)["sha256"], rows[0]["payload"])
         self.assertNotIn(SECRET, rows[0]["payload"])
@@ -1428,9 +1435,10 @@ class ThroughTheWorker(unittest.TestCase):
         rows = []
         out = br.handle([self._row(gen, {key: spec({"body": "nope"})}, "cid-fail-1",
                                     req="REQ-AUDIT03")], conn, now=self.now, append=rows.append)
-        self.assertEqual("REFUSED", out["answered"][0]["status"])
+        self.assertEqual(([], 1), (out["answered"], len(out["refused"])))
         self.assertEqual([], out["errors"])
-        self.assertIn("withheld", rows[0]["payload"])
+        self.assertIn(br.redis_keys.BOARD_REDIS_REFUSAL, rows[0]["payload"])
+        self.assertEqual(0, conn.fetches, "refused before Redis: nothing fetched")
         self.assertNotIn(key, rows[0]["payload"])
         self.assertNotIn(SECRET, rows[0]["payload"])
         self.assertNotIn("changed=1", rows[0]["payload"])

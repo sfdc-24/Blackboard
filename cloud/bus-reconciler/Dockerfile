@@ -39,6 +39,8 @@ COPY cloud/bus-reconciler/probe.py /app/probe.py
 # ONE board-write path on this fleet that sends a single transport attempt and then reads the
 # row back by Row_ID; a second implementation in here would be a second thing to get wrong.
 COPY scripts/bus_request.py /app/bus_request.py
+# The unauthenticated board Redis key boundary shared with the request producers.
+COPY scripts/redis_keys.py /app/redis_keys.py
 # Governed Redis access (redis-op): the module that decides, and the access list it decides by.
 # The ACL is baked in, so changing anyone's rights is a reviewed commit and a rebuild - and every
 # audit entry names the ACL digest it was decided under.

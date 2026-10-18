@@ -96,6 +96,10 @@ CURSOR = os.environ.get("CURSOR_NAME") or "%s_waker" % AGENT.replace("-", "_")
 CLAIM_LEASE_SECONDS = int(os.environ.get("CLAIM_LEASE_SECONDS") or 600)
 POST_TIMEOUT_SECONDS = 400
 POST_LEASE_SECONDS = POST_TIMEOUT_SECONDS + 60
+# The lease taken at reserve covers the request append, what runs between the two appends (okf_land
+# may open a PR) and the reply append: two post timeouts and a margin (the third adversarial check
+# on #367 found 460 s short of that). post_and_record renews it once more before the reply.
+RESERVE_LEASE_SECONDS = 2 * POST_TIMEOUT_SECONDS + 120
 
 
 def _field(row, name: str) -> str:
@@ -367,6 +371,12 @@ def run(argv=None, store=None, waker=None, board_contains=None,
             return
         visible = reply_visible(inflight)
         if phase == "posting":
+            # A LIVE posting claim is an owner still inside the Redis request append or the final
+            # reply append (the request alone may take its whole 400 s), not a crash. It is left
+            # alone; the lease check below defers this run. Only a dead one is reconciled
+            # (Aya's supplement to #367, 2026-10-11).
+            if not visible and live(claim_of(box["state"])):
+                return
             s = dict(box["state"])
             if visible:
                 mark_answered(s, inflight)
@@ -385,12 +395,12 @@ def run(argv=None, store=None, waker=None, board_contains=None,
 
     resolve_inflight()
 
-    # A claim saved by a run that is still inside the model. Do not enter
-    # the loop, and do not save: a watermark write here would move the
-    # generation out from under the owner before they can append.
-    # phase=posting was reconciled above; it is not a live claim to defer.
+    # A claim saved by a run that is still inside the model, or still inside
+    # the request or reply append. Do not enter the loop, and do not save: a
+    # watermark write here would move the generation out from under the owner
+    # before they can append. A dead posting claim was reconciled above.
     held = claim_of(box["state"])
-    if held["phase"] != "posting" and live(held) and held["owner"] != owner:
+    if live(held) and held["owner"] != owner:
         print(json.dumps({"ran": False, "reason":
                           "live claim %s held by %s until %s"
                           % (held["id"], held["owner"], held["until"])}))
@@ -420,9 +430,12 @@ def run(argv=None, store=None, waker=None, board_contains=None,
     original_call = getattr(waker, "call_agent", None)
     had_claim = hasattr(waker, "claim_answer")
     original_claim = getattr(waker, "claim_answer", None)
+    had_reserve = hasattr(waker, "reserve_redis_side_effect")
+    original_reserve = getattr(waker, "reserve_redis_side_effect", None)
+    reserved_posts = set()
 
-    def begin_post(answers_id: str) -> bool:
-        """Write phase=posting and renew the lease, then the append may start.
+    def begin_post(answers_id: str, span: int = POST_LEASE_SECONDS) -> bool:
+        """Write phase=posting and renew the lease to at least `span` from now, then the append may start.
 
         An ownership check after the subprocess has been launched cannot
         pull the append back. The renewed lease is at least the post
@@ -437,7 +450,7 @@ def run(argv=None, store=None, waker=None, board_contains=None,
             return False
         s = dict(box["state"])
         s["claim_phase"] = "posting"
-        renewed = expiry_after(POST_LEASE_SECONDS)
+        renewed = expiry_after(span)
         if (s.get("claim_until") or "") < renewed:
             s["claim_until"] = renewed
         try:
@@ -450,10 +463,43 @@ def run(argv=None, store=None, waker=None, board_contains=None,
 
     def post_and_record(me, cfg, text, to, answers, verbose, phase="DONE"):
         # The phase is forwarded: an answer to a DISPATCH is a RESULT (Blackboard #297).
-        if not begin_post(answers):
+        had_request_reservation = answers in reserved_posts
+        if had_request_reservation:
+            # The posting claim was taken before the Redis request append (reserve below).
+            # It must still be ours and live; then the lease is renewed under compare-and-swap,
+            # because the request may have used nearly its whole 400 s before this reply append.
+            held_now = claim_of(box["state"])
+            if not (held_now["id"] == answers and held_now["owner"] == owner
+                    and held_now["phase"] == "posting" and live(held_now)):
+                return False
+            s = dict(box["state"])
+            renewed = expiry_after(POST_LEASE_SECONDS)
+            if (s.get("claim_until") or "") < renewed:
+                s["claim_until"] = renewed
+            try:
+                persist(s)
+            except state_store.Conflict:
+                return False
+        elif not begin_post(answers):
             return False
         ok = original_post(me, cfg, text, to, answers, verbose, phase=phase)
+        import agent_waker
+        if not ok and ok is agent_waker.NOT_SENT:
+            # Only the final reply is definitely unsent. An earlier Redis request may already be
+            # on the board, so its reserved posting claim must remain for the next run to reconcile.
+            if had_request_reservation:
+                return ok
+            # With no earlier request, release only OUR claim so the next run can ask again.
+            s = dict(box["state"])
+            if s.get("claim_owner") == owner and s.get("inflight") == answers:
+                clear_claim(s)
+                try:
+                    persist(s)
+                except state_store.Conflict:
+                    pass
+            return ok
         if ok:
+            reserved_posts.discard(answers)
             s = dict(box["state"])
             # Confirmed on the board. Record that, and drop the posting claim
             # only when this run still holds it. A takeover's claim is not ours
@@ -469,6 +515,19 @@ def run(argv=None, store=None, waker=None, board_contains=None,
         # A post that did not confirm stays phase=posting. The next run
         # reconciles it from the board. It is not claimed again.
         return ok
+
+    def reserve_redis_side_effect(answers_id: str) -> bool:
+        """Fence the Redis request append with the durable posting claim BEFORE it starts.
+
+        Copilot on #365 asked for the write to be inside the same durable claim lifecycle as the
+        reply; Aya's supplement to #367 drew it. phase=posting is written and the lease renewed
+        here, so a later run reconciles or defers this source row instead of calling the model and
+        the Redis operation again after an uncertain append. The reply append that follows renews
+        the lease once more (post_and_record)."""
+        if not begin_post(answers_id, span=RESERVE_LEASE_SECONDS):
+            return False
+        reserved_posts.add(answers_id)
+        return True
 
     def call_agent(*args, **kwargs):
         text, route = original_call(*args, **kwargs)
@@ -488,6 +547,7 @@ def run(argv=None, store=None, waker=None, board_contains=None,
 
     waker.post_reply = post_and_record
     waker.claim_answer = claim_answer
+    waker.reserve_redis_side_effect = reserve_redis_side_effect
     if original_call is not None:
         waker.call_agent = call_agent
 
@@ -507,6 +567,10 @@ def run(argv=None, store=None, waker=None, board_contains=None,
             waker.claim_answer = original_claim
         elif hasattr(waker, "claim_answer"):
             del waker.claim_answer
+        if had_reserve:
+            waker.reserve_redis_side_effect = original_reserve
+        elif hasattr(waker, "reserve_redis_side_effect"):
+            del waker.reserve_redis_side_effect
 
     # The pass's own view: its watermark, and answered_ids that already include
     # everything recorded above. Union, so nothing recorded mid-pass is dropped.

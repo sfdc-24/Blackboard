@@ -37,10 +37,13 @@ USAGE
 import argparse
 import datetime as dt
 import gzip
+import hashlib
 import json
 import os
 import re
 import sys
+import time
+import urllib.error
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -326,6 +329,18 @@ def cmd_dupes(args):
     return 0
 
 
+def default_post_id(prefix: str, tag: str, phase: str, text: str, moment=None) -> str:
+    """The id of a post that named none: the prefix, the second, and six hex of what is posted.
+
+    Row ids are global and verified as exactly one row (d53079b), so the old minute-resolution
+    default made a second post in the same minute a refusal (the fourth adversarial check on #367).
+    The digest makes two different posts in one second differ. The timestamp changes across seconds;
+    a retry that must keep the same row id must pass an explicit --id."""
+    stamp = (moment or dt.datetime.now(dt.timezone.utc)).strftime("%Y%m%dT%H%M%SZ")
+    digest = hashlib.sha256(("%s\n%s\n%s" % (tag, phase, text or "")).encode("utf-8")).hexdigest()[:6]
+    return "%s-%s-%s" % (prefix, stamp, digest)
+
+
 def cmd_post(args):
     """Write a CORRECTLY SHAPED row. Hand-assembling the array is how three
     rows got mangled on 2026-09-17.
@@ -349,8 +364,8 @@ def cmd_post(args):
     from instances that were demonstrably reading the board.
     """
     tag = args.tag
-    now = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-    rid = args.id or ("%s-%s" % (args.prefix, dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%MZ")))
+    moment = dt.datetime.now(dt.timezone.utc)
+    now = moment.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     to = args.to
     text = args.text
     if getattr(args, "text_file", None):
@@ -359,6 +374,7 @@ def cmd_post(args):
     if not (text or "").strip():
         print("  refusing an empty post: pass text or --text-file with content")
         return 2
+    rid = args.id or default_post_id(args.prefix, tag, args.phase, text, moment)
     header = "BCB|v=1|id=%s|phase=%s|class=%s|from=%s|to=%s|" % (
         rid, args.phase, args.klass, tag, to.replace(";", ","))
     # NEVER TRIM SILENTLY (board_row, 2026-10-09). Every agent's post comes through here, so this is
@@ -375,17 +391,187 @@ def cmd_post(args):
               % (fitted["chars"], fitted["error"] or "no spill store"))
     gist = args.gist or board_row.split_fields(text)[1][:180]
     row = [rid, now, tag, to, args.phase, payload, args.category, args.project, gist[:180], ""]
-    return append_and_verify(rid, row, fitted, spill)
+    # exact=False: a reply retried with other text under the same id is the ask already answered.
+    return append_and_verify(rid, row, fitted, spill, exact=False)
 
 
-def append_and_verify(rid, row, fitted=None, spill=None):
-    """Append one row, commit its spill if it has one, and prove it landed by reading it back.
-    0 only on a verified row. The one append path for post and request, so they cannot drift."""
+# The row list's cells, by index; the board's headers for them are Row_ID, Source_Tag, Action_Type, Payload.
+ROW_ID_COL, SOURCE_COL, ACTION_COL, PAYLOAD_COL = 0, 2, 4, 5
+
+# Exit codes of post and request. Four outcomes, four numbers, because a caller that cannot tell
+# "nothing was sent" from "something may have landed" is a caller that posts twice (Grok on #367).
+EXIT_VERIFIED, EXIT_NOT_SENT, EXIT_REFUSED, EXIT_UNCONFIRMED = 0, 1, 2, 3
+
+# WHAT A REQUEST MAY NAME THROUGH THIS TOOL, on the waker's path and on the command line alike:
+# scripts/redis_keys.py, one rule in one file (Grok on #367, item 1). Re-exported here for callers.
+from redis_keys import key_allowed_for  # noqa: E402
+
+
+def _same_payload(a, b) -> bool:
+    """Two payload cells that say the same thing. Whitespace-normalised, because the sheet is not
+    byte-faithful about runs of spaces and the comparison must not fail every post over one."""
+    return " ".join(str(a or "").split()) == " ".join(str(b or "").split())
+
+
+BOARD_HEAD = ("Row_ID", "Timestamp", "Source_Tag", "Target_Surface", "Action_Type", "Payload",
+              "Category", "Project Tag", "Gist", "Sub-Gist")     # the A:J layout, by position
+BOARD_WIDTH = 10        # A:J, the ten named cells every row is written with
+
+
+def _ten_cells(cells):
+    """A row as it was written: its first ten cells as strings, a shorter row padded with "".
+
+    None when any cell past the tenth is not blank. THE LIVE BOARD IS TWELVE WIDE: one historical
+    malformed append widened Alpha DB from A:J to A:L, and getDataRange() returns every row at the
+    sheet's full width, K and L blank (docs/COMMS-PROTOCOL.md rule 5, scripts/OrderSupervisor.psm1,
+    src/bus_server.py). A pin on exactly ten cells (d53079b) made every post NOT SENT on that board;
+    the fourth adversarial check on #367 caught it before anything was deployed. Blank padding is
+    the shape; a non-blank cell past J is not this row."""
+    if not isinstance(cells, (list, tuple)):
+        return None
+    if any(str(c if c is not None else "").strip() for c in cells[BOARD_WIDTH:]):
+        return None
+    head = [str(c) if c is not None else "" for c in cells[:BOARD_WIDTH]]
+    return head + [""] * (BOARD_WIDTH - len(head))
+
+
+# THE FAST FAILURES OF A READ ARE RETRIED, THE SLOW ONES ARE NOT (the fifth adversarial check on #367).
+# The gateway is documented to answer a read now and then with a health ping ({ok, service, time}, no
+# rows: "unknown, never an empty board", docs/board-protocol.md) and with a 404 on the redirect hop.
+# Both come back in a second or two. One of them on a one-try read before the append turned a blip
+# into NOT SENT - on the Redis path a final "refused, nothing was sent" for an ask that only needed a
+# second look. A timeout or a dropped connection is the slow failure the one-try rule was written
+# for (a 120 s hop inside the waker's 400 s budget): it still ends the read at once.
+READ_TRIES_BEFORE_APPEND = 3
+READ_TRIES_AFTER_APPEND = 3
+FAST_RETRY_WINDOW_SECONDS = 45
+_pause = time.sleep          # a seam, so a test does not sleep
+
+
+def _matching_rows(rid, tries=1):
+    """The board's rows that mention `rid`, by a FILTERED read, or None when the board could not be read.
+
+    A filtered read, not the whole board (the third adversarial check on #367): the unfiltered read
+    is megabytes, four attempts of two 120 s hops each, and it ran BEFORE the append inside the
+    waker's 400 s budget, so a slow gateway could spend the whole budget before anything was sent,
+    while the waker said "it may have landed" about a row that never was. `match` is a substring
+    over the whole row (a later row quoting the id matches too), so the caller still compares
+    Row_ID exactly. No `limit` is safe here: later rows quoting an id could hide its exact row
+    behind the cap. Require the known filtered-read metadata and data-row shape; a gateway that
+    ignores `match` is UNKNOWN, not an empty board, and is not asked again.
+
+    `tries` counts attempts against the FAST failures only (a health ping, a non-JSON body, an HTTP
+    error such as the redirect hop's 404), within FAST_RETRY_WINDOW_SECONDS of the first; a timeout
+    or a dropped connection returns None at once, which keeps the budget for the append."""
+    env = _bus_load_env()
+    payload = {"action": "read", "secret": env["BUS_SECRET"], "title": BOARD, "match": str(rid)}
+    began = time.monotonic()
+    answer = None
+    for attempt in range(max(1, tries)):
+        if attempt:
+            if time.monotonic() - began > FAST_RETRY_WINDOW_SECONDS:
+                return None
+            _pause(2 * attempt)
+        try:
+            body = _bus_fetch(env["BUS_URL"], payload, tries=1)
+        except urllib.error.HTTPError:
+            continue                  # fast: the redirect hop's intermittent 404
+        except Exception:  # noqa: BLE001 - a timeout or a dropped connection is not an empty board
+            return None               # slow: never retried inside the budget
+        try:
+            answer = json.loads(body)
+        except (TypeError, ValueError):
+            answer = None
+            continue                  # fast: a non-JSON body
+        if isinstance(answer, dict) and answer.get("ok") is True and "rows" not in answer:
+            answer = None
+            continue                  # fast: the documented health ping
+        break
+    if answer is None:
+        return None
+    if not isinstance(answer, dict) or answer.get("ok") is not True or answer.get("title") != BOARD:
+        return None
+    rows, filtered, total = answer.get("rows"), answer.get("filtered"), answer.get("total")
+    if (not isinstance(rows, list) or type(filtered) is not int or filtered != len(rows)
+            or type(total) is not int or total < filtered or filtered == 200):
+        # A gateway with the former 200-row cap can report an apparently valid 200-row slice
+        # while hiding an exact row or duplicate. An exact saturation is unknown, never absent.
+        return None
+    # The filtered endpoint returns data rows only. A header, unfiltered row, or malformed cell
+    # shape means its match contract was not established; fail before the append.
+    if any(not isinstance(row, (list, tuple)) or len(row) < BOARD_WIDTH
+           or _ten_cells(row) is None
+           or not any(str(rid).casefold() in str(cell).casefold() for cell in row)
+           for row in rows):
+        return None
+    return rows
+
+
+FREE_TEXT_COLS = (PAYLOAD_COL, 8, 9)      # Payload, Gist, Sub-Gist: runs of spaces are the sheet's
+
+
+def _same_complete_row(hit, row) -> bool:
+    """Compare every semantic cell of the row's ten: the Timestamp must be non-empty but is not
+    compared (the sheet reformats it); the free-text cells are compared with runs of spaces
+    collapsed; the rest byte-exact; blank padding past the tenth cell is ignored."""
+    got, want = _ten_cells(hit), _ten_cells(row)
+    return (got is not None and want is not None and bool(got[1].strip())
+            and all((_same_payload(got[i], want[i]) if i in FREE_TEXT_COLS else got[i] == want[i])
+                    for i in range(BOARD_WIDTH) if i != 1))
+
+
+def _board_rows_like(rid, row, tries=1):
+    """(hit, identical, why): every row on the board under this Row_ID, those that are this row, and
+    "" - or (None, None, why) when the board could not be read."""
+    recs = _matching_rows(rid, tries=tries)
+    if recs is None:
+        return None, None, "the board could not be read (filtered read, up to %d tr%s)" % (tries, "y" if tries == 1 else "ies")
+    hit = [r for r in recs if isinstance(r, (list, tuple)) and r and str(r[0] if r[0] is not None else "") == rid]
+    return hit, [r for r in hit if _same_complete_row(r, row)], ""
+
+
+def append_and_verify(rid, row, fitted=None, spill=None, exact=True):
+    """Read the board, append the row if it is not there, commit its spill, and prove it landed by
+    reading it back. EXIT_VERIFIED requires exactly one complete row under this global Row_ID,
+    matching every semantic cell. The board may reformat Timestamp, so a nonempty timestamp is
+    required but its bytes are not compared. The one append path serves post and request.
+
+    THE BOARD IS READ FIRST. The ids are stable on purpose (reply_row_id, the waker's request_id), so
+    a retry carries the id of an earlier attempt: the identical row already there is not posted
+    again and counts as verified; the same id under different content is refused before posting,
+    including on a reply retry. A board that cannot
+    be read before posting means NOT SENT: a blind append is the double write this fleet keeps
+    paying for. After the append, the read-back is the proof; "not found" is UNCONFIRMED, never
+    "absent" (a 404 on the redirect hop has been raised client-side after the row landed)."""
     fitted = fitted or {}
+    hit, identical, why = _board_rows_like(rid, row, tries=READ_TRIES_BEFORE_APPEND)
+    if hit is None:
+        # The id cannot be checked, and a blind append is the double write this fleet keeps paying
+        # for. Nothing was appended: the caller may try again on its next pass.
+        print("  NOT SENT: %s; the id could not be checked, nothing was appended" % why)
+        return EXIT_NOT_SENT
+    if len(hit) == len(identical) == 1:
+        print("  already on the board: Row_ID=%s carries this complete row; not posted again" % rid)
+        print("  VERIFIED on the board: Row_ID=%s Source_Tag=%s Target_Surface=%s"
+              % (rid, row[SOURCE_COL], row[3]))
+        return EXIT_VERIFIED
+    if len(hit) > 1:
+        # Something WAS sent, earlier, more than once (a race): not "refused", which means nothing
+        # was ever sent. The worker answers the id once; the board carries the duplicates.
+        print("  UNCONFIRMED: Row_ID=%s is on the board %d times already (an earlier race); not posted "
+              "again; the worker answers the id once" % (rid, len(hit)))
+        return EXIT_UNCONFIRMED
+    if hit:
+        print("  refused before posting: %s id %s is already used by different or incomplete content; "
+              "not posted again" % ("request" if exact else "reply", rid))
+        return EXIT_REFUSED
     # tries=1 is not a tuning choice. The v1 bus does not dedup, and a
     # googleusercontent 404 on the redirect hop can be raised client-side AFTER
     # the row has landed - that replayed a row onto the live board once already.
     # The read-back below is what closes the loop, not this response.
+    # THE MARKER BEFORE THE APPEND. It helps diagnose a partial run, but missing captured output
+    # on a parent timeout cannot prove no append. The caller keeps that outcome unconfirmed.
+    print("  appending Row_ID=%s" % rid, flush=True)
     try:
         body = _bus_fetch(
             _bus_load_env()["BUS_URL"],
@@ -409,21 +595,32 @@ def append_and_verify(rid, row, fitted=None, spill=None):
         except Exception as exc:  # noqa: BLE001
             print("  SPILL_UNCONFIRMED: %s: %s" % (type(exc).__name__, exc))
             print("  The row is already posted. The object name is the row id plus the sha256, so "
-                  "a later commit of the same text reuses it and cannot overwrite a different one.")
+                  "a later commit using the same row id and text reuses it without overwriting another.")
 
-    # D-4: the response is not the proof. Read the row back by its own id.
-    data = read_board(quiet=True)
-    if data is None:
-        print("  COULD NOT VERIFY — no valid board read. Do NOT retry blindly.")
-        return 1
-    _, recs = rows_frame(data)
-    hit = [r for r in recs if str(r.get("Row_ID", "")) == rid]
-    if hit:
+    # D-4: the response is not the proof. Read the row back: exactly one identical row.
+    hit, identical, why = _board_rows_like(rid, row, tries=READ_TRIES_AFTER_APPEND)
+    if hit is None:
+        print("  UNCONFIRMED: no usable board read after the append (%s). It may have landed. Do NOT retry blindly." % why)
+        return EXIT_UNCONFIRMED
+    if len(hit) == len(identical) == 1:
         print("  VERIFIED on the board: Row_ID=%s Source_Tag=%s Target_Surface=%s"
-              % (rid, hit[-1].get("Source_Tag"), hit[-1].get("Target_Surface")))
-        return 0
-    print("  NOT FOUND after append — the ok:true was a silent no-op.")
-    return 1
+              % (rid, row[SOURCE_COL], row[3]))
+        return EXIT_VERIFIED
+    if len(hit) > 1:
+        print("  UNCONFIRMED: %d rows carry Row_ID=%s (duplicate or conflicting appends); "
+              "not confirmed as ONE post" % (len(hit), rid))
+        return EXIT_UNCONFIRMED
+    if hit:
+        print("  UNCONFIRMED: Row_ID=%s has incomplete or changed content; do not reuse the id." % rid)
+        # The two heads, so a board that is not byte-faithful shows itself here rather than as a
+        # row that is never confirmed. Sixty chars is the BCB header, before any value.
+        print("  expected: %r" % " ".join(str(row[PAYLOAD_COL]).split())[:60])
+        found_payload = hit[0][PAYLOAD_COL] if len(hit[0]) > PAYLOAD_COL else ""
+        print("  found   : %r" % " ".join(str(found_payload).split())[:60])
+        return EXIT_UNCONFIRMED
+    print("  UNCONFIRMED: not found after the append. The ok:true may have been a no-op, or the read "
+          "raced the write. It may yet land; do NOT post again blindly.")
+    return EXIT_UNCONFIRMED
 
 
 # ---------------------------------------------------------------- redis-op requests
@@ -466,9 +663,16 @@ def request_row(tag, op, key, val=None, field=None, count=None, project="FLEET",
         raise ValueError("key is required and may not contain a pipe or whitespace")
     if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", tag):
         raise ValueError("tag must be the agent's board tag (letters, digits, . _ -)")
+    denied = key_allowed_for(tag, op, key)
+    if denied:
+        raise ValueError(denied)
     stamp = now or dt.datetime.now(dt.timezone.utc)
-    rid = rid or "%s-REDIS-%s-%s" % (re.sub(r"[^A-Za-z0-9]", "", tag.upper())[:12],
-                                     stamp.strftime("%Y%m%dT%H%M%SZ"), os.urandom(3).hex())
+    # THE CALLER NAMES THE REQUEST (Grok on #367: this used to make one up from the clock and three
+    # random bytes). A retry is the same id and a new request is a new id; a tool that guesses which
+    # one you meant is a tool that can write twice, and the worker answers an id once.
+    if not rid:
+        raise ValueError("a request id is required (--id): a retry is the same id, a new request is a "
+                         "new id, and this tool does not guess which one you meant")
     if not _REQUEST_ID.match(rid):
         raise ValueError("request id %r is outside the worker's id grammar" % rid)
     parts = ["BCB", "v=1", "id=%s" % rid, "req=%s" % rid, "do=redis-op", "op=%s" % op, "key=%s" % key]
@@ -502,16 +706,22 @@ def request_row(tag, op, key, val=None, field=None, count=None, project="FLEET",
 
 def cmd_request(args):
     """Post one governed Redis request and read the row back. The answer arrives later, as an
-    AYA_RESULT row addressed to --tag; this exit code says only whether the ASK landed."""
+    AYA_RESULT row addressed to --tag; this exit code says only whether the ASK landed.
+
+    Exit codes (EXIT_*): 0 VERIFIED (exactly one identical row read back, or already there), 1 NOT
+    SENT (the board could not be read first), 2 refused before posting (the tool's gates, or the id
+    already used by a different request), 3 UNCONFIRMED (appended, no clean read-back: it may have
+    landed). The waker's post_request reads the same words: VERIFIED is posted, "refused before
+    posting" and NOT SENT are refused, UNCONFIRMED is unconfirmed."""
     try:
         rid, row = request_row(args.tag, args.op, args.key, val=args.val, field=args.field,
                                count=args.count, project=args.project, rid=args.id,
                                after=getattr(args, "after", None))
     except ValueError as why:
         print("  refused before posting: %s" % why)
-        return 2
+        return EXIT_REFUSED
     print("  request %s: %s %s" % (rid, args.op, args.key))
-    return append_and_verify(rid, row)
+    return append_and_verify(rid, row, exact=True)
 
 
 def cmd_archive(args):
@@ -570,7 +780,9 @@ def build_parser():
                     help="xrange only: the entries after this stream id (<ms>-<seq>), oldest first")
     rq.add_argument("--tag", default="claude-code-cli")
     rq.add_argument("--project", default="FLEET")
-    rq.add_argument("--id", default=None)
+    rq.add_argument("--id", required=True,
+                    help="your request id (letters, digits, . _ -; 4-64 chars): the same id for a retry, "
+                         "a new id for a new request; the tool does not make one up")
     rq.set_defaults(fn=cmd_request)
     return p
 

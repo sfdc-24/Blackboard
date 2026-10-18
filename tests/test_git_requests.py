@@ -339,7 +339,9 @@ class ItRunsThroughTheSameGovernance(unittest.TestCase):
             conn, posted = FakeRedis(), []
             br.handle(rows, conn, now=NOW, append=posted.append, clock=lambda: NOW.timestamp())
             self.assertEqual(1, len(posted))
-            self.assertIn("withheld", posted[0]["payload"])
+            # On the board the worker answers only the public side stream (#367), so a board haudit is
+            # refused with its one key-free sentence; the Git channel keeps the governor's withheld.
+            self.assertIn("withheld" if rows is git else br.redis_keys.BOARD_REDIS_REFUSAL, posted[0]["payload"])
             # The second pass sees the first answer in its snapshot (git: not a stop by itself) or not.
             br.handle(rows + [_result_row(posted[0])], conn, now=NOW, append=posted.append,
                       clock=lambda: NOW.timestamp() + 999)

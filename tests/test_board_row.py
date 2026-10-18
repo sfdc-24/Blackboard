@@ -60,7 +60,10 @@ def post_through_fleet_agent(argv, board, spill_dir):
     with mock.patch.dict(os.environ, {"BOARD_SPILL_URI": spill_dir}), \
             mock.patch.object(fleet_agent, "_bus_fetch", board.fetch), \
             mock.patch.object(fleet_agent, "_bus_load_env", return_value={"BUS_URL": "x", "BUS_SECRET": "y"}), \
-            mock.patch.object(fleet_agent, "read_board", board.read_board):
+            mock.patch.object(fleet_agent, "read_board", board.read_board), \
+            mock.patch.object(fleet_agent, "_matching_rows",
+                              lambda rid, tries=1: [r for r in board.read_board()["rows"][1:]
+                                                    if str(rid) in "|".join(str(c) for c in r)]):
         return fleet_agent.cmd_post(args)
 
 
