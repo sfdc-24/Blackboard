@@ -18,7 +18,7 @@
 # Redis keys under bus:. A compare run cannot alter the thing it is comparing.
 #
 #   bash cloud/bus-reconciler/deploy.sh setup    # service account and the four secret grants
-#   bash cloud/bus-reconciler/deploy.sh build    # build the image from the repo root
+#   bash cloud/bus-reconciler/deploy.sh build    # build the image from the repo root (IMAGE=... for a new tag)
 #   bash cloud/bus-reconciler/deploy.sh deploy   # create or update the job, with egress
 #   bash cloud/bus-reconciler/deploy.sh run      # execute it once and wait
 #   bash cloud/bus-reconciler/deploy.sh readback # what is actually deployed, printed
@@ -45,7 +45,10 @@ NAME="bus-reconciler"
 SA_NAME="${SA_NAME:-bus-reconciler}"
 SA="${SA_NAME}@${PROJECT}.iam.gserviceaccount.com"
 REPO="${REGION}-docker.pkg.dev/${PROJECT}/cloud-run-source-deploy"
-IMAGE="${REPO}/${NAME}:v1"
+# IMAGE pins a build. Unset, it is the shared :v1 tag every job on this image was deployed from. Set, it
+# names an exact build - a new tag (`IMAGE=${REPO}/${NAME}:git-<sha7> deploy.sh build`) or a digest
+# (`...@sha256:<digest>`) - so one job can move to new code without a rebuild of :v1 moving the others.
+IMAGE="${IMAGE:-${REPO}/${NAME}:v1}"
 GCLOUD="${GCLOUD:-gcloud}"
 
 # The four, and only four, secrets this job may read.

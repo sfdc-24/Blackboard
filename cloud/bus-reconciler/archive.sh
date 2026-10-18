@@ -12,9 +12,10 @@
 #
 # THE ORDER, each step with its read-back
 #   bash cloud/bus-reconciler/archive.sh setup      # ticker account, its TokenCreator, the prefix grant
-#   bash cloud/bus-reconciler/deploy.sh build       # the image, which now carries redis_archive.py
-#   bash cloud/bus-reconciler/archive.sh deploy     # the job, flag OFF (REDIS_HOST resolved if unset)
-#   bash cloud/bus-reconciler/archive.sh dryrun     # one execution that reads and reports, writes nothing
+#   IMAGE=<registry>/bus-reconciler:git-<sha7> bash cloud/bus-reconciler/deploy.sh build   # a NEW tag; :v1 untouched
+#   IMAGE=<that tag or its @sha256 digest> bash cloud/bus-reconciler/archive.sh deploy     # flag OFF
+#   bash cloud/bus-reconciler/archive.sh dryrun     # one execution that reads and reports: no object, ledger or row;
+#                                                   # it takes and releases gov:archive:lock, so it is not zero-write
 #   bash cloud/bus-reconciler/archive.sh on         # the flag
 #   bash cloud/bus-reconciler/archive.sh run        # one real execution, and wait
 #   bash cloud/bus-reconciler/archive.sh verify <redis-archive/<date>/<hour>/LEDGER-....json>   # re-hash every object
@@ -35,7 +36,11 @@ INVOKER_NAME="${INVOKER_NAME:-redis-archive-ticker}"
 INVOKER="${INVOKER_NAME}@${PROJECT}.iam.gserviceaccount.com"
 SCHED_JOB="${SCHED_JOB:-redis-archive-hourly}"
 SCHEDULE="${SCHEDULE:-5 * * * *}"
-IMAGE="${REGION}-docker.pkg.dev/${PROJECT}/cloud-run-source-deploy/bus-reconciler:v1"
+# The build this job runs, NAMED EXPLICITLY at deploy: a tag such as bus-reconciler:git-<sha7> or a digest
+# (bus-reconciler@sha256:...). Not the shared :v1 default, which may predate redis_archive.py, and whose
+# rebuild could move every other job on the image with it. Build one with
+#   IMAGE=<registry>/bus-reconciler:git-<sha7> bash cloud/bus-reconciler/deploy.sh build
+IMAGE="${IMAGE:-}"
 BUCKET="${REDIS_ARCHIVE_BUCKET:-sfdc24-fleet-state}"
 PREFIX="${REDIS_ARCHIVE_PREFIX:-redis-archive}"
 INSTANCE="${INSTANCE:-redis-central}"
@@ -66,6 +71,7 @@ setup() {
 }
 
 deploy() {
+  : "${IMAGE:?set IMAGE to the build that carries redis_archive.py (bus-reconciler:git-<sha7> or bus-reconciler@sha256:<digest>); the shared :v1 tag is not assumed}"
   if [ -z "$REDIS_HOST" ]; then
     # Resolved here and passed straight to the job: the address is topology and this repository is public.
     REDIS_HOST="$("$GCLOUD" redis instances describe "$INSTANCE" --region "$REGION" --project "$PROJECT" --format 'value(host)')"
@@ -83,14 +89,14 @@ deploy() {
     --max-retries 0 --task-timeout 10m --cpu 1 --memory 512Mi
   "$GCLOUD" run jobs add-iam-policy-binding "$JOB" --project "$PROJECT" --region "$REGION" \
     --member "serviceAccount:${INVOKER}" --role roles/run.invoker >/dev/null
-  echo "job ${JOB} ${verb}d, REDIS_ARCHIVE_ENABLED=off; ${INVOKER} may run it"
+  echo "job ${JOB} ${verb}d on ${IMAGE}, REDIS_ARCHIVE_ENABLED=off; ${INVOKER} may run it"
 }
 
 dryrun() {
   # An execution-level override: the job's own flag is untouched.
   "$GCLOUD" run jobs execute "$JOB" --project "$PROJECT" --region "$REGION" --wait \
     --update-env-vars "REDIS_ARCHIVE_ENABLED=on,REDIS_ARCHIVE_DRY_RUN=1"
-  echo "dry run done: its log has one JSON line - streams, entries it WOULD archive, nothing written"
+  echo "dry run done: its log has one JSON line - streams, entries it WOULD archive. No object, ledger or row was written; gov:archive:lock was taken and released"
 }
 
 run_once() {
