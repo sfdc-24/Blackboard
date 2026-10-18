@@ -4,9 +4,16 @@ T1 weather_now: the current weather for a place, from open-meteo (no key, no spe
 T6 transcript: at call end the session history goes to Redis lou:transcript:<room>:<session> (the owner's standing
    rule: every Lou call saves a transcript). If Redis cannot be reached the record goes to a local file
    instead, so a call never ends without one.
+Consent (the owner, 2026-10-18: "Lou consent gate before greeting/recording"): a call only exists once the visitor
+   has consented. Lou says nothing, the realtime model hears nothing and no transcript is kept until the visitor's
+   OWN participant attribute lou.consent is exactly "yes". Withdrawn mid-call, the call ends and nothing is kept.
+   PIPEDA and the CRTC require consent before recording or a transcript; a pre-checked box, a name or a company is
+   not consent, and neither is the room's notice. Who may set the attribute: only the visitor's own client, on the
+   visitor's own action (its token needs canUpdateOwnMetadata). A server must never mint it into a token.
 
 Nothing here dials, texts or contacts anyone. Spec: Drive doc 1OFhYVy_omCXwxaJRqcMagfJa9Aln-wTsSu7xpNK7MX4.
 """
+import asyncio
 import json
 import os
 import time
@@ -18,6 +25,8 @@ FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 HTTP_SECONDS = 4          # the caller is waiting on the line
 TRANSCRIPT_TTL = 90 * 24 * 3600
 DEFAULT_COUNTRY = os.environ.get("LOU_DEFAULT_COUNTRY", "CA")   # Converspan is Canada-first
+CONSENT_ATTRIBUTE = "lou.consent"
+CONSENT_WAIT = 180        # seconds Lou waits, silent, for the visitor's consent before it leaves
 
 # WMO weather codes as open-meteo returns them, in words Lou can say.
 WMO = {
@@ -142,3 +151,59 @@ def save_transcript(record: dict, client=None, fallback_dir=None, ttl=TRANSCRIPT
 
 def _iso(epoch: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
+
+
+def consented(attributes) -> bool:
+    """The visitor's consent: their participant attribute lou.consent is exactly "yes". Anything else is no."""
+    return isinstance(attributes, dict) and attributes.get(CONSENT_ATTRIBUTE) == "yes"
+
+
+def consent_wait(environ=None) -> float:
+    """LOU_CONSENT_WAIT seconds, 10 to 900; CONSENT_WAIT when unset or unusable."""
+    environ = os.environ if environ is None else environ
+    try:
+        wait = float(environ.get("LOU_CONSENT_WAIT") or CONSENT_WAIT)
+    except ValueError:
+        return CONSENT_WAIT
+    return wait if 10 <= wait <= 900 else CONSENT_WAIT
+
+
+async def wait_for_consent(room, visitor, timeout=CONSENT_WAIT) -> bool:
+    """True once THIS visitor consents; False when they leave first or the wait runs out.
+    room is a livekit.rtc.Room (on/off, participant_attributes_changed, participant_disconnected)."""
+    if consented(visitor.attributes):
+        return True
+    done = asyncio.get_running_loop().create_future()
+
+    def changed(_changed, who):
+        if who.identity == visitor.identity and consented(who.attributes) and not done.done():
+            done.set_result(True)
+
+    def left(who):
+        if who.identity == visitor.identity and not done.done():
+            done.set_result(False)
+
+    room.on("participant_attributes_changed", changed)
+    room.on("participant_disconnected", left)
+    try:
+        if consented(visitor.attributes):   # it may have landed between the first look and on()
+            return True
+        return await asyncio.wait_for(done, timeout)
+    except asyncio.TimeoutError:
+        return False
+    finally:
+        room.off("participant_attributes_changed", changed)
+        room.off("participant_disconnected", left)
+
+
+def watch_consent(room, visitor, withdrawn):
+    """Calls withdrawn() once, when this visitor's consent stops holding. Returns the handler (for room.off)."""
+    fired = []
+
+    def changed(_changed, who):
+        if who.identity == visitor.identity and not consented(who.attributes) and not fired:
+            fired.append(True)
+            withdrawn()
+
+    room.on("participant_attributes_changed", changed)
+    return changed

@@ -6,6 +6,8 @@ stays as the fallback until this one passes rehearsals; this one registers under
 (LOU_AGENT_NAME, default lou-code), so a dispatch only reaches it when it asks for that name.
 
 Tools in this cut: T1 get_weather (open-meteo, no key, no spend) and T6 the transcript saved at call end.
+Consent first: Lou joins, waits silent for the visitor's lou.consent attribute (lou_tools.consented), and leaves
+without a word or a transcript when it does not come. The realtime session starts only after it.
 Nothing here dials, texts or contacts anyone: the caller is whoever the dispatch already put in the room.
 
 The prompt is NOT in this repo (the repo is public). LOU_INSTRUCTIONS_FILE names the v4 prompt file on the
@@ -27,7 +29,8 @@ log = logging.getLogger("lou-agent")
 AGENT_NAME = os.environ.get("LOU_AGENT_NAME", "lou-code")
 MINIMAL_PROMPT = ("You are Lou, an AI assistant for Converspan. Say early in the call that you are an AI. "
                   "Be warm, brief and moderate in pace. Use get_weather when someone asks about the weather.")
-OPENER = "Greet the person. Say you are Lou, an AI assistant from Converspan, and ask how you can help."
+OPENER = ("Greet the person. Say you are Lou, an AI assistant from Converspan, that this call's transcript is kept "
+          "because they agreed to it, and ask how you can help.")
 
 
 def instructions(environ=None) -> str:
@@ -97,9 +100,15 @@ async def entrypoint(ctx: JobContext):
     session = AgentSession(llm=openai.realtime.GPTLiveModel(
         model=os.environ.get("LOU_REALTIME_MODEL", "gpt-live-1"),
         voice=os.environ.get("LOU_VOICE", "marin")))
-    call = {"session": "t%d" % int(started)}   # replaced by LiveKit's room session id once connected
+    # session: replaced by LiveKit's room session id once connected. visitor: who must consent. talked: the
+    # realtime session started, which only happens after consent.
+    call = {"session": "t%d" % int(started), "visitor": None, "talked": False}
 
     async def save_transcript(reason: str = ""):
+        visitor = call["visitor"]
+        if not (call["talked"] and visitor is not None and tools.consented(visitor.attributes)):
+            log.info("transcript NOT kept: no consent, or consent withdrawn (%s)", reason or "ended")
+            return
         record = tools.transcript_record(ctx.room.name, call["session"], session.history.to_dict(), started,
                                          time.time(), AGENT_NAME)
         where = await asyncio.to_thread(tools.save_transcript, record, redis_client())
@@ -108,8 +117,15 @@ async def entrypoint(ctx: JobContext):
     ctx.add_shutdown_callback(save_transcript)
     await ctx.connect()
     call["session"] = await room_session_id(ctx.room, call["session"])
-    await ctx.wait_for_participant()   # on an outbound call, the callee; Lou speaks only once someone is there
+    # On an outbound call, the callee. A phone line cannot set lou.consent, so Lou stays silent there too.
+    visitor = call["visitor"] = await ctx.wait_for_participant()
+    if not await tools.wait_for_consent(ctx.room, visitor, tools.consent_wait()):
+        log.info("no consent from the visitor; Lou leaves without speaking and keeps nothing")
+        ctx.shutdown(reason="no consent")
+        return
+    tools.watch_consent(ctx.room, visitor, lambda: ctx.shutdown(reason="consent withdrawn"))
     await session.start(agent=Lou(instructions()), room=ctx.room)
+    call["talked"] = True
     await session.generate_reply(instructions=OPENER)
 
 
