@@ -6,7 +6,8 @@ T6 transcript: at call end the session history goes to Redis lou:transcript:<roo
    instead, so a call never ends without one.
 Consent (the owner, 2026-10-18: "Lou consent gate before greeting/recording"): a call only exists once the visitor
    has consented. Lou says nothing, the realtime model hears nothing and no transcript is kept until the visitor's
-   OWN participant attribute lou.consent is exactly "yes". Withdrawn mid-call, the call ends and nothing is kept.
+   OWN participant attribute lou.consent is exactly "yes". Withdrawn at any point after the yes, the call ends and
+   nothing is kept; a yes set again later in the same call does not count. One Consent object per call holds this.
    PIPEDA and the CRTC require consent before recording or a transcript; a pre-checked box, a name or a company is
    not consent, and neither is the room's notice. Who may set the attribute: only the visitor's own client, on the
    visitor's own action (its token needs canUpdateOwnMetadata). A server must never mint it into a token.
@@ -168,42 +169,70 @@ def consent_wait(environ=None) -> float:
     return wait if 10 <= wait <= 900 else CONSENT_WAIT
 
 
-async def wait_for_consent(room, visitor, timeout=CONSENT_WAIT) -> bool:
-    """True once THIS visitor consents; False when they leave first or the wait runs out.
+class Consent:
+    """THE consent state of one call, shared by Lou's startup and the transcript save, so the two never disagree.
+    It listens from the moment it is made, so a change between two looks is never missed. A withdrawal is
+    latched: a "yes" set again later in the same call does not bring the call or its transcript back (Aya,
+    PR 426: a withdrawal before the session started was not seen, and withdraw-then-restore kept a transcript).
     room is a livekit.rtc.Room (on/off, participant_attributes_changed, participant_disconnected)."""
-    if consented(visitor.attributes):
-        return True
-    done = asyncio.get_running_loop().create_future()
 
-    def changed(_changed, who):
-        if who.identity == visitor.identity and consented(who.attributes) and not done.done():
-            done.set_result(True)
+    def __init__(self, room, visitor):
+        self.room, self.visitor = room, visitor
+        self.given = consented(visitor.attributes)
+        self.withdrawn = False
+        self._waiters, self._on_withdrawn = [], []
+        room.on("participant_attributes_changed", self._changed)
+        room.on("participant_disconnected", self._left)
 
-    def left(who):
-        if who.identity == visitor.identity and not done.done():
-            done.set_result(False)
+    def holds(self) -> bool:
+        """Given and never withdrawn in this call."""
+        return self.given and not self.withdrawn
 
-    room.on("participant_attributes_changed", changed)
-    room.on("participant_disconnected", left)
-    try:
-        if consented(visitor.attributes):   # it may have landed between the first look and on()
-            return True
-        return await asyncio.wait_for(done, timeout)
-    except asyncio.TimeoutError:
-        return False
-    finally:
-        room.off("participant_attributes_changed", changed)
-        room.off("participant_disconnected", left)
+    def on_withdrawn(self, callback):
+        """callback() once, at the withdrawal; at once if consent was already withdrawn."""
+        if self.withdrawn:
+            callback()
+        else:
+            self._on_withdrawn.append(callback)
 
+    async def wait(self, timeout=CONSENT_WAIT) -> bool:
+        """True once the visitor consents and consent still holds; False when they leave first, withdraw, or the
+        wait runs out."""
+        if self.given or self.withdrawn:
+            return self.holds()
+        done = asyncio.get_running_loop().create_future()
+        self._waiters.append(done)
+        try:
+            await asyncio.wait_for(done, timeout)
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            if done in self._waiters:
+                self._waiters.remove(done)
+        return self.holds()
 
-def watch_consent(room, visitor, withdrawn):
-    """Calls withdrawn() once, when this visitor's consent stops holding. Returns the handler (for room.off)."""
-    fired = []
+    def close(self):
+        self.room.off("participant_attributes_changed", self._changed)
+        self.room.off("participant_disconnected", self._left)
 
-    def changed(_changed, who):
-        if who.identity == visitor.identity and not consented(who.attributes) and not fired:
-            fired.append(True)
-            withdrawn()
+    def _wake(self):
+        for done in self._waiters:
+            if not done.done():
+                done.set_result(None)
 
-    room.on("participant_attributes_changed", changed)
-    return changed
+    def _changed(self, _changed, who):
+        if who.identity != self.visitor.identity:
+            return
+        if consented(who.attributes):
+            if not self.withdrawn:
+                self.given = True
+        elif self.given and not self.withdrawn:
+            self.withdrawn = True
+            callbacks, self._on_withdrawn = self._on_withdrawn, []
+            for callback in callbacks:
+                callback()
+        self._wake()
+
+    def _left(self, who):
+        if who.identity == self.visitor.identity:
+            self._wake()

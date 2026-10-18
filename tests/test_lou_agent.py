@@ -11,7 +11,8 @@ The ways this goes wrong, each with a test that fails when the guard is removed:
   - Redis failing drops the transcript instead of writing the file
   - the tool is defined but the SDK never runs it, or the session id is lost (skipped without livekit-agents)
   - Lou greets, the model hears, or a transcript is kept before the visitor's own consent; another participant's
-    consent, a near-yes, or a withdrawn consent counts (the owner, 2026-10-18: consent gate before greeting/recording)
+    consent, a near-yes, or a withdrawn consent counts, before the session starts or
+    after a yes is set again (the owner, 2026-10-18: consent gate before greeting/recording)
 """
 import asyncio
 import importlib
@@ -246,11 +247,15 @@ class ConsentTest(unittest.TestCase):
 
     def wait(self, room, visitor, timeout, during=None):
         async def run():
-            task = asyncio.ensure_future(tools.wait_for_consent(room, visitor, timeout))
+            consent = tools.Consent(room, visitor)
+            task = asyncio.ensure_future(consent.wait(timeout))
             await asyncio.sleep(0)
             if during:
                 during()
-            return await task
+            try:
+                return await task
+            finally:
+                consent.close()
         return asyncio.run(run())
 
     def test_consent_already_given_needs_no_wait(self):
@@ -289,13 +294,50 @@ class ConsentTest(unittest.TestCase):
     def test_a_withdrawal_is_seen_once_and_only_for_the_visitor(self):
         room, visitor, other = FakeRoom(), Who("v", {"lou.consent": "yes"}), Who("o", {"lou.consent": "yes"})
         seen = []
-        tools.watch_consent(room, visitor, lambda: seen.append("withdrawn"))
+        tools.Consent(room, visitor).on_withdrawn(lambda: seen.append("withdrawn"))
         room.emit("participant_attributes_changed", {"topic": "x"}, visitor)
         room.emit("participant_attributes_changed", consent_of(other, None), other)
         self.assertEqual([], seen)
         room.emit("participant_attributes_changed", consent_of(visitor, "no"), visitor)
         room.emit("participant_attributes_changed", consent_of(visitor, None), visitor)
         self.assertEqual(["withdrawn"], seen)
+
+    def test_a_yes_set_again_after_a_withdrawal_does_not_bring_consent_back(self):
+        room, visitor = FakeRoom(), Who("v", {"lou.consent": "yes"})
+        consent, seen = tools.Consent(room, visitor), []
+        consent.on_withdrawn(lambda: seen.append("withdrawn"))
+        self.assertTrue(consent.holds())
+        room.emit("participant_attributes_changed", consent_of(visitor, None), visitor)
+        room.emit("participant_attributes_changed", consent_of(visitor, "yes"), visitor)
+        self.assertFalse(consent.holds(), "withdrawn stays withdrawn for this call")
+        self.assertFalse(asyncio.run(consent.wait(0.05)))
+        room.emit("participant_attributes_changed", consent_of(visitor, None), visitor)
+        self.assertEqual(["withdrawn"], seen)
+
+    def test_a_withdrawal_before_anyone_watches_is_still_seen(self):
+        room, visitor = FakeRoom(), Who("v", {"lou.consent": "yes"})
+        consent, seen = tools.Consent(room, visitor), []
+        room.emit("participant_attributes_changed", consent_of(visitor, "no"), visitor)
+        consent.on_withdrawn(lambda: seen.append("withdrawn"))
+        self.assertEqual(["withdrawn"], seen)
+        self.assertFalse(consent.holds())
+
+    def test_a_yes_and_a_withdrawal_in_one_breath_is_no(self):
+        """The yes wakes Lou, but the withdrawal lands before Lou looks: the wait answers no."""
+        room, visitor = FakeRoom(), Who("v")
+        self.assertFalse(self.wait(room, visitor, 5, lambda: (
+            room.emit("participant_attributes_changed", consent_of(visitor, "yes"), visitor),
+            room.emit("participant_attributes_changed", consent_of(visitor, None), visitor))))
+        self.assertEqual(0, room.live())
+
+    def test_a_no_before_any_yes_is_not_a_withdrawal(self):
+        room, visitor = FakeRoom(), Who("v")
+        consent, seen = tools.Consent(room, visitor), []
+        consent.on_withdrawn(lambda: seen.append("withdrawn"))
+        room.emit("participant_attributes_changed", consent_of(visitor, "no"), visitor)
+        room.emit("participant_attributes_changed", consent_of(visitor, "yes"), visitor)
+        self.assertEqual([], seen)
+        self.assertTrue(consent.holds())
 
 
 class ImageTest(unittest.TestCase):
@@ -489,9 +531,11 @@ class SdkTest(unittest.TestCase):
         self.assertEqual({"port": 9000, "num_idle_processes": 2},
                          agent.server_options({"PORT": "9000", "LOU_IDLE_PROCESSES": "2"}))
 
-    def call(self, consent_at=None, withdraw=False, leave=False, wait="10"):
+    def call(self, consent_at=None, withdraw=None, restore=False, leave=False, wait="10"):
         """Runs Lou's entrypoint against a fake room, context and session. consent_at: None (never), 0 (before
-        Lou looks) or 1 (while Lou waits). Returns what Lou did, in order, and what was saved."""
+        Lou looks) or 1 (while Lou waits). withdraw: None, "waiting" (right after the yes, before Lou wakes),
+        "starting" (while the session starts) or "greeting"; restore sets the yes again right after. Returns what
+        Lou did, in order, and what was saved."""
         import os  # noqa: PLC0415
         agent = importlib.import_module("lou_agent")
         room, visitor = FakeRoom(), Who("visitor-1", {"lou.consent": "yes"} if consent_at == 0 else {})
@@ -520,11 +564,17 @@ class SdkTest(unittest.TestCase):
 
             async def start(self, agent=None, room=None):
                 did.append("start")
+                withdrawal("starting")
 
             async def generate_reply(self, instructions=""):
                 did.append("greet")
-                if withdraw:
-                    room.emit("participant_attributes_changed", consent_of(visitor, None), visitor)
+                withdrawal("greeting")
+
+        def withdrawal(when):
+            if withdraw == when:
+                room.emit("participant_attributes_changed", consent_of(visitor, None), visitor)
+                if restore:
+                    room.emit("participant_attributes_changed", consent_of(visitor, "yes"), visitor)
 
         async def no_sid(_room, fallback):
             return "RM_test"
@@ -535,6 +585,7 @@ class SdkTest(unittest.TestCase):
                 await asyncio.sleep(0)
             if consent_at == 1:
                 room.emit("participant_attributes_changed", consent_of(visitor, "yes"), visitor)
+                withdrawal("waiting")
             if leave:
                 room.emit("participant_disconnected", visitor)
             await task
@@ -578,9 +629,27 @@ class SdkTest(unittest.TestCase):
             self.assertEqual("RM_test", saved[0]["session"])
 
     def test_consent_withdrawn_mid_call_ends_it_and_keeps_nothing(self):
-        did, saved = self.call(consent_at=0, withdraw=True)
+        did, saved = self.call(consent_at=0, withdraw="greeting")
         self.assertEqual(["connect", "start", "greet", "shutdown:consent withdrawn"], did)
         self.assertEqual([], saved)
+
+    def test_consent_withdrawn_before_the_session_starts_means_no_session_and_no_greeting(self):
+        """Aya, PR 426: the watcher began only after the wait, so this withdrawal was missed and Lou greeted."""
+        did, saved = self.call(consent_at=1, withdraw="waiting")
+        self.assertEqual(["connect", "shutdown:consent withdrawn"], did)
+        self.assertEqual([], saved)
+        did, saved = self.call(consent_at=0, withdraw="starting")
+        self.assertEqual(["connect", "start", "shutdown:consent withdrawn"], did, "no greeting")
+        self.assertEqual([], saved)
+
+    def test_consent_withdrawn_then_restored_still_ends_the_call_and_keeps_nothing(self):
+        """Aya, PR 426: the save read the attribute as it stood at the end, so a restored yes kept the transcript."""
+        for when, expected in (("waiting", ["connect", "shutdown:consent withdrawn"]),
+                               ("starting", ["connect", "start", "shutdown:consent withdrawn"]),
+                               ("greeting", ["connect", "start", "greet", "shutdown:consent withdrawn"])):
+            did, saved = self.call(consent_at=1 if when == "waiting" else 0, withdraw=when, restore=True)
+            self.assertEqual(expected, did, when)
+            self.assertEqual([], saved, when)
 
     def test_the_opener_says_ai_and_that_the_transcript_is_kept(self):
         agent = importlib.import_module("lou_agent")

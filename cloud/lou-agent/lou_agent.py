@@ -100,13 +100,16 @@ async def entrypoint(ctx: JobContext):
     session = AgentSession(llm=openai.realtime.GPTLiveModel(
         model=os.environ.get("LOU_REALTIME_MODEL", "gpt-live-1"),
         voice=os.environ.get("LOU_VOICE", "marin")))
-    # session: replaced by LiveKit's room session id once connected. visitor: who must consent. talked: the
+    # session: replaced by LiveKit's room session id once connected. consent: the call's ONE consent state
+    # (lou_tools.Consent), read by the startup below and by this save, so the two never disagree. talked: the
     # realtime session started, which only happens after consent.
-    call = {"session": "t%d" % int(started), "visitor": None, "talked": False}
+    call = {"session": "t%d" % int(started), "consent": None, "talked": False}
 
     async def save_transcript(reason: str = ""):
-        visitor = call["visitor"]
-        if not (call["talked"] and visitor is not None and tools.consented(visitor.attributes)):
+        consent = call["consent"]
+        if consent is not None:
+            consent.close()
+        if not (call["talked"] and consent is not None and consent.holds()):
             log.info("transcript NOT kept: no consent, or consent withdrawn (%s)", reason or "ended")
             return
         record = tools.transcript_record(ctx.room.name, call["session"], session.history.to_dict(), started,
@@ -118,13 +121,18 @@ async def entrypoint(ctx: JobContext):
     await ctx.connect()
     call["session"] = await room_session_id(ctx.room, call["session"])
     # On an outbound call, the callee. A phone line cannot set lou.consent, so Lou stays silent there too.
-    visitor = call["visitor"] = await ctx.wait_for_participant()
-    if not await tools.wait_for_consent(ctx.room, visitor, tools.consent_wait()):
-        log.info("no consent from the visitor; Lou leaves without speaking and keeps nothing")
-        ctx.shutdown(reason="no consent")
+    consent = call["consent"] = tools.Consent(ctx.room, await ctx.wait_for_participant())
+    # Before the wait, so a withdrawal at any moment after the yes ends the call, the moments before the session
+    # starts included.
+    consent.on_withdrawn(lambda: ctx.shutdown(reason="consent withdrawn"))
+    if not await consent.wait(tools.consent_wait()):
+        if not consent.withdrawn:
+            log.info("no consent from the visitor; Lou leaves without speaking and keeps nothing")
+            ctx.shutdown(reason="no consent")
         return
-    tools.watch_consent(ctx.room, visitor, lambda: ctx.shutdown(reason="consent withdrawn"))
     await session.start(agent=Lou(instructions()), room=ctx.room)
+    if not consent.holds():   # withdrawn while the session started: no greeting, and the withdrawal ended the call
+        return
     call["talked"] = True
     await session.generate_reply(instructions=OPENER)
 
