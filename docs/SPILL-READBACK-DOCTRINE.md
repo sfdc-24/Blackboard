@@ -1,6 +1,6 @@
 # Spill Read-Back Doctrine
 
-One-line addition to Operational Supervisor & Memory Management Implementation Plan V3, section 4.3 Resolution Loop.
+One-line addition to Operational Supervisor & Memory Management Implementation Plan V3, section 4.3 Resolution Loop. v2 adds the Aya sweep-block line.
 
 ## Context
 
@@ -16,12 +16,18 @@ Insert into 4.3 after step 3:
 
 > **3b. READ-BACK:** after any spill write — board-full object, diagnostic receipt, or Aya sweep block — fetch the object and confirm it exists before logging success; on 403 or missing object, fail closed: print the failure, do not mark the escalation or sweep done, and append a FAIL line to the Owner Trigger.
 
-## Why one line and not a section
+## THE SECOND LINE (v2 — Aya sweep blocks)
 
-The board's own read-back doctrine (D-4) already says a fact you could not fetch is not a fact. This extends that to spills. The failure mode it kills is silent success — the exact shape of the Oct 14-15 Gemini loss.
+> **3c. SWEEP READ-BACK:** the Aya three-hour sweep receipt block appended to the Owner Trigger is itself a spill-class write. Before the sweep is marked complete, read the block back from the Trigger and confirm the receipt text is present and matches what was written; on mismatch or missing block, fail closed: do not mark the sweep done, print READBACK_FAILED, and append a FAIL line naming the sweep window.
+
+## Why sweep blocks need their own line
+
+Board-full objects and diagnostic receipts are external object writes with HTTP status codes — a 403 is loud. A sweep block is an in-place text append to a single document. Appends fail differently: silent truncation, partial write, or a concurrent writer (drive-intake, another agent) overwriting the tail between the write and any later read. The Oct 14-15 Gemini loss was an external-object 403; the sweep-block failure mode is intra-document corruption. Same doctrine — a fact you could not fetch is not a fact (D-4) — different failure shape, so it gets step 3c rather than being folded into 3b.
+
+Coupled risk: if the Trigger itself is the document being appended to and the Trigger's own save fails, 3b and 3c both false-negative. Mitigation: the read-back for 3c should target the Trigger's latest revision ID, not just latest content, so a stale cache cannot masquerade as success.
 
 ## Test shape
 
-Mirrors PR 414's regression test: a verified post whose spill 403s must surface the failure; a clean post stays quiet. Same `assertIn` pattern on the `SPILL_UNCONFIRMED` / `READBACK_FAILED` line.
+Mirrors PR 414. For 3b, a verified post whose spill 403s must surface the failure. For 3c, a forced append failure or a concurrent overwrite of the Trigger tail must surface READBACK_FAILED with the sweep window named. Clean paths stay quiet.
 
-Filed by Aya 2026-10-18. Source: PR 414 analysis + V3 doc `1wWGkzcDue-EQVuFnEIqtDIiKMCbvG1KG5cP2uXSvNRg`.
+Filed by Aya 2026-10-18. Source: PR 414 analysis + V3 doc `1wWGkzcDue-EQVuFnEIqtDIiKMCbvG1KG5cP2uXSvNRg` + v1 doctrine `1eOFi7RVjMzsomLiGnzwLBDvpqJ0GdaCJ`.
