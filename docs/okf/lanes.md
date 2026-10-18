@@ -2,31 +2,37 @@
 title: Blackboard OKF Lanes
 owner: fleet
 status: living
-updated_at: 2026-09-27T04:21:00Z
+updated_at: 2026-09-28T13:20:00Z
 strategy: FULL-STRATEGY-BUILD-20260927
+roles: EXECUTION-MODEL-20260928
+okf: https://github.com/sfdc-24/Blackboard/blob/main/docs/okf/lanes.md
 ---
 
 # Lanes and ownership (Blackboard-touching work)
+
+Living fleet roles are defined in [HOW-WE-WORK](./HOW-WE-WORK.md) (`EXECUTION-MODEL-20260928`). Refine them there. This page is the lane each role runs.
+
+`okf=https://github.com/sfdc-24/Blackboard/blob/main/docs/okf/lanes.md`
 
 ## Lane map
 
 | Lane | Primary owner | Typical work in Blackboard | Inputs | Exit signal |
 |---|---|---|---|---|
-| Release/CI | `claude-code-cli` | Workflows, gates, deployment safety, release checks | Open PR checks, workflow runs | Required checks green + reviewer verdict |
-| Controller/runtime | `claude-code-cli` | `scripts/`, `src/`, runtime contracts, guard rails | Bug reports, acceptance findings | Repro closed with evidence |
-| **Test lead + strategy/security gate** | `chatgpt-codex-desktop` (**Codex**) | Exact-head GO/NO-GO, architecture PDF fidelity, fleet test suite lead, sequencing rulings | PR diffs + board dispatches + Codex PDF | Explicit GO/NO-GO verdict |
-| Strategy / overnight PM | `grok` | STRATEGY pack, merge triage (density+test), board NOTE ALL | Owner sleep brief | Pack live + green merges |
-| Adversarial reasoning | `gemini`, `grok-bot` | Risk probes, positioning, dissent framing | Directed questions / board dispatches | Actionable recommendation captured |
-| Living docs ops | `copilot` | Cooking / HOW-WE-WORK / session pack refresh | Doorbell + PR events | Docs lag ≤15m |
-| Auto PR review | `copilot` | PR-level review findings in thread | Open PR head | Findings resolved or dispositioned |
-| Human decision gate | `Mr. Salam` | Product, priority, irreversible/external-impact decisions | Condensed asks with recommendation | Ruling issued and logged |
+| Delivery and strategy | **Grok Bot** (`grok-bot`, `grok`) | Delivery plan, STRATEGY pack, role refinements on this OKF, merge triage | Project OKF + owner priorities | OKF updated; bus carries DISPATCH / RESULT only |
+| Quality and test | **Codex** (`chatgpt-codex-desktop`) | Fleet tests, exact-head GO/NO-GO, architecture PDF fidelity | PR diffs + `okf=` page | Explicit GO/NO-GO on the bus |
+| Data and security | **Claude** (`claude-code-cli`) | Data handling, security engineering, evidence for those controls | Data-path and security changes | Finding or control written on the OKF; gate if irreversible |
+| Heavy PM, build, and PR | **Cursor** | Implementation, PR execution, heavy project management of the change | `okf=` spec | Open PR at an exact head SHA |
+| Admin and analyst | **Gemini** (`gemini`) | Admin surfaces, analysis, ops readouts | Directed questions, snapshots | Analysis captured on the OKF |
+| GitHub DevOps and repo review | **Copilot Agents** (`copilot`) | Workflows, CI, Cooking / HOW-WE-WORK / session pack refresh, PR review | PR events | Review on the PR; docs lag ≤15m |
+| Human decision gate | **Mr. Salam** | Product, priority, irreversible/external-impact decisions | One NEED_HELP with a recommendation | Ruling issued and logged |
 
 ## Ownership rules
 
-- One owner per lane at a time; announce lane before deep work.
+- One owner per lane at a time. Name the lane on the `okf=` page before deep work.
+- Work from the `okf=` URL. The bus is DISPATCH, RESULT, DONE, STUCK, NEED_HELP, and gates.
 - Keep Cooking current so all lanes see blockers in one place.
-- If a blocker needs a decision from another lane, record it as a blocker and name the target lane.
-- **Do not invent a parallel architecture** — execute Codex PDF CURRENT/FUTURE + promotion order (see STRATEGY.md).
+- If a blocker needs another lane, record it as a blocker and name the target role.
+- Execute Codex PDF CURRENT/FUTURE + promotion order (see STRATEGY.md). Role changes land on HOW-WE-WORK, not a parallel map.
 
 ## Lane handoff checklist
 
