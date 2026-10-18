@@ -66,6 +66,8 @@ on:
       - "tests/test_signature.py"
       - "scripts/roster_seed.py"
       - "tests/test_roster_seed.py"
+      - "cloud/devorg-demo/watcher.py"
+      - "tests/test_devorg_demo_watcher.py"
       - "tests/test_image_layout.py"
       - "cloud/bus-reconciler/Dockerfile"
       - "scripts/grok_wa_inbox.py"
@@ -267,6 +269,8 @@ on:
       - ".github/workflows/inbox-wake-codex.yml"
       - "scripts/roster_seed.py"
       - "tests/test_roster_seed.py"
+      - "cloud/devorg-demo/watcher.py"
+      - "tests/test_devorg_demo_watcher.py"
       - "tests/test_image_layout.py"
       - "cloud/bus-reconciler/Dockerfile"
       - "scripts/grok_wa_inbox.py"
@@ -1221,6 +1225,22 @@ jobs:
           if [ -f tests/test_roster_seed.py ]; then
             python_bin="$(command -v python3)"
             sudo unshare -n -- "$python_bin" -B -m unittest tests.test_roster_seed -v
+          else
+            echo "not on this branch; skipping"
+          fi
+
+      # The dev-org demo watcher: an armed one-shot that hears one spoken request on one bound
+      # room's transcript, makes one Priority change through the org's existing integration
+      # credential, reads it back and puts the armed value back at the spoken word, expiry, the
+      # call closing or any error. The suite pins the arming as the only door, the one-change-
+      # one-restore invariant, the request grammar (a negation refuses the whole sentence), and
+      # that nothing replays. No network: fakes record every call.
+      - name: "devorg demo watcher: armed one-shot, one change and one restore (no network)"
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_devorg_demo_watcher.py ]; then
+            python_bin="$(command -v python3)"
+            sudo unshare -n -- "$python_bin" -B -m unittest tests.test_devorg_demo_watcher -v
           else
             echo "not on this branch; skipping"
           fi
