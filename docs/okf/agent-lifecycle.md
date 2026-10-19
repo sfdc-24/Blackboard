@@ -2,7 +2,7 @@
 type: guide
 title: Agent onboarding, offboarding and reactivation
 status: proposed
-updated: 2026-10-19T14:55:00Z
+updated: 2026-10-19T20:56:00Z
 classification: public-safe template; operational records require an approved destination
 ---
 
@@ -30,11 +30,13 @@ Record these fields in an approved destination:
 | Identity | Unique transition/task ID, phase, agent, one accountable owner, independent verifier, and UTC update time |
 | Scope | Purpose, permitted files, intended result, canonical repository/path, and exact revision |
 | State | Completed, active, blocked, parked, or archived; dependencies and next checkpoint |
-| Evidence | Artifact links and exact heads, checks actually run, PASS/FAIL/UNKNOWN, and remaining gates |
+| Evidence | Artifact links and exact heads; substantive test suite, run receipt and result for the exact commit; PASS/FAIL/UNKNOWN and remaining gates |
 | Authority | Approval reference and bounds where required; classification and approved destination |
 | Continuity | Supersedes/superseded-by links and the next responsible owner |
 
 For every gate, name **Who / What / When / How / Timeout**. Silence means hold. Track *sent*, *pickup*, *result received*, *independently verified*, and *accepted* separately. A dispatch is not an acknowledgment; a commit is not a deployment; source checks are not live acceptance.
+
+A passing placeholder workflow is not a test receipt. Cite the substantive checks that actually ran against the recorded commit, with a run link or durable log and result. If those checks did not run, record **NOT RUN** and keep the verification gate open; do not infer it from a green required status.
 
 ## Onboarding
 
@@ -54,10 +56,12 @@ For each task-relevant system or tool, record the following in the appropriately
 | Context and operations | Verified environment/identity and observed read, write, or execute capability; keep private details private |
 | Boundary | Allowed scope, approval needed, and prohibited actions |
 | Evidence | Harmless read-only probe, exact outcome, and UTC observation time |
+| Wake route | Actual doorbell, scheduler, or workflow; enabled state, last observed end-to-end delivery, and who checks for missed receipts |
 | Owner and dependency | Approved access owner; required feature or quota and its verified status or UNKNOWN |
 | Revalidation | New session, changed identity/environment, expiry, or denied operation |
 
 Tool presence is not proof of permission, and an earlier success is not proof of current access. Use harmless reads first. Do not request secrets in chat, copy credentials, install an unapproved tool, create an account, grant access, or activate a paid feature as an onboarding shortcut. On denial, pause that dependency and report it; do not route around it.
+An echo-only workflow does not prove that an agent was woken. If the route is off or its delivery cannot be observed without an unauthorized invocation, mark wake readiness **UNKNOWN** or **BLOCKED**.
 
 ### 3. Demonstrate a bounded pickup
 
@@ -77,7 +81,7 @@ Offboarding documentation does not itself stop an agent, cancel a subscription, 
 
 ### 1. Preserve the work
 
-Record new knowledge and decisions with rationale and sources; exact diffs, branches, and commits; runbooks, tests, failures, artifacts, holds, dependencies, open commitments, and next safe actions. Distinguish measured findings, author reports, and proposals. Include unfinished work outside the canonical branch with its exact location and status, but do not publish private material here. Flag local-only artifacts that a successor cannot yet recover. Preservation is complete only after an approved durable copy is independently readable.
+Record new knowledge and decisions with rationale and sources; exact diffs, branches, and commits; runbooks, tests, failures, artifacts, holds, dependencies, open commitments, and next safe actions. Distinguish measured findings, author reports, and proposals. Include unfinished work outside the canonical branch with its exact location and status, but do not publish private material here. Inventory local-only memory, session scratch files, and other artifacts a successor cannot yet recover. For a log cited by checksum, preserve the underlying file in an approved durable destination and verify that an independent reader can open it and compare the checksum; a hash alone is not recoverable evidence. If that destination is missing, mark preservation **BLOCKED** pending the owner decision, and do not claim offboarding complete.
 
 ### 2. Record continuity risks
 
@@ -86,6 +90,8 @@ Identify task-relevant feature, quota, retention, and account dependencies in th
 ### 3. Commit and index through the legitimate writer
 
 Submit the sanitized or approved restricted record through the owning repository's review process. Record its exact durable commit and link it from the existing index or WIP entry. A branch or draft PR is a proposal, not an accepted canonical revision; retain the review gate. Preserve history, mark replaced records superseded, and keep useful failure evidence. Do not rename dependency-sensitive documents or tidy away unresolved work.
+
+If ownership enforcement reserves a path for the departing writer, record that constraint in the appropriately classified handoff. Before retirement, the owner must designate a successor who can write through the existing legitimate ownership and review route, and that route must be verified. Until then, keep the transfer **BLOCKED**; do not borrow an identity or create a grant to force the handoff through.
 
 ### 4. Obtain successor acceptance
 
@@ -101,11 +107,11 @@ Sending a record is not acceptance. If no successor is available, mark **archive
 
 ### 5. Review access retirement separately
 
-List access that may need review only in an approved restricted record. Credential revocation, account suspension, permission changes, session termination, and destructive cleanup require separate authorized owner action. Distinguish requested, completed, and independently verified retirement. Never include secret values or silently revoke shared access another service may use.
+List access that may need review only in an approved restricted record. Check the successor writer and preservation gates above before proposing retirement. Credential revocation, account suspension, permission changes, session termination, and destructive cleanup require separate authorized owner action. Distinguish requested, completed, and independently verified retirement. Never include secret values or silently revoke shared access another service may use.
 
 ## Reactivation
 
-Start from the latest canonical index and revision, not an old chat or archived approval. Read superseding decisions, WIP, and holds. Revalidate the tools, identity, permissions, features, and environment needed for the intended scope with safe reads. Repeat the bounded onboarding test, name an accountable owner and verifier, confirm the next authorized action, and issue a fresh PICKUP receipt. Dormant access and expired or task-specific approval are not standing authority.
+Start from the latest canonical index and revision, not an old chat or archived approval. Read superseding decisions, WIP, and holds. Revalidate the tools, identity, permissions, features, environment, and actual wake route needed for the intended scope with safe reads. Record whether that route is enabled and when an end-to-end delivery was last observed; an echo-only workflow is insufficient. Repeat the bounded onboarding test, name an accountable owner and verifier, confirm the next authorized action, and issue a fresh PICKUP receipt. Dormant access and expired or task-specific approval are not standing authority.
 
 ## Completion receipt
 
@@ -114,8 +120,9 @@ Start from the latest canonical index and revision, not an old chat or archived 
 | Transition ID and phase | |
 | Accountable owner / agent / verifier | |
 | Canonical record and exact commit | |
-| Artifact coverage and known gaps | |
-| Checks run and independent read-back | |
+| Artifact coverage, durable copies, and local-only gaps | |
+| Substantive checks and run receipts for the exact commit; independent read-back | |
+| Legitimate successor writer and wake route state | |
 | Successor ACK and acceptance state | |
 | Remaining holds, dependencies, and next checkpoint | |
 | Separate owner actions still required | |
