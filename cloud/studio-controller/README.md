@@ -270,19 +270,23 @@ value as `DRIVE_INTAKE_POLL_TOKEN`, from Secret Manager), and `roles/run.invoker
 on drive-intake for this service's account, since the call carries this
 service's own OIDC identity. The binding is written only by
 `bind_telephone_doc`, not by the query, and that writer is off with the flag.
-It is not an HTTP route. Nothing in session creation calls it. `POST /v1/session`
-has no server-assigned Drive file id (its body is the client's, and the
-session's task id is minted here). drive-intake's `correlate` keeps
-`source_doc_id` on its own tuple and derives its own task id from the file,
-the request revision, and the request id. That task is not this session, the
-tuple has no session id, and the doc grammar does not name one. Studio state
-is not the fleet inbox, and the controller's inbound authenticators (browser
-token, voice-sweep secret) are not drive-intake. A binding from drive-intake
-would require a correlation of that trusted file id to a live session. None
-exists, so none was invented: not a session id in the doc, not an
-operator-to-doc map, not a client doc field, not a session minted at
-dispatch. A normal session therefore stays unbound, and with the flag on its
-telephone read stays 403.
+`POST /v1/session` binds nothing: its body is the client's.
+
+The binding is a pairing code. When drive-intake dispatches a request and
+`DRIVE_INTAKE_STUDIO_URL` is set, it writes one more line into that doc:
+`STUDIO LINK - task <id> on a live studio call: <studio>?live=1#pair=<code> -
+until <time> - id <receipt id>`. The code is random (80 bits), stored in Redis
+only as a hash with the doc it opens, and good for `DRIVE_INTAKE_PAIR_TTL`
+(12 hours by default). It sits in the URL fragment, so no web server logs it.
+`POST /v1/session/{id}/telephone/pair` with `{"code": ...}` (this session's
+token, an operator's live session; a visitor or pilot session is 403) asks
+drive-intake's `POST /pair`, as this service's identity with the poll token,
+which doc the code opens. drive-intake names the doc; the browser never does.
+Unknown and expired codes are one 403; five tries per session. A session is
+bound once: the same doc again is a no-op and another doc is 409. So whoever
+can read the doc can show its trail on their own operator session: the same
+people who can already read every receipt in it. Nothing else binds: not a
+session id in the doc, not an operator-to-doc map, not a client doc field.
 
 Keep `STUDIO_MAX_SESSION_SECONDS=600`, `STUDIO_DAILY_SESSION_CAP=20`, and
 the operator allowlist for the approved initial envelope. Voice is one call per

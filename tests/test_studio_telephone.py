@@ -635,5 +635,174 @@ class TelephoneTests(unittest.TestCase):
             self.assertEqual([], self.upstream.calls)
 
 
+CODE = "ABCDEFGHIJKLMNOP"
+OTHER_DOC = "1gZlJFDD2Wm419YOuolIXC3HXwzXOWYfP"
+
+
+class PairingUpstream(FakeTelephone):
+    """drive-intake with POST /pair: a code opens the doc in `codes`, anything else is its 404."""
+
+    def __init__(self, codes=None, pair_answer=None, pair_raises=None):
+        super().__init__()
+        self.codes = {CODE: DOC} if codes is None else codes
+        self.pair_answer, self.pair_raises, self.posts = pair_answer, pair_raises, []
+
+    def post(self, url, json=None, headers=None):
+        self.posts.append((url, dict(json or {}), dict(headers or {})))
+        if self.pair_raises is not None:
+            raise self.pair_raises
+        if self.pair_answer is not None:
+            return self.pair_answer
+        doc = self.codes.get((json or {}).get("code"))
+        return Answer(200, {"enabled": True, "doc": doc}) if doc else Answer(404, {"error": "no such pairing code"})
+
+
+class PairingTests(unittest.TestCase):
+    """The binding (step 4): an operator's live session is bound to the doc a pairing code opens, and
+    drive-intake, not the browser, names that doc."""
+
+    # The same app, sign-in and store reads as TelephoneTests, without running its tests twice.
+    app = TelephoneTests.app
+    session = TelephoneTests.session
+    stored = TelephoneTests.stored
+
+    def pair(self, client, sid, headers, body=None):
+        return client.post("/v1/session/%s/telephone/pair" % sid, headers=headers,
+                           json={"code": CODE} if body is None else body)
+
+    def test_a_code_binds_the_doc_drive_intake_names_and_then_the_trail_reads(self):
+        with TestClient(self.app(upstream=PairingUpstream())) as client:
+            sid, headers, _created = self.session(client)
+            response = self.pair(client, sid, headers)
+            self.assertEqual(200, response.status_code, response.text)
+            self.assertEqual({"doc": DOC}, response.json())
+            self.assertEqual(DOC, self.stored(sid)["telephone_doc"])
+            url, sent, auth = self.upstream.posts[0]
+            self.assertEqual("https://drive-intake-96522051727.us-central1.run.app/pair", url)
+            self.assertEqual({"code": CODE}, sent)
+            self.assertEqual("poll-secret", auth["X-Drive-Intake-Poll-Token"])
+            self.assertEqual("Bearer idtok-for-https://drive-intake-96522051727.us-central1.run.app", auth["Authorization"])
+            self.assertEqual([], self.upstream.calls)                    # pairing reads no trail
+            trail = client.get("/v1/session/%s/telephone" % sid, params={"doc": DOC}, headers=headers)
+            self.assertEqual(200, trail.status_code, trail.text)
+            other = client.get("/v1/session/%s/telephone" % sid, params={"doc": OTHER_DOC}, headers=headers)
+            self.assertEqual(403, other.status_code, other.text)        # bound to one doc, not to any
+
+    def test_the_body_is_the_code_alone_and_a_doc_in_it_binds_nothing(self):
+        with TestClient(self.app(upstream=PairingUpstream())) as client:
+            sid, headers, _created = self.session(client)
+            for body in ({"code": CODE, "doc": OTHER_DOC}, {"doc": DOC}, {}, {"code": CODE.lower()},
+                         {"code": CODE[:15]}, {"code": 7}, {"code": [CODE]}, {"session_id": sid, "code": CODE}):
+                response = self.pair(client, sid, headers, body)
+                self.assertEqual(400, response.status_code, (body, response.text))
+            self.assertEqual(400, client.post("/v1/session/%s/telephone/pair" % sid, headers=headers,
+                                              content=b"not json").status_code)
+            self.assertEqual([], self.upstream.posts)
+            self.assertNotIn("telephone_doc", self.stored(sid))
+
+    def test_an_unknown_or_expired_code_is_403_and_binds_nothing(self):
+        with TestClient(self.app(upstream=PairingUpstream(codes={}))) as client:
+            sid, headers, _created = self.session(client)
+            response = self.pair(client, sid, headers)
+            self.assertEqual(403, response.status_code, response.text)
+            self.assertEqual({"detail": "that code does not open a trail"}, response.json())
+            self.assertNotIn(DOC, response.text)
+            self.assertNotIn("telephone_doc", self.stored(sid))
+
+    def test_drive_intake_off_broken_or_vague_is_502_and_binds_nothing(self):
+        answers = (Answer(200, {"enabled": False, "doc": None}), Answer(500, {"error": "x"}), Answer(401, {}),
+                   Answer(200, raw=b"not json"), Answer(200, ["a"]), Answer(200, {"enabled": True, "doc": "short"}),
+                   Answer(200, {"enabled": True}), Answer(200, {"doc": DOC}), Answer(200, {"enabled": "yes", "doc": DOC}))
+        for answer in answers:
+            with TestClient(self.app(upstream=PairingUpstream(pair_answer=answer))) as client:
+                sid, headers, _created = self.session(client)
+                response = self.pair(client, sid, headers)
+                self.assertEqual(502, response.status_code, (answer.content, response.text))
+                self.assertNotIn("telephone_doc", self.stored(sid))
+        with TestClient(self.app(upstream=PairingUpstream(pair_raises=ConnectionError("down")))) as client:
+            sid, headers, _created = self.session(client)
+            response = self.pair(client, sid, headers)
+            self.assertEqual(502, response.status_code, response.text)
+            self.assertIn("ConnectionError", response.text)
+            self.assertNotIn("telephone_doc", self.stored(sid))
+
+    def test_off_is_404_and_drive_intake_is_never_asked(self):
+        with TestClient(self.app(telephone_url="", upstream=PairingUpstream())) as client:
+            sid, headers, _created = self.session(client)
+            self.assertEqual(404, self.pair(client, sid, headers).status_code)
+            self.assertEqual([], self.upstream.posts)
+            self.assertNotIn("telephone_doc", self.stored(sid))
+
+    def test_only_this_sessions_token_and_a_live_session_can_pair(self):
+        with TestClient(self.app(upstream=PairingUpstream())) as client:
+            sid, headers, _created = self.session(client)
+            self.assertEqual(401, self.pair(client, sid, ORIGIN).status_code)
+            other = mint_token("someone-else", 2000, self.configured.session_secret)
+            self.assertEqual(403, self.pair(client, sid, {**ORIGIN, "Authorization": "Bearer " + other}).status_code)
+            self.assertEqual(403, self.pair(client, sid, {"Authorization": headers["Authorization"],
+                                                          "Origin": "https://evil.example"}).status_code)
+            stopped = client.post("/v1/session/%s/commands" % sid, headers=headers, json={
+                "command_id": "stop-1", "session_id": sid, "type": "stop", "expected_version": 1})
+            self.assertEqual(200, stopped.status_code, stopped.text)
+            self.assertEqual(410, self.pair(client, sid, headers).status_code)
+            ghost = "s-not-a-session"
+            token = mint_token(ghost, 2000, self.configured.session_secret)
+            self.assertEqual(404, self.pair(client, ghost, {**ORIGIN, "Authorization": "Bearer " + token}).status_code)
+            self.assertEqual([], self.upstream.posts)
+            self.assertNotIn("telephone_doc", self.stored(sid))
+
+    def test_a_pilots_session_cannot_pair(self):
+        guest = "guest@lab.example"
+        with TestClient(self.app(upstream=PairingUpstream(), pilot_enabled=True, pilot_emails=(guest,),
+                                 pilot_seconds=300)) as client:
+            key = "browser-instance-pilot-1234567890"
+            started = client.post("/v1/auth/start", headers=ORIGIN, json={"email": guest, "client_key": key})
+            code = [c for e, c in self.email_sender.calls if e == guest][-1]
+            verified = client.post("/v1/auth/verify", headers=ORIGIN, json={
+                "challenge_id": started.json()["challenge_id"], "email": guest, "code": code, "client_key": key})
+            self.assertEqual("pilot", verified.json()["scope"], verified.text)
+            made = client.post("/v1/session", headers={**ORIGIN, "Authorization": "Bearer " + verified.json()["token"]},
+                               json={"title": "Test", "creation_id": "pilot-1"})
+            self.assertEqual(200, made.status_code, made.text)
+            sid = made.json()["session_id"]
+            self.assertEqual("", self.stored(sid).get("operator_subject"))
+            response = self.pair(client, sid, {**ORIGIN, "Authorization": "Bearer " + made.json()["token"]})
+            self.assertEqual(403, response.status_code, response.text)
+            self.assertIn("operator", response.text)
+            self.assertEqual([], self.upstream.posts)
+            self.assertNotIn("telephone_doc", self.stored(sid))
+
+    def test_a_session_is_bound_once_the_same_doc_again_is_a_no_op_and_another_is_409(self):
+        upstream = PairingUpstream(codes={CODE: DOC, "QRSTUVWXYZ234567": DOC, "ZZZZZZZZZZZZZZZZ": OTHER_DOC})
+        with TestClient(self.app(upstream=upstream)) as client:
+            sid, headers, _created = self.session(client)
+            self.assertEqual(200, self.pair(client, sid, headers).status_code)
+            again = self.pair(client, sid, headers, {"code": "QRSTUVWXYZ234567"})
+            self.assertEqual((200, {"doc": DOC}), (again.status_code, again.json()))
+            moved = self.pair(client, sid, headers, {"code": "ZZZZZZZZZZZZZZZZ"})
+            self.assertEqual(409, moved.status_code, moved.text)
+            self.assertEqual(DOC, self.stored(sid)["telephone_doc"])
+            with self.assertRaises(HTTPException) as caught:
+                client.app.state.bind_telephone_doc(sid, OTHER_DOC)
+            self.assertEqual(409, caught.exception.status_code)
+            self.assertEqual(DOC, self.stored(sid)["telephone_doc"])
+            # A second operator session pairs on its own; the first one's binding is not shared.
+            sid2, headers2, _second = self.session(client, "create-2")
+            self.assertEqual(403, client.get("/v1/session/%s/telephone" % sid2, params={"doc": DOC},
+                                             headers=headers2).status_code)
+            self.assertEqual(200, self.pair(client, sid2, headers2, {"code": "ZZZZZZZZZZZZZZZZ"}).status_code)
+            self.assertEqual(OTHER_DOC, self.stored(sid2)["telephone_doc"])
+
+    def test_tries_are_bounded_per_session(self):
+        with TestClient(self.app(upstream=PairingUpstream(codes={}))) as client:
+            sid, headers, _created = self.session(client)
+            for _ in range(5):
+                self.assertEqual(403, self.pair(client, sid, headers).status_code)
+            self.assertEqual(429, self.pair(client, sid, headers).status_code)
+            self.assertEqual(5, len(self.upstream.posts))
+            sid2, headers2, _second = self.session(client, "create-2")
+            self.assertEqual(403, self.pair(client, sid2, headers2).status_code)   # its own count
+
+
 if __name__ == "__main__":
     unittest.main()

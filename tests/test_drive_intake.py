@@ -2038,5 +2038,149 @@ class TrailPageTest(unittest.TestCase):
         self.assertEqual([], c.writes)
 
 
+STUDIO = "https://www.sfdc24.com/studio/"
+LINK_CODE = re.compile(r"\?live=1#pair=([A-Z2-7]{16}) - until ")
+
+
+class StudioLinkTest(unittest.TestCase):
+    """The binding (step 4): a dispatched doc gets a studio link holding a pairing code, and only the
+    studio controller, with the poll token, can trade the code for the doc. Off unless configured."""
+
+    def dispatched(self, **over):
+        d = deps(ring=di.polled_ring, studio_url=STUDIO, **over)
+        out = di.decide(hint(), d)
+        self.assertEqual("dispatched", out["status"], out)
+        return d, out
+
+    def link_line(self, d):
+        lines = [b for _, _, b in d.receipts.lines if di.STUDIO_LINK in b]
+        self.assertEqual(1, len(lines), d.receipts.lines)
+        return lines[0].strip().splitlines()[-1]
+
+    def test_off_by_default_no_link_is_written_and_pair_says_so(self):
+        d = deps(ring=di.polled_ring)
+        out = di.decide(hint(), d)
+        self.assertEqual(("dispatched", "off"), (out["status"], out["studio_link"]))
+        self.assertEqual(["REQUESTED", "DISPATCHED"], d.receipts.states())
+        self.assertEqual((200, {"enabled": False, "doc": None}),
+                         di.handle("POST", "/pair", {"X-Drive-Intake-Poll-Token": "poll"},
+                                   json.dumps({"code": "A" * 16}).encode(), d))
+        self.assertEqual("", di.deps_from_env({}, client=None, docs=None).studio_url)
+
+    def test_a_dispatched_doc_gets_one_link_whose_code_is_stored_only_as_a_hash(self):
+        d, out = self.dispatched()
+        self.assertEqual("written", out["studio_link"])
+        self.assertEqual(["REQUESTED", "DISPATCHED", "STUDIO LINK"], d.receipts.states())
+        line = self.link_line(d)
+        code = LINK_CODE.search(line).group(1)
+        task = out["tuple"]["task_id"]
+        self.assertTrue(line.startswith("STUDIO LINK - task %s on a live studio call: %s?live=1#pair=" % (task, STUDIO)), line)
+        self.assertTrue(line.endswith(" - id " + di.receipt_id_for(out["tuple"], di.STUDIO_LINK)), line)
+        self.assertIn(" - until 1970-01-01T12:16:40Z - ", line)            # now 1000 + 12 hours
+        stored = {k: v for k, v in d.claims.beats.items() if str(k).startswith("fleet:intake:pair:")}
+        self.assertEqual({"fleet:intake:pair:" + di.pair_hash(code): (FILE, di.PAIR_TTL)}, stored)
+        self.assertNotIn(code, json.dumps({str(k): v for k, v in d.claims.beats.items()}, default=str))
+        # The link is ours, under the heading: not the request, so no new revision and no retrigger,
+        # and not a receipt, so the page's trail never carries the code.
+        text = REQUEST + d.receipts.text()
+        self.assertEqual(di.request_revision(REQUEST), di.request_revision(text))
+        d.docs.text = text
+        self.assertEqual("duplicate", di.decide(hint(), d)["status"])
+        self.assertEqual(3, len(d.receipts.lines))
+        trail = di.trail_for_doc(d, FILE)
+        self.assertEqual(["REQUESTED", "DISPATCHED"], [e["state"] for e in trail["entries"]])
+        self.assertNotIn(code, json.dumps(trail))
+
+    def test_two_dispatches_never_share_a_code(self):
+        codes = set()
+        for _ in range(5):
+            d, _out = self.dispatched()
+            codes.add(LINK_CODE.search(self.link_line(d)).group(1))
+        self.assertEqual(5, len(codes))
+
+    def test_a_code_that_could_not_be_stored_is_never_written(self):
+        class NoPair(di.MemoryClaims):
+            def pair_put(self, code_hash, file_id, ttl):
+                raise ConnectionError()
+        d, out = self.dispatched(claims=NoPair())
+        self.assertEqual("unknown:ConnectionError", out["studio_link"])
+        self.assertEqual(["REQUESTED", "DISPATCHED"], d.receipts.states())
+
+    def test_a_link_already_in_the_doc_is_found_and_no_second_code_is_minted(self):
+        d = deps(ring=di.polled_ring, studio_url=STUDIO)
+        t = di.correlate(FILE, REQUEST, "r1", "claude-api")
+        d.receipts.lines.append((FILE, di.receipt_id_for(t, di.STUDIO_LINK), "STUDIO LINK - earlier"))
+        self.assertEqual("written", di.write_studio_link(d, t, REQUEST))
+        self.assertEqual([], [k for k in d.claims.beats if str(k).startswith("fleet:intake:pair:")])
+        self.assertEqual(1, len(d.receipts.lines))
+
+    def test_a_lost_append_that_landed_is_written_once(self):
+        d = deps(ring=di.polled_ring, studio_url=STUDIO)
+        t = di.correlate(FILE, REQUEST, "r1", "claude-api")
+        d.receipts.lose = True
+        self.assertEqual("written", di.write_studio_link(d, t, REQUEST + RECEIPTS))
+        self.assertEqual(1, d.receipts.appends)
+
+    def test_pair_wants_the_token_first_then_the_flag_then_a_code_and_answers_only_a_stored_one(self):
+        d, _out = self.dispatched()
+        code = LINK_CODE.search(self.link_line(d)).group(1)
+        tok = {"X-Drive-Intake-Poll-Token": "poll"}
+        body = json.dumps({"code": code}).encode()
+        self.assertEqual(401, di.handle("POST", "/pair", {}, body, d)[0])
+        self.assertEqual(401, di.handle("POST", "/pair", {"X-Drive-Intake-Poll-Token": "nope"}, body, d)[0])
+        self.assertEqual((200, {"enabled": True, "doc": FILE}), di.handle("POST", "/pair", tok, body, d))
+        self.assertEqual((200, {"enabled": True, "doc": FILE}),
+                         di.handle("POST", "/pair", {"Authorization": "Bearer poll"}, body, d))
+        for bad in (b"", b"[]", b"not json", json.dumps({"code": code.lower()}).encode(),
+                    json.dumps({"code": code[:15]}).encode(), json.dumps({"code": 7}).encode(),
+                    json.dumps({"doc": FILE}).encode()):
+            self.assertEqual(400, di.handle("POST", "/pair", tok, bad, d)[0], bad)
+        other = "B" * 16 if code != "B" * 16 else "C" * 16
+        self.assertEqual((404, {"error": "no such pairing code"}),
+                         di.handle("POST", "/pair", tok, json.dumps({"code": other}).encode(), d))
+        self.assertEqual(404, di.handle("GET", "/pair", tok, body, d)[0])   # POST only
+        off = deps(enabled=False, studio_url=STUDIO, claims=d.claims)
+        self.assertEqual((200, {"enabled": False, "doc": None}), di.handle("POST", "/pair", tok, body, off))
+        self.assertEqual(401, di.handle("POST", "/pair", {}, body, off)[0])  # the token before the flag
+
+        class Broken(di.MemoryClaims):
+            def pair_get(self, code_hash):
+                raise ConnectionError()
+        self.assertEqual(503, di.handle("POST", "/pair", tok, body, deps(studio_url=STUDIO, claims=Broken()))[0])
+        self.assertEqual(503, di.handle("POST", "/pair", tok, body, deps(studio_url=STUDIO, claims=None))[0])
+
+        class Junk(di.MemoryClaims):
+            def pair_get(self, code_hash):
+                return "short"
+        self.assertEqual(404, di.handle("POST", "/pair", tok, body, deps(studio_url=STUDIO, claims=Junk()))[0])
+
+    def test_the_redis_store_keeps_the_hash_with_a_ttl_and_never_the_code(self):
+        class Client:
+            def __init__(self):
+                self.kv, self.sets = {}, []
+
+            def set(self, key, value, ex=None, nx=False):
+                self.sets.append((key, value, ex))
+                self.kv[key] = value.encode() if isinstance(value, str) else value
+
+            def get(self, key):
+                return self.kv.get(key)
+        c = Client()
+        claims = di.RedisClaims(c)
+        claims.pair_put(di.pair_hash("ABCDEFGHIJKLMNOP"), FILE, 600)
+        self.assertEqual([("fleet:intake:pair:" + di.pair_hash("ABCDEFGHIJKLMNOP"), FILE, 600)], c.sets)
+        self.assertEqual(FILE, claims.pair_get(di.pair_hash("ABCDEFGHIJKLMNOP")))
+        self.assertIsNone(claims.pair_get(di.pair_hash("ABCDEFGHIJKLMNOQ")))
+        self.assertNotIn("ABCDEFGHIJKLMNOP", json.dumps(c.sets))
+
+    def test_the_studio_url_and_ttl_come_from_env_and_a_bad_url_leaves_the_link_off(self):
+        env = {"DRIVE_INTAKE_STUDIO_URL": " " + STUDIO + " "}
+        self.assertEqual(STUDIO, di.deps_from_env(env, client=None, docs=None).studio_url)
+        for bad in ("http://www.sfdc24.com/studio/", STUDIO + "?x=1", STUDIO + "#x", "https://a b/", "javascript:x"):
+            self.assertEqual("", di.deps_from_env({"DRIVE_INTAKE_STUDIO_URL": bad}, client=None, docs=None).studio_url, bad)
+        ttl = lambda v: di.deps_from_env({"DRIVE_INTAKE_PAIR_TTL": v}, client=None, docs=None).pair_ttl
+        self.assertEqual((di.PAIR_TTL, 300, 86400, 3600, di.PAIR_TTL), (ttl(""), ttl("5"), ttl("999999"), ttl("3600"), ttl("x")))
+
+
 if __name__ == "__main__":
     unittest.main()

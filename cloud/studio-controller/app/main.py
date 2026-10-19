@@ -1209,11 +1209,10 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
                 raise HTTPException(429, "the conversations for today are used up") from exc
         # telephone_doc stays unset. This handler's fields (title, creation_id,
         # start, topic) are the client's, and the task id on the session is
-        # minted here, not taken from a Drive file. drive-intake's correlate()
-        # keeps source_doc_id on its own tuple (a drive task, not this session)
-        # and does not write this session. Copying ?doc= or a body field into
-        # the binding would make the client the authority, which the telephone
-        # read is written to refuse.
+        # minted here, not taken from a Drive file. Copying ?doc= or a body
+        # field into the binding would make the client the authority, which the
+        # telephone read is written to refuse. The one way a doc is bound is
+        # POST /v1/session/{id}/telephone/pair, where drive-intake names the doc.
         token = mint_token(state["session_id"], state["expires_at"], settings.session_secret)
         return {
             "session_id": state["session_id"],
@@ -1539,6 +1538,9 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
     # outside it is a broken upstream and a 502, never a page's trail (Copilot on ff15a56).
     TELEPHONE_STATUSES = ("ok", "no_store", "read_error", "out_of_scope", "too_large")
     TELEPHONE_ENTRY_TEXT = ("state", "task", "request", "rev", "recipient", "by", "at", "detail", "id")
+    # A pairing code as drive-intake mints it (PAIR_CODE_OK there): 16 base32 characters.
+    TELEPHONE_PAIR_CODE = re.compile(r"[A-Z2-7]{16}\Z")
+    TELEPHONE_PAIR_TRIES = 5          # per session: a code is 80 bits, so this bounds load, not guessing
 
     class TelephoneUnavailable(Exception):
         pass
@@ -1554,15 +1556,19 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             return ""
         return response.text.strip() if response.status_code == 200 else ""
 
-    def telephone_trail(doc: str) -> dict:
-        client = app.state.telephone_client
-        if client is None or not settings.telephone_url:
-            raise TelephoneUnavailable("the telephone trail is off")
+    def upstream_headers() -> dict:
+        """This service's own identity (OIDC, for the private service) plus the shared poll token."""
         token = (identity_token or metadata_identity)(settings.telephone_url)
         headers = {"X-Drive-Intake-Poll-Token": settings.telephone_token}
         if token:
             headers["Authorization"] = "Bearer " + token
-        response = client.get(settings.telephone_url + "/trail", params={"doc": doc}, headers=headers)
+        return headers
+
+    def telephone_trail(doc: str) -> dict:
+        client = app.state.telephone_client
+        if client is None or not settings.telephone_url:
+            raise TelephoneUnavailable("the telephone trail is off")
+        response = client.get(settings.telephone_url + "/trail", params={"doc": doc}, headers=upstream_headers())
         if response.status_code != 200:
             raise TelephoneUnavailable("drive-intake answered %d" % response.status_code)
         if len(response.content) > TELEPHONE_MAX_BYTES:
@@ -1605,6 +1611,29 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         out["entries"] = rebuilt
         return out
 
+    def telephone_pair(code: str) -> str:
+        """The doc a pairing code opens, as drive-intake says (POST /pair), or "" when it opens none."""
+        client = app.state.telephone_client
+        if client is None or not settings.telephone_url:
+            raise TelephoneUnavailable("the telephone trail is off")
+        response = client.post(settings.telephone_url + "/pair", json={"code": code}, headers=upstream_headers())
+        if response.status_code == 404:
+            return ""                                       # unknown and expired are the same answer
+        if response.status_code != 200:
+            raise TelephoneUnavailable("drive-intake answered %d" % response.status_code)
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise TelephoneUnavailable("drive-intake gave no JSON") from exc
+        if not isinstance(body, dict):
+            raise TelephoneUnavailable("drive-intake gave no object")
+        if body.get("enabled") is False:
+            raise TelephoneUnavailable("pairing is off at drive-intake")
+        doc = body.get("doc")
+        if body.get("enabled") is not True or not isinstance(doc, str) or not TELEPHONE_DOC.fullmatch(doc):
+            raise TelephoneUnavailable("drive-intake gave no doc")
+        return doc
+
     def bind_telephone_doc(session_id: str, doc: str) -> None:
         """Record the one Drive doc this live session may read.
 
@@ -1612,22 +1641,13 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         query is checked against this field and is not itself the binding.
         Off with the trail (no STUDIO_TELEPHONE_URL), this refuses and stores nothing.
 
-        Nothing in the normal session path calls this, and there is no HTTP
-        route that does. POST /v1/session does not know a Drive file id the
-        server assigned. drive-intake's correlate() trusts source_doc_id as
-        the file it re-read, then derives its own task id from that file, the
-        request revision, and the request id. That task is not this session's
-        task_id, and the tuple has no session id. The doc grammar (to:, request:)
-        does not name a session. Studio state is not the fleet inbox drive-intake
-        writes, and this service's inbound authenticators are the browser token
-        and the voice-sweep secret, neither of which is drive-intake.
-
-        A binding may be written only after drive-intake has correlated a doc
-        to a live session and called this with that source_doc_id. No such
-        correlation exists. A session id in the doc, an operator-to-doc map,
-        a client doc field, and a session minted at dispatch were not added:
-        each would be a new source, and the first three are the author's or
-        the client's claim. A session created the normal way stays unbound.
+        The one caller is the pairing route below, with the doc drive-intake
+        named for a pairing code. drive-intake writes that code, in a studio
+        link, only into the doc it dispatched, so the join is: whoever can read
+        the doc can show its trail on their own operator session. The doc id is
+        never the browser's, the session id is never the doc's, and no
+        operator-to-doc map exists. A session is bound once: the same doc again
+        is a no-op, and another doc is a 409, never an overwrite.
         """
         if not settings.telephone_url:
             raise HTTPException(404, "the telephone trail is off")
@@ -1637,6 +1657,9 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         def change(current):
             if current.get("stopped") or int(current.get("expires_at") or 0) <= int(clock()):
                 raise HTTPException(410, "session has ended")
+            bound = current.get("telephone_doc")
+            if bound and bound != doc:
+                raise HTTPException(409, "this session already shows another doc's trail")
             current["telephone_doc"] = doc
             return current
 
@@ -1646,6 +1669,40 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             raise HTTPException(404, "session not found") from exc
 
     app.state.bind_telephone_doc = bind_telephone_doc
+
+    pair_counts: dict = {}
+
+    @app.post("/v1/session/{session_id}/telephone/pair")
+    async def telephone_pair_route(request: Request, session_id: str):
+        """Bind THIS live operator session to the doc a pairing code opens. Off unless STUDIO_TELEPHONE_URL is set.
+
+        The body is the code and nothing else. The doc comes from drive-intake, never from the
+        caller. A visitor's or a pilot's session is refused (its operator_subject is empty).
+        """
+        require_origin(request)
+        require_session(request, session_id)
+        if not settings.telephone_url:
+            raise HTTPException(404, "the telephone trail is off")
+        state = await asyncio.to_thread(live_state, session_id)
+        if not state.get("operator_subject"):
+            raise HTTPException(403, "only an operator's session can open a trail")
+        body = await json_object(request, "pairing")
+        if set(body) != {"code"}:
+            raise HTTPException(400, "pairing body is the code and nothing else")
+        code = body["code"]
+        if not isinstance(code, str) or not TELEPHONE_PAIR_CODE.fullmatch(code):
+            raise HTTPException(400, "code must be 16 base32 characters")
+        spend(pair_counts, session_id, TELEPHONE_PAIR_TRIES, "pairing")
+        try:
+            doc = await asyncio.to_thread(telephone_pair, code)
+        except TelephoneUnavailable as exc:
+            raise HTTPException(502, str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001 - a transport failure, named by type only
+            raise HTTPException(502, "the code could not be checked: " + type(exc).__name__) from exc
+        if not doc:
+            raise HTTPException(403, "that code does not open a trail")
+        await asyncio.to_thread(bind_telephone_doc, session_id, doc)
+        return {"doc": doc}
 
     def session_owns_doc(state: dict, doc: str) -> bool:
         """True when the server-stored doc id is exactly the one asked for."""

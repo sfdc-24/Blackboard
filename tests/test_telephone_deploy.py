@@ -26,8 +26,10 @@ ENV_READ = re.compile(
 OPTIONAL = {
     # DRIVE_INTAKE_CONFIRM_TOKEN: the task filter's G5 token. Unset is the safe state (no CONFIRM ever
     # matches, so every dial or spend is dry_run); wiring it as a secret is a later owner decision.
+    # DRIVE_INTAKE_STUDIO_URL and DRIVE_INTAKE_PAIR_TTL: the studio link (the telephone binding). Unset is
+    # the safe state (no link is written and /pair answers enabled=false); turning it on is an owner decision.
     "drive-intake": {"INBOX_WAKE_URL", "INBOX_WAKE_SECRET", "PORT", "DRIVE_INTAKE_BIND",
-                     "DRIVE_INTAKE_CONFIRM_TOKEN"},
+                     "DRIVE_INTAKE_CONFIRM_TOKEN", "DRIVE_INTAKE_STUDIO_URL", "DRIVE_INTAKE_PAIR_TTL"},
     "claude-api-worker": {"CLAUDE_API_WORKER_USD_PER_MTOK_IN", "CLAUDE_API_WORKER_USD_PER_MTOK_OUT",
                           "FLEET_CAD_PER_USD"},
 }
