@@ -90,7 +90,8 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
                clock=time.time, id_factory=None, voice_client=None,
                email_sender=None, email_client=None, talk_client=None,
                analyst=None, moderation_client=None, muse=None, summary_sender=None,
-               advisor=None, charter=None, pilot_feedback_sink=None) -> FastAPI:
+               advisor=None, charter=None, pilot_feedback_sink=None,
+               telephone_client=None, identity_token=None) -> FastAPI:
     settings = settings or Settings.from_env()
     settings.validate()
     from workers.topics import TOPICS as _TOPICS, quote_lines as _quote_lines
@@ -352,8 +353,22 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         else:
             app.state.email_client = None
             app.state.close_email_client = False
+        # The telephone trail's client (step 4): one sync client, only while the trail is on.
+        if telephone_client is not None:
+            app.state.telephone_client = telephone_client
+            app.state.close_telephone_client = False
+        elif settings.telephone_url:
+            app.state.telephone_client = httpx.Client(timeout=10)
+            app.state.close_telephone_client = True
+        else:
+            app.state.telephone_client = None
+            app.state.close_telephone_client = False
+        app.state.telephone_cache = {}
+        app.state.telephone_flights = {}
         app.state.voice_sweeper = asyncio.create_task(voice_sweeper())
         yield
+        if app.state.close_telephone_client and app.state.telephone_client is not None:
+            app.state.telephone_client.close()
         app.state.voice_sweeper.cancel()
         try:
             await app.state.voice_sweeper
@@ -1192,6 +1207,12 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
                                         title, settings.visitor_sessions_per_day)
             except LeadCapExceeded as exc:
                 raise HTTPException(429, "the conversations for today are used up") from exc
+        # telephone_doc stays unset. This handler's fields (title, creation_id,
+        # start, topic) are the client's, and the task id on the session is
+        # minted here, not taken from a Drive file. Copying ?doc= or a body
+        # field into the binding would make the client the authority, which the
+        # telephone read is written to refuse. The one way a doc is bound is
+        # POST /v1/session/{id}/telephone/pair, where drive-intake names the doc.
         token = mint_token(state["session_id"], state["expires_at"], settings.session_secret)
         return {
             "session_id": state["session_id"],
@@ -1497,6 +1518,246 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         if pilot.is_pilot(state):
             await emit_pilot_feedback(session_id)    # the host closed a pilot's call
         return {"recap": text, "speaker": agent}
+
+    # THE TELEPHONE TRAIL (step 4 of the broken-telephone fix, Converspan Channel Architecture
+    # v0.1): "the Converspan page shows the live task/receipt trail during a call". The record is
+    # the originating Drive doc; drive-intake reads it and parses the receipt shape back
+    # (GET /trail?doc=); this service reads that as its own identity (an OIDC token for the
+    # private service) plus the shared poll token, and hands the page receipts and the answer
+    # lines - never the owner's request. The query names a doc. That name is authorized only
+    # when it is the doc this live session already has stored (telephone_doc, written by
+    # bind_telephone_doc, never by the query). A stopped, expired, deleted, or unknown session
+    # is refused before any read. One upstream read per session and doc per few seconds,
+    # because every read is a Docs read and one session's cache is not another's.
+    TELEPHONE_DOC = re.compile(r"[A-Za-z0-9_-]{10,128}\Z")
+    TELEPHONE_CACHE_SECONDS = 5.0
+    TELEPHONE_MAX_BYTES = 262144
+    TELEPHONE_KEYS = ("status", "enabled", "doc", "revision", "task", "request", "tasks", "entries",
+                      "live", "at", "error")
+    # The answer's shape, as cloud/drive-intake writes it (trail_for_doc, trail.parse). An answer
+    # outside it is a broken upstream and a 502, never a page's trail (Copilot on ff15a56).
+    TELEPHONE_STATUSES = ("ok", "no_store", "read_error", "out_of_scope", "too_large")
+    TELEPHONE_ENTRY_TEXT = ("state", "task", "request", "rev", "recipient", "by", "at", "detail", "id")
+    # A pairing code as drive-intake mints it (PAIR_CODE_OK there): 16 base32 characters.
+    TELEPHONE_PAIR_CODE = re.compile(r"[A-Z2-7]{16}\Z")
+    TELEPHONE_PAIR_TRIES = 5          # per session: a code is 80 bits, so this bounds load, not guessing
+
+    class TelephoneUnavailable(Exception):
+        pass
+
+    def metadata_identity(audience: str) -> str:
+        """An OIDC identity token for this service's account, from the metadata server, or ''."""
+        client = app.state.telephone_client
+        try:
+            response = client.get(
+                "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity",
+                params={"audience": audience}, headers={"Metadata-Flavor": "Google"})
+        except Exception:  # noqa: BLE001 - off Cloud Run there is no metadata server
+            return ""
+        return response.text.strip() if response.status_code == 200 else ""
+
+    def upstream_headers() -> dict:
+        """This service's own identity (OIDC, for the private service) plus the shared poll token."""
+        token = (identity_token or metadata_identity)(settings.telephone_url)
+        headers = {"X-Drive-Intake-Poll-Token": settings.telephone_token}
+        if token:
+            headers["Authorization"] = "Bearer " + token
+        return headers
+
+    def telephone_trail(doc: str) -> dict:
+        client = app.state.telephone_client
+        if client is None or not settings.telephone_url:
+            raise TelephoneUnavailable("the telephone trail is off")
+        response = client.get(settings.telephone_url + "/trail", params={"doc": doc}, headers=upstream_headers())
+        if response.status_code != 200:
+            raise TelephoneUnavailable("drive-intake answered %d" % response.status_code)
+        if len(response.content) > TELEPHONE_MAX_BYTES:
+            raise TelephoneUnavailable("the trail is larger than a page may read")
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise TelephoneUnavailable("drive-intake gave no JSON") from exc
+        return checked_trail(body, doc)
+
+    def checked_trail(body, doc: str) -> dict:
+        """Upstream's answer in the one shape the page is promised, rebuilt from the named keys."""
+        if not isinstance(body, dict):
+            raise TelephoneUnavailable("drive-intake gave no object")
+        if body.get("enabled") is False:
+            return {"enabled": False}                     # the intake's own flag is off: said, not a trail
+        if body.get("enabled") is not True or body.get("status") not in TELEPHONE_STATUSES:
+            raise TelephoneUnavailable("drive-intake gave no trail")
+        if body.get("doc") != doc:
+            raise TelephoneUnavailable("drive-intake answered for another doc")
+        out = {key: body.get(key) for key in TELEPHONE_KEYS if key in body}
+        for key in ("revision", "task", "request", "at", "error"):
+            if out.get(key) is not None and not isinstance(out[key], str):
+                raise TelephoneUnavailable("drive-intake gave a trail in no known shape")
+        if body["status"] != "ok":
+            return {key: out[key] for key in ("status", "enabled", "doc", "at", "error") if key in out}
+        entries, tasks, live = body.get("entries"), body.get("tasks"), body.get("live")
+        scalar = (str, bool, int, float, type(None))
+        if not (isinstance(entries, list) and isinstance(tasks, list) and isinstance(live, dict)
+                and all(isinstance(task, str) for task in tasks)
+                and all(isinstance(name, str) and isinstance(value, scalar) for name, value in live.items())):
+            raise TelephoneUnavailable("drive-intake gave a trail in no known shape")
+        rebuilt = []
+        for entry in entries:
+            if not (isinstance(entry, dict) and isinstance(entry.get("result"), list)
+                    and all(isinstance(entry.get(key), str) for key in TELEPHONE_ENTRY_TEXT)
+                    and all(isinstance(line, str) for line in entry["result"])):
+                raise TelephoneUnavailable("drive-intake gave a trail in no known shape")
+            rebuilt.append({**{key: entry[key] for key in TELEPHONE_ENTRY_TEXT}, "result": list(entry["result"])})
+        out["entries"] = rebuilt
+        return out
+
+    def telephone_pair(code: str) -> str:
+        """The doc a pairing code opens, as drive-intake says (POST /pair), or "" when it opens none."""
+        client = app.state.telephone_client
+        if client is None or not settings.telephone_url:
+            raise TelephoneUnavailable("the telephone trail is off")
+        response = client.post(settings.telephone_url + "/pair", json={"code": code}, headers=upstream_headers())
+        if response.status_code == 404:
+            return ""                                       # unknown and expired are the same answer
+        if response.status_code != 200:
+            raise TelephoneUnavailable("drive-intake answered %d" % response.status_code)
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise TelephoneUnavailable("drive-intake gave no JSON") from exc
+        if not isinstance(body, dict):
+            raise TelephoneUnavailable("drive-intake gave no object")
+        if body.get("enabled") is False:
+            raise TelephoneUnavailable("pairing is off at drive-intake")
+        doc = body.get("doc")
+        if body.get("enabled") is not True or not isinstance(doc, str) or not TELEPHONE_DOC.fullmatch(doc):
+            raise TelephoneUnavailable("drive-intake gave no doc")
+        return doc
+
+    def bind_telephone_doc(session_id: str, doc: str) -> None:
+        """Record the one Drive doc this live session may read.
+
+        Server-side only: no request body writes telephone_doc. The telephone
+        query is checked against this field and is not itself the binding.
+        Off with the trail (no STUDIO_TELEPHONE_URL), this refuses and stores nothing.
+
+        The one caller is the pairing route below, with the doc drive-intake
+        named for a pairing code. drive-intake writes that code, in a studio
+        link, only into the doc it dispatched, so the join is: whoever can read
+        the doc can show its trail on their own operator session. The doc id is
+        never the browser's, the session id is never the doc's, and no
+        operator-to-doc map exists. A session is bound once: the same doc again
+        is a no-op, and another doc is a 409, never an overwrite.
+        """
+        if not settings.telephone_url:
+            raise HTTPException(404, "the telephone trail is off")
+        if not TELEPHONE_DOC.fullmatch(doc or ""):
+            raise HTTPException(400, "doc must be a Drive file id")
+
+        def change(current):
+            if current.get("stopped") or int(current.get("expires_at") or 0) <= int(clock()):
+                raise HTTPException(410, "session has ended")
+            bound = current.get("telephone_doc")
+            if bound and bound != doc:
+                raise HTTPException(409, "this session already shows another doc's trail")
+            current["telephone_doc"] = doc
+            return current
+
+        try:
+            update_state(session_id, change)
+        except SessionNotFound as exc:
+            raise HTTPException(404, "session not found") from exc
+
+    app.state.bind_telephone_doc = bind_telephone_doc
+
+    pair_counts: dict = {}
+
+    @app.post("/v1/session/{session_id}/telephone/pair")
+    async def telephone_pair_route(request: Request, session_id: str):
+        """Bind THIS live operator session to the doc a pairing code opens. Off unless STUDIO_TELEPHONE_URL is set.
+
+        The body is the code and nothing else. The doc comes from drive-intake, never from the
+        caller. A visitor's or a pilot's session is refused (its operator_subject is empty).
+        """
+        require_origin(request)
+        require_session(request, session_id)
+        if not settings.telephone_url:
+            raise HTTPException(404, "the telephone trail is off")
+        state = await asyncio.to_thread(live_state, session_id)
+        if not state.get("operator_subject"):
+            raise HTTPException(403, "only an operator's session can open a trail")
+        body = await json_object(request, "pairing")
+        if set(body) != {"code"}:
+            raise HTTPException(400, "pairing body is the code and nothing else")
+        code = body["code"]
+        if not isinstance(code, str) or not TELEPHONE_PAIR_CODE.fullmatch(code):
+            raise HTTPException(400, "code must be 16 base32 characters")
+        spend(pair_counts, session_id, TELEPHONE_PAIR_TRIES, "pairing")
+        try:
+            doc = await asyncio.to_thread(telephone_pair, code)
+        except TelephoneUnavailable as exc:
+            raise HTTPException(502, str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001 - a transport failure, named by type only
+            raise HTTPException(502, "the code could not be checked: " + type(exc).__name__) from exc
+        if not doc:
+            raise HTTPException(403, "that code does not open a trail")
+        await asyncio.to_thread(bind_telephone_doc, session_id, doc)
+        return {"doc": doc}
+
+    def session_owns_doc(state: dict, doc: str) -> bool:
+        """True when the server-stored doc id is exactly the one asked for."""
+        bound = state.get("telephone_doc")
+        if not isinstance(bound, str) or len(bound) != len(doc):
+            return False
+        return hmac.compare_digest(bound, doc)
+
+    @app.get("/v1/session/{session_id}/telephone")
+    async def telephone(request: Request, session_id: str, doc: str = Query("")):
+        """The doc's receipt trail for THIS session's page. Off unless STUDIO_TELEPHONE_URL is set."""
+        require_origin(request)
+        require_session(request, session_id)
+        if not settings.telephone_url:
+            raise HTTPException(404, "the telephone trail is off")
+        # Live session before any doc work: unknown and deleted are 404, stopped and expired are 410.
+        state = await asyncio.to_thread(live_state, session_id)
+        if not TELEPHONE_DOC.fullmatch(doc or ""):
+            raise HTTPException(400, "doc must be a Drive file id")
+        if not session_owns_doc(state, doc):
+            # Same answer for an unbound session and for a doc it does not own.
+            # Nothing about that doc's contents, size, or whether it exists.
+            raise HTTPException(403, "this session is not bound to that doc")
+        now = clock()
+        cache_key = (session_id, doc)
+        cache = app.state.telephone_cache
+        cached = cache.get(cache_key)
+        if cached and 0 <= now - cached[0] < TELEPHONE_CACHE_SECONDS:
+            return cached[1]
+        # ONE read in flight per session and doc (Copilot on ff15a56): callers that all miss the
+        # cache share the first one's read, and its answer or its failure, instead of each
+        # reading the doc. Nothing awaits between the lookup and the set, so no second read
+        # can start. Shielded: one page going away does not cancel the read the others wait on.
+        flights = app.state.telephone_flights
+        flight = flights.get(cache_key)
+        if flight is None:
+            flight = asyncio.ensure_future(asyncio.to_thread(telephone_trail, doc))
+            flights[cache_key] = flight
+
+            def landed(done, key=cache_key):
+                if flights.get(key) is done:
+                    del flights[key]
+                if not done.cancelled():
+                    done.exception()                      # read here, so a read nobody waited for is not logged as lost
+            flight.add_done_callback(landed)
+        try:
+            trail = await asyncio.shield(flight)
+        except TelephoneUnavailable as exc:
+            raise HTTPException(502, str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001 - a transport failure, named by type only
+            raise HTTPException(502, "the trail could not be read: " + type(exc).__name__) from exc
+        for key in [key for key, kept in cache.items() if not 0 <= now - kept[0] < TELEPHONE_CACHE_SECONDS]:
+            del cache[key]                                # a stopped session's last trail does not stay in memory
+        cache[cache_key] = (now, trail)
+        return trail
 
     @app.get("/v1/leads")
     async def leads(request: Request):
