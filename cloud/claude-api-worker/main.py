@@ -26,6 +26,8 @@ HIS THREE DECISIONS (2026-10-10 21:36Z), EACH ENCODED
      its inbox is taken when the laptop is off, or when the doc addresses
      claude-api by name, or when the laptop is up but the task has waited
      REASSIGN_AFTER (his 30-minute rule) with nobody's acceptance in the doc.
+     With CLAUDE_API_WORKER_ADDRESSED_ONLY=on, ONLY the doc that names
+     claude-api is taken, laptop on or off: the rest of the folder is free.
      It has no shell, no repo, no cloud CLI and no PR. It writes into one
      doc and one Redis prefix. What needs the laptop, it names in the doc
      for claude-code-cli; it never narrates an action it cannot take (L-116).
@@ -155,6 +157,8 @@ STATE_ACCEPTED = "accepted"  # accepted:<since>:<attempt>:<rejections> - a call 
 STATE_CAPPED = "capped"      # capped:<day>:<attempt>:<rejections> - the day's cap refused it; tomorrow retries
 STATE_RESULTED = "resulted"  # resulted:<since>:<attempt>:<rejections> - answer stored, terminal line owed
 STATE_UNCERTAIN = "uncertain"  # a call happened, but its result could not be confirmed in the store
+STATE_APPROVAL_FAILED = pilot.APPROVAL_RECEIPT_OWED  # no call; FAILED receipt alone is owed
+STATE_APPROVAL_REFUND_UNKNOWN = pilot.APPROVAL_REFUND_UNKNOWN  # no call; refund needs manual reconciliation
 STATE_DONE = "done"
 
 # Any receipt in the shared shape, by anyone: "<STATE> - task <id> - request .. - rev .. - recipient .. - by <who> - "
@@ -172,7 +176,7 @@ DOCTRINE = (
     "reasoning, decided, drafted or explained, in plain prose, at most %d characters. Then, under "
     "the heading FOR THE LAPTOP:, list what needs claude-code-cli's tools, one item per line, or "
     "write 'nothing'. Never say you did, ran, checked, opened or sent anything; you cannot. "
-    "Address the owner as Mr. Salam."
+    "Address the owner as Abdus."
 )
 
 
@@ -199,6 +203,11 @@ class AdmissionTimeMoved(Exception):
 def enabled_from_env(environ=None) -> bool:
     environ = os.environ if environ is None else environ
     return environ.get("CLAUDE_API_WORKER_ENABLED") == "on"
+
+
+def addressed_only_from_env(environ=None) -> bool:
+    environ = os.environ if environ is None else environ
+    return environ.get("CLAUDE_API_WORKER_ADDRESSED_ONLY") == "on"
 
 
 def trail_for(doc_text: str, task_id: str) -> list:
@@ -395,6 +404,15 @@ def consider(entry_id, fields: dict, deps) -> dict:
         return {"status": "not_mine", "task": fields.get("task_id") or None, "ran": False}
     task_id = tuple_["task_id"]
     out = {"status": "", "task": task_id, "ran": False}
+    # drive-intake's task filter (PR 419) puts its verdict on the entry. mode=dry_run is the owner's G5:
+    # no CONFIRM token matched, so validate only - no spend. An action other than "task" (a LOU CALL GO's
+    # rehearsal_call) is a dialer's job, never a model call. Entries from before the filter carry neither.
+    if fields.get("mode") == "dry_run":
+        out["status"] = "dry_run"
+        return out
+    if fields.get("action") and fields.get("action") != "task":
+        out.update(status="not_a_task", action=str(fields.get("action")))
+        return out
     try:
         if deps.claims.done(task_id):
             out["status"] = "done"
@@ -446,6 +464,13 @@ def consider(entry_id, fields: dict, deps) -> dict:
         out.update(status="taken", by=other)
         return out
 
+    if deps.addressed_only and not addressed_to_worker(text):
+        # ADDRESSED ONLY (Gate 3, 2026-10-16). Every doc in the folder lands on this inbox, so with the
+        # laptop off a blog draft or a relay note was a paid call. With the flag on, only a doc whose
+        # To: line names claude-api is taken: no claim, no receipt, no call, and the sweep moves past it.
+        out["status"] = "not_addressed"
+        return out
+
     now = _now(deps)
     alive = di.heartbeat_age(deps.claims, now, window=deps.heartbeat_window)
     if alive is not None and not addressed_to_worker(text):
@@ -477,6 +502,12 @@ def consider(entry_id, fields: dict, deps) -> dict:
     if phase == STATE_DONE:
         _mark_done(deps, task_id)
         out["status"] = "done"
+        return out
+
+    if phase == STATE_APPROVAL_FAILED:
+        return _finish_approval_failure(deps, tuple_, text, current, out)
+    if phase == STATE_APPROVAL_REFUND_UNKNOWN:
+        out["status"] = "approval_unconfirmed_reservation_unknown"
         return out
 
     if phase in (STATE_RESULTED, STATE_UNCERTAIN):
@@ -563,6 +594,8 @@ def consider(entry_id, fields: dict, deps) -> dict:
         deps.claims.advance(task_id, current, _state(STATE_ACCEPTED, 0, max(0, attempt - 1), rejected))  # lease given up
         out["status"] = "accepted_receipt_owed"
         return out
+    if not _pilot_approval_live(deps, fields):
+        return _stop_unstarted_for_approval(deps, tuple_, text, current, out)
 
     # The cap, BEFORE the call. Price and a conservative maximum are required.
     # Receipt I/O can cross midnight or the authorization cutoff. Redis checks its own
@@ -595,6 +628,9 @@ def consider(entry_id, fields: dict, deps) -> dict:
         deps.claims.advance(task_id, current, _state(STATE_CAPPED, day, max(0, attempt - 1), rejected))
         out["status"] = "capped"
         return out
+    if not _pilot_approval_live(deps, fields):
+        return _stop_unstarted_for_approval(deps, tuple_, text, current, out,
+                                            day=day, reserve_cents=reserve_cents)
 
     # ONE call. Whatever it returns is kept BEFORE the receipt is written (guard 2).
     out["ran"] = True
@@ -657,6 +693,63 @@ def _spent(deps, day):
         return int(deps.ledger.spent(day))
     except Exception:  # noqa: BLE001
         return "?"
+
+
+def _pilot_approval_live(deps, fields):
+    inbox = deps.inbox
+    if getattr(inbox, "target", None) is None:
+        return True  # the ordinary non-pilot worker is unchanged
+    try:
+        return inbox.target_approved_now(fields)
+    except Exception:
+        return False
+
+
+def _stop_unstarted_for_approval(deps, tuple_, text, current, out, day=None, reserve_cents=0):
+    """Persist the no-call outcome before any refund or fallible receipt write."""
+    task_id = tuple_["task_id"]
+    pending = (STATE_APPROVAL_REFUND_UNKNOWN if reserve_cents else STATE_APPROVAL_FAILED)
+    try:
+        moved = deps.claims.advance(task_id, current, pending)
+    except Exception:
+        moved = False
+    if not moved:
+        out["status"] = "approval_unconfirmed_claim_unknown"
+        return out
+    if reserve_cents:
+        try:
+            deps.ledger.settle(day, -int(reserve_cents))
+            out["ledger"] = "unstarted_reservation_released"
+        except Exception:
+            out["status"] = "approval_unconfirmed_reservation_unknown"
+            return out  # uncertain ledger state requires manual reconciliation
+        try:
+            moved = deps.claims.advance(task_id, pending, STATE_APPROVAL_FAILED)
+        except Exception:
+            moved = False
+        if not moved:
+            out["status"] = "approval_unconfirmed_reservation_unknown"
+            return out  # never repeat a refund after an uncertain claim update
+    return _finish_approval_failure(deps, tuple_, text, STATE_APPROVAL_FAILED, out)
+
+
+def _finish_approval_failure(deps, tuple_, text, current, out):
+    """Retry only the FAILED receipt; this claim can never reach inference."""
+    out["receipt"] = write_receipt(deps, tuple_, text, FAILED, deps.at,
+                                   "pilot approval not confirmed before inference; no provider call")
+    if out["receipt"] in ("written", "no_receipt_writer"):
+        try:
+            moved = deps.claims.advance(tuple_["task_id"], current, STATE_DONE)
+        except Exception:
+            moved = False
+        if not moved:
+            out["status"] = "approval_unconfirmed_claim_unknown"
+            return out
+        _mark_done(deps, tuple_["task_id"])
+        out["status"] = "approval_unconfirmed"
+    else:
+        out["status"] = "approval_unconfirmed_receipt_owed"
+    return out
 
 
 def _refund(deps, day, reserve_cents):
@@ -766,6 +859,11 @@ def _recover_pilot_result(deps, tuple_, text, out):
         out.update(status="claim_error", error=type(exc).__name__)
         return out
     phase, _middle, attempt, rejected = _split(current)
+    if phase == STATE_APPROVAL_FAILED:
+        return _finish_approval_failure(deps, tuple_, text, current, out)
+    if phase == STATE_APPROVAL_REFUND_UNKNOWN:
+        out["status"] = "approval_unconfirmed_reservation_unknown"
+        return out
     if phase == STATE_RESULTED:
         return _finish_from_store(deps, tuple_, text, current, attempt, out)
     if phase not in (STATE_ACCEPTED, STATE_UNCERTAIN):
@@ -867,6 +965,8 @@ def _api_pass(deps, now) -> dict:
         pass
     try:
         entries = list(deps.inbox.read(WORKER, INBOX_LOOKBACK) or [])
+    except pilot.TargetUnavailable:
+        return {"status": "target_unavailable", "considered": []}
     except Exception as exc:  # noqa: BLE001
         return {"status": "inbox_error", "error": type(exc).__name__, "considered": []}
     considered, calls = [], 0
@@ -1261,8 +1361,10 @@ class Deps:
                  heartbeat_window=di.DEFAULT_HEARTBEAT, reassign_after=DEFAULT_REASSIGN,
                  max_attempts=DEFAULT_MAX_ATTEMPTS, cap_cents=0, reserve_cents=0,
                  price_in=None, price_out=None, cad_per_usd=None, max_tokens=DEFAULT_MAX_TOKENS,
-                 max_input_tokens=0, authorized_until=None, lane_enabled=False, board=None):
+                 max_input_tokens=0, authorized_until=None, lane_enabled=False, board=None,
+                 addressed_only=False):
         self.enabled = enabled
+        self.addressed_only = bool(addressed_only)
         self.lane_enabled = lane_enabled
         self.board = board
         self.inbox = inbox
@@ -1338,6 +1440,7 @@ def deps_from_env(environ=None, client=None, docs=None, board=None):  # pragma: 
                            max_tokens=_int_env(environ, "CLAUDE_API_WORKER_MAX_TOKENS", DEFAULT_MAX_TOKENS))
     return Deps(
         enabled=enabled_from_env(environ),
+        addressed_only=addressed_only_from_env(environ),
         lane_enabled=lane_enabled_from_env(environ),
         board=board,
         inbox=RedisInbox(client) if client is not None else None,
@@ -1365,6 +1468,18 @@ def main():  # pragma: no cover - the job entry point
     if not enabled_from_env() and not lane_enabled_from_env():
         print(json.dumps({"status": "disabled"}))
         return 0
+    pilot_enabled = enabled_from_env() and os.environ.get("PHONE_DOC_INTAKE_ENABLED") == "on"
+    target = None
+    if (os.environ.get("PHONE_DOC_PILOT_TARGET") and not pilot_enabled) or (
+            pilot_enabled and lane_enabled_from_env()):
+        print(json.dumps({"status": "pilot_flags_invalid"}))
+        return 1
+    if pilot_enabled:
+        try:
+            target = pilot.target_from_env(os.environ)
+        except pilot.TargetUnavailable:
+            print(json.dumps({"status": "pilot_target_invalid"}))
+            return 1
     sys.path.insert(0, HERE)
     client = None
     try:
@@ -1379,12 +1494,16 @@ def main():  # pragma: no cover - the job entry point
     except Exception as exc:  # noqa: BLE001
         print(json.dumps({"status": "no_docs", "error": type(exc).__name__}))
     board = AppendBoard() if os.environ.get("BUS_URL") and os.environ.get("BUS_SECRET") else None
-    pilot_enabled = enabled_from_env() and os.environ.get("PHONE_DOC_INTAKE_ENABLED") == "on"
-    intake = pilot.run_prepass(client, docs, enabled=True) if pilot_enabled else None
+    intake = pilot.run_prepass(client, docs, enabled=True, target=target) if pilot_enabled else None
+    if pilot_enabled and not (pilot.target_ready(intake, target) or
+            (client is not None and pilot.target_recovery_ready(
+                intake, target, RedisClaims(client)))):
+        print(json.dumps({"status": "pilot_hold", "intake": intake}, sort_keys=True))
+        return 1
     deps = deps_from_env(client=client, docs=docs, board=board)
     if pilot_enabled and client is not None and docs is not None:
-        # API entries from these two Docs only; other queued work cannot call the model.
-        deps.inbox = pilot.PilotInbox(deps.inbox, client)
+        # Only the exact approved tuple can reach the ordinary worker path.
+        deps.inbox = pilot.PilotInbox(deps.inbox, client, target=target, claims=deps.claims)
         deps.pilot_docs = pilot.PilotDocs(docs)
     out = run_once(deps)
     if pilot_enabled:

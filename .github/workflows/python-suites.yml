@@ -129,6 +129,28 @@ on:
       - "tests/test_bus_reconcile.py"
       - "scripts/bus_request.py"
       - "tests/test_bus_request.py"
+      - "scripts/redis_gov.py"
+      - "tests/test_redis_gov_verify.py"
+      - "tests/test_redis_gov.py"
+      - "scripts/redis_acl.json"
+      - "scripts/git_requests.py"
+      - "tests/test_git_requests.py"
+      - "cloud/bus-reconciler/serve_requests.py"
+      - "tests/test_live_mode.py"
+      - "cloud/bus-reconciler/redis_archive.py"
+      - "cloud/bus-reconciler/archive.sh"
+      - "tests/test_redis_archive.py"
+      - "scripts/redis_inbox.py"
+      - "tests/test_redis_inbox.py"
+      - "scripts/bridge_client.py"
+      - "tests/test_bridge_client.py"
+      - "cloud/redis-tool-bridge/callers.json"
+      - "tests/test_inbox_wake.py"
+      - "cloud/inbox-wake/main.py"
+      - "cloud/inbox-wake/Dockerfile"
+      - ".github/workflows/inbox-wake-sweep.yml"
+      - ".github/workflows/inbox-wake-claude.yml"
+      - ".github/workflows/inbox-wake-codex.yml"
       - "scripts/sf360.py"
       - "tests/test_org_publish.py"
       - "scripts/org_publish.py"
@@ -147,6 +169,8 @@ on:
       - "tests/fixtures/wa_outbox_rows.json"
       - "scripts/agent_waker.py"
       - "tests/test_agent_waker.py"
+      - "scripts/cloud_context.py"
+      - "tests/test_gemini_wider_read.py"
       - "scripts/board_row.py"
       - "tests/test_board_row.py"
       - "tools/board_governor/board_facts.py"
@@ -154,8 +178,13 @@ on:
       - "tests/test_board_governor.py"
       - "cloud/drive-intake/main.py"
       - "cloud/drive-intake/drive_feed.py"
+      - "cloud/drive-intake/task_filter.py"
+      - "cloud/drive-intake/drive_watch.py"
+      - "tests/test_drive_intake_watch.py"
+      - "cloud/drive-intake/Dockerfile"
       - "cloud/claude-api-worker/gdocs.py"
       - "tests/test_drive_intake.py"
+      - "tests/test_drive_intake_task_filter.py"
       - "cloud/claude-api-worker/**"
       - "tests/test_claude_api_worker.py"
       - "tests/test_claude_api_lane.py"
@@ -216,6 +245,28 @@ on:
       - "tests/test_bus_reconcile.py"
       - "scripts/bus_request.py"
       - "tests/test_bus_request.py"
+      - "scripts/redis_gov.py"
+      - "tests/test_redis_gov_verify.py"
+      - "tests/test_redis_gov.py"
+      - "scripts/redis_acl.json"
+      - "scripts/git_requests.py"
+      - "tests/test_git_requests.py"
+      - "cloud/bus-reconciler/serve_requests.py"
+      - "tests/test_live_mode.py"
+      - "cloud/bus-reconciler/redis_archive.py"
+      - "cloud/bus-reconciler/archive.sh"
+      - "tests/test_redis_archive.py"
+      - "scripts/redis_inbox.py"
+      - "tests/test_redis_inbox.py"
+      - "scripts/bridge_client.py"
+      - "tests/test_bridge_client.py"
+      - "cloud/redis-tool-bridge/callers.json"
+      - "tests/test_inbox_wake.py"
+      - "cloud/inbox-wake/main.py"
+      - "cloud/inbox-wake/Dockerfile"
+      - ".github/workflows/inbox-wake-sweep.yml"
+      - ".github/workflows/inbox-wake-claude.yml"
+      - ".github/workflows/inbox-wake-codex.yml"
       - "scripts/roster_seed.py"
       - "tests/test_roster_seed.py"
       - "tests/test_image_layout.py"
@@ -292,6 +343,8 @@ on:
       - "tests/fixtures/wa_outbox_rows.json"
       - "scripts/agent_waker.py"
       - "tests/test_agent_waker.py"
+      - "scripts/cloud_context.py"
+      - "tests/test_gemini_wider_read.py"
       - "scripts/board_row.py"
       - "tests/test_board_row.py"
       - "tools/board_governor/board_facts.py"
@@ -299,8 +352,13 @@ on:
       - "tests/test_board_governor.py"
       - "cloud/drive-intake/main.py"
       - "cloud/drive-intake/drive_feed.py"
+      - "cloud/drive-intake/task_filter.py"
+      - "cloud/drive-intake/drive_watch.py"
+      - "tests/test_drive_intake_watch.py"
+      - "cloud/drive-intake/Dockerfile"
       - "cloud/claude-api-worker/gdocs.py"
       - "tests/test_drive_intake.py"
+      - "tests/test_drive_intake_task_filter.py"
       - "cloud/claude-api-worker/**"
       - "tests/test_claude_api_worker.py"
       - "tests/test_claude_api_lane.py"
@@ -378,6 +436,7 @@ jobs:
                    tests/test_wa_outbox_cloud.py \
                    tests/test_pi1_wake.py \
                    tests/test_gemini_cloud_waker.py \
+                   tests/test_gemini_wider_read.py \
                    tests/test_soak_report.py \
                    tests/test_studio_controller.py \
                    tests/test_studio_telephone.py \
@@ -397,6 +456,8 @@ jobs:
                    tests/test_agent_waker.py \
                    tests/test_board_governor.py \
                    tests/test_drive_intake.py \
+                   tests/test_drive_intake_task_filter.py \
+                   tests/test_drive_intake_watch.py \
                    tests/test_claude_api_worker.py \
                    tests/test_claude_api_lane.py \
                    tests/test_phone_intake.py \
@@ -496,7 +557,7 @@ jobs:
           set -euo pipefail
           if [ -f tests/test_drive_intake.py ]; then
             python_bin="$(command -v python3)"
-            sudo unshare -n -- "$python_bin" -m unittest tests.test_drive_intake -v
+            sudo unshare -n -- "$python_bin" -m unittest tests.test_drive_intake tests.test_drive_intake_task_filter tests.test_drive_intake_watch -v
           else
             echo "not on this branch; skipping"
           fi
@@ -841,6 +902,19 @@ jobs:
             echo "not on this branch; skipping"
           fi
 
+      # Gemini's read-only cloud context (scripts/cloud_context.py): values withheld, logs redacted,
+      # and the past-state reads a checker's re-check needs (Gate 3 Step 1b). Every API is faked.
+      - name: "gemini cloud context: values withheld, logs redacted, past state (no network)"
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_gemini_wider_read.py ]; then
+            python_bin="$(command -v python3)"
+            # Loopback only: the redirect test serves on 127.0.0.1, and a new namespace starts with lo down.
+            sudo unshare -n -- sh -c 'ip link set lo up && exec "$0" -B tests/test_gemini_wider_read.py' "$python_bin"
+          else
+            echo "not on this branch; skipping"
+          fi
+
       # The soak judge, which is the evidence cutover step 8 would be decided
       # on - step 8 being Mr Salam disabling the laptop scheduler. A judge that
       # cannot fail is worse than no judge, so every criterion here is tested by
@@ -1042,6 +1116,61 @@ jobs:
             echo "not on this branch; skipping"
           fi
 
+      # The governed Redis path end to end, and the live worker around it. Until 2026-10-11 none of
+      # these four files ran in CI: PR 390's lock and one-answer tests and PR 392's after= tests were
+      # green here only because nothing executed them. Each suite is offline (fake Redis, fake board,
+      # fake bucket), proved by the empty network namespace.
+      # test_bridge_client (2026-10-13): the direct route's client. gcloud and the HTTP opener are
+      # fakes; the empty network namespace is what proves no token is minted and no socket opened.
+      # Its combined tests drive the REAL service in process: bridge_client.call -> main.Handler.do_POST
+      # -> op.handle -> redis_gov.execute (Aya on 0baa197). Only the socket, Google's verifier and Redis
+      # are stood in, so this suite also fails on a change to cloud/redis-tool-bridge/ or redis_gov.py.
+      - name: "redis gov, git requests, live mode, archive, inbox, bridge client: the governed path and its worker (no network)"
+        run: |
+          set -euo pipefail
+          python_bin="$(command -v python3)"
+          # Each suite with the code it guards. A suite is skipped ONLY when that code is absent too: a
+          # branch that deletes the suite and keeps the code fails here (Copilot on 9cbcda6; the Pi1 step
+          # refuses the same shape).
+          for pair in "test_redis_gov:scripts/redis_gov.py" \
+                      "test_git_requests:scripts/git_requests.py" \
+                      "test_live_mode:cloud/bus-reconciler/serve_requests.py" \
+                      "test_redis_archive:cloud/bus-reconciler/redis_archive.py" \
+                      "test_redis_inbox:scripts/redis_inbox.py" \
+                      "test_bridge_client:scripts/bridge_client.py"; do
+            suite="${pair%%:*}"; code="${pair#*:}"
+            if [ -f "tests/${suite}.py" ]; then
+              sudo unshare -n -- "$python_bin" -B -m unittest "tests.${suite}" -v
+            elif [ -f "$code" ]; then
+              echo "::error::${code} is on this branch but tests/${suite}.py is not: the code would ship ungated"
+              exit 1
+            else
+              echo "tests/${suite}.py and ${code} are both absent on this branch; skipping"
+            fi
+          done
+
+      # Generation digest audit. Flag off, synthetic hashes only: no Redis, no network.
+      # A stored string must not come back; missing, extra, changed, movement, partial
+      # and timeout must not look like a pass.
+      - name: "redis gov: generation digest audit returns no stored strings (no network)"
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_redis_gov_verify.py ]; then
+            python_bin="$(command -v python3)"
+            sudo unshare -n -- "$python_bin" -B -m unittest tests.test_redis_gov_verify -v
+          else
+            echo "not on this branch; skipping"
+          fi
+      - name: "inbox wake is default off and idempotent on message id (no network)"
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_inbox_wake.py ]; then
+            python_bin="$(command -v python3)"
+            sudo unshare -n -- "$python_bin" -B tests/test_inbox_wake.py
+          else
+            echo "not on this branch; skipping"
+          fi
+
       # Phase 1 of the bus roll-up: the parallel check. The property under test is the one
       # that decides whether the phase gate means anything - an empty or unreachable Redis is
       # UNKNOWN and exits 2, never zero divergence. Codex's gate looks for zero, and
@@ -1168,6 +1297,7 @@ jobs:
              && [ ! -f tests/test_board_watcher.py ] \
              && [ ! -f tests/test_wa_outbox_cloud.py ] \
              && [ ! -f tests/test_gemini_cloud_waker.py ] \
+             && [ ! -f tests/test_gemini_wider_read.py ] \
              && [ ! -f tests/test_soak_report.py ] \
              && [ ! -f tests/test_studio_controller.py ] \
              && [ ! -f tests/test_studio_auth.py ] \

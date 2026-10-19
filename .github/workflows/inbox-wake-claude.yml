@@ -1,0 +1,37 @@
+# The wake for claude-code-cli. The inbox service dispatches this workflow.
+# It does not check out the repo and it does not expand the message text into
+# a shell. SHIPPED OFF unless INBOX_WAKE_ENABLED is exactly "on".
+name: inbox-wake-claude
+
+on:
+  workflow_dispatch:
+    inputs:
+      message_id:
+        description: inbox message id
+        required: true
+        type: string
+      by:
+        description: sender id
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  record:
+    if: vars.INBOX_WAKE_ENABLED == 'on'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Wake recorded
+        env:
+          MESSAGE_ID: ${{ inputs.message_id }}
+          BY: ${{ inputs.by }}
+        run: |
+          set -euo pipefail
+          case "$MESSAGE_ID" in
+            ""|*[!A-Za-z0-9_.:-]*) echo "refusing message id"; exit 1 ;;
+          esac
+          echo "inbox wake for claude-code-cli id=${MESSAGE_ID}"

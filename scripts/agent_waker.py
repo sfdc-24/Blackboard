@@ -798,6 +798,12 @@ def post_reply(me: str, cfg: dict, text: str, to: str, answers: str, verbose: bo
     ok = "VERIFIED on the board" in out
     if verbose or not ok:
         print("    " + out.strip()[-400:].replace("\n", "\n    "))
+    elif "SPILL_UNCONFIRMED" in out:
+        # The row landed, but the whole reply it points to (full=) did not: the board then carries a
+        # summary and a pointer to nothing. fleet_agent says so; a verified row hid it, and every long
+        # Gemini answer from 2026-10-14 to 10-15 was unreadable while the log said only "posted"
+        # (waker-gemini could write gemini_waker.json and no other object in the bucket).
+        print("    " + " ".join(line.strip() for line in out.splitlines() if "SPILL_UNCONFIRMED" in line)[:300])
     return ok
 
 
@@ -844,6 +850,8 @@ def redis_request(text: str):
             continue
         request = {"op": op, "key": key, "val": fields.get("val"), "field": fields.get("field") or None,
                    "count": fields.get("count") or None}
+        if fields.get("after"):              # xrange after a cursor; absent, the request is unchanged
+            request["after"] = fields["after"]
         if request["val"] is None and op in ("set", "hset", "hput", "xadd"):
             request, dropped = None, dropped + 1
     body = "\n".join(kept)
@@ -869,6 +877,8 @@ def post_request(me: str, cfg: dict, request: dict, verbose: bool):
         args += ["--field", request["field"]]
     if request.get("count"):
         args += ["--count", str(request["count"])]
+    if request.get("after"):
+        args += ["--after", str(request["after"])]
     try:
         res = subprocess.run(args, cwd=REPO, capture_output=True, text=True, timeout=POST_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:

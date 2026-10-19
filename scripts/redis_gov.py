@@ -46,6 +46,20 @@ WHAT NOBODY MAY WRITE THROUGH THIS, WHATEVER THE ACL SAYS
     Reads of all of these are allowed - including gov:audit, because governance that cannot be
     inspected is not governance.
 
+WHAT ONLY MOVES FORWARD
+    FORWARD_ONLY below, also in code and not configurable by the ACL: a reader's cursor,
+    fleet:cursor:<agent>. A `set` there must be a stream entry id and may not be LOWER than the one the
+    key holds. It is decided under the same WATCH as the write, so it is a compare-and-set, not a
+    look-then-write. Why (Aya, 2026-10-13): a checkpoint whose answer was lost may still be on its way.
+    Without this, that old `set` could land AFTER a newer one and move the cursor back. With it, the old
+    one is refused whenever it arrives. `del` still removes the key: moving a cursor back on purpose is
+    a deletion first, audited as one.
+    "Whenever it arrives" needs the key to still be there (Copilot on 98a3e90): the rule compares
+    against the value the key HOLDS, so a cursor that expired would let a delayed older save in with
+    nothing to refuse it and nothing audited as removed. So a `set` of a cursor is written with NO
+    expiry, whatever ttl_seconds says for fleet:, and it clears an expiry an older governor left.
+    One small string per reader; only `del` removes it.
+
 IDENTITY, STATED HONESTLY
     The actor is the row's Source_Tag. Appending a row needs the board secret, so the writer is a
     fleet member - but WHICH fleet member is a claim, not a proof. This does not pretend otherwise:
@@ -60,7 +74,9 @@ import binascii
 import datetime
 import hashlib
 import json
+import os
 import re
+import unicodedata
 from pathlib import Path
 
 ACL_FILE = Path(__file__).resolve().parent / "redis_acl.json"
@@ -68,6 +84,7 @@ AUDIT_STREAM = "gov:audit"
 AUDIT_MAXLEN = 200000
 
 PROTECTED = ("v1:bus:", "v1:agent:", "v1:conf:", "v1:synth:", "probe:", "gov:")
+FORWARD_ONLY = ("fleet:cursor:",)
 
 OPS_READ = ("get", "hgetall", "xrange")
 # hput: REPLACE a whole hash from one b64 JSON object {field: string}, in one transaction with one
@@ -79,14 +96,65 @@ OPS_WRITE = ("set", "del", "hset", "hput", "xadd")
 MAX_PUT_FIELDS = 50
 OPS = OPS_READ + OPS_WRITE
 
-# A key reaches the server verbatim, so its grammar is closed: no space, no glob character (* ? [ ]),
-# no control character, bounded length. A colon is allowed - it is how a namespace is spelled.
+# Generation audit. Off unless REDIS_GOV_VERIFY is explicitly on, so a deploy of this module does
+# not answer haudit and does not change get, hgetall, xrange, or any write. The op compares
+# SHA-256 and byte length of a canonical UTF-8 hash payload. It does not return the payload.
+VERIFY_OP = "haudit"
+VERIFY_FLAG = "REDIS_GOV_VERIFY"
+# bus_request.HEARTBEAT_KEY. Repeated here so this module does not import the worker.
+HEARTBEAT_READ_KEY = "gov:worker:heartbeat"
+MAX_AUDIT_MANIFEST_BYTES = 65536
+# Truly paged. Page size 8. A read is at most one batch of 128. The manifest cap is the measured
+# UTF-8 size of the submitted manifest, keys form or pages form, and it does not rise.
+# The honest maximum for the fixture's document shape replaces the old 512-document ceiling.
+# That shape is one item shard and one action shard per conference pull request, plus the eight
+# rollup documents (three repos, three turn rows, meta, closed). 233 such pull requests are 474
+# documents: pages-form manifest 65400 bytes, keys-form manifest 64089 bytes. 234 pull requests
+# are 476 documents and 65671 pages-form bytes, over the cap. 252 pull requests are the old 512
+# documents and 69238 keys-form bytes, which also does not fit. The 326-document inventory is
+# 44928 pages-form bytes and stays inside the cap. 2048 does not rise.
+PAGE_SIZE = 8
+MAX_AUDIT_BATCH = 128
+MAX_GENERATION_DOCS = 474
+MAX_AUDIT_KEYS = MAX_AUDIT_BATCH
+MAX_AUDIT_PAGES = (MAX_GENERATION_DOCS + PAGE_SIZE - 1) // PAGE_SIZE
+# Per-document canonical cap. Checked with HLEN/HSTRLEN before HGETALL. Shared with the writer.
+# The manifest-root preimage is not a stored hash value. A 41-page preimage is 2787 bytes and
+# the head stores only its SHA-256, so this cap is not applied to that preimage.
+MAX_AUDIT_DOCUMENT_BYTES = 2048
+MAX_AUDIT_FIELDS = 64
+_VERIFY_ON = {"1", "true", "on", "yes"}
+
+# Key encoding, shared with sfdc24-site #296 head 9a0d8f85 (C14). repo_key is owner:name,
+# for example "sfdc-24:conference". A colon is legal and a GitHub owner or name has none,
+# so the first colon splits. Plus is outside the grammar. No percent-encoding.
+KEY_ENCODING = "owner:name"
 _KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _FIELD = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
 
 PREVIEW_CHARS = 200          # how much of a value an audit entry or a RESULT row may quote
 MAX_HASH_FIELDS = 50
 MAX_RANGE = 20
+# A stream entry id, `<ms>-<seq>`, for `xrange after=`: an inbox reader asks for everything after the last
+# entry it read, so a burst of more than MAX_RANGE messages is paged, never silently cut to the newest.
+STREAM_ID = re.compile(r"[0-9]{1,20}-[0-9]{1,20}")
+U64_MAX = 2 ** 64 - 1
+
+
+def _id_pair(value: str) -> tuple:
+    """A stream id that stream_id_ok has passed, as two integers: ids compare as numbers, never as text
+    ("9-0" sorts after "10-0" as a string)."""
+    ms, seq = value.split("-")
+    return int(ms), int(seq)
+
+
+def stream_id_ok(value: str) -> bool:
+    """`<ms>-<seq>`, each part an unsigned 64-bit integer as Redis requires. 20 digits alone admit
+    99999999999999999999, which Redis rejects at XRANGE with a generic error (Copilot on 6b1d459)."""
+    if not STREAM_ID.fullmatch(value or ""):
+        return False
+    ms, seq = value.split("-")
+    return int(ms) <= U64_MAX and int(seq) <= U64_MAX
 
 
 class Refused(Exception):
@@ -148,6 +216,20 @@ def _matches(key: str, prefixes) -> bool:
     return any(p == "*" or key.startswith(p) for p in (prefixes or ()))
 
 
+def verifier_enabled(env=None) -> bool:
+    """True only when REDIS_GOV_VERIFY is explicitly on. Unset, empty, and anything else are off."""
+    source = os.environ if env is None else env
+    return str(source.get(VERIFY_FLAG) or "").strip().lower() in _VERIFY_ON
+
+
+def active_ops(env=None):
+    """The ops check() will accept. haudit is absent until the flag is on, so the refusal for an
+    unknown op stays the list this module shipped with."""
+    if verifier_enabled(env):
+        return OPS + (VERIFY_OP,)
+    return OPS
+
+
 def check(acl: dict, who: str, op: str, key: str, field: str = "") -> None:
     """Raise Refused unless `who` may perform `op` on `key`. Returns nothing when allowed.
 
@@ -158,8 +240,8 @@ def check(acl: dict, who: str, op: str, key: str, field: str = "") -> None:
         raise Refused("the access list is unreadable, so nothing is permitted")
     if not who:
         raise Refused("the sender is not a principal in the access list")
-    if op not in OPS:
-        raise Refused("unknown op; the ops are " + ", ".join(OPS))
+    if op not in active_ops():
+        raise Refused("unknown op; the ops are " + ", ".join(active_ops()))
     if not _KEY.match(key or ""):
         raise Refused("the key is missing or not a key (letters, digits, . _ : - only, at most 200)")
     if field and not _FIELD.match(field):
@@ -256,17 +338,30 @@ def _audit_alone(conn, fields) -> None:
 # ------------------------------------------------------------------------------------------ the ops
 
 def execute(conn, acl: dict, raw_tag: str, via: str, op: str, key: str, field: str = "",
-            raw_value: str = "", enc: str = "", count: int = 10, now=None) -> dict:
+            raw_value: str = "", enc: str = "", count: int = 10, now=None, generation: str = "",
+            correlation: str = "", head: str = "", after: str = "") -> dict:
     """Do one governed operation. Always returns a result dict; never raises into the caller.
 
     Every outcome - refused, read, written, or failed - leaves exactly one gov:audit entry, and a
-    write's entry is committed in the SAME transaction as the write."""
+    write's entry is committed in the SAME transaction as the write.
+
+    generation, correlation and head are read only by haudit. Other ops ignore them.
+    after is read only by xrange; on any other op it is refused, so a caller cannot believe it paged."""
     who = principal(acl, raw_tag)
     op = (op or "").strip().lower()
     key = (key or "").strip()
     field = (field or "").strip()
+    echoed_generation = _id_echo(generation, "generation") if op == VERIFY_OP else ""
+    echoed_correlation = _id_echo(correlation, "correlation") if op == VERIFY_OP else ""
     try:
+        if op == VERIFY_OP and not verifier_enabled():
+            raise Refused("the verifier is off")
         check(acl, who, op, key, field)
+        after = (after or "").strip()
+        if after and op != "xrange":
+            raise Refused("after= is for xrange only")
+        if after and not stream_id_ok(after):
+            raise Refused("after= must be a stream entry id, <ms>-<seq>")
         value = decode_value(raw_value, enc, acl, key) if op in ("set", "hset", "xadd") else None
         if op == "hset" and not field:
             raise Refused("hset needs field=")
@@ -274,16 +369,21 @@ def execute(conn, acl: dict, raw_tag: str, via: str, op: str, key: str, field: s
             if field:
                 raise Refused("hput replaces the whole hash; it takes no field=")
             value = decode_mapping(raw_value, enc, acl, key)
+        if op == VERIFY_OP:
+            return _audit_generation(conn, acl, who, raw_tag, via, key, field, raw_value, enc,
+                                     echoed_generation, echoed_correlation, (head or "").strip(), now)
         if op in OPS_READ:
-            return _read(conn, acl, who, raw_tag, via, op, key, count, now)
+            return _read(conn, acl, who, raw_tag, via, op, key, count, now, after)
         return _write(conn, acl, who, raw_tag, via, op, key, field, value, now)
     except Refused as why:
         try:
             _audit_alone(conn, audit_fields(acl, who, raw_tag, via, op, key, field, False, str(why),
                                             now=now))
         except Exception as error:
-            return {"ok": False, "refused": str(why), "audit": "FAILED:" + type(error).__name__}
-        return {"ok": False, "refused": str(why), "audit": "ok"}
+            result = {"ok": False, "refused": str(why), "audit": "FAILED:" + type(error).__name__}
+        else:
+            result = {"ok": False, "refused": str(why), "audit": "ok"}
+        return _attach_verify_ids(result, op, echoed_generation, echoed_correlation)
     except Exception as error:
         # The TYPE, never the message: a client's message can quote what it was sent.
         reason = "failed:" + type(error).__name__
@@ -292,10 +392,129 @@ def execute(conn, acl: dict, raw_tag: str, via: str, op: str, key: str, field: s
                                             now=now))
         except Exception:
             pass
-        return {"ok": False, "error": type(error).__name__}
+        result = {"ok": False, "error": type(error).__name__}
+        if op == VERIFY_OP:
+            result["partial"] = True
+            result["timeout"] = _is_timeout(error)
+        return _attach_verify_ids(result, op, echoed_generation, echoed_correlation)
 
 
-def _read(conn, acl, who, raw_tag, via, op, key, count, now) -> dict:
+def complete_receipt(conn, acl, raw_tag, via, prefix, raw_value, enc, generation, correlation,
+                     head, now=None) -> dict:
+    """The backend complete receipt. The site calls this, not a local writer receipt.
+
+    Signature: complete_receipt(conn, acl, raw_tag, via, prefix, raw_value, enc, generation,
+    correlation, head, now=None) -> dict.
+
+    Publish and ACTION both require ``backend_receipt_accepts`` of this dict. That is true
+    only when ``ok`` and ``page_ok`` are both true, the union is complete, ``manifest_root``
+    equals ``head_manifest_root``, and the head is unchanged (``moved`` is false and
+    ``head_generation`` is the generation id). ``page_ok`` means every page in this receipt
+    verified, so a full pass keeps it true. One page returns ``page_ok`` true and ``ok`` false.
+
+    REDIS_GOV_VERIFY off returns a refusal with ``ok`` false and does not read documents.
+    A missing receipt is not this function's return; ``backend_receipt_accepts(None)`` is false.
+    The receipt carries counts and digests only. It has no listed key names.
+    """
+    return execute(conn, acl, raw_tag, via, VERIFY_OP, prefix, raw_value=raw_value, enc=enc,
+                   generation=generation, correlation=correlation, head=head, now=now)
+
+
+def _real_bool(value, expected):
+    """True only for a real bool with this value. 0, 1, and strings are not bools."""
+    return type(value) is bool and value is expected
+
+
+def _as_hex64(value):
+    """A 64-hex str, or None. Numbers and bytes are not coerced, so they cannot reach re.fullmatch."""
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+        return None
+    return value
+
+
+def backend_receipt_accepts(receipt) -> bool:
+    """True only for a complete backend receipt the site may publish or mark ACTION ready.
+
+    None, a flag-off refusal, a single page, a moved head, and a root mismatch are false.
+    A full pass has page_ok true. The gate accepts that.
+
+    Every field this gate reads is typed before it is used. A dict must be a dict, a digest or
+    id must be a str, a count must be a strict int, and a flag must be a real bool. A wrong
+    type returns False and does not raise. Counts have to agree: listed equals the coverage
+    expected, seen, and matched counts; missing, extra, and changed are 0; pages equals
+    page_count; and that count is a full union of indexes 0..N-1 at page size 8, N at least 2.
+    manifest_root and head_manifest_root are non-empty hex strings and equal.
+    """
+    if not isinstance(receipt, dict):
+        return False
+    if not _real_bool(receipt.get("ok"), True) or not _real_bool(receipt.get("page_ok"), True):
+        return False
+    if not _real_bool(receipt.get("partial"), False) or not _real_bool(receipt.get("moved"), False):
+        return False
+    if not _real_bool(receipt.get("timeout"), False):
+        return False
+    if receipt.get("op") != VERIFY_OP or receipt.get("audit") != "ok":
+        return False
+    correlation = receipt.get("correlation")
+    if not isinstance(correlation, str) or not correlation:
+        return False
+    if "refused" in receipt and not isinstance(receipt.get("refused"), str):
+        return False
+    if "error" in receipt and not isinstance(receipt.get("error"), str):
+        return False
+    if receipt.get("refused") or receipt.get("error"):
+        return False
+    coverage = receipt.get("coverage")
+    if not isinstance(coverage, dict) or not _real_bool(coverage.get("covered"), True):
+        return False
+    root = _as_hex64(receipt.get("manifest_root"))
+    head_root = _as_hex64(receipt.get("head_manifest_root"))
+    if root is None or head_root is None or root != head_root:
+        return False
+    if _as_hex64(receipt.get("digest")) is None or _as_hex64(receipt.get("manifest_digest")) is None:
+        return False
+    generation = _as_hex64(receipt.get("generation"))
+    if generation is None or _as_hex64(receipt.get("head_generation")) != generation:
+        return False
+    page_count = _strict_int(receipt.get("page_count"))
+    pages = _strict_int(receipt.get("pages"))
+    listed = _strict_int(receipt.get("listed"))
+    length = _strict_int(receipt.get("length"))
+    if page_count is None or pages is None or listed is None or length is None or length <= 0:
+        return False
+    # pages is the length of the union. Indexes 0..N-1, N at least 2, every page but the last full.
+    if page_count < 2 or page_count != pages or page_count > MAX_AUDIT_PAGES:
+        return False
+    if listed > MAX_GENERATION_DOCS:
+        return False
+    span = (page_count - 1) * PAGE_SIZE
+    if listed <= span or listed > page_count * PAGE_SIZE:
+        return False
+    counts = {}
+    for name in ("expected", "seen", "missing", "extra", "changed", "matched"):
+        got = _strict_int(coverage.get(name))
+        if got is None:
+            return False
+        counts[name] = got
+    if counts["expected"] != listed or counts["seen"] != listed or counts["matched"] != listed:
+        return False
+    if counts["missing"] != 0 or counts["extra"] != 0 or counts["changed"] != 0:
+        return False
+    return True
+
+
+def entry_view(entry_id, fields) -> dict:
+    """One stream entry as an answer shows it. "id" is ALWAYS the stream id. A field that is itself named
+    `id` is shown as "field:id": it used to overwrite the stream id, so a reader that keeps a cursor by the
+    shown id could be moved past messages it never read (Cursor on PR 397). A field already named
+    "field:..." gains one more prefix, so no two fields can land on one name (Copilot on PR 397)."""
+    view = {("field:" + k if k == "id" or k.startswith("field:") else k): preview(v)
+            for k, v in (fields or {}).items()}
+    view["id"] = str(entry_id)
+    return view
+
+
+def _read(conn, acl, who, raw_tag, via, op, key, count, now, after="") -> dict:
     if op == "get":
         value = conn.get(key)
         out = {"ok": True, "op": op, "key": key, "found": value is not None, "value": preview(value)}
@@ -304,12 +523,27 @@ def _read(conn, acl, who, raw_tag, via, op, key, count, now) -> dict:
         items = sorted(found.items())[:MAX_HASH_FIELDS]
         out = {"ok": True, "op": op, "key": key, "fields": len(found),
                "value": {k: preview(v) for k, v in items}, "truncated": len(found) > MAX_HASH_FIELDS}
-    else:                                                                       # xrange
+    elif after:                                                                 # xrange after a cursor
+        # OLDEST FIRST from just past the cursor (exclusive "(", Redis 6.2+; redis-central is 7.0). One
+        # more than asked is read so the answer can say whether a next page exists, without a second call.
+        n = max(1, min(int(count or 10), MAX_RANGE))
+        if tuple(int(p) for p in after.split("-")) == (U64_MAX, U64_MAX):
+            # Nothing can follow the largest id, and Redis 7.0 rejects an exclusive start there ("invalid
+            # start ID for the interval", Cursor on 2dc187a): the empty page IS the answer, with no call.
+            entries = []
+        else:
+            entries = conn.xrange(key, min="(" + after, max="+", count=n + 1) or []
+        more = len(entries) > n
+        entries = entries[:n]
+        # `last` - the next after= - is the raw stream id of the last entry returned (Cursor on 2dc187a).
+        out = {"ok": True, "op": op, "key": key, "entries": len(entries), "after": after, "more": more,
+               "last": str(entries[-1][0]) if entries else after,
+               "value": [entry_view(i, f) for i, f in entries]}
+    else:                                                                       # xrange, the newest n
         n = max(1, min(int(count or 10), MAX_RANGE))
         entries = conn.xrevrange(key, count=n) or []
         out = {"ok": True, "op": op, "key": key, "entries": len(entries),
-               "value": [{"id": str(i), **{k: preview(v) for k, v in f.items()}}
-                         for i, f in reversed(entries)]}
+               "value": [entry_view(i, f) for i, f in reversed(entries)]}
     # A read is audited too - "who looked at what" is half of governance - but cheaply: no value.
     _audit_alone(conn, audit_fields(acl, who, raw_tag, via, op, key, "", True, "", now=now))
     out["audit"] = "ok"
@@ -330,12 +564,780 @@ def _text(value) -> str:
     return value.decode("utf-8", "replace") if isinstance(value, bytes) else str(value)
 
 
+def _strict_text(value) -> str:
+    """UTF-8 text, or UnicodeDecodeError. Invalid bytes are never replaced.
+
+    Replacement would make two different byte strings one payload, so a manifest of U+FFFD would
+    match data that was never valid UTF-8. Callers that digest a hash use this. `_text` stays for
+    paths that only need a type name or an audit quote."""
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return str(value)
+
+
+def _nfc(value) -> str:
+    return unicodedata.normalize("NFC", _strict_text(value))
+
+
+def canonical_utf8(mapping) -> bytes:
+    """The hash as canonical UTF-8 bytes.
+
+    Field names and values are decoded as strict UTF-8 and NFC-normalised before they are sorted,
+    so a composed character and its decomposed form are one payload, and insertion order is not
+    part of the payload. Invalid UTF-8 raises UnicodeDecodeError and is not a payload. The JSON is
+    compact and not ASCII-escaped. Two fields whose names collapse to the same NFC string are a
+    collision: this raises Refused rather than dropping one of them."""
+    clean = {}
+    for key, value in (mapping or {}).items():
+        name = _nfc(key)
+        if name in clean:
+            raise Refused("two fields normalise to one name; nothing was treated as a match")
+        clean[name] = _nfc(value)
+    return json.dumps(clean, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def payload_digest(mapping) -> tuple:
+    """(sha256 hex, byte length) of canonical_utf8(mapping)."""
+    raw = canonical_utf8(mapping)
+    return hashlib.sha256(raw).hexdigest(), len(raw)
+
+
+def _id_echo(value, kind) -> str:
+    """An id safe to put back on a board row, or "" when the raw text is not one.
+
+    The raw text is never returned. A generation id is 64 hex characters. A correlation id is a
+    short token from the same alphabet as a Redis key."""
+    text = str(value or "").strip()
+    if kind == "generation":
+        return text if re.fullmatch(r"[0-9a-f]{64}", text) else ""
+    return text if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,80}", text) else ""
+
+
+def _is_timeout(error) -> bool:
+    return isinstance(error, TimeoutError) or type(error).__name__ == "TimeoutError"
+
+
+def _attach_verify_ids(result, op, generation, correlation):
+    if op != VERIFY_OP:
+        return result
+    result["op"] = VERIFY_OP
+    result["generation"] = generation
+    result["correlation"] = correlation
+    return result
+
+
+def verifier_scope(who: str, key: str) -> bool:
+    """The keys haudit may touch, which is narrower than a fleet agent's read '*'.
+
+    Own inbox, the governed write prefixes, and the worker heartbeat. get and hgetall are unchanged
+    and still follow the access list. A digest of a key the caller could not otherwise name is
+    still a digest of that key, so this op does not become a second way to read the board mirror,
+    another agent's inbox, or the audit stream."""
+    own = "fleet:inbox:" + (who or "")
+    if key == own or key.startswith(own + ":"):
+        return True
+    if key.startswith("conf:") or key.startswith("proj:"):
+        return True
+    return key == HEARTBEAT_READ_KEY
+
+
+def _guard_verify_key(acl, who, key) -> None:
+    if not verifier_scope(who, key):
+        raise Refused("that key is outside this agent's verifier scope")
+    check(acl, who, "hgetall", key)
+
+
+def _parse_key_specs(keys) -> dict:
+    """One page's {key: {sha256, len}}. Any other field is refused, unread."""
+    if not isinstance(keys, dict) or not keys:
+        raise Refused("haudit manifest needs a non-empty keys object")
+    expected = {}
+    for name, spec in keys.items():
+        if not isinstance(name, str) or not _KEY.match(name):
+            raise Refused("haudit key is not a key")
+        if not isinstance(spec, dict) or set(spec) != {"sha256", "len"}:
+            raise Refused("haudit key entry must be sha256 and len only")
+        digest, length = spec["sha256"], spec["len"]
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise Refused("haudit sha256 must be 64 hex characters")
+        if isinstance(length, bool) or not isinstance(length, int) or length < 0:
+            raise Refused("haudit len must be a byte length")
+        if length > MAX_AUDIT_DOCUMENT_BYTES:
+            raise Refused("haudit len is over 2048 bytes")
+        expected[name] = {"sha256": digest, "len": length}
+    return expected
+
+
+def _pages_from_keys(specs) -> list:
+    """Split a flat key map into pages of PAGE_SIZE, keys sorted. That sort is the index order."""
+    names = sorted(specs)
+    pages = []
+    for index, start in enumerate(range(0, len(names), PAGE_SIZE)):
+        chunk = names[start:start + PAGE_SIZE]
+        pages.append({"index": index, "keys": {name: specs[name] for name in chunk}})
+    return pages
+
+
+def _parse_manifest(raw: str, enc: str) -> list:
+    """b64 JSON of a paged manifest. Page size is 8. At most MAX_GENERATION_DOCS documents.
+
+    ``{"keys": {...}}`` is split into pages of 8 in key order. ``{"pages": [{"index", "keys"}]}``
+    is the explicit form. A gap, a repeated key, or a short page that is not the last of a
+    multi-page submission is refused before any document read. One page is accepted and can be
+    page_ok; it is never a full-generation pass. A stored string does not belong here."""
+    if enc != "b64":
+        raise Refused("haudit needs enc=b64")
+    try:
+        blob = base64.b64decode(str(raw or "").encode("ascii"), validate=True)
+    except (binascii.Error, ValueError):
+        raise Refused("haudit val is not valid base64")
+    if len(blob) > MAX_AUDIT_MANIFEST_BYTES:
+        raise Refused("haudit manifest is over the byte cap")
+    try:
+        data = json.loads(blob.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise Refused("haudit manifest is not UTF-8 JSON")
+    if not isinstance(data, dict) or set(data) not in ({"keys"}, {"pages"}):
+        raise Refused("haudit manifest must be one page of keys")
+    if set(data) == {"keys"}:
+        pages = _pages_from_keys(_parse_key_specs(data["keys"]))
+    else:
+        raw_pages = data["pages"]
+        if not isinstance(raw_pages, list) or not raw_pages:
+            raise Refused("haudit manifest needs pages")
+        pages = []
+        for page in raw_pages:
+            if not isinstance(page, dict) or set(page) != {"index", "keys"}:
+                raise Refused("haudit page must be index and keys only")
+            index = page["index"]
+            if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+                raise Refused("haudit page index is not valid")
+            pages.append({"index": index, "keys": _parse_key_specs(page["keys"])})
+    reason = check_page_union(pages)
+    if reason:
+        raise Refused(reason)
+    total = sum(len(page["keys"]) for page in pages)
+    if total > MAX_GENERATION_DOCS:
+        raise Refused("haudit manifest has too many keys")
+    return pages
+
+
+def _bound_head(prefix: str, generation: str) -> str:
+    """The head key that belongs to `<namespace>g:<16 hex>:`.
+
+    That key is `<namespace>head`. `proj:pr-board:v1:g:<gen16>:` binds to
+    `proj:pr-board:v1:head`. The caller does not choose it: a head in another namespace can store
+    the same generation id and must not stand in for this one."""
+    marker = "g:" + (generation or "")[:16] + ":"
+    if len(generation or "") != 64 or not str(prefix or "").endswith(marker):
+        raise Refused("the prefix is not this generation")
+    namespace = prefix[:-len(marker)]
+    head = namespace + "head"
+    if not namespace.endswith(":") or not _KEY.match(head):
+        raise Refused("the prefix is not this generation")
+    return head
+
+
+def _exec_error(results) -> str:
+    """The type name of the first failed command, or "" when every result is a value.
+
+    Pipeline.execute(raise_on_error=False) returns an exception in the list and does not raise.
+    A confirmation that does not read that list can report a pass for a command that failed."""
+    if not isinstance(results, (list, tuple)) or not results:
+        return "ExecError"
+    for item in results:
+        if isinstance(item, BaseException):
+            return type(item).__name__
+    return ""
+
+
+def _hex64(value) -> str:
+    text = _text(value or "")
+    return text if re.fullmatch(r"[0-9a-f]{64}", text) else ""
+
+
+def _strict_int(value):
+    """An int, or None. Bool and str are not coerced, so page_count='bad' does not raise."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def _count_field(raw):
+    """A head count, or None when the field is not a small integer. The raw text is not returned."""
+    text = _text(raw or "").strip()
+    if not re.fullmatch(r"[0-9]{1,3}", text):
+        return None
+    value = int(text)
+    if value > MAX_GENERATION_DOCS:
+        return None
+    return value
+
+
+def _hash_head(conn, key):
+    """generation, manifest_root, page_count and listed, plus the raw fields for the movement compare.
+
+    All four are read before any document. A string or stream is not read at all. Counts and the
+    root digest are published only when they have the right shape, so a secret parked in a field
+    cannot ride out on the result."""
+    empty = {"generation": "", "manifest_root": "", "page_count": None, "listed": None,
+             "raw_generation": "", "raw_manifest_root": "", "raw_page_count": "", "raw_listed": ""}
+    kind = _text(conn.type(key))
+    if kind != "hash":
+        return empty
+    raw_gen = _text(conn.hget(key, "generation") or "")
+    raw_root = _text(conn.hget(key, "manifest_root") or "")
+    raw_count = _text(conn.hget(key, "page_count") or "")
+    raw_listed = _text(conn.hget(key, "listed") or "")
+    return {
+        "generation": _hex64(raw_gen),
+        "manifest_root": _hex64(raw_root),
+        "page_count": _count_field(raw_count),
+        "listed": _count_field(raw_listed),
+        "raw_generation": raw_gen,
+        "raw_manifest_root": raw_root,
+        "raw_page_count": raw_count,
+        "raw_listed": raw_listed,
+    }
+
+
+def _head_raw(head) -> tuple:
+    return (head.get("raw_generation"), head.get("raw_manifest_root"),
+            head.get("raw_page_count"), head.get("raw_listed"))
+
+
+def check_page_union(pages) -> str:
+    """"" when the pages can be read. The reason does not contain a key name.
+
+    One page of at most PAGE_SIZE keys is allowed and is only ever page_ok. Two or more pages
+    must be indexes 0..N-1, each full page exactly PAGE_SIZE, no repeated key. More than
+    MAX_GENERATION_DOCS documents is refused before any read."""
+    if not pages:
+        return "haudit needs a page"
+    if len(pages) > MAX_AUDIT_PAGES:
+        return "haudit manifest has too many pages"
+    indexes = []
+    seen = set()
+    total = 0
+    for page in pages:
+        index = page.get("index")
+        keys = page.get("keys") or {}
+        if isinstance(index, bool) or not isinstance(index, int) or index < 0 or index >= MAX_AUDIT_PAGES:
+            return "haudit page index is not valid"
+        if not keys:
+            return "haudit needs a page"
+        if len(keys) > PAGE_SIZE:
+            return "haudit page is over the page size"
+        indexes.append(index)
+        total += len(keys)
+        for name in keys:
+            if name in seen:
+                return "haudit key is listed on two pages"
+            seen.add(name)
+    if total > MAX_GENERATION_DOCS:
+        return "haudit manifest has too many keys"
+    if len(set(indexes)) != len(indexes):
+        return "haudit page index is repeated"
+    if len(pages) > 1:
+        if sorted(indexes) != list(range(len(pages))):
+            return "haudit pages are not contiguous"
+        ordered = sorted(pages, key=lambda item: item["index"])
+        for page in ordered[:-1]:
+            if len(page["keys"]) != PAGE_SIZE:
+                return "haudit page is short of the page size"
+    return ""
+
+
+def full_page_union(pages, page_count, listed) -> bool:
+    """True when these pages are the whole generation: 0..N-1, N at least 2, counts match.
+
+    A single page is never a full union. The head's page_count and listed have to name this set."""
+    if not isinstance(page_count, int) or not isinstance(listed, int) or page_count < 2:
+        return False
+    if len(pages) != page_count or sum(len(page["keys"]) for page in pages) != listed:
+        return False
+    return check_page_union(pages) == "" and sorted(page["index"] for page in pages) == list(range(page_count))
+
+
+def manifest_body(specs) -> bytes:
+    """Canonical UTF-8 of the manifest object. The head key is not a member.
+
+    ``{"keys": {name: {"len": n, "sha256": hex}}}`` with sorted keys and compact separators.
+    ``len`` sorts before ``sha256``. This is the manifest digest's preimage, not the report."""
+    keys = {name: {"len": int(specs[name]["len"]), "sha256": specs[name]["sha256"]}
+            for name in specs}
+    return json.dumps({"keys": keys}, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False).encode("utf-8")
+
+
+def manifest_digest(specs) -> str:
+    """SHA-256 hex of manifest_body(specs). This is not the page digest and not the root."""
+    return hashlib.sha256(manifest_body(specs)).hexdigest()
+
+
+def page_entries(specs) -> list:
+    """One page's entries in index order: sorted by key, each ``{"key", "len", "sha256"}``."""
+    return [{"key": name, "len": int(specs[name]["len"]), "sha256": specs[name]["sha256"]}
+            for name in sorted(specs)]
+
+
+def page_body(entries) -> bytes:
+    """UTF-8 JSON of a page entries array. Object keys are sorted, separators are compact.
+
+    ``[{"key": "...", "len": n, "sha256": "<64 hex>"}, ...]`` in the list's index order.
+    ``ensure_ascii`` is false. This is the page digest's preimage. #296 head 45916666."""
+    return json.dumps(list(entries), sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False).encode("utf-8")
+
+
+def page_digest(entries) -> str:
+    """SHA-256 hex of page_body(entries)."""
+    return hashlib.sha256(page_body(entries)).hexdigest()
+
+
+def root_body(page_digests, listed) -> bytes:
+    """Canonical UTF-8 of the manifest root. Page digests stay in index order, 0..N-1.
+
+    ``{"listed": n, "page_count": n, "pages": ["<page digest>", ...]}`` with sorted object keys,
+    compact separators, and UTF-8 without ASCII escaping. ``page_count`` is the length of
+    ``pages``. The head stores the SHA-256 of these bytes as ``manifest_root``, plus
+    ``page_count`` and ``listed``. #296 head 45916666."""
+    digests = [str(item) for item in page_digests]
+    payload = {"listed": int(listed), "page_count": len(digests), "pages": digests}
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False).encode("utf-8")
+
+
+def root_digest(page_digests, listed) -> str:
+    """SHA-256 hex of root_body(page_digests, listed)."""
+    return hashlib.sha256(root_body(page_digests, listed)).hexdigest()
+
+
+def root_from_pages(pages) -> str:
+    """Root digest of pages in index order. Entries within a page are sorted by key."""
+    ordered = sorted(pages, key=lambda item: item["index"])
+    digests = [page_digest(page_entries(page["keys"])) for page in ordered]
+    listed = sum(len(page["keys"]) for page in ordered)
+    return root_digest(digests, listed)
+
+
+def report_body(specs) -> bytes:
+    """One line per generation document, excluding the head: ``key<TAB>sha256<TAB>len``, sorted.
+
+    No status column. The writer and the verifier hash these same bytes."""
+    lines = ["%s\t%s\t%d" % (name, specs[name]["sha256"], int(specs[name]["len"]))
+             for name in sorted(specs)]
+    return "\n".join(lines).encode("utf-8")
+
+
+def report_digest(specs) -> tuple:
+    """(sha256 hex, byte length) of report_body(specs)."""
+    raw = report_body(specs)
+    return hashlib.sha256(raw).hexdigest(), len(raw)
+
+
+def _audit_report(entries) -> tuple:
+    specs = {}
+    for entry in entries:
+        length = _strict_int(entry.get("len"))
+        specs[entry["key"]] = {"sha256": entry.get("sha256") or "", "len": 0 if length is None else length}
+    return report_digest(specs)
+
+
+def _publish_audit(entries, generation, correlation, coverage, partial, moved, timeout,
+                   head_generation, audit="ok", refused="", error="", manifest_digest_hex="",
+                   root_digest_hex="", head_root=""):
+    """The receipt haudit returns. Counts and digests only. No listed key name, no stored string.
+
+    ``page_ok`` is true when every page read in this receipt verified. A full receipt has
+    ``page_ok`` and ``ok`` both true. One page has ``page_ok`` true and ``ok`` false. ``ok``
+    also requires the full 0..N-1 union, the recomputed root, and an unchanged head.
+    Partial or incomplete is never ok. ``extra`` is not a keyspace claim."""
+    digest, length = _audit_report(entries)
+    numbers_ok = True
+    counted = {}
+    for name in ("expected", "seen", "missing", "extra", "changed", "matched", "pages"):
+        got = _strict_int(coverage.get(name))
+        if got is None:
+            numbers_ok = False
+            got = 0
+        counted[name] = got
+    raw_page_count = coverage.get("page_count")
+    page_count = _strict_int(raw_page_count)
+    if page_count is None:
+        if raw_page_count is not None:
+            numbers_ok = False
+            page_count = 0
+        else:
+            page_count = counted["pages"]
+    listed = counted["expected"]
+    shown_length = _strict_int(length)
+    if shown_length is None:
+        numbers_ok = False
+        shown_length = 0
+    out = {
+        "ok": False,
+        "page_ok": False,
+        "op": VERIFY_OP,
+        "generation": generation,
+        "correlation": correlation,
+        "partial": bool(partial),
+        "moved": bool(moved),
+        "timeout": bool(timeout),
+        "head_generation": head_generation if re.fullmatch(r"[0-9a-f]{64}", head_generation or "") else "",
+        "head_manifest_root": head_root if re.fullmatch(r"[0-9a-f]{64}", head_root or "") else "",
+        "coverage": {
+            "expected": counted["expected"],
+            "seen": counted["seen"],
+            "missing": counted["missing"],
+            "extra": counted["extra"],
+            "changed": counted["changed"],
+            "matched": counted["matched"],
+            "covered": False,
+        },
+        "audit": audit or "",
+    }
+    out["digest"] = digest
+    out["length"] = shown_length
+    out["listed"] = listed
+    out["pages"] = counted["pages"]
+    out["manifest_digest"] = (manifest_digest_hex
+                              if re.fullmatch(r"[0-9a-f]{64}", manifest_digest_hex or "") else "")
+    out["manifest_root"] = (root_digest_hex
+                            if re.fullmatch(r"[0-9a-f]{64}", root_digest_hex or "") else "")
+    out["page_count"] = page_count
+    if not numbers_ok:
+        out["partial"] = True
+    page_clean = (out["coverage"]["missing"] == 0 and out["coverage"]["extra"] == 0
+                  and out["coverage"]["changed"] == 0
+                  and out["coverage"]["matched"] == out["coverage"]["expected"]
+                  and out["coverage"]["expected"] > 0 and not out["partial"] and not out["moved"]
+                  and not out["timeout"] and not refused and not error and numbers_ok
+                  and bool(coverage.get("page_read")))
+    # A single page is page_ok only. Full ok needs the complete 0..N-1 union, N at least 2.
+    full = page_clean and bool(coverage.get("complete"))
+    out["coverage"]["covered"] = full
+    out["page_ok"] = page_clean and audit == "ok"
+    out["ok"] = full and audit == "ok"
+    if refused:
+        out["ok"] = False
+        out["page_ok"] = False
+        out["coverage"]["covered"] = False
+        out["refused"] = str(refused)[:200]
+    if error:
+        out["ok"] = False
+        out["page_ok"] = False
+        out["coverage"]["covered"] = False
+        out["error"] = str(error)[:80]
+    return out
+
+
+def _byte_len(value) -> int:
+    if isinstance(value, bytes):
+        return len(value)
+    return len(str(value).encode("utf-8"))
+
+
+def _document_too_big(pipe, name) -> bool:
+    """True when the hash cannot be under 2048 bytes. Does not fetch field values.
+
+    HLEN first, so a huge field set is refused before HKEYS. HSTRLEN then refuses a single
+    oversized value before HGETALL. A 1.1M-character field stops here."""
+    count = pipe.hlen(name)
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0 or count > MAX_AUDIT_FIELDS:
+        return True
+    if count == 0:
+        return False
+    fields = pipe.hkeys(name) or []
+    if len(fields) != count:
+        return True
+    total = 0
+    for field in fields:
+        if _byte_len(field) > MAX_AUDIT_DOCUMENT_BYTES:
+            return True
+        total += _byte_len(field)
+        n = pipe.hstrlen(name, field)
+        if isinstance(n, bool) or not isinstance(n, int) or n < 0:
+            return True
+        if n > MAX_AUDIT_DOCUMENT_BYTES or total + n > MAX_AUDIT_DOCUMENT_BYTES:
+            return True
+        total += n
+    return False
+
+
+def _read_listed(pipe, names, records):
+    """Digest each manifest key. Returns (partial, timed_out, hard_error, bound).
+
+    Size is checked with HLEN and HSTRLEN before HGETALL. Over the bound does not fetch.
+    Stops at the first failure so a partial read is not reported as a complete match.
+    No key outside ``names`` is read."""
+    partial = timed_out = bound = False
+    hard_error = ""
+    for name in names:
+        try:
+            kind = _text(pipe.type(name))
+            if kind == "none":
+                records[name] = ("missing", "", 0)
+                continue
+            if kind != "hash":
+                records[name] = ("changed", "", 0)
+                continue
+            if _document_too_big(pipe, name):
+                bound = True
+                partial = True
+                break
+            raw_hash = pipe.hgetall(name) or {}
+            try:
+                digest, length = payload_digest(raw_hash)
+            except UnicodeDecodeError:
+                records[name] = ("changed", "", 0)
+                continue
+            except Refused:
+                records[name] = ("changed", "", 0)
+                partial = True
+                continue
+            if length > MAX_AUDIT_DOCUMENT_BYTES:
+                bound = True
+                partial = True
+                break
+            records[name] = ("hash", digest, length)
+        except Exception as error:
+            partial = True
+            if _is_timeout(error):
+                timed_out = True
+            else:
+                hard_error = type(error).__name__
+            break
+    return partial, timed_out, hard_error, bound
+
+
+def _read_in_batches(conn, head, names, before):
+    """Read listed keys in batches of MAX_AUDIT_BATCH. One WATCH set lasts until the final EXEC.
+
+    The head snapshot was taken before any document. Each batch reads at most 128 documents,
+    one manifest page at a time, and the head is read again after every page. Watches are not
+    reset between batches. TYPE runs once, after the last batch, on the head and every listed
+    key. A change to a document from an earlier batch aborts that confirmation: the receipt is
+    not ok and moved. There is no KEYS and no SCAN. The batch size and the generation ceiling
+    are unchanged."""
+    records = {}
+    partial = timed_out = bound = moved = False
+    hard_error = ""
+    snapshot = _head_raw(before)
+    pipe = conn.pipeline(transaction=True)
+    read_names = []
+    try:
+        pipe.watch(head)
+        for start in range(0, len(names), MAX_AUDIT_BATCH):
+            batch = names[start:start + MAX_AUDIT_BATCH]
+            try:
+                now = _hash_head(pipe, head)
+            except Exception as error:
+                partial = True
+                if _is_timeout(error):
+                    timed_out = True
+                else:
+                    hard_error = type(error).__name__
+                break
+            if _head_raw(now) != snapshot:
+                moved = True
+                partial = True
+                break
+            for name in batch:
+                pipe.watch(name)
+            failed = False
+            for page_start in range(0, len(batch), PAGE_SIZE):
+                page = batch[page_start:page_start + PAGE_SIZE]
+                read_partial, timed_out, hard_error, bound = _read_listed(pipe, page, records)
+                partial = partial or read_partial
+                if timed_out or hard_error or bound:
+                    failed = True
+                    break
+                try:
+                    after = _hash_head(pipe, head)
+                except Exception as error:
+                    partial = True
+                    if _is_timeout(error):
+                        timed_out = True
+                    else:
+                        hard_error = type(error).__name__
+                    failed = True
+                    break
+                if _head_raw(after) != snapshot:
+                    moved = True
+                    partial = True
+                    failed = True
+                    break
+            if failed:
+                break
+            read_names.extend(batch)
+        if not (partial or timed_out or hard_error or bound or moved) and len(read_names) == len(names):
+            pipe.multi()
+            pipe.type(head)
+            for name in read_names:
+                pipe.type(name)
+            confirmed = pipe.execute(raise_on_error=False)
+            failed_exec = _exec_error(confirmed)
+            if failed_exec or len(confirmed) != 1 + len(read_names):
+                hard_error = failed_exec or "ExecError"
+                partial = True
+    except Exception as error:
+        partial = True
+        if type(error).__name__ == "WatchError":
+            moved = True
+        elif _is_timeout(error):
+            timed_out = True
+        else:
+            hard_error = type(error).__name__
+    finally:
+        pipe.reset()
+    return records, partial, timed_out, hard_error, bound, moved
+
+
+def _audit_generation(conn, acl, who, raw_tag, via, prefix, field, raw_value, enc,
+                      generation, correlation, head, now) -> dict:
+    """Receipt for a paged manifest. Root serialization is #296 head 45916666. Ceiling is 474.
+
+    The head is bound from the generation namespace. generation, manifest_root, page_count and
+    listed are read before any document and again after every manifest page and every batch.
+    Only manifest-listed keys are read, each under WATCH. Pages are 8 keys. A generation may
+    hold MAX_GENERATION_DOCS documents and is read in batches of MAX_AUDIT_BATCH. There is no
+    KEYS, no SCAN, and no Lua walk. A document over 2048 bytes is refused before HGETALL. One
+    page is page_ok and never ok. ok requires every page 0..N-1, no gaps or overlap, the
+    recomputed root equal to manifest_root, and the head unchanged from the first read through
+    the last page. A public route is refused before any read. The receipt has no key names."""
+    if "public-sheet" in str(via or "").lower():
+        raise Refused("haudit is not accepted from a public route")
+    if field:
+        raise Refused("haudit takes no field=")
+    if not generation:
+        raise Refused("haudit needs a 64-hex generation id")
+    if not correlation:
+        raise Refused("haudit needs a correlation id")
+    if not head:
+        raise Refused("haudit needs a head key")
+    bound_head = _bound_head(prefix, generation)
+    _guard_verify_key(acl, who, prefix)
+    if head != bound_head:
+        raise Refused("the head key is not this generation's head")
+    _guard_verify_key(acl, who, head)
+    pages = _parse_manifest(raw_value, enc)
+    expected = {}
+    for page in pages:
+        expected.update(page["keys"])
+    for name in expected:
+        if not name.startswith(prefix):
+            raise Refused("a manifest key is outside the generation prefix")
+        _guard_verify_key(acl, who, name)
+
+    claimed = manifest_digest(expected)
+    claimed_root = root_from_pages(pages)
+    names = sorted(expected)
+    pipe = conn.pipeline(transaction=True)
+    records = {}
+    partial = False
+    moved = False
+    timed_out = False
+    hard_error = ""
+    bound = False
+    head_generation = ""
+    head_root = ""
+    head_match = False
+    root_match = False
+    complete = False
+    started = False
+    before = None
+    try:
+        pipe.watch(head)
+        try:
+            before = _hash_head(pipe, head)
+        except Exception as error:
+            if _is_timeout(error):
+                timed_out = True
+            else:
+                hard_error = type(error).__name__
+            partial = True
+            before = None
+        head_generation = (before or {}).get("generation") or ""
+        head_root = (before or {}).get("manifest_root") or ""
+        # Head -> generation id before any document read. A mismatch does not open the manifest keys.
+        if not timed_out and not hard_error and before and before["raw_generation"] == generation:
+            started = True
+            (records, read_partial, timed_out, hard_error, bound, moved) = _read_in_batches(
+                conn, head, names, before)
+            partial = partial or read_partial
+        head_match = bool(before) and before["raw_generation"] == generation and not moved
+        root_match = (head_match and bool(head_root) and head_root == claimed_root
+                      and before["page_count"] == len(pages) and before["listed"] == len(expected))
+        complete = root_match and full_page_union(pages, before["page_count"] if before else None,
+                                                   before["listed"] if before else None)
+    finally:
+        pipe.reset()
+
+    entries = []
+    missing = changed = matched = 0
+    if started and not bound:
+        for name in names:
+            if name not in records:
+                partial = True
+                continue
+            kind, digest, length = records[name]
+            want = expected[name]
+            if kind == "missing":
+                status = "missing"
+                missing += 1
+                digest, length = "", 0
+            elif kind != "hash" or digest != want["sha256"] or length != want["len"]:
+                status = "changed"
+                changed += 1
+            else:
+                status = "match"
+                matched += 1
+            entries.append({"key": name, "sha256": digest, "len": length, "status": status})
+    coverage = {
+        "expected": len(expected), "seen": len(records), "missing": missing, "extra": 0,
+        "changed": changed, "matched": matched, "head_match": head_match, "root_match": root_match,
+        "page_read": started and not bound, "pages": len(pages), "page_count": len(pages),
+        "complete": complete,
+    }
+    refusal = "haudit document is over 2048 bytes" if bound else ""
+    return _finish_audit(conn, acl, who, raw_tag, via, prefix, entries, generation, correlation,
+                         coverage, partial=partial or bool(hard_error) or bound, moved=moved,
+                         timeout=timed_out, head_generation=head_generation, now=now,
+                         error=("TimeoutError" if timed_out else hard_error),
+                         manifest_digest_hex=claimed, root_digest_hex=claimed_root,
+                         head_root=head_root, refused=refusal)
+
+
+def _finish_audit(conn, acl, who, raw_tag, via, key, entries, generation, correlation, coverage,
+                  partial, moved, timeout, head_generation, now, error="", manifest_digest_hex="",
+                  root_digest_hex="", head_root="", refused=""):
+    result = _publish_audit(entries, generation, correlation, coverage, partial, moved, timeout,
+                            head_generation, audit="ok", error=error, refused=refused,
+                            manifest_digest_hex=manifest_digest_hex,
+                            root_digest_hex=root_digest_hex, head_root=head_root)
+    reason = "missing=%d extra=%d changed=%d partial=%d moved=%d timeout=%d page_ok=%d" % (
+        result["coverage"]["missing"], result["coverage"]["extra"], result["coverage"]["changed"],
+        int(result["partial"]), int(result["moved"]), int(result["timeout"]), int(result["page_ok"]))
+    try:
+        _audit_alone(conn, audit_fields(acl, who, raw_tag, via, VERIFY_OP, key, "", result["ok"],
+                                        reason, now=now))
+    except Exception as failure:
+        result["audit"] = "FAILED:" + type(failure).__name__
+        result["ok"] = False
+        result["page_ok"] = False
+        result["coverage"]["covered"] = False
+        result["partial"] = True
+    return result
+
+
 def _write(conn, acl, who, raw_tag, via, op, key, field, value, now) -> dict:
     """WATCH, check the type, read the old value, then MULTI the write AND its audit entry together.
 
     Every Refused raised in here is audited by the caller. Every EXEC result is inspected: a success
     is reported only when both the write and its audit entry succeeded."""
-    ttl = ttl_for(acl, key)
+    # A saved read cursor never expires: FORWARD_ONLY compares against what the key holds.
+    ttl = None if (op == "set" and key.startswith(FORWARD_ONLY)) else ttl_for(acl, key)
     pipe = conn.pipeline(transaction=True)
     try:
         pipe.watch(key)                              # immediate mode until multi()
@@ -346,6 +1348,13 @@ def _write(conn, acl, who, raw_tag, via, op, key, field, value, now) -> dict:
         # The OLD value, read under the WATCH, so the audit says exactly what this replaced.
         if op in ("set", "del"):
             old = pipe.get(key) if kind in ("none", "string") else "(%s)" % kind
+            if op == "set" and key.startswith(FORWARD_ONLY):
+                # Under the WATCH: if the key changes after this comparison, EXEC applies nothing.
+                if not stream_id_ok(value):
+                    raise Refused("a read cursor is a stream entry id, <ms>-<seq>")
+                held = _text(old) if old is not None else ""
+                if stream_id_ok(held) and _id_pair(value) < _id_pair(held):
+                    raise Refused("a read cursor only moves forward; the key holds a later one")
         elif op == "hset":
             old = pipe.hget(key, field)
         elif op == "hput":
@@ -402,8 +1411,41 @@ def _write(conn, acl, who, raw_tag, via, op, key, field, value, now) -> dict:
             "old_sha": entry["old_sha"], "new_sha": entry["new_sha"], "audit": "ok"}
 
 
+def _summarise_verify(result: dict) -> str:
+    """One line of ids, counts and digests. Stored strings are not in the result, and this does not
+    go looking for them."""
+    if result.get("refused"):
+        return "REFUSED haudit gen=%s cid=%s: %s (audited: %s)" % (
+            result.get("generation") or "-", result.get("correlation") or "-",
+            result["refused"], result.get("audit", "?"))
+    cov = result.get("coverage") or {}
+    # Counts and digests only. Listed key names are not part of a board line.
+    def shown(value):
+        got = _strict_int(value)
+        return 0 if got is None else got
+
+    return ("HAUDIT ok=%d page_ok=%d gen=%s cid=%s listed=%d page_count=%d expected=%d seen=%d "
+            "missing=%d extra=%d changed=%d matched=%d covered=%d partial=%d moved=%d timeout=%d "
+            "manifest_root=%s manifest=%s digest=%s length=%d%s" % (
+                int(bool(result.get("ok"))), int(bool(result.get("page_ok"))),
+                result.get("generation") or "-", result.get("correlation") or "-",
+                shown(result.get("listed") if result.get("listed") is not None else cov.get("expected")),
+                shown(result.get("page_count") if result.get("page_count") is not None else cov.get("pages")),
+                shown(cov.get("expected")),
+                shown(cov.get("seen")), shown(cov.get("missing")), shown(cov.get("extra")),
+                shown(cov.get("changed")), shown(cov.get("matched")),
+                int(bool(cov.get("covered"))), int(bool(result.get("partial"))),
+                int(bool(result.get("moved"))), int(bool(result.get("timeout"))),
+                result.get("manifest_root") or "-", result.get("manifest_digest") or "-",
+                result.get("digest") or "-", shown(result.get("length")),
+                (" error=%s" % result["error"]) if result.get("error") else ""))
+
+
 def summarise(result: dict) -> str:
     """One line for a board RESULT row: pipe-free, newline-free, bounded."""
+    if result.get("op") == VERIFY_OP:
+        line = _summarise_verify(result).replace("|", "/").replace("\n", " ")
+        return line
     if not result.get("ok"):
         if "refused" in result:
             return "REFUSED: %s (audited: %s)" % (result["refused"], result.get("audit", "?"))
@@ -413,7 +1455,14 @@ def summarise(result: dict) -> str:
         body = body.replace("|", "/")
         if len(body) > 1500:
             body = body[:1500] + "..."
-        return "OK %s %s: %s" % (result["op"], result["key"], body)
+        # A paged read says where it stands BEFORE the entries, so a body cut at 1500 characters cannot
+        # take it away: the cursor it read after, whether another page waits, and the last id returned -
+        # the next after= - even when that entry itself was cut (Copilot on 6b1d459: `more` was dropped).
+        page = ""
+        if "after" in result:
+            page = " [after=%s more=%s last=%s]" % (
+                result["after"], "true" if result.get("more") else "false", result.get("last", result["after"]))
+        return "OK %s %s%s: %s" % (result["op"], result["key"], page, body)
     return "OK %s %s%s ttl=%s old=%s new=%s (audited)" % (
         result["op"], result["key"], (" field=" + result["field"]) if result.get("field") else "",
         result.get("ttl"), result.get("old_sha") or "-", result.get("new_sha") or "-")
