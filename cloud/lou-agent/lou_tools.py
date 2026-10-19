@@ -174,19 +174,28 @@ class Consent:
     It listens from the moment it is made, so a change between two looks is never missed. A withdrawal is
     latched: a "yes" set again later in the same call does not bring the call or its transcript back (Aya,
     PR 426: a withdrawal before the session started was not seen, and withdraw-then-restore kept a transcript).
+    The visitor leaving is latched too: a yes from someone who has gone never starts a call (Aya, 2026-10-19 P1).
+    Only a consent transition, a withdrawal or the visitor leaving wakes the wait; any other attribute the visitor
+    changes leaves Lou waiting (P2).
     room is a livekit.rtc.Room (on/off, participant_attributes_changed, participant_disconnected)."""
 
     def __init__(self, room, visitor):
         self.room, self.visitor = room, visitor
         self.given = consented(visitor.attributes)
         self.withdrawn = False
+        self.gone = False
         self._waiters, self._on_withdrawn = [], []
         room.on("participant_attributes_changed", self._changed)
         room.on("participant_disconnected", self._left)
 
     def holds(self) -> bool:
-        """Given and never withdrawn in this call."""
+        """Given and never withdrawn in this call. What the transcript save reads: a visitor who consented and
+        then hung up still has the call they agreed to."""
         return self.given and not self.withdrawn
+
+    def ready(self) -> bool:
+        """Consent holds AND the visitor is still here. What starting and greeting read."""
+        return self.holds() and not self.gone
 
     def on_withdrawn(self, callback):
         """callback() once, at the withdrawal; at once if consent was already withdrawn."""
@@ -196,20 +205,24 @@ class Consent:
             self._on_withdrawn.append(callback)
 
     async def wait(self, timeout=CONSENT_WAIT) -> bool:
-        """True once the visitor consents and consent still holds; False when they leave first, withdraw, or the
-        wait runs out."""
-        if self.given or self.withdrawn:
-            return self.holds()
-        done = asyncio.get_running_loop().create_future()
-        self._waiters.append(done)
-        try:
-            await asyncio.wait_for(done, timeout)
-        except asyncio.TimeoutError:
-            pass
-        finally:
-            if done in self._waiters:
-                self._waiters.remove(done)
-        return self.holds()
+        """True once the visitor consents and is still here with consent holding; False when they leave, withdraw,
+        or the wait runs out. A wake that settles nothing (it should not happen) goes back to waiting."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while not (self.given or self.withdrawn or self.gone):
+            left = deadline - loop.time()
+            if left <= 0:
+                break
+            done = loop.create_future()
+            self._waiters.append(done)
+            try:
+                await asyncio.wait_for(done, left)
+            except asyncio.TimeoutError:
+                break
+            finally:
+                if done in self._waiters:
+                    self._waiters.remove(done)
+        return self.ready()
 
     def close(self):
         self.room.off("participant_attributes_changed", self._changed)
@@ -224,15 +237,19 @@ class Consent:
         if who.identity != self.visitor.identity:
             return
         if consented(who.attributes):
-            if not self.withdrawn:
-                self.given = True
+            if self.given or self.withdrawn:
+                return                         # already given, or withdrawn for good: nothing settles
+            self.given = True
         elif self.given and not self.withdrawn:
             self.withdrawn = True
             callbacks, self._on_withdrawn = self._on_withdrawn, []
             for callback in callbacks:
                 callback()
+        else:
+            return                             # another attribute, or a no before any yes: Lou keeps waiting
         self._wake()
 
     def _left(self, who):
         if who.identity == self.visitor.identity:
+            self.gone = True
             self._wake()

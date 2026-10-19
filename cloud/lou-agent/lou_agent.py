@@ -126,12 +126,17 @@ async def entrypoint(ctx: JobContext):
     # starts included.
     consent.on_withdrawn(lambda: ctx.shutdown(reason="consent withdrawn"))
     if not await consent.wait(tools.consent_wait()):
-        if not consent.withdrawn:
+        if consent.given and consent.gone and not consent.withdrawn:
+            log.info("the visitor left before Lou started; Lou says nothing and keeps nothing")
+            ctx.shutdown(reason="visitor left")
+        elif not consent.withdrawn:
             log.info("no consent from the visitor; Lou leaves without speaking and keeps nothing")
             ctx.shutdown(reason="no consent")
         return
     await session.start(agent=Lou(instructions()), room=ctx.room)
-    if not consent.holds():   # withdrawn while the session started: no greeting, and the withdrawal ended the call
+    if not consent.ready():   # withdrawn, or the visitor left, while the session started: no greeting
+        if consent.gone and not consent.withdrawn:
+            ctx.shutdown(reason="visitor left")
         return
     call["talked"] = True
     await session.generate_reply(instructions=OPENER)
