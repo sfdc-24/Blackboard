@@ -117,17 +117,19 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
-def _load_module(name, filename):
-    """A module beside this file (in the image: /app/<filename>)."""
-    here = os.path.dirname(os.path.abspath(__file__))
-    spec = importlib.util.spec_from_file_location(name, os.path.join(here, filename))
+def _load_module(name, path):
+    """A module beside this file (in the image: /app/<file>)."""
+    spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-trail_module = _load_module("drive_intake_trail", "trail.py")   # the one parser of the receipt shape
-tf = _load_module("drive_intake_task_filter", "task_filter.py")
+# Each sibling file is named as a literal in the join below: the claude-api worker image loads this file
+# as its contract, and that image's test reads these names to check the image copies every one.
+here = os.path.dirname(os.path.abspath(__file__))
+trail_module = _load_module("drive_intake_trail", os.path.join(here, "trail.py"))   # the receipt-shape parser
+tf = _load_module("drive_intake_task_filter", os.path.join(here, "task_filter.py"))
 
 MAX_BODY = 65536
 MAX_DOC = 400000          # a doc larger than this is refused, not truncated (PR 354's rule)
