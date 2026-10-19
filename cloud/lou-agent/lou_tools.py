@@ -4,9 +4,17 @@ T1 weather_now: the current weather for a place, from open-meteo (no key, no spe
 T6 transcript: at call end the session history goes to Redis lou:transcript:<room>:<session> (the owner's standing
    rule: every Lou call saves a transcript). If Redis cannot be reached the record goes to a local file
    instead, so a call never ends without one.
+Consent (the owner, 2026-10-18: "Lou consent gate before greeting/recording"): a call only exists once the visitor
+   has consented. Lou says nothing, the realtime model hears nothing and no transcript is kept until the visitor's
+   OWN participant attribute lou.consent is exactly "yes". Withdrawn at any point after the yes, the call ends and
+   nothing is kept; a yes set again later in the same call does not count. One Consent object per call holds this.
+   PIPEDA and the CRTC require consent before recording or a transcript; a pre-checked box, a name or a company is
+   not consent, and neither is the room's notice. Who may set the attribute: only the visitor's own client, on the
+   visitor's own action (its token needs canUpdateOwnMetadata). A server must never mint it into a token.
 
 Nothing here dials, texts or contacts anyone. Spec: Drive doc 1OFhYVy_omCXwxaJRqcMagfJa9Aln-wTsSu7xpNK7MX4.
 """
+import asyncio
 import json
 import os
 import time
@@ -18,6 +26,8 @@ FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 HTTP_SECONDS = 4          # the caller is waiting on the line
 TRANSCRIPT_TTL = 90 * 24 * 3600
 DEFAULT_COUNTRY = os.environ.get("LOU_DEFAULT_COUNTRY", "CA")   # Converspan is Canada-first
+CONSENT_ATTRIBUTE = "lou.consent"
+CONSENT_WAIT = 180        # seconds Lou waits, silent, for the visitor's consent before it leaves
 
 # WMO weather codes as open-meteo returns them, in words Lou can say.
 WMO = {
@@ -142,3 +152,104 @@ def save_transcript(record: dict, client=None, fallback_dir=None, ttl=TRANSCRIPT
 
 def _iso(epoch: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
+
+
+def consented(attributes) -> bool:
+    """The visitor's consent: their participant attribute lou.consent is exactly "yes". Anything else is no."""
+    return isinstance(attributes, dict) and attributes.get(CONSENT_ATTRIBUTE) == "yes"
+
+
+def consent_wait(environ=None) -> float:
+    """LOU_CONSENT_WAIT seconds, 10 to 900; CONSENT_WAIT when unset or unusable."""
+    environ = os.environ if environ is None else environ
+    try:
+        wait = float(environ.get("LOU_CONSENT_WAIT") or CONSENT_WAIT)
+    except ValueError:
+        return CONSENT_WAIT
+    return wait if 10 <= wait <= 900 else CONSENT_WAIT
+
+
+class Consent:
+    """THE consent state of one call, shared by Lou's startup and the transcript save, so the two never disagree.
+    It listens from the moment it is made, so a change between two looks is never missed. A withdrawal is
+    latched: a "yes" set again later in the same call does not bring the call or its transcript back (Aya,
+    PR 426: a withdrawal before the session started was not seen, and withdraw-then-restore kept a transcript).
+    The visitor leaving is latched too: a yes from someone who has gone never starts a call (Aya, 2026-10-19 P1).
+    Only a consent transition, a withdrawal or the visitor leaving wakes the wait; any other attribute the visitor
+    changes leaves Lou waiting (P2).
+    room is a livekit.rtc.Room (on/off, participant_attributes_changed, participant_disconnected)."""
+
+    def __init__(self, room, visitor):
+        self.room, self.visitor = room, visitor
+        self.given = consented(visitor.attributes)
+        self.withdrawn = False
+        self.gone = False
+        self._waiters, self._on_withdrawn = [], []
+        room.on("participant_attributes_changed", self._changed)
+        room.on("participant_disconnected", self._left)
+
+    def holds(self) -> bool:
+        """Given and never withdrawn in this call. What the transcript save reads: a visitor who consented and
+        then hung up still has the call they agreed to."""
+        return self.given and not self.withdrawn
+
+    def ready(self) -> bool:
+        """Consent holds AND the visitor is still here. What starting and greeting read."""
+        return self.holds() and not self.gone
+
+    def on_withdrawn(self, callback):
+        """callback() once, at the withdrawal; at once if consent was already withdrawn."""
+        if self.withdrawn:
+            callback()
+        else:
+            self._on_withdrawn.append(callback)
+
+    async def wait(self, timeout=CONSENT_WAIT) -> bool:
+        """True once the visitor consents and is still here with consent holding; False when they leave, withdraw,
+        or the wait runs out. A wake that settles nothing (it should not happen) goes back to waiting."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while not (self.given or self.withdrawn or self.gone):
+            left = deadline - loop.time()
+            if left <= 0:
+                break
+            done = loop.create_future()
+            self._waiters.append(done)
+            try:
+                await asyncio.wait_for(done, left)
+            except asyncio.TimeoutError:
+                break
+            finally:
+                if done in self._waiters:
+                    self._waiters.remove(done)
+        return self.ready()
+
+    def close(self):
+        self.room.off("participant_attributes_changed", self._changed)
+        self.room.off("participant_disconnected", self._left)
+
+    def _wake(self):
+        for done in self._waiters:
+            if not done.done():
+                done.set_result(None)
+
+    def _changed(self, _changed, who):
+        if who.identity != self.visitor.identity:
+            return
+        if consented(who.attributes):
+            if self.given or self.withdrawn:
+                return                         # already given, or withdrawn for good: nothing settles
+            self.given = True
+        elif self.given and not self.withdrawn:
+            self.withdrawn = True
+            callbacks, self._on_withdrawn = self._on_withdrawn, []
+            for callback in callbacks:
+                callback()
+        else:
+            return                             # another attribute, or a no before any yes: Lou keeps waiting
+        self._wake()
+
+    def _left(self, who):
+        if who.identity == self.visitor.identity:
+            self.gone = True
+            self._wake()

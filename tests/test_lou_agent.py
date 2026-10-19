@@ -10,6 +10,9 @@ The ways this goes wrong, each with a test that fails when the guard is removed:
   - two calls in the reused room, or two distinct keys, land on one transcript (Codex and cowork-chrome)
   - Redis failing drops the transcript instead of writing the file
   - the tool is defined but the SDK never runs it, or the session id is lost (skipped without livekit-agents)
+  - Lou greets, the model hears, or a transcript is kept before the visitor's own consent; another participant's
+    consent, a near-yes, or a withdrawn consent counts, before the session starts or
+    after a yes is set again (the owner, 2026-10-18: consent gate before greeting/recording)
 """
 import asyncio
 import importlib
@@ -192,6 +195,198 @@ class TranscriptTest(unittest.TestCase):
         for room, session in (("", "s"), ("r", ""), ("x" * 129, "s"), ("r", "x" * 129)):
             with self.assertRaises(ValueError):
                 tools.transcript_key(room, session)
+
+
+class FakeRoom:
+    """livekit.rtc.Room's event surface as Lou uses it: on, off, and the two events."""
+    def __init__(self):
+        self.handlers = {}
+
+    def on(self, event, callback):
+        self.handlers.setdefault(event, []).append(callback)
+        return callback
+
+    def off(self, event, callback):
+        self.handlers[event].remove(callback)
+
+    def emit(self, event, *args):
+        for callback in list(self.handlers.get(event, [])):
+            callback(*args)
+
+    def live(self):
+        return sum(len(v) for v in self.handlers.values())
+
+
+class Who:
+    def __init__(self, identity, attributes=None):
+        self.identity, self.attributes = identity, dict(attributes or {})
+
+
+def consent_of(who, value):
+    """The visitor's client sets (or clears) its own attribute; LiveKit then raises the event."""
+    if value is None:
+        who.attributes.pop(tools.CONSENT_ATTRIBUTE, None)
+    else:
+        who.attributes[tools.CONSENT_ATTRIBUTE] = value
+    return {tools.CONSENT_ATTRIBUTE: value or ""}
+
+
+class ConsentTest(unittest.TestCase):
+    def test_only_an_exact_yes_is_consent(self):
+        self.assertTrue(tools.consented({"lou.consent": "yes"}))
+        for attributes in ({}, None, "yes", ["lou.consent"], {"lou.consent": "Yes"}, {"lou.consent": "true"},
+                           {"lou.consent": "1"}, {"lou.consent": ""}, {"lou.consent": " yes"}, {"consent": "yes"},
+                           {"lou.consent": True}):
+            self.assertFalse(tools.consented(attributes), attributes)
+
+    def test_the_wait_is_bounded(self):
+        self.assertEqual(tools.CONSENT_WAIT, tools.consent_wait({}))
+        self.assertEqual(60.0, tools.consent_wait({"LOU_CONSENT_WAIT": "60"}))
+        for bad in ("0", "5", "901", "-1", "soon", "nan"):
+            self.assertEqual(tools.CONSENT_WAIT, tools.consent_wait({"LOU_CONSENT_WAIT": bad}), bad)
+
+    def wait(self, room, visitor, timeout, during=None):
+        async def run():
+            consent = tools.Consent(room, visitor)
+            task = asyncio.ensure_future(consent.wait(timeout))
+            await asyncio.sleep(0)
+            if during:
+                during()
+            try:
+                return await task
+            finally:
+                consent.close()
+        return asyncio.run(run())
+
+    def test_consent_already_given_needs_no_wait(self):
+        room, visitor = FakeRoom(), Who("v", {"lou.consent": "yes"})
+        self.assertTrue(self.wait(room, visitor, 0.01))
+        self.assertEqual(0, room.live())
+
+    def test_consent_given_while_lou_waits(self):
+        room, visitor = FakeRoom(), Who("v")
+        self.assertTrue(self.wait(room, visitor, 5, lambda: room.emit(
+            "participant_attributes_changed", consent_of(visitor, "yes"), visitor)))
+        self.assertEqual(0, room.live(), "the handlers are removed")
+
+    def test_someone_elses_consent_or_a_near_yes_is_not_the_visitors(self):
+        room, visitor, other = FakeRoom(), Who("v"), Who("o")
+
+        def others():
+            room.emit("participant_attributes_changed", consent_of(other, "yes"), other)
+            room.emit("participant_attributes_changed", consent_of(visitor, "Yes"), visitor)
+            room.emit("participant_attributes_changed", {"topic": "x"}, visitor)
+        self.assertFalse(self.wait(room, visitor, 0.05, others))
+        self.assertEqual(0, room.live())
+
+    def test_the_visitor_leaving_ends_the_wait_with_no(self):
+        import time  # noqa: PLC0415
+        room, visitor = FakeRoom(), Who("v")
+        began = time.monotonic()
+        self.assertFalse(self.wait(room, visitor, 5, lambda: (room.emit("participant_disconnected", Who("o")),
+                                                              room.emit("participant_disconnected", visitor))))
+        self.assertLess(time.monotonic() - began, 1, "at once, not at the end of the wait")
+        self.assertEqual(0, room.live())
+
+    def test_no_consent_in_time_is_no(self):
+        self.assertFalse(self.wait(FakeRoom(), Who("v"), 0.05))
+
+    def test_a_withdrawal_is_seen_once_and_only_for_the_visitor(self):
+        room, visitor, other = FakeRoom(), Who("v", {"lou.consent": "yes"}), Who("o", {"lou.consent": "yes"})
+        seen = []
+        tools.Consent(room, visitor).on_withdrawn(lambda: seen.append("withdrawn"))
+        room.emit("participant_attributes_changed", {"topic": "x"}, visitor)
+        room.emit("participant_attributes_changed", consent_of(other, None), other)
+        self.assertEqual([], seen)
+        room.emit("participant_attributes_changed", consent_of(visitor, "no"), visitor)
+        room.emit("participant_attributes_changed", consent_of(visitor, None), visitor)
+        self.assertEqual(["withdrawn"], seen)
+
+    def test_a_yes_set_again_after_a_withdrawal_does_not_bring_consent_back(self):
+        room, visitor = FakeRoom(), Who("v", {"lou.consent": "yes"})
+        consent, seen = tools.Consent(room, visitor), []
+        consent.on_withdrawn(lambda: seen.append("withdrawn"))
+        self.assertTrue(consent.holds())
+        room.emit("participant_attributes_changed", consent_of(visitor, None), visitor)
+        room.emit("participant_attributes_changed", consent_of(visitor, "yes"), visitor)
+        self.assertFalse(consent.holds(), "withdrawn stays withdrawn for this call")
+        self.assertFalse(asyncio.run(consent.wait(0.05)))
+        room.emit("participant_attributes_changed", consent_of(visitor, None), visitor)
+        self.assertEqual(["withdrawn"], seen)
+
+    def test_a_withdrawal_before_anyone_watches_is_still_seen(self):
+        room, visitor = FakeRoom(), Who("v", {"lou.consent": "yes"})
+        consent, seen = tools.Consent(room, visitor), []
+        room.emit("participant_attributes_changed", consent_of(visitor, "no"), visitor)
+        consent.on_withdrawn(lambda: seen.append("withdrawn"))
+        self.assertEqual(["withdrawn"], seen)
+        self.assertFalse(consent.holds())
+
+    def test_a_yes_and_a_withdrawal_in_one_breath_is_no(self):
+        """The yes wakes Lou, but the withdrawal lands before Lou looks: the wait answers no."""
+        room, visitor = FakeRoom(), Who("v")
+        self.assertFalse(self.wait(room, visitor, 5, lambda: (
+            room.emit("participant_attributes_changed", consent_of(visitor, "yes"), visitor),
+            room.emit("participant_attributes_changed", consent_of(visitor, None), visitor))))
+        self.assertEqual(0, room.live())
+
+    def test_a_yes_then_the_visitor_leaving_before_lou_looks_is_no(self):
+        """Aya P1: the disconnect woke the wait, and the yes latched before it still counted."""
+        room, visitor = FakeRoom(), Who("v")
+        self.assertFalse(self.wait(room, visitor, 5, lambda: (
+            room.emit("participant_attributes_changed", consent_of(visitor, "yes"), visitor),
+            room.emit("participant_disconnected", visitor))))
+        self.assertEqual(0, room.live())
+
+    def test_another_attribute_from_the_visitor_keeps_lou_waiting(self):
+        """Aya P2: any attribute change woke the wait, which then ended with no. Only the yes may end it."""
+        async def run():
+            room, visitor = FakeRoom(), Who("v")
+            consent = tools.Consent(room, visitor)
+            task = asyncio.ensure_future(consent.wait(5))
+            await asyncio.sleep(0)
+            room.emit("participant_attributes_changed", {"topic": "x"}, visitor)
+            room.emit("participant_attributes_changed", consent_of(visitor, "no"), visitor)
+            room.emit("participant_attributes_changed", consent_of(visitor, "Yes"), visitor)
+            woken = any(w.done() for w in consent._waiters)
+            for _ in range(5):
+                await asyncio.sleep(0)
+            still = not task.done()
+            room.emit("participant_attributes_changed", consent_of(visitor, "yes"), visitor)
+            got = await task
+            consent.close()
+            return woken, still, got
+        woken, still, got = asyncio.run(run())
+        self.assertFalse(woken, "only a consent transition, a withdrawal or leaving wakes the wait")
+        self.assertTrue(still, "a non-consent change must not end the wait")
+        self.assertTrue(got)
+
+    def test_a_wake_that_settles_nothing_goes_back_to_waiting(self):
+        async def run():
+            room, visitor = FakeRoom(), Who("v")
+            consent = tools.Consent(room, visitor)
+            task = asyncio.ensure_future(consent.wait(5))
+            await asyncio.sleep(0)
+            consent._wake()
+            for _ in range(5):
+                await asyncio.sleep(0)
+            still = not task.done()
+            room.emit("participant_attributes_changed", consent_of(visitor, "yes"), visitor)
+            got = await task
+            consent.close()
+            return still, got
+        still, got = asyncio.run(run())
+        self.assertTrue(still)
+        self.assertTrue(got)
+
+    def test_a_no_before_any_yes_is_not_a_withdrawal(self):
+        room, visitor = FakeRoom(), Who("v")
+        consent, seen = tools.Consent(room, visitor), []
+        consent.on_withdrawn(lambda: seen.append("withdrawn"))
+        room.emit("participant_attributes_changed", consent_of(visitor, "no"), visitor)
+        room.emit("participant_attributes_changed", consent_of(visitor, "yes"), visitor)
+        self.assertEqual([], seen)
+        self.assertTrue(consent.holds())
 
 
 class ImageTest(unittest.TestCase):
@@ -384,6 +579,162 @@ class SdkTest(unittest.TestCase):
         self.assertEqual({"port": 8081, "num_idle_processes": 1}, agent.server_options({}))
         self.assertEqual({"port": 9000, "num_idle_processes": 2},
                          agent.server_options({"PORT": "9000", "LOU_IDLE_PROCESSES": "2"}))
+
+    def call(self, consent_at=None, withdraw=None, restore=False, leave=False, noise=False, wait="10"):
+        """Runs Lou's entrypoint against a fake room, context and session. consent_at: None (never), 0 (before
+        Lou looks) or 1 (while Lou waits). withdraw: None, "waiting" (right after the yes, before Lou wakes),
+        "starting" (while the session starts) or "greeting"; restore sets the yes again right after. leave: True
+        (while Lou waits, after any yes) or "starting". noise: the visitor changes another attribute, and Lou gets
+        to look, before the yes. Returns what Lou did, in order, and what was saved."""
+        import os  # noqa: PLC0415
+        agent = importlib.import_module("lou_agent")
+        room, visitor = FakeRoom(), Who("visitor-1", {"lou.consent": "yes"} if consent_at == 0 else {})
+        room.name = "C8J98G"
+        did, saved, closers = [], [], []
+
+        class Ctx:
+            def __init__(self):
+                self.room = room
+
+            def add_shutdown_callback(self, callback):
+                closers.append(callback)
+
+            async def connect(self):
+                did.append("connect")
+
+            async def wait_for_participant(self):
+                return visitor
+
+            def shutdown(self, reason=""):
+                did.append("shutdown:" + reason)
+
+        class Session:
+            def __init__(self, **kwargs):
+                self.history = type("H", (), {"to_dict": lambda _self: {"items": [{"type": "message"}]}})()
+
+            async def start(self, agent=None, room=None):
+                did.append("start")
+                withdrawal("starting")
+                if leave == "starting":
+                    room.emit("participant_disconnected", visitor)
+
+            async def generate_reply(self, instructions=""):
+                did.append("greet")
+                withdrawal("greeting")
+
+        def withdrawal(when):
+            if withdraw == when:
+                room.emit("participant_attributes_changed", consent_of(visitor, None), visitor)
+                if restore:
+                    room.emit("participant_attributes_changed", consent_of(visitor, "yes"), visitor)
+
+        async def no_sid(_room, fallback):
+            return "RM_test"
+
+        async def run():
+            task = asyncio.ensure_future(entry(Ctx()))
+            for _ in range(5):
+                await asyncio.sleep(0)
+            if noise:
+                room.emit("participant_attributes_changed", {"topic": "x"}, visitor)
+                for _ in range(5):
+                    await asyncio.sleep(0)
+            if consent_at == 1:
+                room.emit("participant_attributes_changed", consent_of(visitor, "yes"), visitor)
+                withdrawal("waiting")
+            if leave is True:
+                room.emit("participant_disconnected", visitor)
+            await task
+            for close in closers:
+                await close("ended")
+
+        entry = getattr(agent.entrypoint, "__wrapped__", agent.entrypoint)
+        realtime = agent.openai.realtime
+        patched = (agent.AgentSession, agent.room_session_id, tools.save_transcript, realtime.GPTLiveModel)
+        old_wait = os.environ.get("LOU_CONSENT_WAIT")
+        agent.AgentSession, agent.room_session_id = Session, no_sid
+        realtime.GPTLiveModel = lambda **kwargs: None   # no key, no network: the fake session never uses it
+        tools.save_transcript = lambda record, client=None: saved.append(record) or "redis:test"
+        os.environ["LOU_CONSENT_WAIT"] = wait
+        try:
+            asyncio.run(asyncio.wait_for(run(), 30))
+        finally:
+            agent.AgentSession, agent.room_session_id, tools.save_transcript, realtime.GPTLiveModel = patched
+            if old_wait is None:
+                os.environ.pop("LOU_CONSENT_WAIT", None)
+            else:
+                os.environ["LOU_CONSENT_WAIT"] = old_wait
+        return did, saved
+
+    def test_without_consent_lou_never_starts_greets_or_keeps_a_transcript(self):
+        """Lou waits 10 s here (the smallest wait allowed), then leaves silent."""
+        did, saved = self.call(consent_at=None)
+        self.assertEqual(["connect", "shutdown:no consent"], did)
+        self.assertEqual([], saved)
+
+    def test_the_visitor_leaving_before_consent_ends_it_silently(self):
+        did, saved = self.call(consent_at=None, leave=True)
+        self.assertEqual(["connect", "shutdown:no consent"], did)
+        self.assertEqual([], saved)
+
+    def test_consent_first_then_the_session_the_greeting_and_the_transcript(self):
+        for when in (0, 1):
+            did, saved = self.call(consent_at=when)
+            self.assertEqual(["connect", "start", "greet"], did, when)
+            self.assertEqual(1, len(saved), when)
+            self.assertEqual("RM_test", saved[0]["session"])
+
+    def test_consent_withdrawn_mid_call_ends_it_and_keeps_nothing(self):
+        did, saved = self.call(consent_at=0, withdraw="greeting")
+        self.assertEqual(["connect", "start", "greet", "shutdown:consent withdrawn"], did)
+        self.assertEqual([], saved)
+
+    def test_consent_withdrawn_before_the_session_starts_means_no_session_and_no_greeting(self):
+        """Aya, PR 426: the watcher began only after the wait, so this withdrawal was missed and Lou greeted."""
+        did, saved = self.call(consent_at=1, withdraw="waiting")
+        self.assertEqual(["connect", "shutdown:consent withdrawn"], did)
+        self.assertEqual([], saved)
+        did, saved = self.call(consent_at=0, withdraw="starting")
+        self.assertEqual(["connect", "start", "shutdown:consent withdrawn"], did, "no greeting")
+        self.assertEqual([], saved)
+
+    def test_a_yes_then_leaving_before_lou_starts_means_no_session_and_no_greeting(self):
+        """Aya P1 (AYA-BACKEND-REVIEW-HANDOFF-20261019T0235Z): yes, then the visitor disconnects before the wait
+        resumes. Lou must not start or greet; and leaving while the session starts means no greeting."""
+        did, saved = self.call(consent_at=1, leave=True)
+        self.assertEqual(["connect", "shutdown:visitor left"], did)
+        self.assertEqual([], saved)
+        did, saved = self.call(consent_at=0, leave="starting")
+        self.assertEqual(["connect", "start", "shutdown:visitor left"], did, "no greeting")
+        self.assertEqual([], saved)
+
+    def test_another_attribute_while_lou_waits_does_not_end_the_wait(self):
+        """Aya P2: an unrelated attribute from the visitor ended the wait with no consent; now Lou waits on."""
+        did, saved = self.call(consent_at=1, noise=True)
+        self.assertEqual(["connect", "start", "greet"], did)
+        self.assertEqual(1, len(saved))
+
+    def test_consent_withdrawn_then_restored_still_ends_the_call_and_keeps_nothing(self):
+        """Aya, PR 426: the save read the attribute as it stood at the end, so a restored yes kept the transcript."""
+        for when, expected in (("waiting", ["connect", "shutdown:consent withdrawn"]),
+                               ("starting", ["connect", "start", "shutdown:consent withdrawn"]),
+                               ("greeting", ["connect", "start", "greet", "shutdown:consent withdrawn"])):
+            did, saved = self.call(consent_at=1 if when == "waiting" else 0, withdraw=when, restore=True)
+            self.assertEqual(expected, did, when)
+            self.assertEqual([], saved, when)
+
+    def test_the_opener_says_ai_and_that_the_transcript_is_kept(self):
+        agent = importlib.import_module("lou_agent")
+        self.assertIn("an AI assistant", agent.OPENER)
+        self.assertIn("transcript is kept", agent.OPENER)
+
+    def test_the_sdk_raises_the_events_lou_listens_for(self):
+        """The fake room's event names must be the real Room's, or the gate waits on an event that never comes."""
+        from livekit import rtc  # noqa: PLC0415
+        import inspect  # noqa: PLC0415
+        source = inspect.getsource(rtc.Room)
+        for event in ("participant_attributes_changed", "participant_disconnected"):
+            self.assertIn('"%s"' % event, source)
 
     def test_the_gpt_live_model_takes_the_tool(self):
         from livekit.plugins import openai  # noqa: PLC0415
