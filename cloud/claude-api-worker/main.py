@@ -26,6 +26,8 @@ HIS THREE DECISIONS (2026-10-10 21:36Z), EACH ENCODED
      its inbox is taken when the laptop is off, or when the doc addresses
      claude-api by name, or when the laptop is up but the task has waited
      REASSIGN_AFTER (his 30-minute rule) with nobody's acceptance in the doc.
+     With CLAUDE_API_WORKER_ADDRESSED_ONLY=on, ONLY the doc that names
+     claude-api is taken, laptop on or off: the rest of the folder is free.
      It has no shell, no repo, no cloud CLI and no PR. It writes into one
      doc and one Redis prefix. What needs the laptop, it names in the doc
      for claude-code-cli; it never narrates an action it cannot take (L-116).
@@ -174,7 +176,7 @@ DOCTRINE = (
     "reasoning, decided, drafted or explained, in plain prose, at most %d characters. Then, under "
     "the heading FOR THE LAPTOP:, list what needs claude-code-cli's tools, one item per line, or "
     "write 'nothing'. Never say you did, ran, checked, opened or sent anything; you cannot. "
-    "Address the owner as Mr. Salam."
+    "Address the owner as Abdus."
 )
 
 
@@ -201,6 +203,11 @@ class AdmissionTimeMoved(Exception):
 def enabled_from_env(environ=None) -> bool:
     environ = os.environ if environ is None else environ
     return environ.get("CLAUDE_API_WORKER_ENABLED") == "on"
+
+
+def addressed_only_from_env(environ=None) -> bool:
+    environ = os.environ if environ is None else environ
+    return environ.get("CLAUDE_API_WORKER_ADDRESSED_ONLY") == "on"
 
 
 def trail_for(doc_text: str, task_id: str) -> list:
@@ -397,6 +404,15 @@ def consider(entry_id, fields: dict, deps) -> dict:
         return {"status": "not_mine", "task": fields.get("task_id") or None, "ran": False}
     task_id = tuple_["task_id"]
     out = {"status": "", "task": task_id, "ran": False}
+    # drive-intake's task filter (PR 419) puts its verdict on the entry. mode=dry_run is the owner's G5:
+    # no CONFIRM token matched, so validate only - no spend. An action other than "task" (a LOU CALL GO's
+    # rehearsal_call) is a dialer's job, never a model call. Entries from before the filter carry neither.
+    if fields.get("mode") == "dry_run":
+        out["status"] = "dry_run"
+        return out
+    if fields.get("action") and fields.get("action") != "task":
+        out.update(status="not_a_task", action=str(fields.get("action")))
+        return out
     try:
         if deps.claims.done(task_id):
             out["status"] = "done"
@@ -446,6 +462,13 @@ def consider(entry_id, fields: dict, deps) -> dict:
     if other:
         _mark_done(deps, task_id)
         out.update(status="taken", by=other)
+        return out
+
+    if deps.addressed_only and not addressed_to_worker(text):
+        # ADDRESSED ONLY (Gate 3, 2026-10-16). Every doc in the folder lands on this inbox, so with the
+        # laptop off a blog draft or a relay note was a paid call. With the flag on, only a doc whose
+        # To: line names claude-api is taken: no claim, no receipt, no call, and the sweep moves past it.
+        out["status"] = "not_addressed"
         return out
 
     now = _now(deps)
@@ -1338,8 +1361,10 @@ class Deps:
                  heartbeat_window=di.DEFAULT_HEARTBEAT, reassign_after=DEFAULT_REASSIGN,
                  max_attempts=DEFAULT_MAX_ATTEMPTS, cap_cents=0, reserve_cents=0,
                  price_in=None, price_out=None, cad_per_usd=None, max_tokens=DEFAULT_MAX_TOKENS,
-                 max_input_tokens=0, authorized_until=None, lane_enabled=False, board=None):
+                 max_input_tokens=0, authorized_until=None, lane_enabled=False, board=None,
+                 addressed_only=False):
         self.enabled = enabled
+        self.addressed_only = bool(addressed_only)
         self.lane_enabled = lane_enabled
         self.board = board
         self.inbox = inbox
@@ -1415,6 +1440,7 @@ def deps_from_env(environ=None, client=None, docs=None, board=None):  # pragma: 
                            max_tokens=_int_env(environ, "CLAUDE_API_WORKER_MAX_TOKENS", DEFAULT_MAX_TOKENS))
     return Deps(
         enabled=enabled_from_env(environ),
+        addressed_only=addressed_only_from_env(environ),
         lane_enabled=lane_enabled_from_env(environ),
         board=board,
         inbox=RedisInbox(client) if client is not None else None,

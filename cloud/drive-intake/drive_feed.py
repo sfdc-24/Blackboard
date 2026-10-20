@@ -12,11 +12,12 @@ WHY POLLING FIRST
 
 WHAT ONE POLL ASKS, AND WHAT IT NEVER WRITES
   files.list in the approved folder: Google Docs only, not trashed, modified
-  after the WATERMARK less a margin, OLDEST FIRST. The watermark is where the
-  last poll got to, not when it ran: a listing that still has pages after the
-  cap is returned as incomplete, with the watermark at the last doc it did
-  return, so the next poll continues from there instead of re-reading the
-  same newest thousand (Cursor on 0bee083). No watermark on record means a
+  after the WATERMARK less a margin, OLDEST FIRST, when the previous listing
+  finished. The watermark is where the last poll got to, not when it ran. A
+  listing that still has pages after the cap is incomplete, and its watermark
+  is the last doc it returned: the next poll resumes THERE, with no margin.
+  Subtracting the margin would re-read the same thousand docs and the cursor
+  would never move (Cursor on 0bee083). No watermark on record means a
   bounded look back, not "everything ever".
 
   This module writes NOTHING to the store. Cursor on 0bee083: the feed used to
@@ -97,6 +98,36 @@ def hints_from(files: list, folder_id: str) -> list:
     return out
 
 
+IDENTITY = ("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity"
+            "?audience=%s")
+
+
+def audience_of(url: str) -> str:
+    """A Cloud Run service's audience is its own origin: scheme and host, no path."""
+    parts = urllib.parse.urlsplit(url or "")
+    if parts.scheme != "https" or not parts.netloc:
+        raise Unconfigured("not an https service url")
+    return "%s://%s" % (parts.scheme, parts.netloc)
+
+
+def identity_token(audience: str, fetch) -> str:
+    """An ID token for `audience` from the metadata server: the service identity, never a key."""
+    status, raw = fetch("GET", IDENTITY % urllib.parse.quote(audience, safe=""), None, {"Metadata-Flavor": "Google"})
+    token = (raw.decode("utf-8") if isinstance(raw, bytes) else str(raw or "")).strip()
+    if status != 200 or not token:
+        raise Unconfigured("metadata server gave no identity token (%s)" % status)
+    return token
+
+
+def private_post(url, body, headers, fetch, post=None):
+    """POST to a PRIVATE Cloud Run service (inbox-wake is not public): its run.invoker check needs an ID
+    token for the service's own origin, beside the ring's own signature. Gate 3 Step 3."""
+    sender = post or http_post
+    signed = dict(headers or {})
+    signed["Authorization"] = "Bearer " + identity_token(audience_of(url), fetch)
+    return sender(url, body, signed)
+
+
 def http_post(url, body, headers):  # pragma: no cover - the ring's one socket, kept out of main.py
     """POST and return the raw answer; the caller reads the readout. Used by WakeRing in main()."""
     import urllib.request  # noqa: PLC0415
@@ -135,7 +166,23 @@ class DriveFolder:
     def changes(self, folder_id: str) -> dict:
         import time  # noqa: PLC0415
         now = float(self.now) if self.now is not None else time.time()
-        since = since_for(self.store.watermark(), now, self.lookback, self.margin)
+        # A capped listing is resumed at its last doc. The margin is only for a listing that
+        # finished: an edit that landed while that poll ran is still inside the next window.
+        resume = getattr(self.store, "resume", None)
+        mark = self.store.watermark()
+        if callable(resume) and resume() and mark is not None:
+            try:
+                since = max(0.0, min(float(mark), now))
+            except (TypeError, ValueError):
+                since = since_for(mark, now, self.lookback, self.margin)
+        else:
+            since = since_for(mark, now, self.lookback, self.margin)
+        # The baseline (main.poll's first poll): nothing modified before it is listed, whatever the
+        # watermark or the look back says.
+        floor = getattr(self.store, "floor", None)
+        low = floor() if callable(floor) else None
+        if low is not None:
+            since = max(since, min(float(low), now))
         query = query_for(folder_id, since)
         self.last_query = query
         files, page_token, complete = [], "", True

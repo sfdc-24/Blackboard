@@ -26,6 +26,8 @@
 #   bash cloud/drive-intake/deploy.sh schedule  # the poll tick, every 2 minutes, OIDC
 #   bash cloud/drive-intake/deploy.sh readback  # what is actually deployed, printed; /healthz
 #   bash cloud/drive-intake/deploy.sh on | off  # the flag, and nothing else
+#   bash cloud/drive-intake/deploy.sh watch     # PUSH: the Drive watch, its daily renewal, the first channel
+#   bash cloud/drive-intake/deploy.sh unwatch   # back to the poll alone
 
 set -euo pipefail
 
@@ -44,9 +46,14 @@ IMAGE="${REPO}/${NAME}:${TAG}"
 GCLOUD="${GCLOUD:-gcloud}"
 SCHED_JOB="${SCHED_JOB:-drive-intake-poll}"
 SCHEDULE="${SCHEDULE:-*/2 * * * *}"
+RENEW_JOB="${RENEW_JOB:-drive-intake-watch-renew}"
+RENEW_SCHEDULE="${RENEW_SCHEDULE:-17 9 * * *}"
 
-# The four, and only four, secrets this service may read.
-SECRETS=(REDIS_AUTH_STRING REDIS_CA_CERT DRIVE_INTAKE_POLL_TOKEN DRIVE_INTAKE_CHANNEL_TOKEN)
+# The four secrets this service may read, and the ring's HMAC once inbox-wake is wired (Gate 3 Step 3).
+SECRETS=(REDIS_AUTH_STRING REDIS_CA_CERT DRIVE_INTAKE_POLL_TOKEN DRIVE_INTAKE_CHANNEL_TOKEN INBOX_WAKE_SECRET)
+# The ring into inbox-wake (cloud/inbox-wake/deploy.sh). Set: drive-intake rings it, signed with
+# INBOX_WAKE_SECRET and carrying its own ID token. Unset: the polled ring below, as before.
+WAKE_URL="${INBOX_WAKE_URL:-}"
 
 # Passed in, never written here: the private address is topology and this repository is public.
 REDIS_HOST="${REDIS_HOST:-}"
@@ -62,6 +69,10 @@ EGRESS="private-ranges-only"
 
 FOLDER_ID="${DRIVE_INTAKE_FOLDER_ID:-1gZlJFDD2Wm419YOuolIXC3HXwzXOWYfP}"
 API_WORKER="${DRIVE_INTAKE_API_WORKER:-claude-api}"
+# Gate 3 Step 3: "recipient claude-api only". A request addressed to anyone else is refused, not rerouted.
+RECIPIENTS="${DRIVE_INTAKE_RECIPIENTS:-claude-api}"
+# Gate 3 Step 3: no backfill. The first poll lists nothing and sets the floor; only later docs are read.
+FIRST_POLL="${DRIVE_INTAKE_FIRST_POLL:-baseline}"
 HEARTBEAT_SECONDS="${DRIVE_INTAKE_HEARTBEAT_SECONDS:-300}"
 POLL_SECONDS="${DRIVE_INTAKE_POLL_SECONDS:-120}"
 # The ring. "polled": the worker polls its inbox and the laptop lane rings the laptop itself, so the
@@ -135,11 +146,16 @@ build() {
 
 deploy() {
   : "${REDIS_HOST:?set REDIS_HOST to the Memorystore private address; it is not committed here}"
+  local wake_secret="" wake_env=""
+  if [ -n "$WAKE_URL" ]; then
+    wake_secret=",INBOX_WAKE_SECRET=INBOX_WAKE_SECRET:latest"
+    wake_env=",INBOX_WAKE_URL=${WAKE_URL}"
+  fi
   "$GCLOUD" run deploy "$SERVICE" --project "$PROJECT" --region "$REGION" \
     --image "$IMAGE" --service-account "$SA" \
     --no-allow-unauthenticated --min-instances 0 --max-instances 2 \
-    --set-secrets "${CA_PATH}=REDIS_CA_CERT:latest,${AUTH_PATH}=REDIS_AUTH_STRING:latest,DRIVE_INTAKE_POLL_TOKEN=DRIVE_INTAKE_POLL_TOKEN:latest,DRIVE_INTAKE_CHANNEL_TOKEN=DRIVE_INTAKE_CHANNEL_TOKEN:latest" \
-    --set-env-vars "DRIVE_INTAKE_ENABLED=off,REDIS_CONNECT=true,REDIS_HOST=${REDIS_HOST},REDIS_PORT=${REDIS_PORT},DRIVE_INTAKE_FOLDER_ID=${FOLDER_ID},DRIVE_INTAKE_API_WORKER=${API_WORKER},DRIVE_INTAKE_HEARTBEAT_SECONDS=${HEARTBEAT_SECONDS},DRIVE_INTAKE_POLL_SECONDS=${POLL_SECONDS},DRIVE_INTAKE_RING=${RING}" \
+    --set-secrets "${CA_PATH}=REDIS_CA_CERT:latest,${AUTH_PATH}=REDIS_AUTH_STRING:latest,DRIVE_INTAKE_POLL_TOKEN=DRIVE_INTAKE_POLL_TOKEN:latest,DRIVE_INTAKE_CHANNEL_TOKEN=DRIVE_INTAKE_CHANNEL_TOKEN:latest${wake_secret}" \
+    --set-env-vars "DRIVE_INTAKE_ENABLED=off,REDIS_CONNECT=true,REDIS_HOST=${REDIS_HOST},REDIS_PORT=${REDIS_PORT},DRIVE_INTAKE_FOLDER_ID=${FOLDER_ID},DRIVE_INTAKE_API_WORKER=${API_WORKER},DRIVE_INTAKE_RECIPIENTS=${RECIPIENTS},DRIVE_INTAKE_FIRST_POLL=${FIRST_POLL},DRIVE_INTAKE_HEARTBEAT_SECONDS=${HEARTBEAT_SECONDS},DRIVE_INTAKE_POLL_SECONDS=${POLL_SECONDS},DRIVE_INTAKE_RING=${RING}${wake_env}" \
     --network "$NETWORK" --subnet "$SUBNET" --vpc-egress "$EGRESS" \
     --cpu 1 --memory 512Mi --timeout 60
   "$GCLOUD" run services add-iam-policy-binding "$SERVICE" --project "$PROJECT" --region "$REGION" \
@@ -196,6 +212,59 @@ flag() {
   echo "DRIVE_INTAKE_ENABLED=$1 on ${SERVICE}"
 }
 
+# PUSH (the fast-handoff POC, drive_watch.py). Drive's push notification carries no OIDC token, so the
+# service must answer an unauthenticated caller: allUsers gets run.invoker. That does not open the work:
+# /hooks/drive still needs the channel token AND a channel on record, /poll and /watch/renew the poll
+# token, and each answers 401 without. /healthz carries no doc and no secret. The poll keeps running as
+# the reconcile path; unwatch takes the service back to it alone.
+watch() {
+  local url token verb=create header_flag
+  url="$(service_url)"
+  "$GCLOUD" run services add-iam-policy-binding "$SERVICE" --project "$PROJECT" --region "$REGION" \
+    --member allUsers --role roles/run.invoker >/dev/null
+  "$GCLOUD" run services update "$SERVICE" --project "$PROJECT" --region "$REGION" \
+    --update-env-vars "DRIVE_INTAKE_WATCH=on,DRIVE_INTAKE_PUSH_URL=${url}/hooks/drive"
+  token="$("$GCLOUD" secrets versions access latest --secret DRIVE_INTAKE_POLL_TOKEN --project "$PROJECT")"
+  "$GCLOUD" scheduler jobs describe "$RENEW_JOB" --project "$PROJECT" --location "$REGION" >/dev/null 2>&1 && verb=update
+  header_flag="--headers"
+  if [ "$verb" = update ]; then
+    header_flag="--update-headers"
+  fi
+  "$GCLOUD" scheduler jobs "$verb" http "$RENEW_JOB" --project "$PROJECT" --location "$REGION" \
+    --schedule "$RENEW_SCHEDULE" --http-method POST --uri "${url}/watch/renew" \
+    --oidc-service-account-email "$INVOKER" --oidc-token-audience "$url" \
+    "$header_flag" "X-Drive-Intake-Poll-Token=${token}" --attempt-deadline 60s >/dev/null
+  echo "scheduler ${RENEW_JOB} ${verb}d: ${RENEW_SCHEDULE} -> POST ${url}/watch/renew"
+  # The first channel now, not at tomorrow's tick. The readout is Drive's own answer.
+  echo "first renewal:"
+  curl -s -X POST -H "X-Drive-Intake-Poll-Token: ${token}" "${url}/watch/renew"; echo
+  token=""
+  echo "healthz:"
+  curl -s "${url}/healthz"; echo
+}
+
+unwatch() {
+  "$GCLOUD" run services update "$SERVICE" --project "$PROJECT" --region "$REGION" \
+    --update-env-vars "DRIVE_INTAKE_WATCH=off"
+  "$GCLOUD" scheduler jobs pause "$RENEW_JOB" --project "$PROJECT" --location "$REGION" || true
+  # The removal fails both when it cannot be done and when there is nothing to remove, so its exit code
+  # says nothing. The policy read afterwards is the answer (Aya on bddafa3: never claim a rollback unread).
+  "$GCLOUD" run services remove-iam-policy-binding "$SERVICE" --project "$PROJECT" --region "$REGION" \
+    --member allUsers --role roles/run.invoker >/dev/null 2>&1 || true
+  local policy
+  if ! policy="$("$GCLOUD" run services get-iam-policy "$SERVICE" --project "$PROJECT" --region "$REGION" \
+      --format 'value(bindings.members)')"; then
+    echo "FAILED: could not read ${SERVICE}'s policy, so the allUsers removal is unconfirmed"
+    return 1
+  fi
+  case "$policy" in
+    *allUsers*)
+      echo "FAILED: allUsers still holds run.invoker on ${SERVICE}; the watch flag is off but the service is public"
+      return 1 ;;
+  esac
+  echo "watch off: the poll alone, allUsers removed (read back); Drive's channel expires on its own within seven days"
+}
+
 case "${1:-}" in
   setup) setup ;;
   tokens) tokens ;;
@@ -205,5 +274,7 @@ case "${1:-}" in
   readback) readback ;;
   on) flag on ;;
   off) flag off ;;
-  *) sed -n '2,28p' "$0"; exit 2 ;;
+  watch) watch ;;
+  unwatch) unwatch ;;
+  *) sed -n '2,30p' "$0"; exit 2 ;;
 esac

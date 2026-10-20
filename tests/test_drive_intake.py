@@ -1283,6 +1283,27 @@ class AuthTest(unittest.TestCase):
         self.assertEqual([{"file_id": "", "poll": True}], hints)
         self.assertEqual("bad_file_id", di.decide(hints[0], deps())["status"])
 
+    def test_a_changes_channel_push_reads_the_feed_and_delivers(self):
+        """Copilot on #362: the folder trigger's push carries no file id; it was answered 200 with nothing done."""
+        d = deps(changes=lambda folder: [{"file_id": FILE, "folder_id": folder}])
+        push = {"x-goog-channel-token": "tok", "x-goog-resource-state": "change",
+                "x-goog-resource-uri": "https://www.googleapis.com/drive/v3/changes?pageToken=7&alt=json"}
+        code, out = di.handle("POST", "/hooks/drive", push, b"", d)
+        self.assertEqual(200, code)
+        self.assertEqual(["dispatched"], [r["status"] for r in out["intake"]], out)
+        self.assertEqual(1, len(d.queue.puts))
+        self.assertIsNotNone(d.claims.last_poll(), "the push's read of the feed goes on record as a poll")
+        again = di.handle("POST", "/hooks/drive", push, b"", d)[1]
+        self.assertEqual(["duplicate"], [r["status"] for r in again["intake"]], again)
+        self.assertEqual(1, len(d.queue.puts), "a second push of the same change is one task")
+
+    def test_a_changes_channel_push_with_no_feed_says_so(self):
+        d = deps(changes=None)
+        out = di.handle("POST", "/hooks/drive", {"x-goog-channel-token": "tok",
+                                                 "x-goog-resource-state": "change"}, b"", d)[1]
+        self.assertEqual(["no_store"], [r["status"] for r in out["intake"]], out)
+        self.assertEqual(0, d.docs.reads)
+
 
 class OfflineTest(unittest.TestCase):
     def test_the_module_opens_no_socket_on_import_and_names_no_credential(self):
@@ -1322,11 +1343,13 @@ class WiringTest(unittest.TestCase):
         self.assertEqual("dispatched", out[0]["status"])
         self.assertEqual(5000.0, d.claims.last_poll())
         self.assertEqual(5000.0, d.claims.watermark())                    # a plain list: the watermark is now
+        self.assertFalse(d.claims.resume())                               # it finished, so the margin applies next
         self.assertEqual(set(), d.claims.pending())                       # finished: not kept
         d = deps(changes=lambda folder: {"hints": [{"file_id": FILE, "folder_id": folder}], "watermark": 4321.0,
                                          "complete": False}, now=5000.0)
         di.poll(d)
         self.assertEqual((5000.0, 4321.0), (d.claims.last_poll(), d.claims.watermark()))   # the feed's own watermark
+        self.assertTrue(d.claims.resume())                                # capped: the next poll starts at 4321
 
         def broken(folder):
             raise ConnectionError()
@@ -1499,6 +1522,125 @@ class WiringTest(unittest.TestCase):
         self.assertEqual(di.DEFAULT_POLL_TICK, off.poll_tick)
 
 
+class Step3ClaudeApiOnly(unittest.TestCase):
+    """Gate 3 Step 3 (CO-20261013-001): "recipient claude-api only. No other folder, no other recipient." """
+
+    def only(self, **over):
+        over.setdefault("baseline", True)
+        return deps(recipients=di.recipients_from_env({"DRIVE_INTAKE_RECIPIENTS": "claude-api"}), **over)
+
+    def test_the_list_parses_and_never_falls_open(self):
+        self.assertIsNone(di.recipients_from_env({}))
+        self.assertEqual(frozenset({"claude-api"}), di.recipients_from_env({"DRIVE_INTAKE_RECIPIENTS": "claude-api"}))
+        self.assertEqual(frozenset(), di.recipients_from_env({"DRIVE_INTAKE_RECIPIENTS": "nobody, *"}))
+        self.assertEqual(frozenset(), di.recipients_from_env({"DRIVE_INTAKE_RECIPIENTS": ""}))
+
+    def test_a_request_to_the_laptop_is_refused_not_rerouted(self):
+        d = self.only(docs=Docs(text="to: claude-code-cli\n" + REQUEST))
+        laptop_up(d)
+        out = di.decide(hint(), d)
+        self.assertEqual(("not_allowed", "claude-code-cli"), (out["status"], out["to"]))
+        self.assertEqual([], d.queue.puts)
+
+    def test_an_unaddressed_request_goes_to_claude_api_even_with_the_laptop_up(self):
+        d = self.only()
+        laptop_up(d)
+        out = di.decide(hint(), d)
+        self.assertEqual("dispatched", out["status"], out)
+        self.assertEqual(["claude-api"], [t["recipient_id"] for t, _, _ in d.queue.puts])
+
+    def test_work_that_needs_the_laptop_is_blocked_and_said(self):
+        text = REQUEST + "\nThis one is laptop only: open the local repo.\n"
+        self.assertTrue(di.needs_cli_tools(text))
+        d = self.only(docs=Docs(text=text))
+        out = di.decide(hint(), d)
+        self.assertEqual("blocked", out["status"], out)
+        self.assertEqual([], d.queue.puts)
+
+    def test_the_first_poll_is_a_baseline_and_lists_nothing(self):
+        listed = []
+
+        def feed(folder):
+            listed.append(folder)
+            return [{"file_id": FILE, "folder_id": folder}]
+        d = self.only(changes=feed, now=5000.0)
+        first = di.poll(d)
+        self.assertEqual(["baseline"], [r["status"] for r in first], first)
+        self.assertEqual([], listed, "the folder is not listed on the baseline")
+        self.assertEqual([], d.queue.puts)
+        self.assertEqual(5000.0, d.claims.floor())
+        d.now = 5120.0
+        second = di.poll(d)
+        self.assertEqual(["dispatched"], [r["status"] for r in second], second)
+        self.assertEqual(1, len(listed))
+
+    def test_the_floor_is_set_once(self):
+        d = self.only(changes=lambda folder: [], now=5000.0)
+        di.poll(d)
+        d.claims.beats.pop("watermark")         # the watermark aged out; the floor did not
+        d.now = 9000.0
+        self.assertEqual([], di.poll(d))
+        self.assertEqual(5000.0, d.claims.floor())
+
+    def test_the_feed_never_lists_before_the_floor(self):
+        class Store:
+            def watermark(self):
+                return None                     # no watermark: the bounded look back of a day
+
+            def floor(self):
+                return 7200.0
+        asked = []
+        folder = drive_feed.DriveFolder(lambda: "tok", lambda method, url, body, headers: (
+            asked.append(url) or (200, b'{"files": []}')), Store(), now=90000.0)
+        folder.changes(FOLDER)
+        self.assertIn(drive_feed.iso(7200.0), folder.last_query, folder.last_query)
+
+    def test_a_deploy_names_claude_api_only(self):
+        script = (REPO / "cloud" / "drive-intake" / "deploy.sh").read_text(encoding="utf-8")
+        self.assertIn('RECIPIENTS="${DRIVE_INTAKE_RECIPIENTS:-claude-api}"', script)
+        self.assertIn("DRIVE_INTAKE_RECIPIENTS=${RECIPIENTS}", script)
+        self.assertIn('FIRST_POLL="${DRIVE_INTAKE_FIRST_POLL:-baseline}"', script)
+        self.assertIn("DRIVE_INTAKE_FIRST_POLL=${FIRST_POLL}", script)
+        d = di.deps_from_env({"DRIVE_INTAKE_RECIPIENTS": "claude-api", "DRIVE_INTAKE_FIRST_POLL": "baseline"},
+                             client=None, docs=None)
+        self.assertEqual((frozenset({"claude-api"}), True), (d.recipients, d.baseline))
+        self.assertFalse(di.deps_from_env({}, client=None, docs=None).baseline)
+
+    def test_without_the_baseline_the_first_poll_lists_as_before(self):
+        d = self.only(changes=lambda folder: [{"file_id": FILE, "folder_id": folder}], baseline=False)
+        self.assertEqual(["dispatched"], [r["status"] for r in di.poll(d)])
+
+
+class PrivateRingTest(unittest.TestCase):
+    """Gate 3 Step 3: inbox-wake stays private; the ring carries an ID token for its origin."""
+
+    def test_the_ring_carries_an_identity_token_for_the_service_origin(self):
+        asked, sent = [], []
+
+        def fetch(method, url, body, headers):
+            asked.append((method, url, headers))
+            return 200, b"id-token-for-wake"
+
+        def post(url, body, headers):
+            sent.append((url, body, headers))
+            return b'{"woke": [{"status": "woke"}]}'
+        out = drive_feed.private_post("https://inbox-wake-abc-uc.a.run.app/wake", b"{}",
+                                      {"X-Hub-Signature-256": "sha256=x"}, fetch, post=post)
+        self.assertEqual(b'{"woke": [{"status": "woke"}]}', out)
+        self.assertIn("audience=https%3A%2F%2Finbox-wake-abc-uc.a.run.app", asked[0][1])
+        self.assertNotIn("%2Fwake", asked[0][1], "the audience is the origin, not the path")
+        self.assertEqual("Google", asked[0][2]["Metadata-Flavor"])
+        self.assertEqual("Bearer id-token-for-wake", sent[0][2]["Authorization"])
+        self.assertEqual("sha256=x", sent[0][2]["X-Hub-Signature-256"], "the signature is kept")
+
+    def test_no_token_is_no_ring(self):
+        with self.assertRaises(drive_feed.Unconfigured):
+            drive_feed.private_post("https://inbox-wake.example/wake", b"{}", {},
+                                    lambda *a: (404, b""), post=lambda *a: self.fail("posted"))
+        with self.assertRaises(drive_feed.Unconfigured):
+            drive_feed.audience_of("http://plain.example/wake")
+
+
 class FeedTest(unittest.TestCase):
     """The poll's question to Drive, and its bookkeeping."""
 
@@ -1576,6 +1718,40 @@ class FeedTest(unittest.TestCase):
         self.assertEqual(1760000000.0, drive_feed.epoch_of("2025-10-09T08:53:20.000Z"))
         self.assertIsNone(drive_feed.epoch_of("soon"))
         self.assertIsNone(drive_feed.epoch_of(""))
+
+    def test_a_capped_listing_is_resumed_at_the_last_doc_and_the_margin_does_not_refill_the_cap(self):
+        """150 docs, one per second, one page of 100. The margin is 600 s, so resuming ten minutes
+        behind the last doc returns the same first page forever and the other 50 are never listed."""
+        base = 1760000000.0
+        docs = [{"id": "doc-%03d" % i, "parents": [FOLDER],
+                 "modifiedTime": drive_feed.iso(base + i)} for i in range(150)]
+        calls = []
+
+        def fetch(method, url, body, headers):
+            calls.append(url)
+            since = url.split("modifiedTime+%3E+%27")[1].split("%27")[0].replace("%3A", ":")
+            listed = [f for f in docs if f["modifiedTime"] > since]
+            page, rest = listed[:drive_feed.PAGE], listed[drive_feed.PAGE:]
+            answer = {"files": page}
+            if rest:
+                answer["nextPageToken"] = "more"
+            return 200, json.dumps(answer).encode()
+
+        store = di.MemoryClaims()
+        feed = drive_feed.DriveFolder(lambda: "tok", fetch, store, now=base + 10000, max_pages=1)
+        first = feed.changes(FOLDER)
+        self.assertFalse(first["complete"])
+        self.assertEqual("doc-099", first["hints"][-1]["file_id"])
+        self.assertEqual(drive_feed.epoch_of(docs[99]["modifiedTime"]), first["watermark"])
+        store.note_poll(base + 10000, first["watermark"], resume=True)
+        feed.now = base + 10120
+        second = feed.changes(FOLDER)
+        resumed = "modifiedTime+%3E+%27" + drive_feed.iso(base + 99).replace(":", "%3A")
+        rewound = "modifiedTime+%3E+%27" + drive_feed.iso(base + 99 - 600).replace(":", "%3A")
+        self.assertIn(resumed, calls[-1])
+        self.assertNotIn(rewound, calls[-1])
+        self.assertEqual(["doc-%03d" % i for i in range(100, 150)], [h["file_id"] for h in second["hints"]])
+        self.assertTrue(second["complete"])
 
 
 if __name__ == "__main__":

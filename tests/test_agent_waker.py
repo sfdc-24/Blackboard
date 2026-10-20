@@ -520,6 +520,26 @@ class ReplyPhaseTest(unittest.TestCase):
                                           phase="RESULT"))
         self.assertEqual("RESULT", seen[0][seen[0].index("--phase") + 1])
 
+    def test_a_spill_that_did_not_land_is_said_even_when_the_row_is_verified(self):
+        """2026-10-15: every long Gemini reply posted a full= pointer to an object the waker could not
+        write; fleet_agent printed SPILL_UNCONFIRMED and the waker, seeing VERIFIED, printed nothing."""
+        import contextlib
+        import io
+        from unittest import mock
+        said = ("  append said: ok\n  SPILL_UNCONFIRMED: HTTPError: HTTP Error 403: Forbidden\n"
+                "  VERIFIED on the board: Row_ID=X\n")
+        out = io.StringIO()
+        with mock.patch.object(aw.subprocess, "run", return_value=mock.Mock(stdout=said, stderr="")), \
+                contextlib.redirect_stdout(out):
+            self.assertTrue(aw.post_reply("gemini", {"project": "Blackboard"}, "text", "grok;ALL", "X", False))
+        self.assertIn("SPILL_UNCONFIRMED: HTTPError: HTTP Error 403", out.getvalue())
+        quiet = io.StringIO()
+        with mock.patch.object(aw.subprocess, "run",
+                               return_value=mock.Mock(stdout="  VERIFIED on the board: Row_ID=X\n", stderr="")), \
+                contextlib.redirect_stdout(quiet):
+            aw.post_reply("gemini", {"project": "Blackboard"}, "text", "grok;ALL", "X", False)
+        self.assertEqual("", quiet.getvalue(), "a clean post stays quiet")
+
     def test_the_set_is_the_board_s_measured_ask_set_plus_ask(self):
         sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                         "tools", "board_governor"))

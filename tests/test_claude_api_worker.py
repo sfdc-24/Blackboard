@@ -82,6 +82,23 @@ class Receipts:
         return "".join(b if b.startswith("\n") else "\n" + b for _, _, b in self.lines) + ("\n" if self.lines else "")
 
 
+class MultiDocs:
+    """Several docs in the folder, one Receipts for all: only the doc that is run ever gets a line."""
+
+    def __init__(self, texts, receipts):
+        self.texts, self.receipts = texts, receipts
+
+    def read(self, file_id):
+        return {"text": self.texts[file_id] + self.receipts.text(), "revision_id": self.receipts.revision,
+                "folder_id": FOLDER}
+
+    def append(self, *args):
+        return self.receipts.append(*args)
+
+    def has(self, *args):
+        return self.receipts.has(*args)
+
+
 class Inbox:
     def __init__(self, entries=()):
         self.entries = list(entries)         # oldest first, like a stream
@@ -123,6 +140,15 @@ def entry(text=REQUEST, when=NOW - 60, recipient=wk.WORKER, task_id=None):
               "text": di.gist(text)["text"], "chars": "40", "full": "1",
               "source_doc_id": FILE, "source_revision": t["source_revision"],
               "request_id": t["request_id"], "task_id": task_id or t["task_id"], "recipient_id": recipient}
+    return ("%d-0" % int(when * 1000), fields)
+
+
+def multi_entry(file_id, text, when):
+    t = di.correlate(file_id, text, "r1", wk.WORKER)
+    fields = {"by": "drive-intake", "at": "2026-10-11T04:00:00Z", "kind": "drive_request",
+              "text": di.gist(text)["text"], "chars": "40", "full": "1",
+              "source_doc_id": file_id, "source_revision": t["source_revision"],
+              "request_id": t["request_id"], "task_id": t["task_id"], "recipient_id": wk.WORKER}
     return ("%d-0" % int(when * 1000), fields)
 
 
@@ -191,7 +217,8 @@ class RunTest(unittest.TestCase):
         self.assertNotIn("REQUESTED - task", prompt)
         self.assertIn("Never say you did", system)
         self.assertIn("FOR THE LAPTOP", system)
-        self.assertIn("Mr. Salam", system)
+        self.assertIn("Address the owner as Abdus.", system)   # his ruling of 2026-10-12
+        self.assertNotIn("Mr. Salam", system)
 
     def test_a_second_pass_does_nothing_from_the_marker_and_nothing_from_the_doc_when_the_marker_is_gone(self):
         d = deps()
@@ -283,6 +310,71 @@ class GateTest(unittest.TestCase):
         d = deps()
         laptop_up(d, age=301.0)
         self.assertEqual("succeeded", wk.run_once(d)["considered"][0]["status"])
+
+    def test_addressed_only_with_the_laptop_off_skips_an_unaddressed_doc_with_nothing_written(self):
+        d = deps(addressed_only=True)
+        out = wk.run_once(d)
+        self.assertEqual("not_addressed", out["considered"][0]["status"], out)
+        self.assertEqual([], d.model.calls)
+        self.assertEqual([], d.receipts.lines)
+        self.assertEqual({}, d.claims.states)
+
+    def test_addressed_only_skips_an_unaddressed_doc_even_after_thirty_minutes(self):
+        d = deps(addressed_only=True)
+        laptop_up(d)
+        d.inbox = Inbox([entry(when=NOW - 1801)])
+        self.assertEqual("not_addressed", wk.run_once(d)["considered"][0]["status"])
+        self.assertEqual([], d.model.calls)
+
+    def test_addressed_only_skips_a_doc_naming_another_worker(self):
+        d = deps(text="to: codex" + chr(10) + REQUEST, addressed_only=True)
+        self.assertEqual("not_addressed", wk.run_once(d)["considered"][0]["status"])
+        self.assertEqual([], d.model.calls)
+
+    def test_addressed_only_runs_the_doc_that_names_claude_api(self):
+        d = deps(text="to: claude-api" + chr(10) + REQUEST, addressed_only=True)
+        self.assertEqual("succeeded", wk.run_once(d)["considered"][0]["status"])
+        self.assertEqual(1, len(d.model.calls))
+
+    def test_addressed_only_passes_a_backlog_to_reach_the_named_doc_in_one_pass(self):
+        named = "to: claude-api" + chr(10) + "GATE3-RUN" + chr(10) + "request: G3-RUN-1" + chr(10) + "One bounded ask." + chr(10)
+        texts = [REQUEST + "draft %d" % i + chr(10) for i in range(3)] + [named]
+        d = deps(addressed_only=True)
+        ids = [FILE[:-1] + c for c in "ABCD"]
+        docs = {f: t + intake_lines(di.correlate(f, t, "r1", wk.WORKER)) for f, t in zip(ids, texts)}
+        d.docs = d.receipts = MultiDocs(docs, d.receipts)
+        d.inbox = Inbox([multi_entry(f, t, NOW - 600 + i) for i, (f, t) in enumerate(zip(ids, texts))])
+        out = wk.run_once(d)
+        self.assertEqual(["not_addressed"] * 3 + ["succeeded"], [c["status"] for c in out["considered"]], out)
+        self.assertEqual(1, len(d.model.calls))
+
+    def test_a_dry_run_task_is_never_a_call_even_when_named(self):
+        d = deps(text="to: claude-api" + chr(10) + REQUEST)
+        entry_id, fields = d.inbox.entries[0]
+        fields.update(action="task", mode="dry_run", prefix="TASK:")
+        out = wk.run_once(d)
+        self.assertEqual("dry_run", out["considered"][0]["status"], out)
+        self.assertEqual([], d.model.calls)
+        self.assertEqual([], d.receipts.lines)
+        self.assertEqual({}, d.claims.states)
+
+    def test_a_live_task_named_runs(self):
+        d = deps(text="to: claude-api" + chr(10) + REQUEST, addressed_only=True)
+        d.inbox.entries[0][1].update(action="task", mode="live", prefix="TASK:")
+        self.assertEqual("succeeded", wk.run_once(d)["considered"][0]["status"])
+        self.assertEqual(1, len(d.model.calls))
+
+    def test_a_rehearsal_call_is_never_a_model_call(self):
+        d = deps(text="to: claude-api" + chr(10) + REQUEST)
+        d.inbox.entries[0][1].update(action="rehearsal_call", mode="live", prefix="LOU CALL GO")
+        self.assertEqual("not_a_task", wk.run_once(d)["considered"][0]["status"])
+        self.assertEqual([], d.model.calls)
+
+    def test_addressed_only_flag_is_exactly_on(self):
+        for value in (None, "", "ON", "1", "true", " on"):
+            env = {} if value is None else {"CLAUDE_API_WORKER_ADDRESSED_ONLY": value}
+            self.assertFalse(wk.addressed_only_from_env(env), repr(value))
+        self.assertTrue(wk.addressed_only_from_env({"CLAUDE_API_WORKER_ADDRESSED_ONLY": "on"}))
 
     def test_a_task_the_laptop_already_accepted_in_the_doc_is_not_run(self):
         t = task_tuple()
@@ -1085,7 +1177,7 @@ class GoogleDocsTest(unittest.TestCase):
             if method == "GET" and "docs.googleapis.com" in url:
                 return 200, json.dumps(doc).encode()
             if method == "GET" and "googleapis.com/drive" in url:
-                return 200, b'{"parents": ["FOLDER1"]}'
+                return 200, b'{"parents": ["FOLDER1"], "name": "TASK: x", "createdTime": "2026-10-16T12:00:00Z"}'
             if method == "POST":
                 sent = json.loads(body)
                 if sent["writeControl"]["requiredRevisionId"] != doc["revisionId"]:
@@ -1095,13 +1187,27 @@ class GoogleDocsTest(unittest.TestCase):
                 return 200, b'{"writeControl": {"requiredRevisionId": "r2"}}'
             raise AssertionError(url)
         g = gd.GoogleDocs(token_provider=lambda: "tok", fetch=fetch)
-        self.assertEqual({"text": "hello\n", "revision_id": "r1", "folder_id": "FOLDER1"}, g.read(FILE))
+        self.assertEqual({"text": "hello\n", "revision_id": "r1", "folder_id": "FOLDER1", "title": "TASK: x",
+                          "created_time": "2026-10-16T12:00:00Z"}, g.read(FILE))
         self.assertFalse(g.has(FILE, "abcd"))
         self.assertEqual("r2", g.append(FILE, "r1", "abcd", "ACCEPTED - task x - id abcd"))
         self.assertTrue(g.has(FILE, "abcd"))
         with self.assertRaises(gd.RevisionConflict):
             g.append(FILE, "r1", "efgh", "stale")
         self.assertTrue(all(FILE in url for _, url, _, _ in calls))
+
+    def test_rename_sets_only_the_name_with_its_own_drive_scoped_token(self):
+        calls = []
+
+        def fetch(method, url, body, headers):
+            calls.append((method, url, json.loads(body) if body else None, headers["Authorization"]))
+            return 200, b'{"name": "CONSUMED task-1 t"}'
+        g = gd.GoogleDocs(token_provider=lambda: "read", rename_token_provider=lambda: "rename", fetch=fetch)
+        self.assertEqual("CONSUMED task-1 t", g.rename(FILE, "CONSUMED task-1 t"))
+        self.assertEqual([("PATCH", gd.DRIVE + FILE + "?fields=name", {"name": "CONSUMED task-1 t"}, "Bearer rename")],
+                         calls)
+        self.assertIn("auth/drive", gd.RENAME_METADATA)
+        self.assertNotIn("auth/drive", gd.METADATA.replace("auth/drive.readonly", ""))
 
     def test_no_token_refuses_before_any_call(self):
         g = gd.GoogleDocs(token_provider=lambda: "", fetch=lambda *a: self.fail("called"))
@@ -1110,6 +1216,19 @@ class GoogleDocsTest(unittest.TestCase):
         with self.assertRaises(gd.Unconfigured):
             gd.metadata_token(fetch=lambda *a: (404, b""))
         self.assertEqual("t", gd.metadata_token(fetch=lambda m, u, b, h: (200, b'{"access_token": "t"}')))
+
+
+class ImageTest(unittest.TestCase):
+    # Gate 3 Step 5, 2026-10-16 23:31Z: image main-195252b died at import because drive_intake.py loads
+    # task_filter.py from beside itself and this Dockerfile never copied it. Every sibling it loads must ride along.
+    def test_the_image_carries_what_the_contract_loads(self):
+        import re  # noqa: PLC0415
+        contract = (REPO / "cloud" / "drive-intake" / "main.py").read_text(encoding="utf-8")
+        dockerfile = (REPO / "cloud" / "claude-api-worker" / "Dockerfile").read_text(encoding="utf-8")
+        siblings = re.findall(r'os\.path\.join\(here, "([^"]+\.py)"\)', contract)
+        self.assertIn("task_filter.py", siblings)
+        for name in siblings:
+            self.assertIn("COPY cloud/drive-intake/%s /app/%s" % (name, name), dockerfile)
 
 
 if __name__ == "__main__":
