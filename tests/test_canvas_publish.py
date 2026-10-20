@@ -108,6 +108,26 @@ class CleanItem(unittest.TestCase):
             self.assertIsNone(cp.clean_item("grok", "3", raw), raw)
 
 
+class ChairSlot(unittest.TestCase):
+    def test_the_chair_s_slot_is_text_and_diagrams_short_and_without_links(self):
+        self.assertIsNotNone(cp.clean_item("chair", "idea-1", item()))
+        self.assertIsNotNone(cp.clean_item("chair", "idea-2", item(type="note", body="Asks:\n- a\n- b")))
+        for over in ({"type": "image_url", "body": "https://storage.googleapis.com/x.png"},
+                     {"type": "wireframe", "body": "<p>x</p>"}, {"type": "datamodel"},
+                     {"body": "see https://x.example"}, {"title": "www.example.com"},
+                     {"body": "flowchart LR\n  A-->B\n  click A go"}, {"body": "a HREF b"},
+                     {"body": "JavaScript:alert(1)"}, {"body": "b" * 500}):
+            self.assertIsNone(cp.clean_item("chair", "idea-1", item(**over)), over)
+            if "type" not in over or over["type"] == "mermaid":
+                self.assertIsNotNone(cp.clean_item("grok", "idea-1", item(**over)), "only the chair's slot: %s" % over)
+
+    def test_the_chair_is_published_with_its_own_name(self):
+        conn = FakeRedis()
+        put(conn, "chair", "idea-1", item())
+        self.assertEqual([("chair/idea-1", "chair")],
+                         [(i["id"], i["agent"]) for i in cp.snapshot(conn, "demo", NOW)["items"]])
+
+
 class Snapshot(unittest.TestCase):
     def test_only_allowlisted_partitions_and_public_items_reach_the_file(self):
         conn = FakeRedis()

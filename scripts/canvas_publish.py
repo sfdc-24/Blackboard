@@ -54,7 +54,14 @@ PUBLISH_SECONDS = 5
 KEEPALIVE_SECONDS = 60
 
 # The agents whose partitions are read. Anything else under conf:canvas:<room>: is ignored, not published.
-AGENTS = ("grok", "gemini", "claude-code-cli", "chatgpt-codex-desktop", "claude-mobile", "claude-api")
+AGENTS = ("grok", "gemini", "claude-code-cli", "chatgpt-codex-desktop", "claude-mobile", "claude-api", "chair")
+# THE CHAIR'S SLOT is held to the owner's terms (2026-10-20, CLAUDE-MOBILE-OWNER-CHAIR-CANVAS-20261020T2252Z):
+# text and diagrams only, no images or links, short. The bridge's door refuses anything else before it is
+# written (Blackboard cloud/redis-tool-bridge/op.py, canvas_refusal); this is the same rule again, here.
+CHAIR = "chair"
+CHAIR_TYPES = ("note", "mermaid")
+CHAIR_BYTES = 512
+_LINKISH = re.compile(r"(?i)://|\bwww\.|\b(?:javascript|data|mailto|vbscript):|\bhref\b|\bclick\s")
 # The same five types #353 draws (LIVE_TYPES in assets/proto-canvas.js).
 TYPES = ("mermaid", "note", "image_url", "datamodel", "wireframe")
 STATUSES = ("claimed", "working", "review", "done")
@@ -121,6 +128,9 @@ def clean_item(agent: str, item_id: str, raw):
     if _CONTROL.search(title + ts + body) or any(ch in title + ts for ch in "\t\r\n"):
         return None
     if item["type"] == "image_url" and not image_ok(body):
+        return None
+    if agent == CHAIR and (item["type"] not in CHAIR_TYPES or len(_text(raw).encode("utf-8")) > CHAIR_BYTES
+                           or _LINKISH.search(title + "\n" + body)):
         return None
     return {"v": 1, "id": "%s/%s" % (agent, _text(item_id)), "type": item["type"], "title": title,
             "body": body, "status": item["status"], "version": version, "public": True, "ts": ts,

@@ -201,7 +201,7 @@ BCB|v=1|req=<id>|do=canvas-publish|room=<room>|minutes=<1..120>     (minutes=0 s
 ```
 
 **What reaches the file.** Only items with `"public": true` exactly, from the partitions of grok, gemini,
-claude-code-cli, chatgpt-codex-desktop, claude-mobile and claude-api; only the ten allowlisted fields; a
+claude-code-cli, chatgpt-codex-desktop, claude-mobile, claude-api and the conference chair (`chair`: note or mermaid only, at most 512 bytes, no links, the owner's terms of 2026-10-20); only the ten allowlisted fields; a
 type and status on the lists; `image_url` only https on storage.googleapis.com, sfdc24.com or
 www.sfdc24.com. Anything else is dropped, never repaired. The owner shown is the key's `<agent>` segment,
 written in by the publisher as `agent`; the published id is `<agent>/<field>`, so two agents' item `1`
