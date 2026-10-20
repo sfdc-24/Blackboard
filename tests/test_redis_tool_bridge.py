@@ -600,10 +600,12 @@ class TheOpEndpoint(unittest.TestCase):
         self.now = NOW
         bridge_op.clock = lambda: self.now
         bridge_op._SPENT.clear()
+        bridge_op._CANVAS_SPENT.clear()
 
         def restore():
             bridge_op.clock = saved
             bridge_op._SPENT.clear()
+            bridge_op._CANVAS_SPENT.clear()
         self.addCleanup(restore)
 
     def post(self, body, claims=None, conn=None, connect=None, token="tok", path="/op",
@@ -928,10 +930,12 @@ class TheOpEndpoint(unittest.TestCase):
                 for key in ("fleet:inbox:probe", "conf:side:20261013"):
                     self.assertTrue(may(who, "xadd", key), "%s cannot write %s" % (who, key))
                 continue
-            self.assertEqual({"read": ["conf:persona:"], "write": ["conf:persona:"]}, acl["principals"][who],
-                             "the chair's line is these two entries and no more")
+            self.assertEqual({"read": ["conf:persona:"], "write": ["conf:persona:", "conf:canvas:"]},
+                             acl["principals"][who], "the chair's line is these entries and no more")
             for op in ("get", "set"):
                 self.assertTrue(may(who, op, "conf:persona:20261014:claude"), op)
+            self.assertTrue(may(who, "hset", "conf:canvas:demo:chair"), "its canvas slot (the door narrows it)")
+            self.assertFalse(may(who, "hgetall", "conf:canvas:demo:chair"), "and it reads no canvas")
             for op, key in (("set", "fleet:x"), ("xadd", "fleet:inbox:probe"), ("set", "conf:side:20261014"),
                             ("xadd", "conf:side:20261014"), ("set", "conf:x"), ("set", "conf:personas:x"),
                             ("set", "proj:x"), ("hput", "proj:milestones:x"), ("set", "v1:conf:room:x"),
@@ -1153,6 +1157,101 @@ class TheOpEndpoint(unittest.TestCase):
         self.assertFalse(bridge_op.take(3699.9, spent))
         self.assertTrue(bridge_op.take(3700.0, spent), "exactly an hour on, the oldest are forgotten")
         self.assertEqual(1, len(spent))
+        other = collections.deque()
+        self.assertEqual([True, True, False], [bridge_op.take(100.0, other, 2) for _ in range(3)],
+                         "a ceiling of its own is that ceiling")
+
+    # --- the chair's canvas slot (the owner, directly, 2026-10-20: its own slot only, text and diagrams only,
+    # no images or links, at most 20 posts an hour; CLAUDE-MOBILE-OWNER-CHAIR-CANVAS-20261020T2252Z)
+    CANVAS = "conf:canvas:demo:chair"
+    DROP = object()
+
+    def item(self, **over):
+        base = {"v": 1, "type": "mermaid", "title": "Who does what", "body": "flowchart LR\n  owner-->chair\n",
+                "status": "working", "version": 1, "public": True, "ts": "2026-10-14T16:00:00Z"}
+        base.update(over)
+        return __import__("json").dumps({k: v for k, v in base.items() if v is not self.DROP})
+
+    def post_item(self, value=None, **body):
+        said = dict({"op": "hset", "key": self.CANVAS, "field": "idea-1", "val": self.b64(value or self.item()),
+                     "enc": "b64", "author": "chair"}, **body)
+        return said
+
+    def test_the_chair_posts_one_item_to_its_own_canvas_slot_and_the_audit_names_it(self):
+        code, out = self.chair(self.post_item())
+        self.assertEqual((200, True, "hset", self.CANVAS, "chair", self.RID),
+                         (code, out["ok"], out["op"], out["key"], out["author"], out["request"]), out)
+        self.assertEqual(self.item(), self.conn.hget(self.CANVAS, "idea-1"))
+        [entry] = self.conn.audit()
+        self.assertEqual(("conference-chair", "bridge:" + CHAIR, "chair"),
+                         tuple(entry[k] for k in ("actor", "via", "claimed_author")))
+        self.assertEqual([NOW], list(bridge_op._CANVAS_SPENT))
+        self.assertEqual([], list(bridge_op._SPENT), "a canvas post is not a persona write")
+        code, out = self.chair(self.post_item(self.item(type="note", body="Three asks:\n- a\n- b"), enc=""))
+        self.assertEqual(400, code, "the value travels base64, as every chair write does")
+
+    def test_only_its_own_slot_with_hset_and_as_the_chair(self):
+        for body in (self.post_item(key="conf:canvas:demo:grok"), self.post_item(key="conf:canvas:demo:chair:x"),
+                     self.post_item(key="conf:canvas:Demo:chair"), self.post_item(key="conf:canvas:demo"),
+                     self.post_item(key="conf:canvas:demo:chairs"), self.post_item(key="conf:canvas:d:chair"),
+                     self.post_item(key=" " + self.CANVAS), self.post_item(key="v1:" + self.CANVAS),
+                     self.post_item(op="set"), self.post_item(op="hput"), self.post_item(op="HSET"),
+                     self.post_item(op="xadd"), {"op": "hgetall", "key": self.CANVAS, "author": "chair"},
+                     {"op": "get", "key": self.CANVAS, "author": "chair"}, {"op": "del", "key": self.CANVAS, "author": "chair"},
+                     self.post_item(author="claude"), self.post_item(author="Chair"),
+                     self.post_item(field=""), self.post_item(field="../x"), self.post_item(field="a b"),
+                     self.post_item(field="x" * 49), self.post_item(enc="hex")):
+            self.refused_at_the_door(body)
+        self.assertEqual([], list(bridge_op._CANVAS_SPENT))
+        self.assertIn("not a canvas post the chair may make", self.log)
+
+    def test_text_and_diagrams_only_and_nothing_that_is_a_link(self):
+        bad_values = [self.item(type=kind) for kind in ("image_url", "wireframe", "datamodel", "outline", "script")]
+        bad_values += [self.item(public=False), self.item(public="true"), self.item(public=self.DROP),
+                       self.item(v=2), self.item(v=True), self.item(version=True), self.item(version=-1),
+                       self.item(version="1"), self.item(status="shipped"), self.item(title=""), self.item(body=" "),
+                       self.item(title="two\nlines"), self.item(body="bell\x07"), self.item(ts=5), self.item(body=7),
+                       self.item(url="https://x.example"), self.item(body=self.DROP), "[1, 2]", "not json",
+                       self.item(body="x" * 600)]
+        for link in ("see https://x.example/a", "www.example.com", "flowchart LR\n  A-->B\n  click A call go()",
+                     'click A "/x"', "a href b", "javascript:alert(1)", "data:text/html,x", "mailto:a@b.example",
+                     "HTTP://X.EXAMPLE", "ftp://x", "WWW.EXAMPLE.COM", "JavaScript:alert(1)", "A HREF b",
+                     "flowchart LR\n  A-->B\n  Click A go"):
+            bad_values.append(self.item(body=link))
+            if "\n" not in link:
+                bad_values.append(self.item(title=link))
+        for value in bad_values:
+            self.refused_at_the_door(self.post_item(value))
+        self.refused_at_the_door(self.post_item(val="!!not-base64!!"))
+        self.assertEqual([], list(bridge_op._CANVAS_SPENT))
+        largest = self.item(body="b" * (512 - len(self.item(body=""))))
+        self.assertEqual(512, len(largest.encode("utf-8")))
+        self.assertEqual(200, self.chair(self.post_item(largest))[0], "512 bytes is the most")
+        self.refused_at_the_door(self.post_item(self.item(body="b" * (513 - len(self.item(body=""))))))
+        self.assertEqual(200, self.chair(self.post_item(self.item(type="note", status="done", ts=self.DROP)))[0])
+
+    def test_the_canvas_has_its_own_ceiling_of_twenty_posts_an_hour(self):
+        self.assertEqual(20, bridge_op.CHAIR_CANVAS_PER_HOUR)
+        conn = gov_tests.FakeRedis()
+        for n in range(20):
+            self.now = NOW + n
+            self.assertEqual(200, self.chair(self.post_item(field="idea-%d" % n), conn=conn)[0], n)
+        self.now = NOW + 20
+        code, out = self.chair(self.post_item(field="idea-20"), conn=conn)
+        self.assertEqual((429, {"error": "quota", "executed": False}), (code, self.said(out)))
+        self.assertIsNone(conn.hget(self.CANVAS, "idea-20"), "the post past the ceiling did not run")
+        self.assertIn("hourly ceiling of 20 canvas posts", self.log)
+        write = {"op": "set", "key": self.KEY, "val": self.b64("v"), "enc": "b64"}
+        self.assertEqual(200, self.chair(write, conn=conn)[0], "the persona writes keep their own hour")
+        self.now = NOW + 3600
+        self.assertEqual(200, self.chair(self.post_item(field="idea-21"), conn=conn)[0], "an hour on, one more")
+
+    def test_the_committed_files_open_the_chair_s_slot_and_no_other(self):
+        code, out = self.chair(self.post_item(), committed=True)
+        self.assertEqual((200, "conference-chair"), (code, out["principal"]))
+        for body in (self.post_item(key="conf:canvas:demo:grok"), self.post_item(key="conf:canvas:demo:chair-2")):
+            code, out = self.chair(body, committed=True)
+            self.assertEqual((400, {"error": "bad request", "executed": False}), (code, self.said(out)), body)
 
     def test_a_value_over_the_persona_key_s_cap_is_the_governor_s_refusal_audited_with_the_chair_s_claims(self):
         """What the door lets through is still redis_gov's to refuse, and its refusal carries the claims."""

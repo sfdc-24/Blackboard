@@ -99,6 +99,12 @@ governed ops, after the source is verified"). **D1 has not been given. Nothing h
   `conf:persona:` and nothing else; a value there is at most 512 bytes and expires in 24 hours; this instance
   takes at most 20 chair writes an hour (in memory, per instance) and the deploy runs one instance. Aya's runtime
   account's line says `"for": "probe"`: `/probe` as before, and a 403 on `/op`.
+- **The canvas (the owner, directly, 2026-10-20; board row `CLAUDE-MOBILE-OWNER-CHAIR-CANVAS-20261020T2252Z`).** The
+  chair may also `hset` its own slot of a room's canvas, `conf:canvas:<room>:chair`, with author `chair`: one item,
+  at most 512 bytes, the canvas's own members, type `note` or `mermaid`, `public` true, and nothing that is a link
+  (a scheme, `www.`, Mermaid's `click` or `href`). At most 20 posts an hour, counted apart from the persona writes.
+  So its principal may also write `conf:canvas:`; the door narrows that to the `:chair` slot. Every refusal is
+  before any connection. Stopping on "Hold on, team" is the chair's: the bridge does not hear the call.
 - **What the pilot does not do: the bridge trusts the chair's identity. It does not see the owner's confirmation
   and does not enforce it; the chair does.** Whoever holds the chair's identity can make these writes with no
   confirmation. The short list above is all that bounds it, and the pilot may not be widened to real content

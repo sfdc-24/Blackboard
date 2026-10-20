@@ -26,7 +26,7 @@
     "claude-mobile":         {"read": ["*"], "write": ["fleet:", "conf:", "proj:"]},
     "pi1-cli":               {"read": ["*"], "write": ["fleet:", "conf:", "proj:"]},
     "milestones-sync":       {"read": ["proj:milestones:"], "write": ["proj:milestones:"]},
-    "conference-chair":      {"read": ["conf:persona:"], "write": ["conf:persona:"]}
+    "conference-chair":      {"read": ["conf:persona:"], "write": ["conf:persona:", "conf:canvas:"]}
   },
   "ttl_seconds": {
     "conf:": 604800,

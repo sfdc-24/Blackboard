@@ -86,6 +86,19 @@ THE BODY
     Each is refused before any connection, with "executed": false. The value's cap and its 24 hours are
     the access list's, for the prefix.
 
+    THE CANVAS (the owner, directly, 2026-10-20: "I approve the conference chair writing to the canvas (its own
+    slot only, text and diagrams only, no images or links, max 20 posts an hour, stops on 'Hold on, team')";
+    board row CLAUDE-MOBILE-OWNER-CHAIR-CANVAS-20261020T2252Z). One more thing the chair may do, and only this:
+        the op            hset, as sent.
+        the key           conf:canvas:<room>:chair, its own slot of a room's canvas (Blackboard
+                          scripts/canvas_publish.py publishes the public items of every slot). The author it
+                          states is "chair"; no persona's name serves here.
+        the value         one canvas item, at most CANVAS_VALUE_BYTES: a JSON object of the canvas's own
+                          members, type note or mermaid, public true, and nothing in it that is a link (canvas_refusal).
+        the ceiling       CHAIR_CANVAS_PER_HOUR posts an hour, per instance, apart from the persona writes': a 429.
+    Each is refused before any connection, with "executed": false. 'Hold on, team' is the chair's to keep: the
+    bridge does not hear the call.
+
     WHAT THIS DOES NOT DO, AND MUST BE SAID WHEREVER THE PILOT IS APPROVED: THE BRIDGE TRUSTS THE CHAIR'S
     IDENTITY. It does not see the owner's confirmation and does not enforce it; the chair does. Whoever
     holds the chair's identity can make these writes with no confirmation at all. What bounds that is the
@@ -94,6 +107,7 @@ THE BODY
 """
 from __future__ import annotations
 
+import base64
 import collections
 import datetime
 import json
@@ -118,8 +132,23 @@ MAX_PERSONAS = 4                        # as the chair's own cast
 # The one kind of key the chair touches: a persona's own, for one day. Its day, and the author it states.
 _PERSONA = re.compile(r"[a-z][a-z0-9-]{1,31}")
 _PERSONA_KEY = re.compile(r"conf:persona:([0-9]{8}):([a-z][a-z0-9-]{1,31})")
+# The chair's canvas slot (Blackboard scripts/canvas_publish.py: ROOM, ITEM_ID and the item's members).
+CANVAS_OPS = ("hset",)
+CANVAS_AUTHOR = "chair"
+CHAIR_CANVAS_PER_HOUR = 20              # the owner's own number; per instance, in memory, as take() is
+CANVAS_VALUE_BYTES = 512
+CANVAS_TYPES = ("note", "mermaid")      # text and diagrams; never image_url, never wireframe's HTML
+CANVAS_STATUSES = ("claimed", "working", "review", "done")
+CANVAS_MEMBERS = ("v", "type", "title", "body", "status", "version", "public", "ts")
+CANVAS_REQUIRED = ("v", "type", "title", "body", "status", "version", "public")
+_CANVAS_KEY = re.compile(r"conf:canvas:([a-z0-9][a-z0-9-]{1,39}):chair")
+_CANVAS_ITEM = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,47}")
+# Anything that is, or makes, a link: a scheme, a bare www. host, Mermaid's click and href directives.
+_LINKISH = re.compile(r"(?i)://|\bwww\.|\b(?:javascript|data|mailto|vbscript):|\bhref\b|\bclick\s")
+_CANVAS_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 clock = time.time                       # the door's clock; a test puts its own here
 _SPENT = collections.deque()            # when this instance's chair writes were made, oldest first
+_CANVAS_SPENT = collections.deque()     # when this instance's chair canvas posts were made, oldest first
 
 
 def _lines(path=None) -> dict:
@@ -187,16 +216,50 @@ def days(now: float) -> tuple:
                  .strftime("%Y%m%d") for back in (0, 1))
 
 
-def take(now: float, spent) -> bool:
+def take(now: float, spent, ceiling: int = CHAIR_WRITES_PER_HOUR) -> bool:
     """May the chair make one more write in this hour? `spent` holds the times of the ones made. THE BOUND IS
     PER INSTANCE AND IN MEMORY: it is a ceiling on a flood, kept honest by deploy.sh's one instance, and it is
     forgotten when the instance restarts. It is not a record and not a total."""
     while spent and now - spent[0] >= 3600.0:
         spent.popleft()
-    if len(spent) >= CHAIR_WRITES_PER_HOUR:
+    if len(spent) >= ceiling:
         return False
     spent.append(now)
     return True
+
+
+def canvas_refusal(request: dict, author: str) -> str:
+    """Why this is not a canvas post the chair may make, for our log; "" when it is. Never the value itself."""
+    if request["op"] not in CANVAS_OPS:
+        return "not hset"
+    if author != CANVAS_AUTHOR:
+        return "the author is not the chair"
+    if not _CANVAS_ITEM.fullmatch(request["field"]):
+        return "not an item id"
+    if request["enc"] != "b64":
+        return "not base64"             # as every chair write travels (the chair's bridge transport)
+    try:
+        raw = base64.b64decode(request["val"], validate=True)
+        item = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeError):
+        return "not a JSON item"
+    if len(raw) > CANVAS_VALUE_BYTES:
+        return "over %d bytes" % CANVAS_VALUE_BYTES
+    if not isinstance(item, dict) or set(item) - set(CANVAS_MEMBERS) or set(CANVAS_REQUIRED) - set(item):
+        return "not the canvas item's members"
+    whole = lambda value: isinstance(value, int) and not isinstance(value, bool)  # noqa: E731
+    if not (whole(item["v"]) and item["v"] == 1) or item["type"] not in CANVAS_TYPES \
+            or item["status"] not in CANVAS_STATUSES or item["public"] is not True \
+            or not (whole(item["version"]) and 0 <= item["version"] < 10 ** 9):
+        return "a member the canvas does not take"
+    title, body, ts = item["title"], item["body"], item.get("ts", "")
+    if not all(isinstance(text, str) for text in (title, body, ts)) or not title.strip() or not body.strip():
+        return "a member the canvas does not take"
+    if _CANVAS_CONTROL.search(title + body + ts) or any(ch in title + ts for ch in "\t\r\n"):
+        return "a control character"
+    if _LINKISH.search(title + "\n" + body):
+        return "a link"
+    return ""
 
 
 def parse(raw: bytes) -> tuple:
@@ -226,7 +289,7 @@ def parse(raw: bytes) -> tuple:
 
 
 def handle(caller: str, raw: bytes, connect, log, callers=None, gov=None, acl=None, purposes=None,
-           personas=None, now=None, spent=None) -> tuple:
+           personas=None, now=None, spent=None, canvas_spent=None) -> tuple:
     """(status, body) for one /op request from an ALREADY VERIFIED caller.
 
     caller   the email main.verify_caller returned: verified, and on BRIDGE_CALLERS.
@@ -258,17 +321,25 @@ def handle(caller: str, raw: bytes, connect, log, callers=None, gov=None, acl=No
     # and never the request. Every refusal here is before the connection, so "executed": false is true.
     op = request["op"].strip().lower()[:16]
     author, asked = request["author"], request["request"]
+    canvas = False                      # the chair's canvas slot (canvas_refusal), and only the chair's
     if purpose == CHAIR:
         if not author or not asked:
             log("op by %s: the chair did not say which persona and which request" % caller)
             return 400, {"error": "bad request", "executed": False}
         # The op and the key as they were SENT, not as redis_gov would tidy them: the chair sends them exact.
-        named = _PERSONA_KEY.fullmatch(request["key"])
-        listed = (load_personas() if personas is None else personas).get(email, ())
-        if request["op"] not in CHAIR_OPS or named is None or named.group(2) != author or author not in listed \
-                or named.group(1) not in days(clock() if now is None else now):
-            log("op by %s: not an op the chair makes, or not today's key of a persona it may name" % caller)
-            return 400, {"error": "bad request", "executed": False}
+        canvas = _CANVAS_KEY.fullmatch(request["key"]) is not None
+        if canvas:
+            why = canvas_refusal(request, author)
+            if why:
+                log("op by %s: not a canvas post the chair may make (%s)" % (caller, why))
+                return 400, {"error": "bad request", "executed": False}
+        else:
+            named = _PERSONA_KEY.fullmatch(request["key"])
+            listed = (load_personas() if personas is None else personas).get(email, ())
+            if request["op"] not in CHAIR_OPS or named is None or named.group(2) != author or author not in listed \
+                    or named.group(1) not in days(clock() if now is None else now):
+                log("op by %s: not an op the chair makes, or not today's key of a persona it may name" % caller)
+                return 400, {"error": "bad request", "executed": False}
     elif author or asked:
         log("op by %s: author or request stated by a caller that is not the chair" % caller)
         return 400, {"error": "bad request", "executed": False}
@@ -284,6 +355,11 @@ def handle(caller: str, raw: bytes, connect, log, callers=None, gov=None, acl=No
         # After every other refusal, so only a write that would have run counts; before the write, so
         # "executed": false is true.
         log("op by %s: the chair's hourly ceiling of %d writes is reached" % (caller, CHAIR_WRITES_PER_HOUR))
+        return 429, {"error": "quota", "executed": False}
+    if purpose == CHAIR and canvas and not take(clock() if now is None else now,
+                                                _CANVAS_SPENT if canvas_spent is None else canvas_spent,
+                                                CHAIR_CANVAS_PER_HOUR):
+        log("op by %s: the chair's hourly ceiling of %d canvas posts is reached" % (caller, CHAIR_CANVAS_PER_HOUR))
         return 429, {"error": "quota", "executed": False}
     result = gov.execute(conn, gov.load_acl() if acl is None else acl, who,
                          ("bridge:%s" % caller)[:120], request["op"], request["key"],
