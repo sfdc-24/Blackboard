@@ -44,6 +44,9 @@ COPY scripts/bus_request.py /app/bus_request.py
 # audit entry names the ACL digest it was decided under.
 COPY scripts/redis_gov.py /app/redis_gov.py
 COPY scripts/redis_acl.json /app/redis_acl.json
+# The live canvas's read path: canvas-publish windows (bus_request) and the publisher thread beside a live
+# run (serve_requests). Stdlib only; bus_request imports it, so without this line the worker dies on import.
+COPY scripts/canvas_publish.py /app/canvas_publish.py
 # The git channel: Redis requests from GitHub bot accounts the access list binds by numeric id (Cursor).
 COPY scripts/git_requests.py /app/git_requests.py
 # The scheduled rewrite of the live milestone chart from its durable repo copy (milestones-sync job).
