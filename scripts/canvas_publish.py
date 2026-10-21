@@ -31,6 +31,20 @@ THE UPLOAD is the Cloud Storage JSON API over HTTPS with the job's own token fro
 only, so the image gains no dependency. Overwriting an object needs storage.objects.delete as well as create,
 so roles/storage.objectCreator alone is NOT enough for this: the bucket grant is roles/storage.objectUser,
 on that one bucket only (cloud/bus-reconciler/canvas-bucket.sh, which nobody has run).
+
+MERMAID IS CHECKED HERE, BEFORE THE FILE (Gemini, CLAUDE-MOBILE-GEMINI-SPILL-CHAIR-20261021T0135Z: guest speech
+reaches the chair's diagrams, and Mermaid can carry script depending on the renderer). The page's own sanitizer
+cleans the SVG that Mermaid RETURNS; some of Mermaid's published flaws run while it renders, before that
+(the KaTeX label and architecture icon advisories fixed in 11.10.0), and #353 pins 11.4.1. So mermaid_ok parses
+every mermaid body line by line and DROPS the item unless all of it is plain diagram text:
+    the first line    one of MERMAID_KINDS, the diagrams with no published render-time flaw we know of; so
+                      --- front matter, which must come first, is refused here
+    nothing that      configures Mermaid (%%{init}%% directives), styles it (classDef, style, linkStyle,
+                      url(, @import), makes it act (click, with its href, call and callback), links (a scheme),
+                      or is HTML or becomes HTML (a tag, an &entity;, Mermaid's own #60; codes,
+                      markdown strings in backticks, KaTeX's $$, icons)
+    and no more than  MERMAID_LINES lines
+A dropped item is not repaired, as everywhere here. The rule is the same for every agent's slot.
 """
 from __future__ import annotations
 
@@ -62,6 +76,20 @@ CHAIR = "chair"
 CHAIR_TYPES = ("note", "mermaid")
 CHAIR_BYTES = 512
 _LINKISH = re.compile(r"(?i)://|\bwww\.|\b(?:javascript|data|mailto|vbscript):|\bhref\b|\bclick\s")
+# MERMAID (mermaid_ok). The diagram kinds a body may open with: sequenceDiagram (KaTeX labels), architecture
+# (icon text), gantt and xychart (render loops) are left out on purpose, after their advisories.
+MERMAID_KINDS = ("flowchart", "graph", "erDiagram", "classDiagram", "stateDiagram", "stateDiagram-v2",
+                 "mindmap", "timeline", "pie")
+MERMAID_LINES = 60
+_MERMAID_KIND = re.compile(r"([A-Za-z][A-Za-z0-9-]*)(?:[ \t].*)?")
+_MERMAID_REFUSED = re.compile(
+    r"(?i)%%\{"                                             # an init directive: Mermaid's configuration
+    r"|^\s*(?:classDef|style|linkStyle)\b|url\(|@import|expression\("        # CSS
+    r"|\bclick\b|://|\b(?:javascript|vbscript):"           # what acts (click ... href, call), or links
+    r"|<\s*[a-z/!?]"                                        # an HTML tag (an arrow is <-- <| <= <.)
+    r"|&#?[a-z0-9]+;|#[a-z0-9]+;"                           # an entity, and Mermaid's own #60; codes
+    r"|`|\$\$|::icon|\bicon\s*\(|\bfa:fa-",                 # markdown strings, KaTeX, icons
+    re.MULTILINE)
 # The same five types #353 draws (LIVE_TYPES in assets/proto-canvas.js).
 TYPES = ("mermaid", "note", "image_url", "datamodel", "wireframe")
 STATUSES = ("claimed", "working", "review", "done")
@@ -105,7 +133,7 @@ def clean_item(agent: str, item_id: str, raw):
     Dropped, never repaired: an item that is not public, not JSON, or carries a type, status, host or length
     outside the rules does not appear at all. Altering what an agent wrote and publishing the result would
     put words on the page that nobody wrote."""
-    if agent not in AGENTS or not ITEM_ID.match(_text(item_id) or ""):
+    if agent not in AGENTS or not ITEM_ID.fullmatch(_text(item_id) or ""):
         return None
     try:
         item = json.loads(_text(raw))
@@ -129,12 +157,26 @@ def clean_item(agent: str, item_id: str, raw):
         return None
     if item["type"] == "image_url" and not image_ok(body):
         return None
+    if item["type"] == "mermaid" and not mermaid_ok(body):
+        return None
     if agent == CHAIR and (item["type"] not in CHAIR_TYPES or len(_text(raw).encode("utf-8")) > CHAIR_BYTES
                            or _LINKISH.search(title + "\n" + body)):
         return None
     return {"v": 1, "id": "%s/%s" % (agent, _text(item_id)), "type": item["type"], "title": title,
             "body": body, "status": item["status"], "version": version, "public": True, "ts": ts,
             "agent": agent}
+
+
+def mermaid_ok(body: str) -> bool:
+    """Plain diagram text of a kind on MERMAID_KINDS, and nothing that configures, styles, links, acts or is
+    HTML (the module's MERMAID IS CHECKED HERE). False drops the item."""
+    lines = [line for line in body.splitlines() if line.strip() and not line.strip().startswith("%%")]
+    if not lines or len(body.splitlines()) > MERMAID_LINES:
+        return False
+    head = _MERMAID_KIND.fullmatch(lines[0].strip())
+    if head is None or head.group(1) not in MERMAID_KINDS:
+        return False
+    return _MERMAID_REFUSED.search(body) is None
 
 
 def image_ok(url: str) -> bool:
@@ -185,7 +227,7 @@ def open_window(conn, room, minutes, by: str, now, bucket: str) -> dict:
     ONE WINDOW PER ROOM, set with SET NX: a second request while one is open is refused, never doubled and
     never extended, so an ask cannot keep a room publishing past the time its opener chose."""
     room = (room or "").strip()
-    if not ROOM.match(room):
+    if not ROOM.fullmatch(room):
         raise Refused("room= must be 2 to 40 characters of a-z, 0-9 and hyphens")
     text = str(minutes if minutes is not None else "").strip()
     if not text.isdigit() or int(text) > MAX_MINUTES:
@@ -194,7 +236,7 @@ def open_window(conn, room, minutes, by: str, now, bucket: str) -> dict:
     if count == 0:
         existed = bool(conn.delete(window_key(room)))
         return {"ok": True, "room": room, "stopped": existed}
-    if not BUCKET.match(bucket or ""):
+    if not BUCKET.fullmatch(bucket or ""):
         raise Refused("no public canvas bucket is configured on this worker (CANVAS_BUCKET); nothing opened")
     until = now + datetime.timedelta(minutes=count)
     value = json.dumps({"room": room, "until": stamp(until), "by": by}, sort_keys=True)
@@ -220,7 +262,7 @@ def active_windows(conn, now) -> list:
     out = []
     for key in conn.scan_iter(match=WINDOW_PREFIX + "*", count=100):
         room = _text(key)[len(WINDOW_PREFIX):]
-        if not ROOM.match(room):
+        if not ROOM.fullmatch(room):
             continue
         held = read_window(conn, room)
         if not held:
@@ -331,7 +373,7 @@ def start(conn, bucket, log, upload=None):
 
     ITS OWN CLOCK, NOT THE LIVE LOOP'S. One pass of the request loop begins with a board read that can take
     minutes, so publishing between passes would stall the canvas for as long as the board does."""
-    if not BUCKET.match(bucket or ""):
+    if not BUCKET.fullmatch(bucket or ""):
         return None
     if upload is None:
         token = Token()

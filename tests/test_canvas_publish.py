@@ -86,10 +86,11 @@ class CleanItem(unittest.TestCase):
 
     def test_lengths_and_control_characters(self):
         self.assertIsNone(cp.clean_item("grok", "3", item(title="t" * (cp.TITLE_MAX + 1))))
-        self.assertIsNone(cp.clean_item("grok", "3", item(body="b" * (cp.BODY_MAX + 1))))
+        self.assertIsNone(cp.clean_item("grok", "3", item(type="note", body="b" * (cp.BODY_MAX + 1))))
+        self.assertIsNotNone(cp.clean_item("grok", "3", item(type="note", body="b" * cp.BODY_MAX)))
         self.assertIsNone(cp.clean_item("grok", "3", item(title="two\nlines")))
-        self.assertIsNone(cp.clean_item("grok", "3", item(body="bell\x07")))
-        self.assertIsNotNone(cp.clean_item("grok", "3", item(title="t" * cp.TITLE_MAX, body="a\r\n\tb")))
+        self.assertIsNone(cp.clean_item("grok", "3", item(type="note", body="bell\x07")))
+        self.assertIsNotNone(cp.clean_item("grok", "3", item(title="t" * cp.TITLE_MAX, body="flowchart LR\r\n\ta-->b")))
 
     def test_image_urls_are_https_on_an_allowlisted_host_only(self):
         good = "https://storage.googleapis.com/x/sketch.png"
@@ -118,14 +119,87 @@ class ChairSlot(unittest.TestCase):
                      {"body": "flowchart LR\n  A-->B\n  click A go"}, {"body": "a HREF b"},
                      {"body": "JavaScript:alert(1)"}, {"body": "b" * 500}):
             self.assertIsNone(cp.clean_item("chair", "idea-1", item(**over)), over)
-            if "type" not in over or over["type"] == "mermaid":
-                self.assertIsNotNone(cp.clean_item("grok", "idea-1", item(**over)), "only the chair's slot: %s" % over)
+            if "type" not in over:              # as a note: a link is text there; a Mermaid body is checked for all
+                self.assertIsNone(cp.clean_item("chair", "idea-1", item(**dict(over, type="note"))), over)
+                self.assertIsNotNone(cp.clean_item("grok", "idea-1", item(**dict(over, type="note"))),
+                                     "only the chair's slot: %s" % over)
+        for over in ({"body": "A Href b"}, {"body": "Click A now"}, {"title": "WWW.EXAMPLE.COM"}):
+            self.assertIsNone(cp.clean_item("chair", "idea-1", item(**dict(over, type="note"))), over)
 
     def test_the_chair_is_published_with_its_own_name(self):
         conn = FakeRedis()
         put(conn, "chair", "idea-1", item())
         self.assertEqual([("chair/idea-1", "chair")],
                          [(i["id"], i["agent"]) for i in cp.snapshot(conn, "demo", NOW)["items"]])
+
+
+class MermaidIsCheckedBeforeTheFile(unittest.TestCase):
+    """CLAUDE-MOBILE-GEMINI-SPILL-CHAIR-20261021T0135Z: a hostile diagram never reaches the public file, from any slot."""
+
+    GOOD = ("flowchart LR\n  owner-->chair\n  chair-- asks -->grok",
+            "graph TD\n  A[Start] --> B{Ready?}\n  B -->|yes| C((Go))\n  B <--> D",
+            "%% a comment first\nflowchart LR\n  a-.->b\n  a==>c",
+            "erDiagram\n  ACCOUNT ||--o{ CONTACT : has",
+            "classDiagram\n  Animal <|-- Duck\n  Duck : +swim()",
+            "stateDiagram-v2\n  [*] --> Draft\n  Draft --> Review",
+            "mindmap\n  root((Rehearsal))\n    Voice\n    Canvas",
+            "timeline\n  title Thursday\n  9am : rehearsal",
+            "pie title Time\n  \"Talk\" : 60\n  \"Draw\" : 40")
+
+    HOSTILE = (
+        "sequenceDiagram\n  A->>B: hi",                                       # left out: KaTeX labels
+        "architecture-beta\n  service s(server)[x]",                           # left out: icon text
+        "gantt\n  title x", "xychart-beta\n  x-axis [a]",                      # left out: render loops
+        "flowchart LR\n  A-->B\n  click A callback",                           # what acts
+        "flowchart LR\n  A-->B\n  click A href \"/x\"",
+        "flowchart LR\n  A-->B\n  CLICK A go",
+        "%%{init: {\"securityLevel\": \"loose\"}}%%\nflowchart LR\n  A-->B",    # configuration
+        "flowchart LR\n  A-->B\n  %%{ init: {\"htmlLabels\": true} }%%",
+        "---\nconfig:\n  securityLevel: loose\n---\nflowchart LR\n  A-->B",
+        "flowchart LR\n  A[\"<img src=x onerror=alert(1)>\"]-->B",              # HTML
+        "flowchart LR\n  A[\"< script >\"]-->B", "flowchart LR\n  A[\"</b>\"]-->B",
+        "flowchart LR\n  A[\"<!-- x -->\"]-->B",
+        "flowchart LR\n  A[\"#60;img src=x onerror=alert(1)#62;\"]-->B",        # Mermaid's own codes
+        "flowchart LR\n  A[\"&lt;img&gt;\"]-->B", "flowchart LR\n  A[\"&#60;img\"]-->B",
+        "flowchart LR\n  A[\"`**md** string`\"]-->B",                         # markdown strings
+        "flowchart LR\n  A[\"$$\alpha$$\"]-->B",                               # KaTeX
+        "flowchart LR\n  classDef bad fill:url(https://x.example/a.png)\n  A-->B",   # CSS
+        "flowchart LR\n  A-->B\n  style A fill:#f9f", "flowchart LR\n  A-->B\n  linkStyle 0 stroke:red",
+        "flowchart LR\n  A[\"see https://x.example\"]-->B", "flowchart LR\n  A[\"javascript:alert(1)\"]-->B",
+        "mindmap\n  root\n    ::icon(fa fa-book)", "flowchart LR\n  A[fa:fa-car Car]-->B",
+        "", "\n\n", "%% only a comment", "flowchart\n" + "  a-->b\n" * 60, "Flowchart LR\n  a-->b",
+        "flowchartLR\n  a-->b", "flowchart;evil\n  a-->b", "not a diagram")
+
+    def test_plain_diagrams_of_the_listed_kinds_are_published(self):
+        for body in self.GOOD:
+            self.assertTrue(cp.mermaid_ok(body), body)
+            self.assertIsNotNone(cp.clean_item("grok", "m", item(body=body)), body)
+            self.assertIsNotNone(cp.clean_item("chair", "m", item(body=body)), body)
+
+    def test_a_hostile_or_unlisted_diagram_is_dropped_from_every_slot(self):
+        for body in self.HOSTILE:
+            self.assertFalse(cp.mermaid_ok(body), body)
+            for agent in ("grok", "gemini", "chair", "claude-code-cli"):
+                self.assertIsNone(cp.clean_item(agent, "m", item(body=body)), (agent, body))
+
+    def test_the_same_words_in_a_note_are_text_and_are_published(self):
+        """The check is for what Mermaid would render; a note is drawn as text."""
+        self.assertIsNotNone(cp.clean_item("grok", "n", item(type="note", body="click A href <b>x</b> $$")))
+
+    def test_a_hostile_diagram_never_reaches_the_snapshot(self):
+        conn = FakeRedis()
+        put(conn, "grok", "ok", item(body=self.GOOD[0]))
+        put(conn, "chair", "bad", item(body=self.HOSTILE[7]))
+        put(conn, "gemini", "bad", item(body=self.HOSTILE[10]))
+        doc = cp.snapshot(conn, "demo", NOW)
+        self.assertEqual(["grok/ok"], [i["id"] for i in doc["items"]])
+        self.assertNotIn("onerror", json.dumps(doc))
+        self.assertNotIn("securityLevel", json.dumps(doc))
+
+    def test_a_final_newline_does_not_make_an_id_or_a_bucket(self):
+        self.assertIsNone(cp.clean_item("grok", "x\n", item()))
+        with self.assertRaises(cp.Refused):
+            cp.open_window(FakeRedis(), "demo", 5, "grok", NOW, "sfdc24-canvas\n")
 
 
 class Snapshot(unittest.TestCase):
