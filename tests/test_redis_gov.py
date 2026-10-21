@@ -61,6 +61,13 @@ class FakeRedis:
             self.ttls.pop(key, None)        # Redis: SET without KEEPTTL discards the key's expiry
         return True
 
+    def incr(self, key):
+        self._need(key, "string")
+        value = int(self.data.get(key) or 0) + 1        # Redis: a missing key counts from nought
+        self.data[key] = str(value)
+        self._bump(key)
+        return value
+
     def delete(self, key):
         existed = key in self.data
         self.data.pop(key, None)
@@ -677,6 +684,61 @@ class TheServerSetsTheTTL(unittest.TestCase):
         conn = FakeRedis()
         run(conn, "grok", "set", "fleet:x", val="1")
         self.assertNotIn(gov.AUDIT_STREAM, conn.ttls)
+
+
+
+class AnHoursCountIsKeptInRedis(unittest.TestCase):
+    """hourly(): one count a clock hour, shared by every process on the same Redis (GROK-407FIX-428REV-0225Z)."""
+
+    HOUR = 1791993600.0                 # 2026-10-14 16:00:00Z
+
+    def test_it_counts_to_the_ceiling_in_a_clock_hour_and_the_next_hour_starts_again(self):
+        conn = FakeRedis()
+        said = [gov.hourly(conn, "chair:canvas", self.HOUR + n, 3) for n in range(5)]
+        self.assertEqual([True, True, True, False, False], said)
+        self.assertEqual("5", conn.get("gov:quota:chair:canvas:2026101416"), "a refusal is counted too")
+        self.assertFalse(gov.hourly(conn, "chair:canvas", self.HOUR + 3599, 3), "16:59:59 is the same hour")
+        self.assertTrue(gov.hourly(conn, "chair:canvas", self.HOUR + 3600, 3), "17:00 is a new one")
+        self.assertEqual("1", conn.get("gov:quota:chair:canvas:2026101417"))
+        self.assertTrue(gov.hourly(conn, "chair:persona", self.HOUR, 3), "each name has its own count")
+
+    def test_the_count_and_its_expiry_land_in_one_multi(self):
+        conn, queued = FakeRedis(), []
+        real = conn.pipeline
+
+        def watched(transaction=True):
+            pipe = real(transaction)
+            self.assertTrue(transaction)
+            original = pipe.execute
+
+            def execute(raise_on_error=True):
+                queued.extend(name for name, _, _ in pipe.queue)
+                return original(raise_on_error)
+            pipe.execute = execute
+            return pipe
+        conn.pipeline = watched
+        gov.hourly(conn, "chair:canvas", self.HOUR, 20)
+        self.assertEqual(["incr", "expire"], queued, "both queued, neither run on its own")
+        self.assertEqual(gov.QUOTA_TTL_SECONDS, conn.ttls["gov:quota:chair:canvas:2026101416"])
+        self.assertEqual(7200, gov.QUOTA_TTL_SECONDS)
+
+    def test_what_redis_raises_reaches_the_caller(self):
+        conn = FakeRedis()
+        conn.fail_next["incr"] = ConnectionError("dropped")
+        with self.assertRaises(ConnectionError):
+            gov.hourly(conn, "chair:canvas", self.HOUR, 20)
+
+    def test_a_name_is_a_name_and_the_key_is_one_no_caller_may_write(self):
+        conn = FakeRedis()
+        for name in ("", "Chair", "chair canvas", "chair:*", "x", 7, "a" * 49):
+            with self.assertRaises(gov.Refused, msg=repr(name)):
+                gov.hourly(conn, name, self.HOUR, 20)
+        self.assertEqual({}, conn.data)
+        for agent in ("conference-chair", "claude-code-cli", "owner"):
+            for op in ("set", "del"):
+                result = run(conn, agent, op, "gov:quota:chair:canvas:2026101416", val="0")
+                self.assertIn("refused", result, (agent, op))
+        self.assertIsNone(conn.get("gov:quota:chair:canvas:2026101416"), "nobody resets the count")
 
 
 class XrangeAfterACursor(unittest.TestCase):

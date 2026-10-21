@@ -1246,6 +1246,56 @@ class TheOpEndpoint(unittest.TestCase):
         self.now = NOW + 3600
         self.assertEqual(200, self.chair(self.post_item(field="idea-21"), conn=conn)[0], "an hour on, one more")
 
+    def test_the_hour_survives_a_new_instance_because_redis_keeps_it(self):
+        """GROK-407FIX-428REV-0225Z: the service scales to zero, and a new instance starts with an empty memory."""
+        conn = gov_tests.FakeRedis()
+        write = {"op": "set", "key": self.KEY, "val": self.b64("v"), "enc": "b64"}
+        for n in range(20):
+            self.now = NOW + n
+            self.assertEqual(200, self.chair(self.post_item(field="idea-%d" % n), conn=conn)[0], n)
+            self.assertEqual(200, self.chair(write, conn=conn)[0], n)
+        self.assertEqual(("20", "20"), (conn.get("gov:quota:chair:canvas:2026101416"),
+                                        conn.get("gov:quota:chair:persona:2026101416")))
+        for fresh in range(3):                  # a cold start, a second instance, another cold start
+            bridge_op._SPENT.clear()
+            bridge_op._CANVAS_SPENT.clear()
+            self.now = NOW + 1000 + fresh
+            code, out = self.chair(self.post_item(field="late-%d" % fresh), conn=conn)
+            self.assertEqual((429, {"error": "quota", "executed": False}), (code, self.said(out)), fresh)
+            self.assertIsNone(conn.hget(self.CANVAS, "late-%d" % fresh), "nothing past the ceiling is written")
+            self.assertEqual(429, self.chair(dict(write, val=self.b64("late")), conn=conn)[0], fresh)
+        self.assertEqual("v", conn.get(self.KEY))
+        self.assertEqual(40, len(conn.audit()), "the refused ones never reached the governor")
+        bridge_op._SPENT.clear()
+        bridge_op._CANVAS_SPENT.clear()
+        self.now = NOW + 3600                   # 17:00Z: a new clock hour
+        self.assertEqual(200, self.chair(self.post_item(field="next-hour"), conn=conn)[0])
+        self.assertEqual(200, self.chair(write, conn=conn)[0])
+
+    def test_memory_still_holds_the_last_hour_across_the_turn_of_the_clock_hour(self):
+        """Redis counts by the clock hour; while an instance lives its memory holds 20 in any 3,600 seconds."""
+        conn = gov_tests.FakeRedis()
+        for n in range(20):
+            self.now = NOW + 3000 + n           # 16:50Z
+            self.assertEqual(200, self.chair(self.post_item(field="idea-%d" % n), conn=conn)[0], n)
+        self.now = NOW + 3600 + 60              # 17:01Z: Redis would serve it, memory does not
+        self.assertEqual(429, self.chair(self.post_item(field="early"), conn=conn)[0])
+        self.assertIsNone(conn.get("gov:quota:chair:canvas:2026101417"), "a flood memory refuses costs Redis nothing")
+
+    def test_if_redis_cannot_count_nothing_is_written(self):
+        conn = gov_tests.FakeRedis()
+        conn.fail_next["incr"] = ConnectionError("dropped")
+        code, out = self.chair(self.post_item(), conn=conn)
+        self.assertEqual((503, {"error": "redis unreachable", "executed": False}), (code, self.said(out)))
+        self.assertEqual((None, []), (conn.hget(self.CANVAS, "idea-1"), conn.audit()))
+        self.assertIn("could not count the chair's hour (ConnectionError)", self.log)
+        self.assertNotIn("dropped", self.log)
+        conn.fail_next["incr"] = ConnectionError("dropped")
+        write = {"op": "set", "key": self.KEY, "val": self.b64("v"), "enc": "b64"}
+        self.assertEqual(503, self.chair(write, conn=conn)[0])
+        self.assertIsNone(conn.get(self.KEY))
+        self.assertEqual(200, self.chair({"op": "get", "key": self.KEY}, conn=conn)[0], "a read is not counted")
+
     def test_the_committed_files_open_the_chair_s_slot_and_no_other(self):
         code, out = self.chair(self.post_item(), committed=True)
         self.assertEqual((200, "conference-chair"), (code, out["principal"]))

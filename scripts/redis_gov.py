@@ -43,6 +43,7 @@ WHAT NOBODY MAY WRITE THROUGH THIS, WHATEVER THE ACL SAYS
         v1:conf:    the chair's own projection of a live call
         v1:synth: / probe:    the probe namespaces
         gov:        this module's own audit stream. An audit an agent can edit is not an audit.
+                    And the hourly counts of hourly() (gov:quota:), which a caller could otherwise reset.
     Reads of all of these are allowed - including gov:audit, because governance that cannot be
     inspected is not governance.
 
@@ -316,6 +317,28 @@ def decode_value(raw: str, enc: str, acl: dict, key: str = "") -> str:
     if len(value.encode("utf-8")) > cap:
         raise Refused("the value is over %d bytes" % cap)
     return value
+
+
+# --------------------------------------------------------------------------------------- an hour's count
+
+QUOTA_KEY = "gov:quota:%s:%s"           # what is counted, the UTC hour as yyyymmddhh
+QUOTA_TTL_SECONDS = 7200                # past its own hour, then gone
+_QUOTA_NAME = re.compile(r"[a-z][a-z0-9:-]{1,47}")
+
+
+def hourly(conn, name: str, now: float, ceiling: int) -> bool:
+    """Count one more `name` in this clock hour, in Redis, for every process that shares it; True while the
+    count is at most `ceiling`. INCR and EXPIRE go in one MULTI, so a count never lands without its expiry.
+    A refusal is counted too, so a flood stays refused for the rest of the hour. The key is under gov:, which
+    PROTECTED keeps from every caller of execute(). Anything Redis raises goes to the caller."""
+    if not isinstance(name, str) or not _QUOTA_NAME.fullmatch(name):
+        raise Refused("a quota name is lower-case letters, digits, colon and hyphen")
+    key = QUOTA_KEY % (name, datetime.datetime.fromtimestamp(now, datetime.timezone.utc).strftime("%Y%m%d%H"))
+    pipe = conn.pipeline(transaction=True)
+    pipe.multi()
+    pipe.incr(key)
+    pipe.expire(key, QUOTA_TTL_SECONDS)
+    return int(pipe.execute()[0]) <= ceiling
 
 
 # --------------------------------------------------------------------------------------- the audit

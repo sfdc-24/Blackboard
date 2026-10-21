@@ -97,7 +97,9 @@ governed ops, after the source is verified"). **D1 has not been given. Nothing h
   day for one listed persona, `conf:persona:<yyyymmdd>:<persona>`, the day being today or yesterday in UTC and
   the persona one of those in its own line of `callers.json` (today: `claude`). Its principal may read and write
   `conf:persona:` and nothing else; a value there is at most 512 bytes and expires in 24 hours; this instance
-  takes at most 20 chair writes an hour (in memory, per instance) and the deploy runs one instance. Aya's runtime
+  takes at most 20 chair writes an hour, counted in Redis by the clock hour (`gov:quota:chair:persona:<hour>`,
+  INCR and EXPIRE, so a restart or a scale-to-zero does not reset it) and in memory over the last 3,600 seconds.
+  The canvas posts have their own 20, kept the same way (`gov:quota:chair:canvas:<hour>`). Aya's runtime
   account's line says `"for": "probe"`: `/probe` as before, and a 403 on `/op`.
 - **The canvas (the owner, directly, 2026-10-20; board row `CLAUDE-MOBILE-OWNER-CHAIR-CANVAS-20261020T2252Z`).** The
   chair may also `hset` its own slot of a room's canvas, `conf:canvas:<room>:chair`, with author `chair`: one item,

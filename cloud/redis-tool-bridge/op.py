@@ -82,7 +82,7 @@ THE BODY
         the op            get or set. Nothing else, whatever the access list would allow.
         the key           conf:persona:<yyyymmdd>:<author>, where the day is today or yesterday in UTC and
                           the author is on the list in the chair's own line of callers.json.
-        the ceiling       CHAIR_WRITES_PER_HOUR sets an hour, per instance: a 429 past it.
+        the ceiling       CHAIR_WRITES_PER_HOUR sets an hour: a 429 past it (THE HOUR, below).
     Each is refused before any connection, with "executed": false. The value's cap and its 24 hours are
     the access list's, for the prefix.
 
@@ -95,9 +95,19 @@ THE BODY
                           states is "chair"; no persona's name serves here.
         the value         one canvas item, at most CANVAS_VALUE_BYTES: a JSON object of the canvas's own
                           members, type note or mermaid, public true, and nothing in it that is a link (canvas_refusal).
-        the ceiling       CHAIR_CANVAS_PER_HOUR posts an hour, per instance, apart from the persona writes': a 429.
+        the ceiling       CHAIR_CANVAS_PER_HOUR posts an hour, apart from the persona writes': a 429 (THE HOUR).
     Each is refused before any connection, with "executed": false. 'Hold on, team' is the chair's to keep: the
     bridge does not hear the call.
+
+    THE HOUR, KEPT IN REDIS (Gemini on e6433ea, GROK-407FIX-428REV-0225Z: the service scales to zero, and a count
+    kept only in memory starts again at nought with every new instance). Each ceiling is held twice:
+        in Redis          INCR and EXPIRE on gov:quota:chair:<what>:<UTC hour> (redis_gov.hourly), so a restart, a
+                          scale-to-zero or a second instance shares one count. The key is under gov:, which
+                          redis_gov PROTECTS, so no caller of /op can reset it. At most the ceiling in a clock hour.
+        in memory         take(), the last 3,600 seconds, per instance: it holds the span across an hour's turn
+                          while the instance lives, and a flood it refuses costs Redis nothing.
+    A post is counted before it is written, so one that then fails is still spent: the count errs toward fewer
+    posts, never more. If Redis cannot count, nothing is written: a 503 with "executed": false.
 
     WHAT THIS DOES NOT DO, AND MUST BE SAID WHEREVER THE PILOT IS APPROVED: THE BRIDGE TRUSTS THE CHAIR'S
     IDENTITY. It does not see the owner's confirmation and does not enforce it; the chair does. Whoever
@@ -127,7 +137,7 @@ READS = ("get", "hgetall", "xrange")
 FLEET, CHAIR, PROBE = "fleet-agent", "chair", "probe"
 PURPOSES = (FLEET, CHAIR, PROBE)
 CHAIR_OPS = ("get", "set")
-CHAIR_WRITES_PER_HOUR = 20              # per instance, in memory: a ceiling on a flood, not a record (take())
+CHAIR_WRITES_PER_HOUR = 20              # in Redis by the clock hour, and in memory by the last hour (THE HOUR)
 MAX_PERSONAS = 4                        # as the chair's own cast
 # The one kind of key the chair touches: a persona's own, for one day. Its day, and the author it states.
 _PERSONA = re.compile(r"[a-z][a-z0-9-]{1,31}")
@@ -135,7 +145,7 @@ _PERSONA_KEY = re.compile(r"conf:persona:([0-9]{8}):([a-z][a-z0-9-]{1,31})")
 # The chair's canvas slot (Blackboard scripts/canvas_publish.py: ROOM, ITEM_ID and the item's members).
 CANVAS_OPS = ("hset",)
 CANVAS_AUTHOR = "chair"
-CHAIR_CANVAS_PER_HOUR = 20              # the owner's own number; per instance, in memory, as take() is
+CHAIR_CANVAS_PER_HOUR = 20              # the owner's own number; kept as CHAIR_WRITES_PER_HOUR is
 CANVAS_VALUE_BYTES = 512
 CANVAS_TYPES = ("note", "mermaid")      # text and diagrams; never image_url, never wireframe's HTML
 CANVAS_STATUSES = ("claimed", "working", "review", "done")
@@ -217,15 +227,15 @@ def days(now: float) -> tuple:
 
 
 def take(now: float, spent, ceiling: int = CHAIR_WRITES_PER_HOUR) -> bool:
-    """May the chair make one more write in this hour? `spent` holds the times of the ones made. THE BOUND IS
-    PER INSTANCE AND IN MEMORY: it is a ceiling on a flood, kept honest by deploy.sh's one instance, and it is
-    forgotten when the instance restarts. It is not a record and not a total."""
+    """May the chair make one more write in this hour? `spent` holds the times of the ones made. THIS HALF IS
+    PER INSTANCE AND IN MEMORY, and forgotten when the instance stops; redis_gov.hourly is the half that is not."""
     while spent and now - spent[0] >= 3600.0:
         spent.popleft()
     if len(spent) >= ceiling:
         return False
     spent.append(now)
     return True
+
 
 
 def canvas_refusal(request: dict, author: str) -> str:
@@ -351,16 +361,21 @@ def handle(caller: str, raw: bytes, connect, log, callers=None, gov=None, acl=No
     except Exception as error:  # noqa: BLE001 - the TYPE only: a client's message can quote a secret
         log("op by %s: redis unreachable (%s)" % (caller, type(error).__name__))
         return 503, {"error": "redis unreachable", "executed": False}
-    if purpose == CHAIR and op == "set" and not take(clock() if now is None else now, _SPENT if spent is None else spent):
+    if purpose == CHAIR and (op == "set" or canvas):
         # After every other refusal, so only a write that would have run counts; before the write, so
-        # "executed": false is true.
-        log("op by %s: the chair's hourly ceiling of %d writes is reached" % (caller, CHAIR_WRITES_PER_HOUR))
-        return 429, {"error": "quota", "executed": False}
-    if purpose == CHAIR and canvas and not take(clock() if now is None else now,
-                                                _CANVAS_SPENT if canvas_spent is None else canvas_spent,
-                                                CHAIR_CANVAS_PER_HOUR):
-        log("op by %s: the chair's hourly ceiling of %d canvas posts is reached" % (caller, CHAIR_CANVAS_PER_HOUR))
-        return 429, {"error": "quota", "executed": False}
+        # "executed": false is true. Memory first, so a flood it refuses costs Redis nothing (THE HOUR).
+        what, ceiling, mine, named = (
+            ("canvas", CHAIR_CANVAS_PER_HOUR, _CANVAS_SPENT if canvas_spent is None else canvas_spent, "canvas posts")
+            if canvas else ("persona", CHAIR_WRITES_PER_HOUR, _SPENT if spent is None else spent, "writes"))
+        at = clock() if now is None else now
+        try:
+            allowed = take(at, mine, ceiling) and gov.hourly(conn, "chair:" + what, at, ceiling)
+        except Exception as error:  # noqa: BLE001 - the TYPE only, as at the connection
+            log("op by %s: redis could not count the chair's hour (%s)" % (caller, type(error).__name__))
+            return 503, {"error": "redis unreachable", "executed": False}
+        if not allowed:
+            log("op by %s: the chair's hourly ceiling of %d %s is reached" % (caller, ceiling, named))
+            return 429, {"error": "quota", "executed": False}
     result = gov.execute(conn, gov.load_acl() if acl is None else acl, who,
                          ("bridge:%s" % caller)[:120], request["op"], request["key"],
                          field=request["field"], raw_value=request["val"], enc=request["enc"],
