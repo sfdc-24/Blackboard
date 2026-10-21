@@ -329,13 +329,34 @@ def gcs_upload(bucket: str, name: str, data: bytes, token, opener=urllib.request
 # -------------------------------------------------------------------------------------------- publisher
 
 class Publisher:
-    """Publishes every open window. tick() is one round; run() is the loop the live worker starts."""
+    """Publishes every open window. tick() is one round; run() is the loop the live worker starts.
 
-    def __init__(self, conn, bucket, upload, log, clock=None):
+    `holds()` says whether this worker still holds gov:worker:lock. NOTHING IS WRITTEN AFTER THE WINDOW OR THE
+    LEASE ENDS (Aya on c633373: publication after expiry, after a stop, and after the lease was lost). The
+    window and the lease are read again immediately before each upload, not only when the round began: a round
+    can take seconds per room, and a stop, an expiry or another worker's takeover can land inside it."""
+
+    def __init__(self, conn, bucket, upload, log, clock=None, holds=None):
         self.conn, self.bucket, self.upload, self.log = conn, bucket, upload, log
         self.clock = clock or (lambda: datetime.datetime.now(datetime.timezone.utc))
+        self.holds = holds
         self.last = {}          # room -> (digest, time of the last write)
         self.stop = threading.Event()
+
+    def may_write(self, room) -> bool:
+        """The publisher is running, the lease is this worker's, and the room's window is open now."""
+        if self.stop.is_set():
+            return False
+        try:
+            if self.holds is None or not self.holds():
+                self.log.warning("canvas: gov:worker:lock is not provably this worker's; nothing published")
+                return False
+            held = read_window(self.conn, room)
+            until = datetime.datetime.fromisoformat(held["until"].replace("Z", "+00:00")) if held else None
+        except Exception as error:                                       # noqa: BLE001 - unknown is no
+            self.log.warning("canvas %s: the window or the lease could not be read (%s)", room, type(error).__name__)
+            return False
+        return until is not None and until > self.clock()
 
     def tick(self) -> list:
         """Write the rooms whose content changed, or whose keepalive is due. Returns the rooms written."""
@@ -346,6 +367,8 @@ class Publisher:
             digest = content_digest(doc)
             prior = self.last.get(room)
             if prior and prior[0] == digest and (now - prior[1]).total_seconds() < KEEPALIVE_SECONDS:
+                continue
+            if not self.may_write(room):
                 continue
             data = json.dumps(doc, sort_keys=True, separators=(",", ":")).encode("utf-8")
             try:
@@ -368,17 +391,19 @@ class Publisher:
             self.stop.wait(interval)
 
 
-def start(conn, bucket, log, upload=None):
+def start(conn, bucket, log, upload=None, holds=None):
     """The publisher on its own thread, or None when no bucket is configured.
 
     ITS OWN CLOCK, NOT THE LIVE LOOP'S. One pass of the request loop begins with a board read that can take
-    minutes, so publishing between passes would stall the canvas for as long as the board does."""
-    if not BUCKET.fullmatch(bucket or ""):
+    minutes, so publishing between passes would stall the canvas for as long as the board does.
+
+    `holds` is required: without a way to ask whether the lease is still this worker's, nothing starts."""
+    if not BUCKET.fullmatch(bucket or "") or holds is None:
         return None
     if upload is None:
         token = Token()
         upload = lambda b, n, d: gcs_upload(b, n, d, token)                # noqa: E731
-    publisher = Publisher(conn, bucket, upload, log)
+    publisher = Publisher(conn, bucket, upload, log, holds=holds)
     thread = threading.Thread(target=publisher.run, name="canvas-publish", daemon=True)
     thread.start()
     publisher.thread = thread

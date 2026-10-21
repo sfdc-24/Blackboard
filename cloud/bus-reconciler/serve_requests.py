@@ -282,7 +282,9 @@ def live_with_canvas(conn, env, execution, me, until, interval, lock_ttl, start=
     still open in Redis is picked up by the next live run. Unset, nothing starts and nothing changes."""
     import canvas_publish                                                # noqa: PLC0415
     bucket = os.environ.get("CANVAS_BUCKET", "")
-    publisher = (start or canvas_publish.start)(conn, bucket, log)
+    # The lease, asked before every upload: a run that lost gov:worker:lock publishes nothing more (Aya on c633373).
+    publisher = (start or canvas_publish.start)(conn, bucket, log,
+                                                holds=lambda: _text(conn.get(WORKER_LOCK_KEY)) == me)
     if publisher is not None:
         log.info("canvas publisher: open windows every %ds to gs://%s/rooms/", canvas_publish.PUBLISH_SECONDS, bucket)
     elif bucket:

@@ -292,7 +292,9 @@ class Publish(unittest.TestCase):
     def setUp(self):
         self.conn, self.up, self.t = FakeRedis(), Uploads(), {"now": NOW}
         self.log = mock.Mock()
-        self.pub = cp.Publisher(self.conn, "sfdc24-canvas", self.up, self.log, clock=lambda: self.t["now"])
+        self.lease = {"held": True}
+        self.pub = cp.Publisher(self.conn, "sfdc24-canvas", self.up, self.log, clock=lambda: self.t["now"],
+                                holds=lambda: self.lease["held"])
         put(self.conn, "grok", "1", item())
         put(self.conn, "grok", "2", item(public=False, body="PRIVATE"))
 
@@ -333,6 +335,51 @@ class Publish(unittest.TestCase):
         self.later(61)
         put(self.conn, "grok", "1", item(version=3))
         self.assertEqual(self.pub.tick(), [])
+
+    # Aya on c633373: publication after expiry, after a stop, and after the lease was lost.
+    def test_nothing_is_written_once_the_lease_is_another_worker_s(self):
+        cp.open_window(self.conn, "demo", "30", "grok", NOW, "sfdc24-canvas")
+        self.lease["held"] = False
+        self.assertEqual((self.pub.tick(), self.up.calls), ([], []))
+        self.assertIn("not provably this worker's", repr(self.log.warning.call_args))
+        self.lease["held"] = True
+        self.assertEqual(self.pub.tick(), ["demo"], "the lease back, the window still open: it publishes")
+
+    def test_a_lease_that_cannot_be_read_is_not_held(self):
+        cp.open_window(self.conn, "demo", "30", "grok", NOW, "sfdc24-canvas")
+
+        def broken():
+            raise ConnectionError("dropped")
+        self.pub.holds = broken
+        self.assertEqual((self.pub.tick(), self.up.calls), ([], []))
+        self.pub.holds = None
+        self.assertEqual((self.pub.tick(), self.up.calls), ([], []), "no way to ask is no")
+
+    def test_a_stop_that_lands_inside_the_round_is_kept(self):
+        cp.open_window(self.conn, "demo", "30", "grok", NOW, "sfdc24-canvas")
+        real = self.conn.hgetall
+
+        def stop_while_reading(key):
+            cp.open_window(self.conn, "demo", "0", "grok", NOW, "sfdc24-canvas")      # minutes=0: stopped
+            return real(key)
+        self.conn.hgetall = stop_while_reading
+        self.assertEqual((self.pub.tick(), self.up.calls), ([], []))
+
+    def test_an_expiry_that_lands_inside_the_round_is_kept(self):
+        cp.open_window(self.conn, "demo", "1", "grok", NOW, "sfdc24-canvas")
+        self.later(59)
+        real = self.conn.hgetall
+
+        def slow(key):
+            self.t["now"] = NOW + datetime.timedelta(seconds=61)                         # the round took 2 s
+            return real(key)
+        self.conn.hgetall = slow
+        self.assertEqual((self.pub.tick(), self.up.calls), ([], []))
+
+    def test_a_stopped_publisher_writes_nothing_more(self):
+        cp.open_window(self.conn, "demo", "30", "grok", NOW, "sfdc24-canvas")
+        self.pub.stop.set()
+        self.assertEqual((self.pub.tick(), self.up.calls), ([], []))
 
 
 class Upload(unittest.TestCase):
@@ -390,10 +437,27 @@ class Upload(unittest.TestCase):
 
     def test_no_bucket_starts_nothing(self):
         for bucket in ("", None, "Bad_Bucket!"):
-            self.assertIsNone(cp.start(FakeRedis(), bucket, mock.Mock(), upload=Uploads()))
+            self.assertIsNone(cp.start(FakeRedis(), bucket, mock.Mock(), upload=Uploads(), holds=lambda: True))
+        self.assertIsNone(cp.start(FakeRedis(), "sfdc24-canvas", mock.Mock(), upload=Uploads()),
+                          "without a way to ask about the lease, nothing starts")
+
+    def test_start_hands_the_lease_to_the_publisher(self):
+        import threading
+        conn, up, asked = FakeRedis(), Uploads(), threading.Event()
+        put(conn, "grok", "1", item())
+        cp.open_window(conn, "demo", "30", "grok", datetime.datetime.now(datetime.timezone.utc), "sfdc24-canvas")
+
+        def holds():
+            asked.set()
+            return False
+        pub = cp.start(conn, "sfdc24-canvas", mock.Mock(), upload=up, holds=holds)
+        self.assertTrue(asked.wait(10), "the publisher asks about the lease before it writes")
+        pub.stop.set()
+        pub.thread.join(timeout=10)
+        self.assertEqual([], up.calls)
 
     def test_start_runs_a_thread_that_stops(self):
-        pub = cp.start(FakeRedis(), "sfdc24-canvas", mock.Mock(), upload=Uploads())
+        pub = cp.start(FakeRedis(), "sfdc24-canvas", mock.Mock(), upload=Uploads(), holds=lambda: True)
         pub.stop.set()
         pub.thread.join(timeout=10)
         self.assertFalse(pub.thread.is_alive())
@@ -493,9 +557,11 @@ class LiveWithCanvas(unittest.TestCase):
                 self.stop = mock.Mock(set=lambda: events.append("stop"))
                 self.thread = mock.Mock(join=lambda timeout: events.append("join"))
 
-        def start(conn, bucket, log):
+        def start(conn, bucket, log, holds):
             events.append(("start", bucket))
+            leases.append(holds)
             return Pub() if bucket else None
+        leases = []
 
         with mock.patch.object(sr, "live", side_effect=lambda *a: events.append("live") or 0), \
                 mock.patch.dict(sr.os.environ, {"CANVAS_BUCKET": "sfdc24-canvas"}):
@@ -512,6 +578,16 @@ class LiveWithCanvas(unittest.TestCase):
                 mock.patch.dict(sr.os.environ, {"CANVAS_BUCKET": ""}):
             sr.live_with_canvas(None, {}, "", "me", NOW, 10, 300, start=start)
         self.assertEqual(events, [("start", "")])
+        conn = FakeRedis()
+        with mock.patch.object(sr, "live", side_effect=lambda *a: 0),                 mock.patch.dict(sr.os.environ, {"CANVAS_BUCKET": "sfdc24-canvas"}):
+            sr.live_with_canvas(conn, {}, "", "me", NOW, 10, 300, start=start)
+        holds = leases[-1]
+        conn.set(sr.WORKER_LOCK_KEY, "me")
+        self.assertTrue(holds(), "the lease is this run's")
+        conn.set(sr.WORKER_LOCK_KEY, "bus-requests-other")
+        self.assertFalse(holds(), "another execution took it")
+        conn.delete(sr.WORKER_LOCK_KEY)
+        self.assertFalse(holds(), "nobody holds it")
 
 
 if __name__ == "__main__":
