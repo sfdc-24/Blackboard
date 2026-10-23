@@ -210,7 +210,8 @@ def load_callers(path=None) -> dict:
     file maps NOBODY, so the bridge is not used: stricter, never looser.
 
     A line is a bare principal or {"principal", "for": "fleet-agent"} for a fleet agent, {"principal",
-    "for": "chair", "personas": [...]} for the conference chair, or {"principal", "for": "probe"} for an
+    "for": "chair", "personas": [...]} for the conference chair, optionally with "rooms": [one room],
+    or {"principal", "for": "probe"} for an
     account admitted for the probe only, which the service refuses on /op and which is therefore NOT
     returned here: this client does not try the bridge with it. Read by the SAME rule as the service
     (cloud/redis-tool-bridge/op.py, load_callers): a line the service would not serve, this does not map
@@ -228,11 +229,19 @@ def load_callers(path=None) -> dict:
             who = line
         elif isinstance(line, dict) and set(line) == {"principal", "for"} and line["for"] == "fleet-agent":
             who = line["principal"]
-        elif isinstance(line, dict) and set(line) == {"principal", "for", "personas"} and line["for"] == "chair":
+        elif isinstance(line, dict) and line.get("for") == "chair" and set(line) in (
+                {"principal", "for", "personas"}, {"principal", "for", "personas", "rooms"}):
             who, named = line["principal"], line["personas"]
             if not isinstance(named, list) or not 1 <= len(named) <= 4 or len(set(map(str, named))) != len(named) \
                     or not all(isinstance(name, str) and re.fullmatch(r"[a-z][a-z0-9-]{1,31}", name) for name in named):
                 continue
+            # The same room rule as op.py: one room, the publisher's grammar. A bad list maps nobody.
+            if "rooms" in line:
+                named_rooms = line["rooms"]
+                if not isinstance(named_rooms, list) or len(named_rooms) != 1 \
+                        or not isinstance(named_rooms[0], str) \
+                        or not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,39}", named_rooms[0]):
+                    continue
         else:
             continue                    # a probe-only account among them: the service refuses it on /op
         if not isinstance(who, str):

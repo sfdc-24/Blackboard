@@ -11,8 +11,11 @@
       "for": "chair",
       "personas": [
         "claude"
+      ],
+      "rooms": [
+        "workshop"
       ]
     }
   },
-  "pilot": "THE PILOT (conference docs/PERSONA-WRITE-CONFIRMATION-A1.md, section 12): the chair is the ONLY /op caller, for get and set of conf:persona:<day>:<persona> for the personas listed. Aya's runtime account keeps what it had before /op existed: the probe. THE BRIDGE TRUSTS THE CHAIR'S IDENTITY AND DOES NOT ENFORCE THE OWNER'S CONFIRMATION; that is checked in the chair alone. Putting a fleet agent on /op, or another persona on the chair's list, is its own reviewed decision. THE CANVAS (the owner, directly, 2026-10-20): the chair may also hset its own slot conf:canvas:<room>:chair, one text or diagram item of at most 512 bytes with no link, at most 20 posts an hour (op.py, canvas_refusal)."
+  "pilot": "THE PILOT (conference docs/PERSONA-WRITE-CONFIRMATION-A1.md, section 12): the chair is the ONLY /op caller, for get and set of conf:persona:<day>:<persona> for the personas listed. Aya's runtime account keeps what it had before /op existed: the probe. THE BRIDGE TRUSTS THE CHAIR'S IDENTITY AND DOES NOT ENFORCE THE OWNER'S CONFIRMATION; that is checked in the chair alone. Putting a fleet agent on /op, or another persona on the chair's list, is its own reviewed decision. THE CANVAS (the owner, directly, 2026-10-20): the chair may also hset its own slot conf:canvas:<room>:chair, one text or diagram item of at most 512 bytes with no link, at most 20 posts an hour (op.py, canvas_refusal). The owner named the conference room Workshop (Abdus, 2026-10-23); rooms lists the only room, workshop."
 }

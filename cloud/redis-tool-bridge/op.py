@@ -92,9 +92,10 @@ THE BODY
     slot only, text and diagrams only, no images or links, max 20 posts an hour, stops on 'Hold on, team')";
     board row CLAUDE-MOBILE-OWNER-CHAIR-CANVAS-20261020T2252Z). One more thing the chair may do, and only this:
         the op            hset, as sent.
-        the key           conf:canvas:<room>:chair, its own slot of a room's canvas (Blackboard
-                          scripts/canvas_publish.py publishes the public items of every slot). The author it
-                          states is "chair"; no persona's name serves here.
+        the key           conf:canvas:<room>:chair, its own slot. <room> is one named on the chair's
+                          line of callers.json. The owner named the conference room Workshop, so the line
+                          names workshop and no other (Abdus, 2026-10-23). The author it states is "chair";
+                          no persona's name serves here.
         the value         one canvas item, at most CANVAS_VALUE_BYTES: a JSON object of the canvas's own
                           members, type note or mermaid, public true, and nothing in it that is a link (canvas_refusal):
                           a scheme, a Markdown link or image, or the same after percent-decoding, HTML entities and
@@ -149,6 +150,7 @@ PURPOSES = (FLEET, CHAIR, PROBE)
 CHAIR_OPS = ("get", "set")
 CHAIR_WRITES_PER_HOUR = 20              # in Redis for 3,600s from the first count, and in memory for the last hour
 MAX_PERSONAS = 4                        # as the chair's own cast
+MAX_ROOMS = 1                           # the owner named one conference room
 # The one kind of key the chair touches: a persona's own, for one day. Its day, and the author it states.
 _PERSONA = re.compile(r"[a-z][a-z0-9-]{1,31}")
 _PERSONA_KEY = re.compile(r"conf:persona:([0-9]{8}):([a-z][a-z0-9-]{1,31})")
@@ -162,6 +164,7 @@ CANVAS_STATUSES = ("claimed", "working", "review", "done")
 CANVAS_MEMBERS = ("v", "type", "title", "body", "status", "version", "public", "ts")
 CANVAS_REQUIRED = ("v", "type", "title", "body", "status", "version", "public")
 _CANVAS_KEY = re.compile(r"conf:canvas:([a-z0-9][a-z0-9-]{1,39}):chair")
+_ROOM = re.compile(r"[a-z0-9][a-z0-9-]{1,39}")   # the same room grammar as the publisher
 _CANVAS_ITEM = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,47}")
 # A scheme, a bare www. host, Mermaid's click and href, or a Markdown link or image with no scheme.
 _LINKISH = re.compile(
@@ -185,7 +188,10 @@ def _lines(path=None) -> dict:
                                                                 probe only, which /op refuses
         {"principal": ..., "for": "chair", "personas": [...]}   the conference chair, and the personas it may
                                                                 name: one to MAX_PERSONAS names, each once
-    Nothing rides in on an extra member, and a list of personas on a line that is not the chair's is one."""
+        that line plus "rooms": [...]                          the rooms whose canvas it may post to: one to
+                                                                MAX_ROOMS names, each a room, each once
+    Nothing rides in on an extra member, and a list of personas on a line that is not the chair's is one.
+    A rooms list of the wrong shape maps nobody, the same as a personas list of the wrong shape."""
     try:
         with open(path or CALLERS_FILE, encoding="utf-8") as fh:
             data = json.load(fh)
@@ -196,24 +202,32 @@ def _lines(path=None) -> dict:
         return {}
     out = {}
     for email, line in callers.items():
-        personas = ()
+        personas, rooms = (), ()
         if isinstance(line, str):
             who, purpose = line, FLEET
         elif isinstance(line, dict) and set(line) == {"principal", "for"} and line["for"] in (FLEET, PROBE):
             who, purpose = line["principal"], line["for"]
-        elif isinstance(line, dict) and set(line) == {"principal", "for", "personas"} and line["for"] == CHAIR:
+        elif isinstance(line, dict) and line.get("for") == CHAIR and set(line) in (
+                {"principal", "for", "personas"}, {"principal", "for", "personas", "rooms"}):
             who, purpose, named = line["principal"], CHAIR, line["personas"]
             if not isinstance(named, list) or not 1 <= len(named) <= MAX_PERSONAS or len(set(map(str, named))) != len(named) \
                     or not all(isinstance(name, str) and _PERSONA.fullmatch(name) for name in named):
                 continue
             personas = tuple(named)
+            if "rooms" in line:
+                named_rooms = line["rooms"]
+                if not isinstance(named_rooms, list) or not 1 <= len(named_rooms) <= MAX_ROOMS \
+                        or len(set(map(str, named_rooms))) != len(named_rooms) \
+                        or not all(isinstance(room, str) and _ROOM.fullmatch(room) for room in named_rooms):
+                    continue
+                rooms = tuple(named_rooms)
         else:
             continue
         if not isinstance(who, str):
             continue
         email, who = str(email).strip().lower(), who.strip().lower()
         if email and who:
-            out[email] = (who, purpose, personas)
+            out[email] = (who, purpose, personas, rooms)
     return out
 
 
@@ -221,17 +235,22 @@ def load_callers(path=None) -> dict:
     """{verified email: principal} for the callers that may use /op, lower-cased. An account admitted for the
     probe only is NOT here: it acts as nobody. A missing or malformed file maps NOBODY: the same direction as
     redis_gov.load_acl, where an absent rule makes access stricter, never looser."""
-    return {email: who for email, (who, purpose, _) in _lines(path).items() if purpose != PROBE}
+    return {email: who for email, (who, purpose, _, _) in _lines(path).items() if purpose != PROBE}
 
 
 def load_purposes(path=None) -> dict:
     """{verified email: what that caller is for}, every line. The same file, the same strictness."""
-    return {email: purpose for email, (_, purpose, _) in _lines(path).items()}
+    return {email: purpose for email, (_, purpose, _, _) in _lines(path).items()}
 
 
 def load_personas(path=None) -> dict:
     """{the chair's verified email: the personas it may name}."""
-    return {email: personas for email, (_, purpose, personas) in _lines(path).items() if purpose == CHAIR}
+    return {email: personas for email, (_, purpose, personas, _) in _lines(path).items() if purpose == CHAIR}
+
+
+def load_rooms(path=None) -> dict:
+    """{the chair's verified email: the rooms it may post to}. A chair with no rooms list is absent."""
+    return {email: rooms for email, (_, purpose, _, rooms) in _lines(path).items() if purpose == CHAIR and rooms}
 
 
 def days(now: float) -> tuple:
@@ -352,7 +371,7 @@ def parse(raw: bytes) -> tuple:
 
 
 def handle(caller: str, raw: bytes, connect, log, callers=None, gov=None, acl=None, purposes=None,
-           personas=None, now=None, spent=None, canvas_spent=None) -> tuple:
+           personas=None, rooms=None, now=None, spent=None, canvas_spent=None) -> tuple:
     """(status, body) for one /op request from an ALREADY VERIFIED caller.
 
     caller   the email main.verify_caller returned: verified, and on BRIDGE_CALLERS.
@@ -390,7 +409,12 @@ def handle(caller: str, raw: bytes, connect, log, callers=None, gov=None, acl=No
             log("op by %s: the chair did not say which persona and which request" % caller)
             return 400, {"error": "bad request", "executed": False}
         # The op and the key as they were SENT, not as redis_gov would tidy them: the chair sends them exact.
-        canvas = _CANVAS_KEY.fullmatch(request["key"]) is not None
+        canvas_key = _CANVAS_KEY.fullmatch(request["key"])
+        canvas = canvas_key is not None and canvas_key.group(1) in (
+            load_rooms() if rooms is None else rooms).get(email, ())
+        if canvas_key is not None and not canvas:
+            log("op by %s: not a canvas post the chair may make (not its room)" % caller)
+            return 400, {"error": "bad request", "executed": False}
         if canvas:
             why = canvas_refusal(request, author)
             if why:

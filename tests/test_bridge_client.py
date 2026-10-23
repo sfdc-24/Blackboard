@@ -512,10 +512,14 @@ class Outcomes(unittest.TestCase):
             "break@x": dict(chair, personas=["claude\n"]), "nul2@x": dict(chair, personas=None),
             "fleetp@x": {"principal": "grok", "for": "fleet-agent", "personas": ["claude"]},
             "four@x": dict(chair, personas=["aa", "bb", "cc", "dd"]),
+            "rooms@x": dict(chair, personas=["claude"], rooms=["workshop"]),
+            "rooms2@x": dict(chair, personas=["claude"], rooms=["workshop", "other"]),
+            "roomsbad@x": dict(chair, personas=["claude"], rooms=["Workshop"]),
         }
         path = os.path.join(self.tmp.name, "lines.json")
         pathlib.Path(path).write_text(json.dumps({"callers": lines}), encoding="utf-8")
-        self.assertEqual({"old@x": "grok", "agent@x": "grok", "chair@x": "conference-chair", "four@x": "conference-chair"},
+        self.assertEqual({"old@x": "grok", "agent@x": "grok", "chair@x": "conference-chair", "four@x": "conference-chair",
+                          "rooms@x": "conference-chair"},
                          bc.load_callers(path))
         self.assertEqual(bridge_op.load_callers(path), bc.load_callers(path))
         self.assertEqual(bridge_op.load_callers(), bc.load_callers(), "and the committed file")

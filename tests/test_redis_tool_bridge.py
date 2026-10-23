@@ -912,6 +912,8 @@ class TheOpEndpoint(unittest.TestCase):
         self.assertEqual({AYA: bridge_op.PROBE, CHAIR: bridge_op.CHAIR}, purposes, "every line says what it is for")
         self.assertEqual({CHAIR: "conference-chair"}, callers, "an account admitted for the probe acts as nobody")
         self.assertEqual({CHAIR: ("claude",)}, bridge_op.load_personas())
+        self.assertEqual({CHAIR: ("workshop",)}, bridge_op.load_rooms(), "the owner named one room")
+        self.assertEqual(1, bridge_op.MAX_ROOMS)
         self.assertEqual((86400, 512), (redis_gov.ttl_for(acl, "conf:persona:20261014:claude"),
                                         redis_gov.value_cap(acl, "conf:persona:20261014:claude")),
                          "a persona's key lives a day and holds 512 bytes, by the access list")
@@ -979,6 +981,10 @@ class TheOpEndpoint(unittest.TestCase):
             "upper@x": dict(chair, personas=["Claude"]), "one@x": dict(chair, personas=["c"]),
             "notstr@x": dict(chair, personas=[7]), "star@x": dict(chair, personas=["*"]),
             "break@x": dict(chair, personas=["claude\n"]), "nul2@x": dict(chair, personas=None),
+            "rooms@x": dict(chair, personas=["claude"], rooms=["workshop"]),
+            "rooms2@x": dict(chair, personas=["claude"], rooms=["workshop", "other"]),
+            "roomsbad@x": dict(chair, personas=["claude"], rooms=["Workshop"]),
+            "roomsempty@x": dict(chair, personas=["claude"], rooms=[]),
             # and a list of personas makes nobody else the chair
             "fleetp@x": {"principal": "grok", "for": "fleet-agent", "personas": ["claude"]},
             "probep@x": {"principal": "grok", "for": "probe", "personas": ["claude"]},
@@ -987,10 +993,13 @@ class TheOpEndpoint(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "callers.json")
             pathlib.Path(path).write_text(json.dumps({"callers": lines}), encoding="utf-8")
-            self.assertEqual({"old@x": "grok", "agent@x": "grok", "chair@x": "conference-chair"}, bridge_op.load_callers(path))
-            self.assertEqual({"old@x": "fleet-agent", "agent@x": "fleet-agent", "chair@x": "chair", "probe@x": "probe"},
+            self.assertEqual({"old@x": "grok", "agent@x": "grok", "chair@x": "conference-chair",
+                              "rooms@x": "conference-chair"}, bridge_op.load_callers(path))
+            self.assertEqual({"old@x": "fleet-agent", "agent@x": "fleet-agent", "chair@x": "chair", "probe@x": "probe",
+                              "rooms@x": "chair"},
                              bridge_op.load_purposes(path))
-            self.assertEqual({"chair@x": ("claude", "grok")}, bridge_op.load_personas(path))
+            self.assertEqual({"chair@x": ("claude", "grok"), "rooms@x": ("claude",)}, bridge_op.load_personas(path))
+            self.assertEqual({"rooms@x": ("workshop",)}, bridge_op.load_rooms(path))
             four = os.path.join(tmp, "four.json")
             pathlib.Path(four).write_text(json.dumps({"callers": {"c@x": dict(chair, personas=["aa", "bb", "cc", "dd"])}}),
                                           encoding="utf-8")
@@ -1163,7 +1172,7 @@ class TheOpEndpoint(unittest.TestCase):
 
     # --- the chair's canvas slot (the owner, directly, 2026-10-20: its own slot only, text and diagrams only,
     # no images or links, at most 20 posts an hour; CLAUDE-MOBILE-OWNER-CHAIR-CANVAS-20261020T2252Z)
-    CANVAS = "conf:canvas:demo:chair"
+    CANVAS = "conf:canvas:workshop:chair"
     DROP = object()
 
     def item(self, **over):
@@ -1191,9 +1200,10 @@ class TheOpEndpoint(unittest.TestCase):
         self.assertEqual(400, code, "the value travels base64, as every chair write does")
 
     def test_only_its_own_slot_with_hset_and_as_the_chair(self):
-        for body in (self.post_item(key="conf:canvas:demo:grok"), self.post_item(key="conf:canvas:demo:chair:x"),
-                     self.post_item(key="conf:canvas:Demo:chair"), self.post_item(key="conf:canvas:demo"),
-                     self.post_item(key="conf:canvas:demo:chairs"), self.post_item(key="conf:canvas:d:chair"),
+        for body in (self.post_item(key="conf:canvas:demo:chair"), self.post_item(key="conf:canvas:other:chair"),
+                     self.post_item(key="conf:canvas:workshop:grok"), self.post_item(key="conf:canvas:workshop:chair:x"),
+                     self.post_item(key="conf:canvas:Workshop:chair"), self.post_item(key="conf:canvas:workshop"),
+                     self.post_item(key="conf:canvas:workshop:chairs"), self.post_item(key="conf:canvas:d:chair"),
                      self.post_item(key=" " + self.CANVAS), self.post_item(key="v1:" + self.CANVAS),
                      self.post_item(op="set"), self.post_item(op="hput"), self.post_item(op="HSET"),
                      self.post_item(op="xadd"), {"op": "hgetall", "key": self.CANVAS, "author": "chair"},
@@ -1337,7 +1347,8 @@ class TheOpEndpoint(unittest.TestCase):
     def test_the_committed_files_open_the_chair_s_slot_and_no_other(self):
         code, out = self.chair(self.post_item(), committed=True)
         self.assertEqual((200, "conference-chair"), (code, out["principal"]))
-        for body in (self.post_item(key="conf:canvas:demo:grok"), self.post_item(key="conf:canvas:demo:chair-2")):
+        for body in (self.post_item(key="conf:canvas:demo:chair"), self.post_item(key="conf:canvas:workshop:grok"),
+                     self.post_item(key="conf:canvas:workshop:chair-2")):
             code, out = self.chair(body, committed=True)
             self.assertEqual((400, {"error": "bad request", "executed": False}), (code, self.said(out)), body)
 
