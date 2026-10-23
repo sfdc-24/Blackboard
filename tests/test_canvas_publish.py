@@ -117,7 +117,10 @@ class ChairSlot(unittest.TestCase):
                      {"type": "wireframe", "body": "<p>x</p>"}, {"type": "datamodel"},
                      {"body": "see https://x.example"}, {"title": "www.example.com"},
                      {"body": "flowchart LR\n  A-->B\n  click A go"}, {"body": "a HREF b"},
-                     {"body": "JavaScript:alert(1)"}, {"body": "b" * 500}):
+                     {"body": "JavaScript:alert(1)"}, {"body": "b" * 500},
+                     {"body": "see [the plan](notes.md)"}, {"body": "see [the plan](/rooms/demo)"},
+                     {"body": "![diagram](pic.png)"}, {"title": "[x](y)"},
+                     {"body": "[x](../secret)"}):
             self.assertIsNone(cp.clean_item("chair", "idea-1", item(**over)), over)
             if "type" not in over:              # as a note: a link is text there; a Mermaid body is checked for all
                 self.assertIsNone(cp.clean_item("chair", "idea-1", item(**dict(over, type="note"))), over)
@@ -281,7 +284,9 @@ class Uploads:
     def __init__(self, fail=0):
         self.calls, self.fail = [], fail
 
-    def __call__(self, bucket, name, data):
+    def __call__(self, bucket, name, data, allow=None):
+        if allow is not None and not allow():
+            return
         if self.fail:
             self.fail -= 1
             raise OSError("boom: Bearer abc")
@@ -381,6 +386,76 @@ class Publish(unittest.TestCase):
         self.pub.stop.set()
         self.assertEqual((self.pub.tick(), self.up.calls), ([], []))
 
+    def _after_precheck(self, mutate):
+        """`mutate` runs once may_write has said yes, which is the last check before the snapshot is sent."""
+        real = self.pub.may_write
+
+        def wrapped(room):
+            ok = real(room)
+            if ok and not getattr(self, "_mutated", False):
+                self._mutated = True
+                mutate()
+            return ok
+        self.pub.may_write = wrapped
+
+    def test_a_stop_after_the_last_precheck_does_not_commit(self):
+        cp.open_window(self.conn, "demo", "30", "grok", NOW, "sfdc24-canvas")
+        self._after_precheck(lambda: self.pub.stop.set())
+        self.assertEqual((self.pub.tick(), self.up.calls), ([], []))
+
+    def test_a_deleted_window_after_the_last_precheck_does_not_commit(self):
+        cp.open_window(self.conn, "demo", "30", "grok", NOW, "sfdc24-canvas")
+        self._after_precheck(lambda: self.conn.delete(cp.window_key("demo")))
+        self.assertEqual((self.pub.tick(), self.up.calls), ([], []))
+
+    def test_a_lost_lease_after_the_last_precheck_does_not_commit(self):
+        cp.open_window(self.conn, "demo", "30", "grok", NOW, "sfdc24-canvas")
+        self._after_precheck(lambda: self.lease.update(held=False))
+        self.assertEqual((self.pub.tick(), self.up.calls), ([], []))
+
+    def test_an_expiry_after_the_last_precheck_does_not_commit(self):
+        cp.open_window(self.conn, "demo", "30", "grok", NOW, "sfdc24-canvas")
+        self._after_precheck(lambda: self.t.update(now=NOW + datetime.timedelta(hours=3)))
+        self.assertEqual((self.pub.tick(), self.up.calls), ([], []))
+
+    def test_an_entered_upload_does_not_commit_after_a_stop(self):
+        cp.open_window(self.conn, "demo", "30", "grok", NOW, "sfdc24-canvas")
+        sent = []
+
+        def upload(bucket, name, data, allow=None):
+            self.pub.stop.set()
+            if allow is not None and not allow():
+                return
+            sent.append(data)
+        self.pub.upload = upload
+        self.assertEqual((self.pub.tick(), sent), ([], []))
+
+    def test_a_stop_and_reopen_does_not_send_the_old_snapshot(self):
+        cp.open_window(self.conn, "demo", "30", "grok", NOW, "sfdc24-canvas")
+
+        def reopen():
+            cp.open_window(self.conn, "demo", "0", "grok", NOW, "sfdc24-canvas")
+            put(self.conn, "grok", "1", item(type="note", version=2, body="FRESH"))
+            cp.open_window(self.conn, "demo", "30", "grok", NOW, "sfdc24-canvas")
+        self._after_precheck(reopen)
+        self.assertEqual(self.pub.tick(), ["demo"])
+        self.assertEqual(["FRESH"], [i["body"] for i in self.up.calls[-1][2]["items"]])
+        self.assertNotIn("flowchart", json.dumps(self.up.calls[0][2]))
+
+    def test_a_privacy_revocation_after_the_snapshot_is_not_what_gets_sent(self):
+        cp.open_window(self.conn, "demo", "30", "grok", NOW, "sfdc24-canvas")
+        real = self.conn.hgetall
+
+        def revoke_after_read(key):
+            found = real(key)
+            put(self.conn, "grok", "1", item(public=False, body="PRIVATE-REVOKED"))
+            return found
+        self.conn.hgetall = revoke_after_read
+        self.pub.tick()
+        blob = json.dumps([doc for _, _, doc in self.up.calls])
+        self.assertNotIn("PRIVATE-REVOKED", blob)
+        self.assertNotIn("flowchart", blob)
+
 
 class Upload(unittest.TestCase):
     def test_one_multipart_call_sets_cache_control_and_carries_the_token(self):
@@ -409,6 +484,26 @@ class Upload(unittest.TestCase):
         self.assertIn('"cacheControl": "public, max-age=5"', body)
         self.assertIn('"name": "rooms/demo.json"', body)
         self.assertIn('{"a":1}', body)
+
+    def test_an_entered_upload_is_not_sent_once_the_fence_fails(self):
+        seen = []
+
+        class Resp:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def opener(req, timeout):
+            seen.append(req)
+            return Resp()
+
+        with self.assertRaises(cp.Aborted):
+            cp.gcs_upload("sfdc24-canvas", "rooms/demo.json", b"{}", lambda: "tok", opener, allow=lambda: False)
+        self.assertEqual(seen, [])
 
     def test_the_token_is_kept_until_a_minute_before_it_expires(self):
         calls, clock = [], {"t": 1000.0}

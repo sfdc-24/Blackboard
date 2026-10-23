@@ -75,7 +75,11 @@ AGENTS = ("grok", "gemini", "claude-code-cli", "chatgpt-codex-desktop", "claude-
 CHAIR = "chair"
 CHAIR_TYPES = ("note", "mermaid")
 CHAIR_BYTES = 512
-_LINKISH = re.compile(r"(?i)://|\bwww\.|\b(?:javascript|data|mailto|vbscript):|\bhref\b|\bclick\s")
+# A relative Markdown link or image (`[label](notes.md)`, `![alt](pic.png)`) is a link with no scheme.
+_LINKISH = re.compile(
+    r"(?i)://|\bwww\.|\b(?:javascript|data|mailto|vbscript):|\bhref\b|\bclick\s"
+    r"|!\[[^\]\n]*\]"
+    r"|\[[^\]\n]*\]\s*\(")
 # MERMAID (mermaid_ok). The diagram kinds a body may open with: sequenceDiagram (KaTeX labels), architecture
 # (icon text), gantt and xychart (render loops) are left out on purpose, after their advisories.
 MERMAID_KINDS = ("flowchart", "graph", "erDiagram", "classDiagram", "stateDiagram", "stateDiagram-v2",
@@ -113,6 +117,10 @@ _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 class Refused(Exception):
     """A canvas-publish request this worker will not act on. The message is published, so it is ours."""
+
+
+class Aborted(Exception):
+    """The upload's fence failed. Nothing new is public."""
 
 
 def stamp(moment) -> str:
@@ -239,13 +247,31 @@ def open_window(conn, room, minutes, by: str, now, bucket: str) -> dict:
     if not BUCKET.fullmatch(bucket or ""):
         raise Refused("no public canvas bucket is configured on this worker (CANVAS_BUCKET); nothing opened")
     until = now + datetime.timedelta(minutes=count)
-    value = json.dumps({"room": room, "until": stamp(until), "by": by}, sort_keys=True)
+    # `gen` makes a stop and a reopen a different window even when `until` is unchanged, so a snapshot
+    # taken under the old window cannot be written into the new one.
+    value = json.dumps({"by": by, "gen": secrets.token_hex(8), "room": room, "until": stamp(until)},
+                       sort_keys=True)
     if not conn.set(window_key(room), value, nx=True, ex=count * 60):
         held = read_window(conn, room)
         raise Refused("room %s is already publishing until %s; send minutes=0 to stop it first"
                       % (room, held["until"] if held else "an unreadable time"))
     return {"ok": True, "room": room, "until": stamp(until), "minutes": count,
             "file": "gs://%s/rooms/%s.json" % (bucket, room)}
+
+
+def _until_of(raw, now):
+    """The window's `until` if `raw` is a window still open at `now`, else None."""
+    try:
+        held = json.loads(raw) if raw else None
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(held, dict) or not isinstance(held.get("until"), str):
+        return None
+    try:
+        until = datetime.datetime.fromisoformat(held["until"].replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return until if until > now else None
 
 
 def read_window(conn, room):
@@ -311,13 +337,18 @@ class Token:
         return self.value
 
 
-def gcs_upload(bucket: str, name: str, data: bytes, token, opener=urllib.request.urlopen) -> int:
-    """One multipart upload, so the object's Cache-Control is set in the same call as its bytes."""
+def gcs_upload(bucket: str, name: str, data: bytes, token, opener=urllib.request.urlopen, allow=None) -> int:
+    """One multipart upload, so the object's Cache-Control is set in the same call as its bytes.
+
+    `allow`, when given, is asked again after the body is built and before the request is sent. An upload
+    that has been entered still sends nothing once the fence has failed."""
     boundary = "canvas" + secrets.token_hex(8)
     meta = json.dumps({"name": name, "contentType": "application/json", "cacheControl": CACHE_CONTROL})
     body = (("--%s\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n%s\r\n--%s\r\n"
              "Content-Type: application/json\r\n\r\n") % (boundary, meta, boundary)).encode("utf-8")
     body += data + ("\r\n--%s--\r\n" % boundary).encode("utf-8")
+    if allow is not None and not allow():
+        raise Aborted()
     url = ("https://storage.googleapis.com/upload/storage/v1/b/%s/o?uploadType=multipart"
            % urllib.parse.quote(bucket, safe=""))
     req = urllib.request.Request(url, data=body, method="POST", headers={
@@ -332,9 +363,9 @@ class Publisher:
     """Publishes every open window. tick() is one round; run() is the loop the live worker starts.
 
     `holds()` says whether this worker still holds gov:worker:lock. NOTHING IS WRITTEN AFTER THE WINDOW OR THE
-    LEASE ENDS (Aya on c633373: publication after expiry, after a stop, and after the lease was lost). The
-    window and the lease are read again immediately before each upload, not only when the round began: a round
-    can take seconds per room, and a stop, an expiry or another worker's takeover can land inside it."""
+    LEASE ENDS, and a snapshot is not sent once its window or its bytes have changed (Aya on ed411d2: a captured
+    upload must not commit after a stop, a deletion, a lost lease or an expiry, and a reopen or a privacy
+    change must not publish the old bytes). The send asks again after it has been entered."""
 
     def __init__(self, conn, bucket, upload, log, clock=None, holds=None):
         self.conn, self.bucket, self.upload, self.log = conn, bucket, upload, log
@@ -358,27 +389,98 @@ class Publisher:
             return False
         return until is not None and until > self.clock()
 
+    def _window_raw(self, room) -> str:
+        try:
+            return _text(self.conn.get(window_key(room)) or "") or ""
+        except Exception as error:                                       # noqa: BLE001
+            self.log.warning("canvas %s: the window or the lease could not be read (%s)", room, type(error).__name__)
+            return ""
+
+    def _unchanged(self, room, raw: str, digest: str, opened) -> bool:
+        """The captured window and the captured bytes are still what Redis holds."""
+        if not self.may_write(room) or self._window_raw(room) != raw:
+            return False
+        try:
+            fresh = snapshot(self.conn, room, self.clock(), opened)
+        except Exception as error:                                       # noqa: BLE001
+            self.log.warning("canvas %s: the window or the lease could not be read (%s)", room, type(error).__name__)
+            return False
+        return content_digest(fresh) == digest
+
+    def _dispatch(self, name: str, data: bytes, allow) -> None:
+        """Send `data` only while `allow` holds, including once the upload has been entered."""
+        if not allow():
+            raise Aborted()
+        try:
+            self.upload(self.bucket, name, data, allow)
+        except TypeError as error:
+            if "argument" not in str(error).lower() and "positional" not in str(error).lower():
+                raise
+            if not allow():
+                raise Aborted()
+            self.upload(self.bucket, name, data)
+        if not allow():
+            raise Aborted()
+
+    def _publish(self, room) -> bool:
+        """One room. A snapshot is sent only with the window and the bytes it was built from.
+
+        Checked again inside the send, so a stop, a deletion, a lost lease, an expiry, a reopen or a
+        privacy change after the last precheck does not commit the captured upload. When the bytes
+        changed and the window is still open, the fresh bytes are what get sent."""
+        now = self.clock()
+        prior_doc = None
+        try:
+            raw = self._window_raw(room)
+            opened = _until_of(raw, now)
+            if opened is None:
+                return False
+            prior_doc = snapshot(self.conn, room, self.clock(), opened)
+        except Exception as error:                                       # noqa: BLE001
+            self.log.warning("canvas %s: the window or the lease could not be read (%s)", room, type(error).__name__)
+            return False
+        digest = content_digest(prior_doc)
+        prior = self.last.get(room)
+        if (prior and prior[0] == digest and (self.clock() - prior[1]).total_seconds() < KEEPALIVE_SECONDS
+                and self._unchanged(room, raw, digest, opened)):
+            return False
+        for _ in range(2):
+            raw = self._window_raw(room)
+            opened = _until_of(raw, self.clock())
+            if opened is None or not self.may_write(room):
+                return False
+            try:
+                doc = snapshot(self.conn, room, self.clock(), opened)
+            except Exception as error:                                   # noqa: BLE001
+                self.log.warning("canvas %s: the window or the lease could not be read (%s)", room, type(error).__name__)
+                return False
+            digest = content_digest(doc)
+            data = json.dumps(doc, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+            def allow(raw=raw, digest=digest, opened=opened):
+                return self._unchanged(room, raw, digest, opened)
+
+            if not allow():
+                continue
+            try:
+                self._dispatch("rooms/%s.json" % room, data, allow)
+            except Aborted:
+                continue
+            except Exception as error:                                   # noqa: BLE001
+                # The TYPE only: an HTTP error's text can quote the request. Retried on the next tick.
+                self.log.warning("canvas %s: upload failed (%s); retried next tick", room, type(error).__name__)
+                return False
+            self.last[room] = (digest, self.clock())
+            return True
+        return False
+
     def tick(self) -> list:
         """Write the rooms whose content changed, or whose keepalive is due. Returns the rooms written."""
         now = self.clock()
         written = []
-        for room, until in active_windows(self.conn, now):
-            doc = snapshot(self.conn, room, now, until)
-            digest = content_digest(doc)
-            prior = self.last.get(room)
-            if prior and prior[0] == digest and (now - prior[1]).total_seconds() < KEEPALIVE_SECONDS:
-                continue
-            if not self.may_write(room):
-                continue
-            data = json.dumps(doc, sort_keys=True, separators=(",", ":")).encode("utf-8")
-            try:
-                self.upload(self.bucket, "rooms/%s.json" % room, data)
-            except Exception as error:                                   # noqa: BLE001
-                # The TYPE only: an HTTP error's text can quote the request. Retried on the next tick.
-                self.log.warning("canvas %s: upload failed (%s); retried next tick", room, type(error).__name__)
-                continue
-            self.last[room] = (digest, now)
-            written.append(room)
+        for room, _until in active_windows(self.conn, now):
+            if self._publish(room):
+                written.append(room)
         return written
 
     def run(self, interval=PUBLISH_SECONDS):
@@ -402,7 +504,7 @@ def start(conn, bucket, log, upload=None, holds=None):
         return None
     if upload is None:
         token = Token()
-        upload = lambda b, n, d: gcs_upload(b, n, d, token)                # noqa: E731
+        upload = lambda b, n, d, allow=None: gcs_upload(b, n, d, token, allow=allow)  # noqa: E731
     publisher = Publisher(conn, bucket, upload, log, holds=holds)
     thread = threading.Thread(target=publisher.run, name="canvas-publish", daemon=True)
     thread.start()
