@@ -1099,7 +1099,7 @@ class TheOpEndpoint(unittest.TestCase):
         write = {"op": "set", "val": self.b64("v"), "enc": "b64"}
         for day, served in (("20261014", True), ("20261013", True), ("20261012", False), ("20261015", False),
                             ("20251014", False), ("00000000", False)):
-            body = dict(write, key="conf:persona:%s:claude" % day)
+            body = dict(write, key="conf:persona:%s:claude" % day, request="day-%s" % day)
             if served:
                 self.assertEqual(200, self.chair(body)[0], day)
                 self.assertEqual(200, self.chair({"op": "get", "key": body["key"]})[0], day)
@@ -1109,7 +1109,7 @@ class TheOpEndpoint(unittest.TestCase):
             bridge_op._SPENT.clear()
         # a write proposed a minute before midnight and confirmed a minute after it keeps its key
         self.now = NOW + 8 * 3600 + 60                                       # 2026-10-15 00:01Z
-        self.assertEqual(200, self.chair(dict(write, key=self.KEY))[0])
+        self.assertEqual(200, self.chair(dict(write, key=self.KEY, request="midnight-1"))[0])
         self.now = NOW + 32 * 3600 + 60                                      # 2026-10-16 00:01Z
         self.refused_at_the_door(dict(write, key=self.KEY))
 
@@ -1120,19 +1120,19 @@ class TheOpEndpoint(unittest.TestCase):
         conn = gov_tests.FakeRedis()
         for n in range(20):
             self.now = NOW + n
-            self.assertEqual(200, self.chair(dict(write, val=self.b64("note %d" % n)), conn=conn)[0], n)
+            self.assertEqual(200, self.chair(dict(write, val=self.b64("note %d" % n), request="w-%d" % n), conn=conn)[0], n)
         self.now = NOW + 20
-        code, out = self.chair(dict(write, val=self.b64("one too many")), conn=conn)
+        code, out = self.chair(dict(write, val=self.b64("one too many"), request="w-too"), conn=conn)
         self.assertEqual((429, {"error": "quota", "executed": False}), (code, self.said(out)))
         self.assertEqual(("note 19", 20), (conn.get(self.KEY), len(conn.audit())), "the write past the ceiling did not run")
         self.assertIn("hourly ceiling of 20 writes", self.log)
         self.assertNotIn("one too many", self.log)
         self.assertEqual(200, self.chair({"op": "get", "key": self.KEY}, conn=conn)[0], "a read is not a write")
         self.now = NOW + 3599
-        self.assertEqual(429, self.chair(write, conn=conn)[0], "the first write is still inside the hour")
+        self.assertEqual(429, self.chair(dict(write, request="w-late"), conn=conn)[0], "the first write is still inside the hour")
         self.now = NOW + 3600
-        self.assertEqual(200, self.chair(write, conn=conn)[0], "an hour after the first write, one more")
-        self.assertEqual(429, self.chair(write, conn=conn)[0], "and only one: the second is 3,599 seconds old")
+        self.assertEqual(200, self.chair(dict(write, request="w-hour"), conn=conn)[0], "an hour after the first write, one more")
+        self.assertEqual(429, self.chair(dict(write, request="w-after"), conn=conn)[0], "and only one: the second is 3,599 seconds old")
 
     def test_what_does_not_run_spends_none_of_the_hour_and_a_fleet_agent_has_no_ceiling_here(self):
         write = {"op": "set", "key": self.KEY, "val": self.b64("v"), "enc": "b64"}
@@ -1216,7 +1216,13 @@ class TheOpEndpoint(unittest.TestCase):
         for link in ("see https://x.example/a", "www.example.com", "flowchart LR\n  A-->B\n  click A call go()",
                      'click A "/x"', "a href b", "javascript:alert(1)", "data:text/html,x", "mailto:a@b.example",
                      "HTTP://X.EXAMPLE", "ftp://x", "WWW.EXAMPLE.COM", "JavaScript:alert(1)", "A HREF b",
-                     "flowchart LR\n  A-->B\n  Click A go"):
+                     "flowchart LR\n  A-->B\n  Click A go",
+                     "see [the plan](notes.md)", "see [the plan](/rooms/demo)", "![diagram](pic.png)",
+                     "[x](../secret)", "http&#58;//evil.example/a", "http%3A%2F%2Fevil.example/a",
+                     "http%253A%252F%252Fevil.example/a",
+                     "flowchart LR\n  A[\"http#3a;#2f;#2f;evil.example\"]-->B",
+                     "flowchart LR\n  A[\"&#58;//evil.example\"]-->B",
+                     "flowchart LR\n  A[\"#60;img src=x#62;\"]-->B"):
             bad_values.append(self.item(body=link))
             if "\n" not in link:
                 bad_values.append(self.item(title=link))
@@ -1226,25 +1232,30 @@ class TheOpEndpoint(unittest.TestCase):
         self.assertEqual([], list(bridge_op._CANVAS_SPENT))
         largest = self.item(body="b" * (512 - len(self.item(body=""))))
         self.assertEqual(512, len(largest.encode("utf-8")))
-        self.assertEqual(200, self.chair(self.post_item(largest))[0], "512 bytes is the most")
+        self.assertEqual(200, self.chair(self.post_item(largest, request="largest"))[0], "512 bytes is the most")
         self.refused_at_the_door(self.post_item(self.item(body="b" * (513 - len(self.item(body=""))))))
-        self.assertEqual(200, self.chair(self.post_item(self.item(type="note", status="done", ts=self.DROP)))[0])
+        self.assertEqual(200, self.chair(self.post_item(self.item(type="note", status="done", ts=self.DROP),
+                                                        request="note-1"))[0])
+        self.assertEqual(200, self.chair(self.post_item(
+            self.item(body="flowchart LR\n  A[Start]-->B[End]\n"), request="nodes"))[0], "a node label is not a link")
+        self.assertEqual(200, self.chair(self.post_item(self.item(type="note", body="100% done\n"),
+                                                        request="percent"))[0], "a bare percent is not an encoding")
 
     def test_the_canvas_has_its_own_ceiling_of_twenty_posts_an_hour(self):
         self.assertEqual(20, bridge_op.CHAIR_CANVAS_PER_HOUR)
         conn = gov_tests.FakeRedis()
         for n in range(20):
             self.now = NOW + n
-            self.assertEqual(200, self.chair(self.post_item(field="idea-%d" % n), conn=conn)[0], n)
+            self.assertEqual(200, self.chair(self.post_item(field="idea-%d" % n, request="c-%d" % n), conn=conn)[0], n)
         self.now = NOW + 20
-        code, out = self.chair(self.post_item(field="idea-20"), conn=conn)
+        code, out = self.chair(self.post_item(field="idea-20", request="c-20"), conn=conn)
         self.assertEqual((429, {"error": "quota", "executed": False}), (code, self.said(out)))
         self.assertIsNone(conn.hget(self.CANVAS, "idea-20"), "the post past the ceiling did not run")
         self.assertIn("hourly ceiling of 20 canvas posts", self.log)
         write = {"op": "set", "key": self.KEY, "val": self.b64("v"), "enc": "b64"}
-        self.assertEqual(200, self.chair(write, conn=conn)[0], "the persona writes keep their own hour")
+        self.assertEqual(200, self.chair(dict(write, request="persona-1"), conn=conn)[0], "the persona writes keep their own hour")
         self.now = NOW + 3600
-        self.assertEqual(200, self.chair(self.post_item(field="idea-21"), conn=conn)[0], "an hour on, one more")
+        self.assertEqual(200, self.chair(self.post_item(field="idea-21", request="c-21"), conn=conn)[0], "an hour on, one more")
 
     def test_the_hour_survives_a_new_instance_because_redis_keeps_it(self):
         """GROK-407FIX-428REV-0225Z: the service scales to zero, and a new instance starts with an empty memory."""
@@ -1252,35 +1263,62 @@ class TheOpEndpoint(unittest.TestCase):
         write = {"op": "set", "key": self.KEY, "val": self.b64("v"), "enc": "b64"}
         for n in range(20):
             self.now = NOW + n
-            self.assertEqual(200, self.chair(self.post_item(field="idea-%d" % n), conn=conn)[0], n)
-            self.assertEqual(200, self.chair(write, conn=conn)[0], n)
-        self.assertEqual(("20", "20"), (conn.get("gov:quota:chair:canvas:2026101416"),
-                                        conn.get("gov:quota:chair:persona:2026101416")))
+            self.assertEqual(200, self.chair(self.post_item(field="idea-%d" % n, request="c-%d" % n), conn=conn)[0], n)
+            self.assertEqual(200, self.chair(dict(write, request="p-%d" % n), conn=conn)[0], n)
+        self.assertEqual(("20", "20"), (conn.get("gov:quota:chair:canvas:n"),
+                                        conn.get("gov:quota:chair:persona:n")))
         for fresh in range(3):                  # a cold start, a second instance, another cold start
             bridge_op._SPENT.clear()
             bridge_op._CANVAS_SPENT.clear()
             self.now = NOW + 1000 + fresh
-            code, out = self.chair(self.post_item(field="late-%d" % fresh), conn=conn)
+            code, out = self.chair(self.post_item(field="late-%d" % fresh, request="late-c-%d" % fresh), conn=conn)
             self.assertEqual((429, {"error": "quota", "executed": False}), (code, self.said(out)), fresh)
             self.assertIsNone(conn.hget(self.CANVAS, "late-%d" % fresh), "nothing past the ceiling is written")
-            self.assertEqual(429, self.chair(dict(write, val=self.b64("late")), conn=conn)[0], fresh)
+            self.assertEqual(429, self.chair(dict(write, val=self.b64("late"), request="late-p-%d" % fresh), conn=conn)[0], fresh)
         self.assertEqual("v", conn.get(self.KEY))
         self.assertEqual(40, len(conn.audit()), "the refused ones never reached the governor")
         bridge_op._SPENT.clear()
         bridge_op._CANVAS_SPENT.clear()
-        self.now = NOW + 3600                   # 17:00Z: a new clock hour
-        self.assertEqual(200, self.chair(self.post_item(field="next-hour"), conn=conn)[0])
-        self.assertEqual(200, self.chair(write, conn=conn)[0])
+        self.now = NOW + 3600                   # 3,600s after the first count: the next window
+        self.assertEqual(200, self.chair(self.post_item(field="next-hour", request="next-c"), conn=conn)[0])
+        self.assertEqual(200, self.chair(dict(write, request="next-p"), conn=conn)[0])
+
+    def test_a_fresh_instance_ten_seconds_into_the_next_clock_hour_does_not_get_another_twenty(self):
+        """20 posts at 16:59:50, then a new instance at 17:00:00, must not commit another 20."""
+        conn = gov_tests.FakeRedis()
+        self.now = NOW + 3590
+        for n in range(20):
+            self.assertEqual(200, self.chair(self.post_item(field="idea-%d" % n, request="edge-%d" % n), conn=conn)[0], n)
+        bridge_op._CANVAS_SPENT.clear()
+        self.now = NOW + 3600
+        code, out = self.chair(self.post_item(field="late", request="edge-late"), conn=conn)
+        self.assertEqual((429, {"error": "quota", "executed": False}), (code, self.said(out)))
+        self.assertIsNone(conn.hget(self.CANVAS, "late"))
+        self.assertEqual("21", conn.get("gov:quota:chair:canvas:n"))
+
+    def test_a_replayed_request_does_not_write_or_charge(self):
+        code, out = self.chair(self.post_item(request="same-id"))
+        self.assertEqual(200, code, out)
+        conn = self.conn
+        spent = list(bridge_op._CANVAS_SPENT)
+        count = conn.get("gov:quota:chair:canvas:n")
+        code, out = self.chair(self.post_item(field="idea-2", request="same-id"), conn=conn)
+        self.assertEqual((409, {"error": "replay", "executed": False}), (code, self.said(out)))
+        self.assertIsNone(conn.hget(self.CANVAS, "idea-2"))
+        self.assertEqual(spent, list(bridge_op._CANVAS_SPENT))
+        self.assertEqual(count, conn.get("gov:quota:chair:canvas:n"))
+        self.assertEqual(200, self.chair({"op": "get", "key": self.KEY, "request": "same-id"}, conn=conn)[0],
+                         "a read does not consume the id")
 
     def test_memory_still_holds_the_last_hour_across_the_turn_of_the_clock_hour(self):
-        """Redis counts by the clock hour; while an instance lives its memory holds 20 in any 3,600 seconds."""
+        """While an instance lives, its memory holds 20 in any 3,600 seconds and that flood costs Redis nothing."""
         conn = gov_tests.FakeRedis()
         for n in range(20):
             self.now = NOW + 3000 + n           # 16:50Z
-            self.assertEqual(200, self.chair(self.post_item(field="idea-%d" % n), conn=conn)[0], n)
-        self.now = NOW + 3600 + 60              # 17:01Z: Redis would serve it, memory does not
-        self.assertEqual(429, self.chair(self.post_item(field="early"), conn=conn)[0])
-        self.assertIsNone(conn.get("gov:quota:chair:canvas:2026101417"), "a flood memory refuses costs Redis nothing")
+            self.assertEqual(200, self.chair(self.post_item(field="idea-%d" % n, request="m-%d" % n), conn=conn)[0], n)
+        self.now = NOW + 3600 + 60              # 17:01Z: still inside the memory window
+        self.assertEqual(429, self.chair(self.post_item(field="early", request="m-early"), conn=conn)[0])
+        self.assertEqual("20", conn.get("gov:quota:chair:canvas:n"), "a flood memory refuses costs Redis nothing")
 
     def test_if_redis_cannot_count_nothing_is_written(self):
         conn = gov_tests.FakeRedis()
@@ -1308,12 +1346,14 @@ class TheOpEndpoint(unittest.TestCase):
         code, out = self.chair({"op": "set", "key": self.KEY, "val": self.b64("x" * 513), "enc": "b64"})
         self.assertEqual((403, "refused", False, "the value is over 512 bytes", "claude", self.RID),
                          (code, out["error"], out["executed"], out["reason"], out["author"], out["request"]))
-        [entry] = self.conn.audit()
+        conn = self.conn
+        [entry] = conn.audit()
         self.assertEqual(("conference-chair", "0", "claude", self.RID),
                          tuple(entry[k] for k in ("actor", "ok", "claimed_author", "request_id")))
-        self.assertIsNone(self.conn.get(self.KEY))
-        self.assertEqual(200, self.chair({"op": "set", "key": self.KEY, "val": self.b64("x" * 512), "enc": "b64"})[0])
-        self.assertEqual(86400, self.conn.ttls[self.KEY], "and what is written is gone in a day")
+        self.assertIsNone(conn.get(self.KEY))
+        self.assertEqual(200, self.chair({"op": "set", "key": self.KEY, "val": self.b64("x" * 512), "enc": "b64"},
+                                         conn=conn)[0], "a refusal writes nothing, so the same id can be sent again")
+        self.assertEqual(86400, conn.ttls[self.KEY], "and what is written is gone in a day")
 
     def test_a_request_id_of_the_wrong_shape_from_the_chair_is_refused_and_not_recorded(self):
         code, out = self.chair({"op": "get", "key": self.KEY, "request": "an id with spaces"})

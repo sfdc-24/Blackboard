@@ -33,6 +33,8 @@ THE TWO LAYERS THAT CAN FAIL ON THEIR OWN, AND THEIR STATUSES
         502 failed               a READ raised inside Redis; the error TYPE only; nothing changed
         502 outcome unknown      a WRITE raised after the connection was made. It may have
                                  committed. The error TYPE only
+        409 replay               the chair sent a request id it already sent; nothing was written
+                                 and the hour was not charged
         200                      redis_gov's result, as it returned it
 
     "EXECUTED": FALSE IS A PROMISE, AND ITS ABSENCE IS NOT ONE (Aya on 919fd52)
@@ -94,20 +96,26 @@ THE BODY
                           scripts/canvas_publish.py publishes the public items of every slot). The author it
                           states is "chair"; no persona's name serves here.
         the value         one canvas item, at most CANVAS_VALUE_BYTES: a JSON object of the canvas's own
-                          members, type note or mermaid, public true, and nothing in it that is a link (canvas_refusal).
+                          members, type note or mermaid, public true, and nothing in it that is a link (canvas_refusal):
+                          a scheme, a Markdown link or image, or the same after percent-decoding, HTML entities and
+                          Mermaid's #60; codes are unfolded.
         the ceiling       CHAIR_CANVAS_PER_HOUR posts an hour, apart from the persona writes': a 429 (THE HOUR).
     Each is refused before any connection, with "executed": false. 'Hold on, team' is the chair's to keep: the
     bridge does not hear the call.
 
     THE HOUR, KEPT IN REDIS (Gemini on e6433ea, GROK-407FIX-428REV-0225Z: the service scales to zero, and a count
     kept only in memory starts again at nought with every new instance). Each ceiling is held twice:
-        in Redis          INCR and EXPIRE on gov:quota:chair:<what>:<UTC hour> (redis_gov.hourly), so a restart, a
-                          scale-to-zero or a second instance shares one count. The key is under gov:, which
-                          redis_gov PROTECTS, so no caller of /op can reset it. At most the ceiling in a clock hour.
-        in memory         take(), the last 3,600 seconds, per instance: it holds the span across an hour's turn
-                          while the instance lives, and a flood it refuses costs Redis nothing.
+        in Redis          redis_gov.hourly, a window of 3,600 seconds from the first count in it
+                          (gov:quota:chair:<what>:n and :t), so a restart, a scale-to-zero or a second instance
+                          shares one count, and the turn of a UTC hour does not open another. The keys are under
+                          gov:, which redis_gov PROTECTS, so no caller of /op can reset them.
+        in memory         take(), the last 3,600 seconds, per instance: a flood it refuses costs Redis nothing.
     A post is counted before it is written, so one that then fails is still spent: the count errs toward fewer
     posts, never more. If Redis cannot count, nothing is written: a 503 with "executed": false.
+
+    A REPEATED REQUEST ID (redis_gov.once, gov:once:chair:<what>:<id>) is not written and is not charged: 409
+    "replay", "executed": false. The claim is forgotten when the quota was not touched or redis_gov refused the
+    write, so that id can be sent again; a 200 and an outcome-unknown keep it.
 
     WHAT THIS DOES NOT DO, AND MUST BE SAID WHEREVER THE PILOT IS APPROVED: THE BRIDGE TRUSTS THE CHAIR'S
     IDENTITY. It does not see the owner's confirmation and does not enforce it; the chair does. Whoever
@@ -120,10 +128,12 @@ from __future__ import annotations
 import base64
 import collections
 import datetime
+import html
 import json
 import os
 import re
 import time
+import urllib.parse
 
 # A value is at most 8 KB (proj:milestones:) and travels base64, so about 11 KB; 16 KB bounds the
 # read without refusing a legitimate write. main.py reads no more than this for /op.
@@ -137,7 +147,7 @@ READS = ("get", "hgetall", "xrange")
 FLEET, CHAIR, PROBE = "fleet-agent", "chair", "probe"
 PURPOSES = (FLEET, CHAIR, PROBE)
 CHAIR_OPS = ("get", "set")
-CHAIR_WRITES_PER_HOUR = 20              # in Redis by the clock hour, and in memory by the last hour (THE HOUR)
+CHAIR_WRITES_PER_HOUR = 20              # in Redis for 3,600s from the first count, and in memory for the last hour
 MAX_PERSONAS = 4                        # as the chair's own cast
 # The one kind of key the chair touches: a persona's own, for one day. Its day, and the author it states.
 _PERSONA = re.compile(r"[a-z][a-z0-9-]{1,31}")
@@ -153,8 +163,13 @@ CANVAS_MEMBERS = ("v", "type", "title", "body", "status", "version", "public", "
 CANVAS_REQUIRED = ("v", "type", "title", "body", "status", "version", "public")
 _CANVAS_KEY = re.compile(r"conf:canvas:([a-z0-9][a-z0-9-]{1,39}):chair")
 _CANVAS_ITEM = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,47}")
-# Anything that is, or makes, a link: a scheme, a bare www. host, Mermaid's click and href directives.
-_LINKISH = re.compile(r"(?i)://|\bwww\.|\b(?:javascript|data|mailto|vbscript):|\bhref\b|\bclick\s")
+# A scheme, a bare www. host, Mermaid's click and href, or a Markdown link or image with no scheme.
+_LINKISH = re.compile(
+    r"(?i)://|\bwww\.|\b(?:javascript|data|mailto|vbscript):|\bhref\b|\bclick\s"
+    r"|!\[[^\]\n]*\]"
+    r"|\[[^\]\n]*\]\s*\(")
+_ENTITY = re.compile(r"(?i)&#?[a-z0-9]+;")
+_MERMAID_CODE = re.compile(r"#([0-9a-fA-F]{1,6});")
 _CANVAS_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 clock = time.time                       # the door's clock; a test puts its own here
 _SPENT = collections.deque()            # when this instance's chair writes were made, oldest first
@@ -238,6 +253,44 @@ def take(now: float, spent, ceiling: int = CHAIR_WRITES_PER_HOUR) -> bool:
 
 
 
+def _unfold(text: str) -> str:
+    """Percent-encoding, HTML entities and Mermaid's #60; codes, twice, so a link cannot hide in them."""
+    def code(match):
+        raw = match.group(1)
+        base = 16 if any(c in "abcdefABCDEF" for c in raw) else 10
+        try:
+            n = int(raw, base)
+        except ValueError:
+            return match.group(0)
+        if not 0 <= n <= 0x10FFFF:
+            return match.group(0)
+        return chr(n)
+
+    out = text
+    for _ in range(2):
+        out = urllib.parse.unquote(out)
+        out = html.unescape(out)
+        out = _MERMAID_CODE.sub(code, out)
+    return out
+
+
+def _linked(title: str, body: str) -> bool:
+    blob = title + "\n" + body
+    if _LINKISH.search(blob) or _ENTITY.search(blob) or _MERMAID_CODE.search(blob):
+        return True
+    return _LINKISH.search(_unfold(blob)) is not None
+
+
+def _release(gov, conn, held) -> None:
+    """The id was claimed and then nothing was written. Forget it; a failure to forget stays in our log's absence."""
+    if not held:
+        return
+    try:
+        gov.release(conn, held[0], held[1])
+    except Exception:
+        pass
+
+
 def canvas_refusal(request: dict, author: str) -> str:
     """Why this is not a canvas post the chair may make, for our log; "" when it is. Never the value itself."""
     if request["op"] not in CANVAS_OPS:
@@ -267,7 +320,7 @@ def canvas_refusal(request: dict, author: str) -> str:
         return "a member the canvas does not take"
     if _CANVAS_CONTROL.search(title + body + ts) or any(ch in title + ts for ch in "\t\r\n"):
         return "a control character"
-    if _LINKISH.search(title + "\n" + body):
+    if _linked(title, body):
         return "a link"
     return ""
 
@@ -361,19 +414,38 @@ def handle(caller: str, raw: bytes, connect, log, callers=None, gov=None, acl=No
     except Exception as error:  # noqa: BLE001 - the TYPE only: a client's message can quote a secret
         log("op by %s: redis unreachable (%s)" % (caller, type(error).__name__))
         return 503, {"error": "redis unreachable", "executed": False}
+    held = ()
     if purpose == CHAIR and (op == "set" or canvas):
         # After every other refusal, so only a write that would have run counts; before the write, so
-        # "executed": false is true. Memory first, so a flood it refuses costs Redis nothing (THE HOUR).
+        # "executed": false is true. A repeated id is neither written nor charged. Memory before Redis,
+        # so a flood it refuses costs Redis nothing (THE HOUR).
         what, ceiling, mine, named = (
             ("canvas", CHAIR_CANVAS_PER_HOUR, _CANVAS_SPENT if canvas_spent is None else canvas_spent, "canvas posts")
             if canvas else ("persona", CHAIR_WRITES_PER_HOUR, _SPENT if spent is None else spent, "writes"))
         at = clock() if now is None else now
+        name = "chair:" + what
         try:
-            allowed = take(at, mine, ceiling) and gov.hourly(conn, "chair:" + what, at, ceiling)
+            fresh = gov.once(conn, name, asked)
+        except gov.Refused:
+            fresh = None                    # not an id that can be claimed; execute records the refusal
         except Exception as error:  # noqa: BLE001 - the TYPE only, as at the connection
             log("op by %s: redis could not count the chair's hour (%s)" % (caller, type(error).__name__))
             return 503, {"error": "redis unreachable", "executed": False}
+        if fresh is False:
+            log("op by %s: the chair repeated a request id" % caller)
+            return 409, {"error": "replay", "executed": False}
+        if fresh:
+            held = (name, asked)
+        try:
+            charged = take(at, mine, ceiling)
+            allowed = charged and gov.hourly(conn, name, at, ceiling)
+        except Exception as error:  # noqa: BLE001 - the TYPE only, as at the connection
+            _release(gov, conn, held)
+            log("op by %s: redis could not count the chair's hour (%s)" % (caller, type(error).__name__))
+            return 503, {"error": "redis unreachable", "executed": False}
         if not allowed:
+            if not charged:
+                _release(gov, conn, held)
             log("op by %s: the chair's hourly ceiling of %d %s is reached" % (caller, ceiling, named))
             return 429, {"error": "quota", "executed": False}
     result = gov.execute(conn, gov.load_acl() if acl is None else acl, who,
@@ -381,6 +453,8 @@ def handle(caller: str, raw: bytes, connect, log, callers=None, gov=None, acl=No
                          field=request["field"], raw_value=request["val"], enc=request["enc"],
                          count=request["count"], after=request["after"],
                          claimed_author=author, request_id=asked)
+    if held and not result.get("ok") and "refused" in result:
+        _release(gov, conn, held)
     if result.get("ok"):
         log("op by %s as %s: %s ok" % (caller, who, op))
         return 200, dict(result, caller=caller, principal=who, **stated)

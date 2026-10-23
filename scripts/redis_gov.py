@@ -321,24 +321,88 @@ def decode_value(raw: str, enc: str, acl: dict, key: str = "") -> str:
 
 # --------------------------------------------------------------------------------------- an hour's count
 
-QUOTA_KEY = "gov:quota:%s:%s"           # what is counted, the UTC hour as yyyymmddhh
-QUOTA_TTL_SECONDS = 7200                # past its own hour, then gone
+QUOTA_KEY = "gov:quota:%s:%s"           # what is counted, then "n" (the count) or "t" (when the window opened)
+QUOTA_TTL_SECONDS = 3600                # the window, from its first count; a later count does not slide it
+ONCE_KEY = "gov:once:%s:%s"             # what was claimed, then the request id
+ONCE_TTL_SECONDS = 7200                 # a repeat of that id stays a repeat past the hour
 _QUOTA_NAME = re.compile(r"[a-z][a-z0-9:-]{1,47}")
 
 
-def hourly(conn, name: str, now: float, ceiling: int) -> bool:
-    """Count one more `name` in this clock hour, in Redis, for every process that shares it; True while the
-    count is at most `ceiling`. INCR and EXPIRE go in one MULTI, so a count never lands without its expiry.
-    A refusal is counted too, so a flood stays refused for the rest of the hour. The key is under gov:, which
-    PROTECTED keeps from every caller of execute(). Anything Redis raises goes to the caller."""
+def _quota_name(name: str) -> str:
     if not isinstance(name, str) or not _QUOTA_NAME.fullmatch(name):
         raise Refused("a quota name is lower-case letters, digits, colon and hyphen")
-    key = QUOTA_KEY % (name, datetime.datetime.fromtimestamp(now, datetime.timezone.utc).strftime("%Y%m%d%H"))
-    pipe = conn.pipeline(transaction=True)
-    pipe.multi()
-    pipe.incr(key)
-    pipe.expire(key, QUOTA_TTL_SECONDS)
-    return int(pipe.execute()[0]) <= ceiling
+    return name
+
+
+def _quota_start(raw):
+    """The epoch the window opened, or None when there is no window to keep."""
+    if raw is None:
+        return None
+    try:
+        return float(_text(raw).strip())
+    except ValueError:
+        return None
+
+
+def hourly(conn, name: str, now: float, ceiling: int) -> bool:
+    """Count one more `name` inside a window of QUOTA_TTL_SECONDS measured from the first count in it.
+
+    True while the count is at most `ceiling`. The window is not a UTC hour: twenty at 01:59:50 and a
+    fresh process at 02:00:00 share one count. Opening the window writes its start, resets the count
+    and sets both expiries in one MULTI; a later count is one INCR and does not refresh the expiry,
+    so the window cannot be slid forward. A refusal is counted too. Both keys are under gov:, which
+    PROTECTED keeps from every caller of execute(). A watched key that changes is retried. Anything
+    else Redis raises goes to the caller."""
+    name = _quota_name(name)
+    try:
+        now = float(now)
+    except (TypeError, ValueError):
+        raise Refused("a quota clock is a number of seconds")
+    count_key, start_key = QUOTA_KEY % (name, "n"), QUOTA_KEY % (name, "t")
+    for _ in range(8):
+        pipe = conn.pipeline(transaction=True)
+        try:
+            pipe.watch(start_key)
+            pipe.watch(count_key)
+            start = _quota_start(pipe.get(start_key))
+            fresh = start is None or now - start >= QUOTA_TTL_SECONDS
+            pipe.multi()
+            if fresh:
+                pipe.set(start_key, repr(now), ex=QUOTA_TTL_SECONDS)
+                pipe.delete(count_key)
+                pipe.incr(count_key)
+                pipe.expire(count_key, QUOTA_TTL_SECONDS)
+            else:
+                pipe.incr(count_key)
+            results = pipe.execute()
+            count = results[-2] if fresh else results[-1]
+            return int(count) <= int(ceiling)
+        except Exception as error:
+            if type(error).__name__ == "WatchError":
+                continue
+            raise
+        finally:
+            pipe.reset()
+    raise Refused("the quota changed while it was being counted")
+
+
+def once(conn, name: str, request_id: str) -> bool:
+    """Claim `request_id` for `name`. True the first time, False when it was already claimed.
+
+    SET NX EX, so two deliveries of one id cannot both win. The key is under gov:. A request id of
+    the wrong shape is Refused before the claim. Anything else Redis raises goes to the caller."""
+    name = _quota_name(name)
+    if not isinstance(request_id, str) or not _REQUEST_ID.fullmatch(request_id):
+        raise Refused("request_id is not an id (letters, digits, . _ : - only, at most 120)")
+    return conn.set(ONCE_KEY % (name, request_id), "1", nx=True, ex=ONCE_TTL_SECONDS) is not None
+
+
+def release(conn, name: str, request_id: str) -> None:
+    """Forget a claim once() took, when the write did not happen, so the same id can be sent again."""
+    name = _quota_name(name)
+    if not isinstance(request_id, str) or not _REQUEST_ID.fullmatch(request_id):
+        raise Refused("request_id is not an id (letters, digits, . _ : - only, at most 120)")
+    conn.delete(ONCE_KEY % (name, request_id))
 
 
 # --------------------------------------------------------------------------------------- the audit

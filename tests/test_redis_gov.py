@@ -688,21 +688,31 @@ class TheServerSetsTheTTL(unittest.TestCase):
 
 
 class AnHoursCountIsKeptInRedis(unittest.TestCase):
-    """hourly(): one count a clock hour, shared by every process on the same Redis (GROK-407FIX-428REV-0225Z)."""
+    """hourly(): one count across 3,600 seconds, shared by every process on the same Redis.
+
+    A UTC hour boundary does not open a new window (the 01:59:50 / 02:00:00 defect)."""
 
     HOUR = 1791993600.0                 # 2026-10-14 16:00:00Z
 
-    def test_it_counts_to_the_ceiling_in_a_clock_hour_and_the_next_hour_starts_again(self):
+    def test_it_counts_to_the_ceiling_and_the_window_starts_again_after_3600_seconds(self):
         conn = FakeRedis()
         said = [gov.hourly(conn, "chair:canvas", self.HOUR + n, 3) for n in range(5)]
         self.assertEqual([True, True, True, False, False], said)
-        self.assertEqual("5", conn.get("gov:quota:chair:canvas:2026101416"), "a refusal is counted too")
-        self.assertFalse(gov.hourly(conn, "chair:canvas", self.HOUR + 3599, 3), "16:59:59 is the same hour")
-        self.assertTrue(gov.hourly(conn, "chair:canvas", self.HOUR + 3600, 3), "17:00 is a new one")
-        self.assertEqual("1", conn.get("gov:quota:chair:canvas:2026101417"))
+        self.assertEqual("5", conn.get("gov:quota:chair:canvas:n"), "a refusal is counted too")
+        self.assertFalse(gov.hourly(conn, "chair:canvas", self.HOUR + 3599, 3), "3,599s is the same window")
+        self.assertTrue(gov.hourly(conn, "chair:canvas", self.HOUR + 3600, 3), "3,600s opens the next")
+        self.assertEqual("1", conn.get("gov:quota:chair:canvas:n"))
         self.assertTrue(gov.hourly(conn, "chair:persona", self.HOUR, 3), "each name has its own count")
 
-    def test_the_count_and_its_expiry_land_in_one_multi(self):
+    def test_ten_seconds_into_the_next_clock_hour_is_still_the_same_window(self):
+        """20 at 16:59:50 and another at 17:00:00 must not both be allowed."""
+        conn = FakeRedis()
+        start = self.HOUR + 3590
+        self.assertEqual([True] * 20, [gov.hourly(conn, "chair:canvas", start, 20) for _ in range(20)])
+        self.assertFalse(gov.hourly(conn, "chair:canvas", start + 10, 20))
+        self.assertEqual("21", conn.get("gov:quota:chair:canvas:n"), "the refusal is counted in the same window")
+
+    def test_the_count_and_its_expiry_land_in_one_multi_and_a_later_count_does_not_slide_it(self):
         conn, queued = FakeRedis(), []
         real = conn.pipeline
 
@@ -718,9 +728,15 @@ class AnHoursCountIsKeptInRedis(unittest.TestCase):
             return pipe
         conn.pipeline = watched
         gov.hourly(conn, "chair:canvas", self.HOUR, 20)
-        self.assertEqual(["incr", "expire"], queued, "both queued, neither run on its own")
-        self.assertEqual(gov.QUOTA_TTL_SECONDS, conn.ttls["gov:quota:chair:canvas:2026101416"])
-        self.assertEqual(7200, gov.QUOTA_TTL_SECONDS)
+        self.assertEqual(["set", "delete", "incr", "expire"], queued, "open the window in one transaction")
+        self.assertEqual(gov.QUOTA_TTL_SECONDS, conn.ttls["gov:quota:chair:canvas:n"])
+        self.assertEqual(gov.QUOTA_TTL_SECONDS, conn.ttls["gov:quota:chair:canvas:t"])
+        self.assertEqual(3600, gov.QUOTA_TTL_SECONDS)
+        queued.clear()
+        gov.hourly(conn, "chair:canvas", self.HOUR + 10, 20)
+        self.assertEqual(["incr"], queued, "a later count does not refresh the expiry")
+        self.assertEqual(repr(self.HOUR), conn.get("gov:quota:chair:canvas:t"))
+        self.assertEqual(3600, conn.ttls["gov:quota:chair:canvas:t"])
 
     def test_what_redis_raises_reaches_the_caller(self):
         conn = FakeRedis()
@@ -728,17 +744,29 @@ class AnHoursCountIsKeptInRedis(unittest.TestCase):
         with self.assertRaises(ConnectionError):
             gov.hourly(conn, "chair:canvas", self.HOUR, 20)
 
+    def test_a_repeated_request_id_is_claimed_once_and_can_be_released(self):
+        conn = FakeRedis()
+        self.assertTrue(gov.once(conn, "chair:canvas", "req-1"))
+        self.assertFalse(gov.once(conn, "chair:canvas", "req-1"))
+        self.assertTrue(gov.once(conn, "chair:persona", "req-1"), "each name has its own claim")
+        self.assertEqual(gov.ONCE_TTL_SECONDS, conn.ttls["gov:once:chair:canvas:req-1"])
+        gov.release(conn, "chair:canvas", "req-1")
+        self.assertTrue(gov.once(conn, "chair:canvas", "req-1"))
+        with self.assertRaises(gov.Refused):
+            gov.once(conn, "chair:canvas", "an id with spaces")
+
     def test_a_name_is_a_name_and_the_key_is_one_no_caller_may_write(self):
         conn = FakeRedis()
         for name in ("", "Chair", "chair canvas", "chair:*", "x", 7, "a" * 49):
             with self.assertRaises(gov.Refused, msg=repr(name)):
                 gov.hourly(conn, name, self.HOUR, 20)
         self.assertEqual({}, conn.data)
-        for agent in ("conference-chair", "claude-code-cli", "owner"):
-            for op in ("set", "del"):
-                result = run(conn, agent, op, "gov:quota:chair:canvas:2026101416", val="0")
-                self.assertIn("refused", result, (agent, op))
-        self.assertIsNone(conn.get("gov:quota:chair:canvas:2026101416"), "nobody resets the count")
+        for key in ("gov:quota:chair:canvas:n", "gov:quota:chair:canvas:t", "gov:once:chair:canvas:req-1"):
+            for agent in ("conference-chair", "claude-code-cli", "owner"):
+                for op in ("set", "del"):
+                    result = run(conn, agent, op, key, val="0")
+                    self.assertIn("refused", result, (agent, op, key))
+            self.assertIsNone(conn.get(key), "nobody resets the count")
 
 
 class XrangeAfterACursor(unittest.TestCase):
