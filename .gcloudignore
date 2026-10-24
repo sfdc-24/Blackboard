@@ -38,6 +38,7 @@
 !/scripts/redis_dual.settings.json
 !/scripts/bus_reconcile.py
 !/scripts/bus_request.py
+!/scripts/canvas_publish.py
 !/scripts/redis_gov.py
 !/scripts/redis_acl.json
 !/scripts/git_requests.py

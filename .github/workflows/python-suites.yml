@@ -135,6 +135,8 @@ on:
       - "tests/test_git_requests.py"
       - "cloud/bus-reconciler/serve_requests.py"
       - "tests/test_live_mode.py"
+      - "scripts/canvas_publish.py"
+      - "tests/test_canvas_publish.py"
       - "cloud/bus-reconciler/redis_archive.py"
       - "cloud/bus-reconciler/archive.sh"
       - "tests/test_redis_archive.py"
@@ -251,6 +253,8 @@ on:
       - "tests/test_git_requests.py"
       - "cloud/bus-reconciler/serve_requests.py"
       - "tests/test_live_mode.py"
+      - "scripts/canvas_publish.py"
+      - "tests/test_canvas_publish.py"
       - "cloud/bus-reconciler/redis_archive.py"
       - "cloud/bus-reconciler/archive.sh"
       - "tests/test_redis_archive.py"
@@ -1119,7 +1123,7 @@ jobs:
       # Its combined tests drive the REAL service in process: bridge_client.call -> main.Handler.do_POST
       # -> op.handle -> redis_gov.execute (Aya on 0baa197). Only the socket, Google's verifier and Redis
       # are stood in, so this suite also fails on a change to cloud/redis-tool-bridge/ or redis_gov.py.
-      - name: "redis gov, git requests, live mode, archive, inbox, bridge client: the governed path and its worker (no network)"
+      - name: "redis gov, git requests, live mode, canvas publish, archive, inbox, bridge client: the governed path and its worker (no network)"
         run: |
           set -euo pipefail
           python_bin="$(command -v python3)"
@@ -1129,6 +1133,7 @@ jobs:
           for pair in "test_redis_gov:scripts/redis_gov.py" \
                       "test_git_requests:scripts/git_requests.py" \
                       "test_live_mode:cloud/bus-reconciler/serve_requests.py" \
+                      "test_canvas_publish:scripts/canvas_publish.py" \
                       "test_redis_archive:cloud/bus-reconciler/redis_archive.py" \
                       "test_redis_inbox:scripts/redis_inbox.py" \
                       "test_bridge_client:scripts/bridge_client.py"; do
