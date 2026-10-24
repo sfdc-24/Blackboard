@@ -33,6 +33,8 @@ THE TWO LAYERS THAT CAN FAIL ON THEIR OWN, AND THEIR STATUSES
         502 failed               a READ raised inside Redis; the error TYPE only; nothing changed
         502 outcome unknown      a WRITE raised after the connection was made. It may have
                                  committed. The error TYPE only
+        409 replay               the chair sent a request id it already sent; nothing was written
+                                 and the hour was not charged
         200                      redis_gov's result, as it returned it
 
     "EXECUTED": FALSE IS A PROMISE, AND ITS ABSENCE IS NOT ONE (Aya on 919fd52)
@@ -64,35 +66,282 @@ THE BODY
     bound principal is not the expected one, the answer is 403 "principal mismatch" and nothing is
     executed. Without it a client configured with another agent's service account would write under
     that agent's name and learn of it only from the answer, after the fact.
+
+    "author" AND "request" ARE FOR THE CONFERENCE CHAIR AND FOR NOBODY ELSE
+    (conference docs/PERSONA-WRITE-CONFIRMATION-A1.md, rows 6 and 7 and section 10.6)
+    The chair writes under its OWN verified identity for a persona that holds no identity at all. So it
+    must say, every time, which persona ("author") and under which request id ("request"); both go into
+    the audit entry as CLAIMS beside the verified actor (redis_gov.said), and both come back in the answer,
+    so the chair can tell the acknowledgment of ITS request from any other 200. What a caller is FOR is
+    its line in callers.json, never the request:
+        a fleet agent     may not state either member: a 400. Its own name is already the verified one.
+        the chair         must state both on every op: a 400 without them.
+        a probe account   is admitted to the service for /probe and is refused here: a 403.
+
+    THE PILOT (conference docs/PERSONA-WRITE-CONFIRMATION-A1.md, section 12; Aya,
+    AYA-PILOT-SOURCE-DIRECTION-20261014T0031Z). For the pilot the chair is the ONLY caller of this endpoint,
+    and all it may do is `get` and `set` ONE synthetic key a day for ONE listed persona:
+        the op            get or set. Nothing else, whatever the access list would allow.
+        the key           conf:persona:<yyyymmdd>:<author>, where the day is today or yesterday in UTC and
+                          the author is on the list in the chair's own line of callers.json.
+        the ceiling       CHAIR_WRITES_PER_HOUR sets an hour: a 429 past it (THE HOUR, below).
+    Each is refused before any connection, with "executed": false. The value's cap and its 24 hours are
+    the access list's, for the prefix.
+
+    THE CANVAS (the owner, directly, 2026-10-20: "I approve the conference chair writing to the canvas (its own
+    slot only, text and diagrams only, no images or links, max 20 posts an hour, stops on 'Hold on, team')";
+    board row CLAUDE-MOBILE-OWNER-CHAIR-CANVAS-20261020T2252Z). One more thing the chair may do, and only this:
+        the op            hset, as sent.
+        the key           conf:canvas:<room>:chair, its own slot. <room> is one named on the chair's
+                          line of callers.json. The owner named the conference room Workshop, so the line
+                          names workshop and no other (Abdus, 2026-10-23). The author it states is "chair";
+                          no persona's name serves here.
+        the value         one canvas item, at most CANVAS_VALUE_BYTES: a JSON object of the canvas's own
+                          members, type note or mermaid, public true, and nothing in it that is a link (canvas_refusal):
+                          a scheme, a Markdown link or image, or the same after percent-decoding, HTML entities and
+                          Mermaid's #60; codes are unfolded.
+        the ceiling       CHAIR_CANVAS_PER_HOUR posts an hour, apart from the persona writes': a 429 (THE HOUR).
+    Each is refused before any connection, with "executed": false. 'Hold on, team' is the chair's to keep: the
+    bridge does not hear the call.
+
+    THE HOUR, KEPT IN REDIS (Gemini on e6433ea, GROK-407FIX-428REV-0225Z: the service scales to zero, and a count
+    kept only in memory starts again at nought with every new instance). Each ceiling is held twice:
+        in Redis          redis_gov.hourly, a window of 3,600 seconds from the first count in it
+                          (gov:quota:chair:<what>:n and :t), so a restart, a scale-to-zero or a second instance
+                          shares one count, and the turn of a UTC hour does not open another. The keys are under
+                          gov:, which redis_gov PROTECTS, so no caller of /op can reset them.
+        in memory         take(), the last 3,600 seconds, per instance: a flood it refuses costs Redis nothing.
+    A post is counted before it is written, so one that then fails is still spent: the count errs toward fewer
+    posts, never more. If Redis cannot count, nothing is written: a 503 with "executed": false.
+
+    A REPEATED REQUEST ID (redis_gov.once, gov:once:chair:<what>:<id>) is not written and is not charged: 409
+    "replay", "executed": false. The claim is forgotten when the quota was not touched or redis_gov refused the
+    write, so that id can be sent again; a 200 and an outcome-unknown keep it.
+
+    WHAT THIS DOES NOT DO, AND MUST BE SAID WHEREVER THE PILOT IS APPROVED: THE BRIDGE TRUSTS THE CHAIR'S
+    IDENTITY. It does not see the owner's confirmation and does not enforce it; the chair does. Whoever
+    holds the chair's identity can make these writes with no confirmation at all. What bounds that is the
+    list above and nothing else, which is why the list is this short, and why the pilot may not be widened
+    to real content while this is so.
 """
 from __future__ import annotations
 
+import base64
+import collections
+import datetime
+import html
 import json
 import os
+import re
+import time
+import urllib.parse
 
 # A value is at most 8 KB (proj:milestones:) and travels base64, so about 11 KB; 16 KB bounds the
 # read without refusing a legitimate write. main.py reads no more than this for /op.
 MAX_BODY_BYTES = 16384
 CALLERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "callers.json")
-MEMBERS = ("op", "key", "field", "val", "enc", "count", "after", "expect")
+MEMBERS = ("op", "key", "field", "val", "enc", "count", "after", "expect", "author", "request")
 # The ops that change nothing a caller owns. A failure inside one of these changed nothing; a failure
 # inside any other op is an unknown outcome. Restated from redis_gov.OPS_READ and held equal by a test.
 READS = ("get", "hgetall", "xrange")
+# What a caller is FOR: its line in callers.json says, and a line that says anything else maps nobody.
+FLEET, CHAIR, PROBE = "fleet-agent", "chair", "probe"
+PURPOSES = (FLEET, CHAIR, PROBE)
+CHAIR_OPS = ("get", "set")
+CHAIR_WRITES_PER_HOUR = 20              # in Redis for 3,600s from the first count, and in memory for the last hour
+MAX_PERSONAS = 4                        # as the chair's own cast
+MAX_ROOMS = 1                           # the owner named one conference room
+# The one kind of key the chair touches: a persona's own, for one day. Its day, and the author it states.
+_PERSONA = re.compile(r"[a-z][a-z0-9-]{1,31}")
+_PERSONA_KEY = re.compile(r"conf:persona:([0-9]{8}):([a-z][a-z0-9-]{1,31})")
+# The chair's canvas slot (Blackboard scripts/canvas_publish.py: ROOM, ITEM_ID and the item's members).
+CANVAS_OPS = ("hset",)
+CANVAS_AUTHOR = "chair"
+CHAIR_CANVAS_PER_HOUR = 20              # the owner's own number; kept as CHAIR_WRITES_PER_HOUR is
+CANVAS_VALUE_BYTES = 512
+CANVAS_TYPES = ("note", "mermaid")      # text and diagrams; never image_url, never wireframe's HTML
+CANVAS_STATUSES = ("claimed", "working", "review", "done")
+CANVAS_MEMBERS = ("v", "type", "title", "body", "status", "version", "public", "ts")
+CANVAS_REQUIRED = ("v", "type", "title", "body", "status", "version", "public")
+_CANVAS_KEY = re.compile(r"conf:canvas:([a-z0-9][a-z0-9-]{1,39}):chair")
+_ROOM = re.compile(r"[a-z0-9][a-z0-9-]{1,39}")   # the same room grammar as the publisher
+_CANVAS_ITEM = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,47}")
+# A scheme, a bare www. host, Mermaid's click and href, or a Markdown link or image with no scheme.
+_LINKISH = re.compile(
+    r"(?i)://|\bwww\.|\b(?:javascript|data|mailto|vbscript):|\bhref\b|\bclick\s"
+    r"|!\[[^\]\n]*\]"
+    r"|\[[^\]\n]*\]\s*\(")
+_ENTITY = re.compile(r"(?i)&#?[a-z0-9]+;")
+_MERMAID_CODE = re.compile(r"#([0-9a-fA-F]{1,6});")
+_CANVAS_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+clock = time.time                       # the door's clock; a test puts its own here
+_SPENT = collections.deque()            # when this instance's chair writes were made, oldest first
+_CANVAS_SPENT = collections.deque()     # when this instance's chair canvas posts were made, oldest first
 
 
-def load_callers(path=None) -> dict:
-    """{verified email: principal}, lower-cased. A missing or malformed file maps NOBODY: the same
-    direction as redis_gov.load_acl, where an absent rule makes access stricter, never looser."""
+def _lines(path=None) -> dict:
+    """{verified email: (principal, what the caller is for, the personas it may name)}, lower-cased.
+
+    A line is one of three, and a line that is none of them maps NOBODY:
+        "principal"                                             a fleet agent, as every line was at first
+        {"principal": ..., "for": "fleet-agent" | "probe"}      a fleet agent; or an account admitted for the
+                                                                probe only, which /op refuses
+        {"principal": ..., "for": "chair", "personas": [...]}   the conference chair, and the personas it may
+                                                                name: one to MAX_PERSONAS names, each once
+        that line plus "rooms": [...]                          the rooms whose canvas it may post to: one to
+                                                                MAX_ROOMS names, each a room, each once
+    Nothing rides in on an extra member, and a list of personas on a line that is not the chair's is one.
+    A rooms list of the wrong shape maps nobody, the same as a personas list of the wrong shape."""
     try:
         with open(path or CALLERS_FILE, encoding="utf-8") as fh:
             data = json.load(fh)
         callers = data["callers"]
         if not isinstance(callers, dict):
             return {}
-        return {str(k).strip().lower(): str(v).strip().lower() for k, v in callers.items()
-                if str(k).strip() and str(v).strip()}
     except (OSError, ValueError, KeyError, TypeError):
         return {}
+    out = {}
+    for email, line in callers.items():
+        personas, rooms = (), ()
+        if isinstance(line, str):
+            who, purpose = line, FLEET
+        elif isinstance(line, dict) and set(line) == {"principal", "for"} and line["for"] in (FLEET, PROBE):
+            who, purpose = line["principal"], line["for"]
+        elif isinstance(line, dict) and line.get("for") == CHAIR and set(line) in (
+                {"principal", "for", "personas"}, {"principal", "for", "personas", "rooms"}):
+            who, purpose, named = line["principal"], CHAIR, line["personas"]
+            if not isinstance(named, list) or not 1 <= len(named) <= MAX_PERSONAS or len(set(map(str, named))) != len(named) \
+                    or not all(isinstance(name, str) and _PERSONA.fullmatch(name) for name in named):
+                continue
+            personas = tuple(named)
+            if "rooms" in line:
+                named_rooms = line["rooms"]
+                if not isinstance(named_rooms, list) or not 1 <= len(named_rooms) <= MAX_ROOMS \
+                        or len(set(map(str, named_rooms))) != len(named_rooms) \
+                        or not all(isinstance(room, str) and _ROOM.fullmatch(room) for room in named_rooms):
+                    continue
+                rooms = tuple(named_rooms)
+        else:
+            continue
+        if not isinstance(who, str):
+            continue
+        email, who = str(email).strip().lower(), who.strip().lower()
+        if email and who:
+            out[email] = (who, purpose, personas, rooms)
+    return out
+
+
+def load_callers(path=None) -> dict:
+    """{verified email: principal} for the callers that may use /op, lower-cased. An account admitted for the
+    probe only is NOT here: it acts as nobody. A missing or malformed file maps NOBODY: the same direction as
+    redis_gov.load_acl, where an absent rule makes access stricter, never looser."""
+    return {email: who for email, (who, purpose, _, _) in _lines(path).items() if purpose != PROBE}
+
+
+def load_purposes(path=None) -> dict:
+    """{verified email: what that caller is for}, every line. The same file, the same strictness."""
+    return {email: purpose for email, (_, purpose, _, _) in _lines(path).items()}
+
+
+def load_personas(path=None) -> dict:
+    """{the chair's verified email: the personas it may name}."""
+    return {email: personas for email, (_, purpose, personas, _) in _lines(path).items() if purpose == CHAIR}
+
+
+def load_rooms(path=None) -> dict:
+    """{the chair's verified email: the rooms it may post to}. A chair with no rooms list is absent."""
+    return {email: rooms for email, (_, purpose, _, rooms) in _lines(path).items() if purpose == CHAIR and rooms}
+
+
+def days(now: float) -> tuple:
+    """Today and yesterday in UTC, as a persona key carries a day. Yesterday: a write proposed a minute before
+    midnight is confirmed a minute after it, under the key it was shown with."""
+    return tuple((datetime.datetime.fromtimestamp(now, datetime.timezone.utc) - datetime.timedelta(days=back))
+                 .strftime("%Y%m%d") for back in (0, 1))
+
+
+def take(now: float, spent, ceiling: int = CHAIR_WRITES_PER_HOUR) -> bool:
+    """May the chair make one more write in this hour? `spent` holds the times of the ones made. THIS HALF IS
+    PER INSTANCE AND IN MEMORY, and forgotten when the instance stops; redis_gov.hourly is the half that is not."""
+    while spent and now - spent[0] >= 3600.0:
+        spent.popleft()
+    if len(spent) >= ceiling:
+        return False
+    spent.append(now)
+    return True
+
+
+
+def _unfold(text: str) -> str:
+    """Percent-encoding, HTML entities and Mermaid's #60; codes, twice, so a link cannot hide in them."""
+    def code(match):
+        raw = match.group(1)
+        base = 16 if any(c in "abcdefABCDEF" for c in raw) else 10
+        try:
+            n = int(raw, base)
+        except ValueError:
+            return match.group(0)
+        if not 0 <= n <= 0x10FFFF:
+            return match.group(0)
+        return chr(n)
+
+    out = text
+    for _ in range(2):
+        out = urllib.parse.unquote(out)
+        out = html.unescape(out)
+        out = _MERMAID_CODE.sub(code, out)
+    return out
+
+
+def _linked(title: str, body: str) -> bool:
+    blob = title + "\n" + body
+    if _LINKISH.search(blob) or _ENTITY.search(blob) or _MERMAID_CODE.search(blob):
+        return True
+    return _LINKISH.search(_unfold(blob)) is not None
+
+
+def _release(gov, conn, held) -> None:
+    """The id was claimed and then nothing was written. Forget it; a failure to forget stays in our log's absence."""
+    if not held:
+        return
+    try:
+        gov.release(conn, held[0], held[1])
+    except Exception:
+        pass
+
+
+def canvas_refusal(request: dict, author: str) -> str:
+    """Why this is not a canvas post the chair may make, for our log; "" when it is. Never the value itself."""
+    if request["op"] not in CANVAS_OPS:
+        return "not hset"
+    if author != CANVAS_AUTHOR:
+        return "the author is not the chair"
+    if not _CANVAS_ITEM.fullmatch(request["field"]):
+        return "not an item id"
+    if request["enc"] != "b64":
+        return "not base64"             # as every chair write travels (the chair's bridge transport)
+    try:
+        raw = base64.b64decode(request["val"], validate=True)
+        item = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeError):
+        return "not a JSON item"
+    if len(raw) > CANVAS_VALUE_BYTES:
+        return "over %d bytes" % CANVAS_VALUE_BYTES
+    if not isinstance(item, dict) or set(item) - set(CANVAS_MEMBERS) or set(CANVAS_REQUIRED) - set(item):
+        return "not the canvas item's members"
+    whole = lambda value: isinstance(value, int) and not isinstance(value, bool)  # noqa: E731
+    if not (whole(item["v"]) and item["v"] == 1) or item["type"] not in CANVAS_TYPES \
+            or item["status"] not in CANVAS_STATUSES or item["public"] is not True \
+            or not (whole(item["version"]) and 0 <= item["version"] < 10 ** 9):
+        return "a member the canvas does not take"
+    title, body, ts = item["title"], item["body"], item.get("ts", "")
+    if not all(isinstance(text, str) for text in (title, body, ts)) or not title.strip() or not body.strip():
+        return "a member the canvas does not take"
+    if _CANVAS_CONTROL.search(title + body + ts) or any(ch in title + ts for ch in "\t\r\n"):
+        return "a control character"
+    if _linked(title, body):
+        return "a link"
+    return ""
 
 
 def parse(raw: bytes) -> tuple:
@@ -121,7 +370,8 @@ def parse(raw: bytes) -> tuple:
     return out, None
 
 
-def handle(caller: str, raw: bytes, connect, log, callers=None, gov=None, acl=None) -> tuple:
+def handle(caller: str, raw: bytes, connect, log, callers=None, gov=None, acl=None, purposes=None,
+           personas=None, rooms=None, now=None, spent=None, canvas_spent=None) -> tuple:
     """(status, body) for one /op request from an ALREADY VERIFIED caller.
 
     caller   the email main.verify_caller returned: verified, and on BRIDGE_CALLERS.
@@ -129,7 +379,13 @@ def handle(caller: str, raw: bytes, connect, log, callers=None, gov=None, acl=No
              connection.
     log      a callable taking one line. No value, no key content and no body ever goes to it.
     """
-    who = (load_callers() if callers is None else callers).get(str(caller or "").strip().lower())
+    email = str(caller or "").strip().lower()
+    purpose = (load_purposes() if purposes is None else purposes).get(email, FLEET)
+    if purpose == PROBE:
+        # Admitted to the service, for the probe. Not our misconfiguration and not a caller of this endpoint.
+        log("op by %s: this account is admitted for the probe only" % caller)
+        return 403, {"error": "not authorised", "executed": False}
+    who = (load_callers() if callers is None else callers).get(email)
     if not who:
         log("REFUSING /op: %s is on the caller allowlist and has no principal in callers.json"
             % caller)
@@ -143,6 +399,38 @@ def handle(caller: str, raw: bytes, connect, log, callers=None, gov=None, acl=No
         # BEFORE the connection, so "nothing was executed" is true by construction.
         log("op by %s: principal mismatch (bound to %s; the client expected another)" % (caller, who))
         return 403, {"error": "principal mismatch", "executed": False, "principal": who}
+    # WHO THE CALLER SAYS IT ACTS FOR. Decided by what the caller is FOR, which is its line in callers.json
+    # and never the request. Every refusal here is before the connection, so "executed": false is true.
+    op = request["op"].strip().lower()[:16]
+    author, asked = request["author"], request["request"]
+    canvas = False                      # the chair's canvas slot (canvas_refusal), and only the chair's
+    if purpose == CHAIR:
+        if not author or not asked:
+            log("op by %s: the chair did not say which persona and which request" % caller)
+            return 400, {"error": "bad request", "executed": False}
+        # The op and the key as they were SENT, not as redis_gov would tidy them: the chair sends them exact.
+        canvas_key = _CANVAS_KEY.fullmatch(request["key"])
+        canvas = canvas_key is not None and canvas_key.group(1) in (
+            load_rooms() if rooms is None else rooms).get(email, ())
+        if canvas_key is not None and not canvas:
+            log("op by %s: not a canvas post the chair may make (not its room)" % caller)
+            return 400, {"error": "bad request", "executed": False}
+        if canvas:
+            why = canvas_refusal(request, author)
+            if why:
+                log("op by %s: not a canvas post the chair may make (%s)" % (caller, why))
+                return 400, {"error": "bad request", "executed": False}
+        else:
+            named = _PERSONA_KEY.fullmatch(request["key"])
+            listed = (load_personas() if personas is None else personas).get(email, ())
+            if request["op"] not in CHAIR_OPS or named is None or named.group(2) != author or author not in listed \
+                    or named.group(1) not in days(clock() if now is None else now):
+                log("op by %s: not an op the chair makes, or not today's key of a persona it may name" % caller)
+                return 400, {"error": "bad request", "executed": False}
+    elif author or asked:
+        log("op by %s: author or request stated by a caller that is not the chair" % caller)
+        return 400, {"error": "bad request", "executed": False}
+    stated = {name: value for name, value in (("author", author), ("request", asked)) if value}
     if gov is None:
         import redis_gov as gov
     try:
@@ -150,20 +438,56 @@ def handle(caller: str, raw: bytes, connect, log, callers=None, gov=None, acl=No
     except Exception as error:  # noqa: BLE001 - the TYPE only: a client's message can quote a secret
         log("op by %s: redis unreachable (%s)" % (caller, type(error).__name__))
         return 503, {"error": "redis unreachable", "executed": False}
+    held = ()
+    if purpose == CHAIR and (op == "set" or canvas):
+        # After every other refusal, so only a write that would have run counts; before the write, so
+        # "executed": false is true. A repeated id is neither written nor charged. Memory before Redis,
+        # so a flood it refuses costs Redis nothing (THE HOUR).
+        what, ceiling, mine, named = (
+            ("canvas", CHAIR_CANVAS_PER_HOUR, _CANVAS_SPENT if canvas_spent is None else canvas_spent, "canvas posts")
+            if canvas else ("persona", CHAIR_WRITES_PER_HOUR, _SPENT if spent is None else spent, "writes"))
+        at = clock() if now is None else now
+        name = "chair:" + what
+        try:
+            fresh = gov.once(conn, name, asked)
+        except gov.Refused:
+            fresh = None                    # not an id that can be claimed; execute records the refusal
+        except Exception as error:  # noqa: BLE001 - the TYPE only, as at the connection
+            log("op by %s: redis could not count the chair's hour (%s)" % (caller, type(error).__name__))
+            return 503, {"error": "redis unreachable", "executed": False}
+        if fresh is False:
+            log("op by %s: the chair repeated a request id" % caller)
+            return 409, {"error": "replay", "executed": False}
+        if fresh:
+            held = (name, asked)
+        try:
+            charged = take(at, mine, ceiling)
+            allowed = charged and gov.hourly(conn, name, at, ceiling)
+        except Exception as error:  # noqa: BLE001 - the TYPE only, as at the connection
+            _release(gov, conn, held)
+            log("op by %s: redis could not count the chair's hour (%s)" % (caller, type(error).__name__))
+            return 503, {"error": "redis unreachable", "executed": False}
+        if not allowed:
+            if not charged:
+                _release(gov, conn, held)
+            log("op by %s: the chair's hourly ceiling of %d %s is reached" % (caller, ceiling, named))
+            return 429, {"error": "quota", "executed": False}
     result = gov.execute(conn, gov.load_acl() if acl is None else acl, who,
                          ("bridge:%s" % caller)[:120], request["op"], request["key"],
                          field=request["field"], raw_value=request["val"], enc=request["enc"],
-                         count=request["count"], after=request["after"])
-    op = request["op"].strip().lower()[:16]
+                         count=request["count"], after=request["after"],
+                         claimed_author=author, request_id=asked)
+    if held and not result.get("ok") and "refused" in result:
+        _release(gov, conn, held)
     if result.get("ok"):
         log("op by %s as %s: %s ok" % (caller, who, op))
-        return 200, dict(result, caller=caller, principal=who)
+        return 200, dict(result, caller=caller, principal=who, **stated)
     if "refused" in result:
         log("op by %s as %s: %s refused" % (caller, who, op))
         # A refusal is redis_gov deciding NOT to act, so nothing ran. `audit` is passed through as
         # it came: "ok", or "FAILED:<type>" when the refusal itself could not be recorded.
-        return 403, {"error": "refused", "reason": str(result["refused"]), "executed": False,
-                     "audit": result.get("audit", ""), "caller": caller, "principal": who}
+        return 403, dict({"error": "refused", "reason": str(result["refused"]), "executed": False,
+                          "audit": result.get("audit", ""), "caller": caller, "principal": who}, **stated)
     kind = str(result.get("error") or "unknown")
     if op in READS:
         log("op by %s as %s: %s failed (%s)" % (caller, who, op, kind))

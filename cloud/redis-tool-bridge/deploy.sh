@@ -71,6 +71,7 @@ gcloud run deploy ${SERVICE} \\
   --service-account=${RUNTIME_SA} \\
   --no-allow-unauthenticated \\
   --ingress=all \\
+  --min-instances=0 --max-instances=1 --concurrency=4 \\
   --network=default --subnet=default --vpc-egress=private-ranges-only \\
   --set-secrets=/secrets/auth/redis-auth=REDIS_AUTH_STRING:2,/secrets/ca/redis-ca.pem=REDIS_CA_CERT:1 \\
   --set-env-vars=REDIS_HOST=${REDIS_HOST},REDIS_PORT=${REDIS_PORT:-6378},REDIS_AUTH_FILE=/secrets/auth/redis-auth,REDIS_CA_CERT_PATH=/secrets/ca/redis-ca.pem,BRIDGE_AUDIENCE=${url},BRIDGE_CALLERS=aya-runtime@${PROJECT}.iam.gserviceaccount.com
