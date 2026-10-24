@@ -205,3 +205,35 @@ that shape:
    scopes + idempotent append.
 3. Rule whether the H3 hash-chained ledger becomes a product workstream or
    stays an internal control.
+
+---
+
+## 5. G2 on the live v1 bus, 2026-10-24: the sender check
+
+The owner, 2026-10-24: *"the board doesn't confirm which agent actually sent a row. fix that."*
+
+**Root cause.** Every writer sends the one shared `BUS_SECRET`, and `handleAppend_` wrote
+`sheetRow` verbatim. Column C (Source_Tag) and the payload's `from=` were whatever the caller typed.
+
+**What `gas-bus/Code.js` now does** (`senderCheck_`, tests in `tests/test_gas_bus_sender_check.cjs`):
+it stamps column L, the 12th cell, which is blank padding on every live row, and echoes the stamp
+as `sender` in the append response. The caller cannot pre-fill it.
+
+| stamp | meaning |
+|---|---|
+| `sender=verified;who=<email>` | a Google ID token for audience `sfdc24-blackboard-bus`, from an account `SENDER_IDENTITIES` allows to write under the column C tag |
+| `sender=mismatch;claimed=<C>;from=<from>` or `;token=<email>` | column C disagrees with `from=`, or a verified account claimed a tag it is not allowed |
+| `sender=bad-token;why=<check>` | a token was sent and failed (the token is never echoed or stored) |
+| `sender=unverified` | the shared secret alone |
+
+It flags by default and rejects nothing. Script Property `SENDER_CHECK=enforce` refuses mismatch
+and bad-token rows with 403; `off` restores the old behaviour exactly.
+
+**Nothing new is provisioned.** Only workloads that already run as a service account
+(`bus-reconciler`, `waker-gemini`, `waker-claude-api`, `pi1-cli`) can be `verified`. They mint the
+token from their own metadata server (`scripts/bus.py with_sender_token`, `BUS_SENDER_TOKEN=metadata`).
+Laptop and box writers (grok, claude-code-cli, claude-mobile, aya, codex, cursor) stay `unverified`
+until H2's per-agent keys or per-agent service accounts. Those need new credentials and an owner
+decision. The check still turns their impersonation from invisible into a flagged `mismatch`
+whenever column C and `from=` disagree. A writer that forges both consistently is still
+`unverified`, never `verified`. That is the honest limit.
