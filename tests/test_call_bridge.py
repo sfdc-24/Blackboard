@@ -192,13 +192,29 @@ class Claim(unittest.TestCase):
         self.assertIn("answers=%s" % ask, entry["text"])
         self.assertIn(ask, self.conn.hgetall(cb.OPEN_KEY))
 
-    def test_his_words_never_reach_the_public_card(self):
-        turn(self.conn, "Codex, draft the price sheet for the client's Port-au-Prince store.")
+    def test_the_public_card_carries_his_ask_in_plain_words_only(self):
+        turn(self.conn, "Codex, draft the price sheet for the client's Port-au-Prince store. Ask Marie Dupont first.")
         [ask] = bridge(self.conn).tick()
         published = json.dumps(cp.snapshot(self.conn, "workshop", NOW))
-        for word in ("price sheet", "Port-au-Prince", "client"):
+        for word in ("Port", "Prince", "client", "Marie", "Dupont"):
             self.assertNotIn(word, published)
         self.assertIn(ask, published)
+        got = card(self.conn, "chatgpt-codex-desktop", ask)
+        self.assertTrue(got["body"].startswith("Draft the price sheet for the ... store. Ask ... first. Claimed in the room at 10:02"), got)
+        self.assertEqual("claimed: Draft the price sheet for the ... store. Ask ... first", got["activity"])
+        [(_, entry)] = self.conn.streams["fleet:inbox:chatgpt-codex-desktop"]
+        self.assertIn("Port-au-Prince", entry["text"], "the agent still gets every word, in Redis")
+
+    def test_the_done_card_keeps_the_summary(self):
+        turn(self.conn, "Grok, center the homepage hero.")
+        [ask] = bridge(self.conn).tick()
+        later = NOW + datetime.timedelta(minutes=3)
+        bridge(self.conn, clock=lambda: later).settle([row("grok", "BCB|v=1|from=grok|answers=%s|text=ok" % ask)])
+        got = card(self.conn, "grok", ask)
+        self.assertEqual("done", got["status"])
+        self.assertTrue(got["body"].startswith("Center the homepage hero. Claimed in the room at 10:02 ET"), got)
+        self.assertEqual("done: Center the homepage hero", got["activity"])
+        self.assertIsNotNone(cp.clean_item("grok", ask, json.dumps(got)))
 
     def test_once_per_ask_however_often_it_is_read(self):
         turn(self.conn, "Codex, draft the queue flow.")
@@ -297,6 +313,130 @@ class Done(unittest.TestCase):
 
     def test_rows_that_are_not_rows_are_passed_over(self):
         self.assertEqual([], self.settle([None, "text", [], ["only", "two"]]))
+
+
+class Summary(unittest.TestCase):
+    """The public line is built by an allowlist: a word not on PLAIN, or a Title Case word inside a sentence, is a '...'."""
+
+    def test_plain_asks_read_as_said(self):
+        self.assertEqual("Center the homepage hero and remove the work section",
+                         cb.summary("Grok, center the homepage hero and remove the work section."))
+        self.assertEqual("I know but it's a simple html update. You just center it",
+                         cb.summary("I know, but it's a simple HTML update. You just center it..."))
+        self.assertEqual("Make a page with 3 columns", cb.summary("make a page with 3 columns"))
+
+    def test_names_places_brands_possessives_and_long_numbers_never_pass(self):
+        cases = {
+            "Codex, draft the price sheet for the client's Port-au-Prince store.": ("client", "Port", "Prince"),
+            "Gemini, can you research Marie Dupont at Acme Corp?": ("Marie", "Dupont", "Acme", "Corp"),
+            "update the Main Street Store page. IBM wants it.": ("Main", "Street", "Store", "IBM"),
+            "Claude, build a page for Apple, call 5551234.": ("Apple", "5551234"),
+            "Grok, draft a note to Will and Rose.": ("Will", "Rose"),
+        }
+        self.assertEqual("Update the ... page", cb.summary("update the Main Street Store page."))
+        for said, banned in cases.items():
+            line = cb.summary(said)
+            for word in banned:
+                self.assertNotIn(word, line, (said, line))
+            self.assertIn("...", line, said)
+
+    def test_the_sentence_with_the_task_word_is_where_it_starts(self):
+        self.assertEqual("So ... I need you to draft the plan", cb.summary("Okay. So, Claude, I need you to draft the plan."))
+        self.assertEqual("Can you research ... at", cb.summary("Hello there. Gemini, can you research Marie Dupont at Acme?"))
+
+    def test_short_one_line_no_pipe_and_nothing_without_a_task(self):
+        line = cb.summary("Claude, build " + "the big page and " * 20)
+        self.assertLessEqual(len(line), cb.SUMMARY_CHARS)
+        self.assertLessEqual(len(cb.summary("build " + "x" * 300)), cb.SUMMARY_CHARS)
+        long = cb.summary("prepare " + "documents integration dashboard " * 5)
+        self.assertLessEqual(len(long), cb.SUMMARY_CHARS)
+        self.assertTrue(long.startswith("Prepare documents integration") and long.endswith(" ..."), long)
+        self.assertNotIn("|", cb.summary("Grok, build the page | then the footer"))
+        self.assertNotIn("\n", cb.summary("Grok, build the page\nthen the footer"))
+        self.assertEqual("", cb.summary("Codex, what do you think?"))
+        self.assertEqual("", cb.summary(""))
+        self.assertTrue(cp.activity_ok("claimed: " + line))
+
+    def test_every_plain_word_is_lower_case_and_one_word(self):
+        for word in cb.PLAIN:
+            self.assertEqual(word, word.lower(), word)
+            self.assertRegex(word, r"^[a-z]+(?:['-][a-z]+)*$")
+        for name in ("will", "may", "mark", "bill", "rose", "grace", "hope", "joy", "apple", "grok", "claude",
+                     "codex", "gemini", "abdus"):
+            self.assertNotIn(name, cb.PLAIN)
+
+
+class FollowUp(unittest.TestCase):
+    """CLAUDE-MOBILE-BRIDGE-CONTINUITY: his follow-up to the voice holding the floor names nobody and is still an ask."""
+    SAID = "I know, but it's a simple HTML update. You just center it."
+
+    def setUp(self):
+        self.conn = FakeRedis()
+        open_window(self.conn)
+
+    def granted(self, persona, turn_id, seconds_ago):
+        return turn(self.conn, None, reason="", actor=persona, seconds_ago=seconds_ago, kind="floor.granted",
+                    turn_id=turn_id)
+
+    def test_what_is_a_follow_up(self):
+        f = {"kind": "turn.started", "actor_id": "owner-1", "reason": "continuity", "utterance": self.SAID}
+        self.assertTrue(cb.follow_up(f))
+        self.assertFalse(cb.follow_up(dict(f, utterance="I know, but why is it slow?")), "no task word")
+        self.assertFalse(cb.follow_up(dict(f, utterance="Codex, update it.")), "a name: the named path's, not this")
+        self.assertFalse(cb.follow_up(dict(f, reason="vocative")))
+        self.assertFalse(cb.follow_up(dict(f, reason="everyone")))
+        self.assertFalse(cb.follow_up(dict(f, actor_id="chair")))
+        self.assertFalse(cb.follow_up(dict(f, kind="floor.granted")))
+        self.assertFalse(cb.follow_up(dict(f, utterance="")))
+
+    def test_the_voice_granted_the_floor_for_that_turn_takes_it(self):
+        self.granted("codex", "t-1", seconds_ago=40)                       # an earlier holder
+        turn(self.conn, self.SAID, reason="continuity", seconds_ago=20, turn_id="t-2")
+        self.granted("grok", "t-2", seconds_ago=15)                        # read ahead in the same page
+        [ask] = bridge(self.conn).tick()
+        got = card(self.conn, "grok", ask)
+        self.assertEqual("claimed", got["status"])
+        self.assertTrue(got["body"].startswith("I know but it's a simple html update. You just center it."), got)
+        self.assertIsNone(self.conn.hget(cp.PARTITION % ("workshop", "chatgpt-codex-desktop"), ask))
+        self.assertIn(self.SAID.split(".")[0], self.conn.streams["fleet:inbox:grok"][0][1]["text"])
+
+    def test_else_the_last_voice_granted_the_floor_in_the_room(self):
+        self.granted("gemini", "t-1", seconds_ago=40)
+        bridge(self.conn).tick()                                           # an earlier pass saw the grant
+        turn(self.conn, self.SAID, reason="continuity", seconds_ago=5, turn_id="t-2")
+        [ask] = bridge(self.conn).tick()                                   # its grant is not in this page yet
+        self.assertIsNotNone(card(self.conn, "gemini", ask))
+        self.assertEqual("gemini", self.conn.get(cb.LAST_KEY % ROOM))
+        self.assertEqual(cb.LAST_SECONDS, self.conn.ttls[cb.LAST_KEY % ROOM])
+        self.assertTrue((cb.LAST_KEY % ROOM).startswith("gov:"))
+
+    def test_nobody_known_nobody_claimed(self):
+        turn(self.conn, self.SAID, reason="continuity", seconds_ago=5, turn_id="t-2")
+        self.assertEqual([], bridge(self.conn).tick())
+        self.assertEqual({}, self.conn.hashes.get(cb.OPEN_KEY, {}))
+
+    def test_a_grant_for_another_turn_or_a_voice_that_is_not_ours_is_not_the_holder(self):
+        turn(self.conn, self.SAID, reason="continuity", seconds_ago=20, turn_id="t-2")
+        self.granted("grok", "t-9", seconds_ago=15)                        # another turn: only the room's last
+        self.granted("owner-1", "t-2", seconds_ago=10)                     # not a voice
+        self.assertEqual([], bridge(self.conn).tick(), "t-9's grant is another turn's, and came after the ask")
+        self.assertEqual([], [k for k in self.conn.hashes if k.startswith("conf:canvas:")])
+        self.assertEqual("grok", self.conn.get(cb.LAST_KEY % ROOM), "the owner's id is never kept as a holder")
+
+    def test_a_follow_up_with_no_task_word_claims_nothing(self):
+        self.granted("grok", "t-1", seconds_ago=40)
+        turn(self.conn, "I know, but why is it so slow?", reason="continuity", seconds_ago=20, turn_id="t-2")
+        self.granted("grok", "t-2", seconds_ago=15)
+        self.assertEqual([], bridge(self.conn).tick())
+        self.assertNotIn("fleet:inbox:grok", self.conn.streams)
+
+    def test_once_per_follow_up(self):
+        turn(self.conn, self.SAID, reason="continuity", seconds_ago=20, turn_id="t-2")
+        self.granted("grok", "t-2", seconds_ago=15)
+        self.assertEqual(1, len(bridge(self.conn).tick()))
+        self.conn.store.pop(cb.CURSOR_KEY % ROOM)
+        self.assertEqual([], bridge(self.conn).tick())
+        self.assertEqual(1, len(self.conn.streams["fleet:inbox:grok"]))
 
 
 class Clock(unittest.TestCase):

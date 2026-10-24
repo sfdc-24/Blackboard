@@ -12,11 +12,22 @@ happened during the call". Inside the existing bus-requests live run, nothing ne
     done      a board row FROM that agent whose answers= names the ask flips the card to "done" with the finish time.
               The rows are the ones the live loop has already read (serve_requests.one_pass): no extra board read.
 
+A FOLLOW-UP COUNTS TOO (the owner's live call, 2026-10-24 ~13:05 ET, CLAUDE-MOBILE-BRIDGE-CONTINUITY-20261024T1718Z):
+"I know, but it's a simple HTML update. You just center it..." went to the voice holding the floor (reason continuity)
+and named nobody, so no card went up. A continuity turn with a task word and no name is that voice's ask: the actor of
+the next floor.granted in the same turn_id, read ahead within the page; else the last voice granted the floor in this
+room, kept in gov:callbridge:last:<room> for LAST_SECONDS. Neither known: nothing is claimed.
+
 WHAT GOES ON THE PUBLIC CARD, AND WHAT DOES NOT. The canvas file is world-readable (canvas_publish.py). His words can
-name a client, its brands or its staff, and no list here could tell which words do. So the card carries WHO was asked
-and WHEN, never WHAT: "Claimed by Codex, 10:02 ET". His words go only to the agent's inbox, in Redis, which every fleet
-agent can already read. The agent's own card, posted under the canvas rules (In the making, then the real card), says
-what the work is in words it chose for a public page.
+name a client, its brands or its staff. On that call he saw only empty "Claimed by" shells and asked to see what the
+work is, so the card carries a one-line SUMMARY built from his words by an allowlist, never a blocklist: from the start
+of the sentence that holds the task word, at most SUMMARY_WORDS words and SUMMARY_CHARS characters, and a word passes
+only if it is in PLAIN (common English and build words, none that is commonly a name on its own) and is not in Title Case
+after a sentence's first word. Anything else, a name, a brand, a place, a possessive, a long number, becomes one "...".
+So "Codex, draft the price sheet for the client's Port-au-Prince store" is published as "Draft the price sheet for the
+... store". His full words go only to the
+agent's inbox, in Redis, which every fleet agent can already read; the agent's own card, posted under the canvas rules,
+says the rest in words it chose for a public page.
 
 WHEN IT RUNS. Only inside a live run, beside the canvas publisher, and only while the canvas room's publish window
 (gov:canvas:publish:<room>) is open, so it follows the owner's sessions and nothing else. Before every write it asks
@@ -40,6 +51,7 @@ import canvas_publish
 STREAM_MATCH = "v1:conf:*:events"
 CONF_ROOM = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 CURSOR_KEY = "gov:callbridge:cursor:%s"
+LAST_KEY = "gov:callbridge:last:%s"
 ASK_KEY = "gov:callbridge:ask:%s"
 OPEN_KEY = "gov:callbridge:open"
 INBOX_KEY = "fleet:inbox:%s"
@@ -50,6 +62,10 @@ LOOKBACK_SECONDS = 300
 TICK_SECONDS = 5
 PAGE = 200
 ASK_CHARS = 1000
+LAST_SECONDS = 15 * 60
+SUMMARY_WORDS = 14
+SUMMARY_CHARS = 70          # with "claimed: " it fits canvas_publish.ACTIVITY_MAX (80)
+FOLLOW = "continuity"
 
 # The room's voices, by the chair's persona ids, and the fleet agent each one's work goes to: the canonical ids of
 # fleet:inbox (cloud/drive-intake ALIASES, agreed 2026-10-09) and of the canvas slots (canvas_publish.AGENTS).
@@ -72,7 +88,44 @@ NAMED = ("vocative", "mention", "view_request")
 TASK = re.compile(
     r"(?i)\b(?:build|draft|make|create|write|design|mock(?:\s+up)?|prototype|add|fix|check|review|draw|diagram|"
     r"sketch|list|find|research|compare|summari[sz]e|update|set\s+up|put|post|show\s+me|work\s+on|look\s+into|"
-    r"prepare|plan|test|verify|deploy|open|wire|map|outline|estimate)\b")
+    r"prepare|plan|test|verify|deploy|open|wire|map|outline|estimate|"
+    r"cent(?:er|re)|align|remove|delete|replace|edit|rename|resize)\b")
+
+
+# THE SUMMARY'S WORDS (summary). Common English and the words of building a page or a plan. Left out on purpose: words
+# that are commonly a first name or a brand on their own (will, may, mark, bill, rose, grace, hope, joy, apple, ...). A
+# word is one reviewed entry here: one that is missing costs a "..." on a card, never a leak.
+PLAIN = frozenset("""
+a an the this that these those it its it's i me my we us our you your they them their
+and or but so if then than as of to in on at by for with from into onto over under about after before between
+up down out off all any each every some more most less few other another same such only just also too very not no
+is are was were be been being am do does did done doing have has had having can could would should must
+please now here there again still both either new old next last first second third one two three four five ten
+okay ok yes yeah know need needs want wants like think let let's go going gonna don't doesn't can't won't isn't
+ask asks asked tell say
+make made build add put get set show give take keep move change update fix check review test verify draft write
+create design mock prototype draw diagram sketch list find research compare summarize summarise post open wire map
+outline estimate prepare plan deploy center centre align remove delete drop hide replace rename resize swap clean
+start stop finish send share look work run try use bring turn see read edit improve simplify shorten expand
+page pages homepage site website home hero header footer banner menu nav navigation link links button buttons form
+forms field fields section sections column columns row rows card cards grid layout panel tab tabs modal popup
+text title titles heading headline subtitle copy line lines word words paragraph caption label labels logo icon icons
+image images picture photo photos video font fonts color colour colors colours background border spacing margin
+padding size width height top bottom left right middle side centered centred bigger smaller larger wider
+narrower bold italic dark light white black blue green red yellow orange purple gray grey
+html css code script style styles theme mobile desktop phone screen screens view views version demo
+canvas board flow flowchart chart charts graph table tables data model schema record records report reports summary
+diagrams wireframe slide slides deck plans step steps lists item items note notes doc docs
+document documents file files folder sheet sheets price prices pricing cost costs budget order orders product
+products inventory store stores shop catalog catalogue customer customers user users account accounts contact
+contacts lead leads case cases ticket tickets email emails message messages call calls meeting meetings agenda
+calendar date dates time times day days week weeks month months year
+login signup sign search filter filters sort dashboard metric metrics status process workflow pipeline integration
+api endpoint service server database query tests bug bugs issue issues fixes feature features
+idea ideas option options choice choices risk risks question questions answer answers point points part parts
+simple simpler quick quickly small big large short long clear full empty main whole better best good
+one-line single
+""".split())
 
 
 def _text(value):
@@ -120,20 +173,85 @@ def asks_in(fields: dict) -> list:
     return agents
 
 
-def claimed_card(agent: str, now) -> dict:
+def follow_up(fields: dict) -> bool:
+    """An owner turn that went to the voice holding the floor (continuity), with a task word and no name in it."""
+    if fields.get("kind") != "turn.started" or fields.get("actor_id") in ("", None, "chair"):
+        return False
+    if fields.get("reason") != FOLLOW:
+        return False
+    said = fields.get("utterance") or ""
+    if not said.strip() or not TASK.search(said):
+        return False
+    return not any(pattern.search(said) for pattern in NAMES.values())
+
+
+# A word (with its apostrophes and hyphens: it's, one-line), a number, or the end of a sentence.
+_TOKEN = re.compile(r"[A-Za-z]+(?:['\u2019-][A-Za-z]+)*|[0-9]+|[.!?;:\n]+")
+_SMALL_NUMBER = re.compile(r"[0-9]{1,2}")
+
+
+def summary(said: str) -> str:
+    """His ask in one public line, by the PLAIN allowlist (module docstring); "" when no task word is in it.
+
+    It starts at the sentence that holds the first task word and runs on across sentences for SUMMARY_WORDS words, so
+    "I know, but it's a simple HTML update. You just center it" keeps both halves of the ask."""
+    said = said or ""
+    found = TASK.search(said)
+    if not found:
+        return ""
+    ends = [m.end() for m in re.finditer(r"[.!?;:\n]+", said[:found.start()])]
+    out, words, opening = [], 0, True
+    for token in _TOKEN.findall(said[ends[-1] if ends else 0:]):
+        if not token[0].isalnum():
+            if out and out[-1] != "..." and not out[-1].endswith("."):
+                out[-1] += "."
+            opening = True
+            continue
+        if words == SUMMARY_WORDS:
+            break
+        words += 1
+        plain = token.lower().replace("\u2019", "'")
+        # Title Case after a sentence's first word is a name ("Store" in "Main Street Store"); all capitals is not
+        # ("HTML"), and the word must be in PLAIN either way.
+        titled = token[0].isupper() and not token.isupper()
+        if token == "I" or _SMALL_NUMBER.fullmatch(token) or (plain in PLAIN and (opening or not titled)):
+            starts = not out or (out[-1].endswith(".") and out[-1] != "...")
+            out.append("I" if plain == "i" else plain.capitalize() if starts else plain)
+        elif not out or out[-1] != "...":
+            out.append("...")
+        opening = False
+    while out and out[0] == "...":
+        out.pop(0)
+    while out and out[-1] == "...":
+        out.pop()
+    while len(" ".join(out)) > SUMMARY_CHARS:
+        out = out[:-1] if out[-1] == "..." else out[:-1] + ["..."]   # whole words only, and the cut shows
+    if out:
+        out[0] = out[0][:1].upper() + out[0][1:]
+        if out[-1] != "...":
+            out[-1] = out[-1].rstrip(".")           # the last sentence's full stop, never the cut's "..."
+    return " ".join(out)
+
+
+def claimed_card(agent: str, now, asked: str = "") -> dict:
     name = NAME_OF[agent]
+    lead = "%s. " % asked if asked else ""
     return {"v": 1, "type": "note", "status": "claimed", "public": True, "version": 1, "ts": stamp(now),
-            "activity": "claimed in the room", "title": "Claimed by %s, %s" % (name, eastern(now)),
-            "body": "Asked in the room at %s. %s's card for this work follows here when it is done." % (eastern(now), name)}
+            "activity": "claimed: %s" % asked if asked else "claimed in the room",
+            "title": "Claimed by %s, %s" % (name, eastern(now)),
+            "body": "%sClaimed in the room at %s. %s's card for this work follows here when it is done." % (
+                lead, eastern(now), name)}
 
 
-def done_card(agent: str, claimed_at, now) -> dict:
+def done_card(agent: str, claimed_at, now, asked: str = "") -> dict:
     name = NAME_OF[agent]
     minutes = max(0, int(round((now - claimed_at).total_seconds() / 60)))
+    lead = "%s. " % asked if asked else ""
     return {"v": 1, "type": "note", "status": "done", "public": True, "version": 2, "ts": stamp(now),
-            "activity": "answered on the board", "title": "Done by %s, %s" % (name, eastern(now)),
-            "body": "Asked in the room at %s, answered on the board at %s (%d min)." % (
-                eastern(claimed_at), eastern(now), minutes)}
+            "activity": "done: %s" % asked if asked else "answered on the board",
+            "title": "Done by %s, %s" % (name, eastern(now)),
+            "body": "%sClaimed in the room at %s, answered on the board at %s (%d min)." % (
+                lead, eastern(claimed_at), eastern(now), minutes)}
 
 
 def inbox_text(ask: str, agent: str, room: str, said: str, now) -> str:
@@ -180,33 +298,51 @@ class Bridge:
         else:
             start = int((now.timestamp() - LOOKBACK_SECONDS) * 1000)
             entries = self.conn.xrange(key, min="%d-0" % max(0, start), max="+", count=PAGE)
+        entries = [(_text(entry_id), _fields(raw)) for entry_id, raw in entries or ()]
         claimed = []
-        for entry_id, raw in entries or ():
-            entry_id = _text(entry_id)
+        for index, (entry_id, fields) in enumerate(entries):
             if entry_id == cursor:
                 continue
-            for agent in asks_in(_fields(raw)):
+            if fields.get("kind") == "floor.granted" and fields.get("actor_id") in AGENT_OF:
+                self.conn.set(LAST_KEY % room, AGENT_OF[fields["actor_id"]], ex=LAST_SECONDS)
+            agents = asks_in(fields)
+            if not agents and follow_up(fields):
+                holder = self._holder(room, fields.get("turn_id"), entries[index + 1:])
+                agents = [holder] if holder else []
+            for agent in agents:
                 if not self.holds():
                     return claimed
-                ask = self._claim(room, entry_id, agent, _fields(raw).get("utterance") or "", now)
+                ask = self._claim(room, entry_id, agent, fields.get("utterance") or "", now)
                 if ask:
                     claimed.append(ask)
             self.conn.set(CURSOR_KEY % room, entry_id, ex=TTL_SECONDS)
         return claimed
 
+    def _holder(self, room, turn_id, ahead):
+        """Whose a follow-up is: the voice granted the floor for that same turn later in this page, else the last voice
+        granted the floor in this room (LAST_SECONDS), else nobody."""
+        if turn_id:
+            for _, fields in ahead:
+                if (fields.get("kind") == "floor.granted" and fields.get("turn_id") == turn_id
+                        and fields.get("actor_id") in AGENT_OF):
+                    return AGENT_OF[fields["actor_id"]]
+        last = _text(self.conn.get(LAST_KEY % room))
+        return last if last in NAME_OF else None
+
     def _claim(self, room, entry_id, agent, said, now):
         ask = ask_id(room, entry_id, agent)
         if not self.conn.set(ASK_KEY % ask, stamp(now), nx=True, ex=TTL_SECONDS):
             return None                                      # claimed before: never twice
+        asked = summary(said)
         pipe = self.conn.pipeline(transaction=True)
         try:
             pipe.multi()
             pipe.hset(canvas_publish.PARTITION % (self.canvas_room, agent), ask,
-                      json.dumps(claimed_card(agent, now), sort_keys=True))
+                      json.dumps(claimed_card(agent, now, asked), sort_keys=True))
             pipe.xadd(INBOX_KEY % agent, {"by": BY, "text": inbox_text(ask, agent, self.canvas_room, said, now),
                                           "at": stamp(now)})
-            pipe.hset(OPEN_KEY, ask, json.dumps({"agent": agent, "claimed_at": stamp(now), "room": self.canvas_room},
-                                                sort_keys=True))
+            pipe.hset(OPEN_KEY, ask, json.dumps({"agent": agent, "claimed_at": stamp(now), "room": self.canvas_room,
+                                                 "asked": asked}, sort_keys=True))
             pipe.expire(OPEN_KEY, TTL_SECONDS)
             pipe.execute()
         finally:
@@ -234,17 +370,18 @@ class Bridge:
                     claimed_at = datetime.datetime.strptime(info["claimed_at"], "%Y-%m-%dT%H:%M:%SZ").replace(
                         tzinfo=datetime.timezone.utc)
                     agent, room = info["agent"], info["room"]
-                except (KeyError, TypeError, ValueError):
+                    asked = str(info.get("asked") or "")
+                except (KeyError, TypeError, ValueError, AttributeError):
                     continue
                 # Its own agent's answer only: the row's tag, or the from= it signs with, is one of that agent's.
                 tags = ANSWERS_FROM.get(agent, ())
                 if sender not in tags and (_field(payload, "from") or "").strip().lower() not in tags:
                     continue
-                self._flip(ask, agent, room, claimed_at, now)
+                self._flip(ask, agent, room, claimed_at, now, asked)
                 done.append(ask)
         return done
 
-    def _flip(self, ask, agent, room, claimed_at, now) -> None:
+    def _flip(self, ask, agent, room, claimed_at, now, asked="") -> None:
         partition = canvas_publish.PARTITION % (room, agent)
         current = _text(self.conn.hget(partition, ask))
         try:
@@ -256,7 +393,7 @@ class Bridge:
             pipe.multi()
             # The agent's own card under the same id, posted after the claim, is never overwritten.
             if mine is None or (mine.get("status") == "claimed" and mine.get("version") == 1):
-                pipe.hset(partition, ask, json.dumps(done_card(agent, claimed_at, now), sort_keys=True))
+                pipe.hset(partition, ask, json.dumps(done_card(agent, claimed_at, now, asked), sort_keys=True))
             pipe.hdel(OPEN_KEY, ask)
             pipe.execute()
         finally:
