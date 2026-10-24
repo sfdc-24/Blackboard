@@ -226,7 +226,7 @@ def main() -> int:
         drop_lock(conn, me)
 
 
-def live(conn, env, execution, me, until, interval, lock_ttl) -> int:
+def live(conn, env, execution, me, until, interval, lock_ttl, settle=None) -> int:
     # LIVE MODE, for a meeting. Mr. Salam, 2026-10-08: "Do not create barriers in agent's ability to read,
     # write, share ideas, propose changes during the meeting (without audio) ... like a background task
     # that runs as side conversation." A request posted during the call is answered within about
@@ -254,8 +254,9 @@ def live(conn, env, execution, me, until, interval, lock_ttl) -> int:
         now = datetime.datetime.now(datetime.timezone.utc)
         with_git = last_git is None or (now - last_git).total_seconds() >= git_every
         try:
+            # `settle` only when the call bridge runs: without it a pass is called exactly as before.
             one_pass(conn, env, execution, with_git=with_git, quiet=True,
-                     renew=lambda: keep_lock(conn, me, lock_ttl))
+                     renew=lambda: keep_lock(conn, me, lock_ttl), **({"settle": settle} if settle else {}))
         except Exception as error:                                       # noqa: BLE001
             # One bad pass (a board flap, a lost reply) must not end the meeting's channel.
             log.warning("pass failed: %s", type(error).__name__)
@@ -273,28 +274,42 @@ def live(conn, env, execution, me, until, interval, lock_ttl) -> int:
     return 0
 
 
-def live_with_canvas(conn, env, execution, me, until, interval, lock_ttl, start=None) -> int:
+def live_with_canvas(conn, env, execution, me, until, interval, lock_ttl, start=None, start_bridge=None,
+                     environ=None) -> int:
     """live(), with the canvas publisher (scripts/canvas_publish.py) beside it while CANVAS_BUCKET is set.
 
     BESIDE THE LOOP, ON ITS OWN THREAD: one pass starts with a board read that can take minutes, and the
     canvas has to move every few seconds. It runs only inside a live run, which is the execution holding
     gov:worker:lock, and it stops when that run ends - so one worker publishes at a time, and a window
-    still open in Redis is picked up by the next live run. Unset, nothing starts and nothing changes."""
+    still open in Redis is picked up by the next live run. Unset, nothing starts and nothing changes.
+
+    THE CALL BRIDGE (scripts/call_bridge.py) runs beside it, on its own thread, only with CALL_BRIDGE=on and a
+    publisher running: its cards reach the page only through the publisher. Its done flips read the board rows
+    each pass already read (one_pass `settle`). Off, or without the flag, nothing starts: the rollback is the flag."""
     import canvas_publish                                                # noqa: PLC0415
-    bucket = os.environ.get("CANVAS_BUCKET", "")
+    environ = os.environ if environ is None else environ
+    bucket = environ.get("CANVAS_BUCKET", "")
+    holds = lambda: _text(conn.get(WORKER_LOCK_KEY)) == me              # noqa: E731
     # The lease, asked before every upload: a run that lost gov:worker:lock publishes nothing more (Aya on c633373).
-    publisher = (start or canvas_publish.start)(conn, bucket, log,
-                                                holds=lambda: _text(conn.get(WORKER_LOCK_KEY)) == me)
+    publisher = (start or canvas_publish.start)(conn, bucket, log, holds=holds)
     if publisher is not None:
         log.info("canvas publisher: open windows every %ds to gs://%s/rooms/", canvas_publish.PUBLISH_SECONDS, bucket)
     elif bucket:
         log.error("CANVAS_BUCKET is not a bucket name; the canvas publisher is not started")
+    bridge = None
+    if publisher is not None and environ.get("CALL_BRIDGE", "").strip().lower() == "on":
+        import call_bridge                                               # noqa: PLC0415
+        bridge = (start_bridge or call_bridge.start)(conn, log, holds)
+        if bridge is not None:
+            log.info("call bridge: on, room asks become claimed cards in conf:canvas:%s", bridge.canvas_room)
     try:
-        return live(conn, env, execution, me, until, interval, lock_ttl)
+        return live(conn, env, execution, me, until, interval, lock_ttl,
+                    bridge.settle if bridge is not None else None)
     finally:
-        if publisher is not None:
-            publisher.stop.set()
-            publisher.thread.join(timeout=15)
+        for worker in (bridge, publisher):
+            if worker is not None:
+                worker.stop.set()
+                worker.thread.join(timeout=15)
 
 
 def live_deadline(until, started, max_minutes):
@@ -320,8 +335,11 @@ def _loop_until(text):
     return when if when.tzinfo else when.replace(tzinfo=datetime.timezone.utc)
 
 
-def one_pass(conn, env, execution, with_git=True, quiet=False, renew=None):
-    """Read the board (and GitHub), answer what is allowed, beat the heartbeat. One pass."""
+def one_pass(conn, env, execution, with_git=True, quiet=False, renew=None, settle=None):
+    """Read the board (and GitHub), answer what is allowed, beat the heartbeat. One pass.
+
+    `settle`, when given, is handed the board rows just read (the call bridge's done flips); its failure costs
+    those flips this pass and nothing else."""
     now = datetime.datetime.now(datetime.timezone.utc)
     bus_request.heartbeat(conn, "running", now=now, execution=execution)
     since = (now - datetime.timedelta(minutes=WINDOW_MINUTES)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -329,6 +347,11 @@ def one_pass(conn, env, execution, with_git=True, quiet=False, renew=None):
     # The board read can take minutes; the lock is renewed after it, and before each append below.
     if renew is not None and renew() is not True:
         raise LockLost("gov:worker:lock is not provably ours after the board read; this pass answers nothing")
+    if settle is not None:
+        try:
+            settle(rows)
+        except Exception as error:                                       # noqa: BLE001
+            log.warning("call bridge settle failed (%s)", type(error).__name__)
     if not quiet:
         log.info("window since=%s: %d board row(s)", since, len(rows))
     # THE GIT CHANNEL (scripts/git_requests.py): requests from the GitHub bot accounts the access list

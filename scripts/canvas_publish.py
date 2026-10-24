@@ -106,6 +106,7 @@ BUCKET = re.compile(r"^[a-z0-9][a-z0-9._-]{1,61}[a-z0-9]$")
 TITLE_MAX = 120
 BODY_MAX = 1800
 TS_MAX = 40
+ACTIVITY_MAX = 80
 MAX_ITEMS = 200
 # A browser's edge copy is at most this old. "public" lets Google's edge serve repeat polls, so many viewers
 # do not each cost a read of the bucket (Gemini on v0.2: 5 s polling inflates Class B operations). Without an
@@ -163,16 +164,29 @@ def clean_item(agent: str, item_id: str, raw):
         return None
     if _CONTROL.search(title + ts + body) or any(ch in title + ts for ch in "\t\r\n"):
         return None
+    activity = item.get("activity")
+    if activity is not None and not activity_ok(activity):
+        return None
     if item["type"] == "image_url" and not image_ok(body):
         return None
     if item["type"] == "mermaid" and not mermaid_ok(body):
         return None
     if agent == CHAIR and (item["type"] not in CHAIR_TYPES or len(_text(raw).encode("utf-8")) > CHAIR_BYTES
-                           or _LINKISH.search(title + "\n" + body)):
+                           or _LINKISH.search(title + "\n" + body + "\n" + (activity or ""))):
         return None
-    return {"v": 1, "id": "%s/%s" % (agent, _text(item_id)), "type": item["type"], "title": title,
-            "body": body, "status": item["status"], "version": version, "public": True, "ts": ts,
-            "agent": agent}
+    out = {"v": 1, "id": "%s/%s" % (agent, _text(item_id)), "type": item["type"], "title": title,
+           "body": body, "status": item["status"], "version": version, "public": True, "ts": ts,
+           "agent": agent}
+    if activity:
+        out["activity"] = activity
+    return out
+
+
+def activity_ok(activity) -> bool:
+    """The optional activity phrase (GROK-CANVAS-RULE-ACTIVITY-20261024T0405Z): a short line of plain words for the
+    page's activity strip. Text, at most ACTIVITY_MAX characters, one line, no control character and no pipe."""
+    return (isinstance(activity, str) and len(activity) <= ACTIVITY_MAX and not _CONTROL.search(activity)
+            and not any(ch in activity for ch in "\t\r\n|"))
 
 
 def mermaid_ok(body: str) -> bool:

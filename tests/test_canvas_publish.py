@@ -66,6 +66,31 @@ class CleanItem(unittest.TestCase):
         self.assertEqual(sorted(got), sorted(["v", "id", "type", "title", "body", "status", "version",
                                               "public", "ts", "agent"]))
 
+    def test_an_activity_phrase_is_published_beside_the_card(self):
+        # GROK-CANVAS-RULE-ACTIVITY-20261024T0405Z: the page's activity strip shows it beside the agent's chip.
+        got = cp.clean_item("grok", "3", item(activity="crafting four checks"))
+        self.assertEqual("crafting four checks", got["activity"])
+        self.assertEqual("x" * cp.ACTIVITY_MAX, cp.clean_item("grok", "3", item(activity="x" * cp.ACTIVITY_MAX))["activity"])
+        self.assertNotIn("activity", cp.clean_item("grok", "3", item()))
+        self.assertNotIn("activity", cp.clean_item("grok", "3", item(activity="")))
+        self.assertEqual(80, cp.ACTIVITY_MAX)
+
+    def test_an_activity_outside_the_rule_drops_the_card(self):
+        for bad in ("x" * (cp.ACTIVITY_MAX + 1), "two|parts", "line\nbreak", "tab\there", "bell\x07", 7, True,
+                    ["crafting"], {"a": 1}, None):
+            raw = json.loads(item())
+            raw["activity"] = bad
+            if bad is None:
+                self.assertIsNotNone(cp.clean_item("grok", "3", json.dumps(raw)), "null is absent")
+                continue
+            self.assertIsNone(cp.clean_item("grok", "3", json.dumps(raw)), repr(bad))
+
+    def test_the_chair_s_activity_is_held_to_its_no_link_rule(self):
+        note = dict(type="note", body="three checks")
+        self.assertIsNotNone(cp.clean_item("chair", "1", item(activity="tracking three changes", **note)))
+        for link in ("see www.example.com", "open https://x.test", "[the plan](notes.md)"):
+            self.assertIsNone(cp.clean_item("chair", "1", item(activity=link, **note)), link)
+
     def test_anything_not_exactly_public_true_stays_in_redis(self):
         for public in (False, "true", 1, None):
             self.assertIsNone(cp.clean_item("grok", "3", item(public=public)), public)
