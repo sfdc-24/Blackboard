@@ -52,10 +52,12 @@ from __future__ import annotations
 import datetime
 import hashlib
 import json
+import os
 import re
 import secrets
 import time
 
+import canvas_publish
 import redis_gov
 
 # The board's ten cells, as scripts/append.py writes them.
@@ -72,7 +74,11 @@ SENDERS = ("aya", "chatgpt-codex-desktop", "claude-code-cli", "owner", "whatsapp
 # inside scripts/redis_gov.py's grammar, its access list and its protected namespaces, every use
 # audited. It is listed TOGETHER with its branch in handle(), never without it: listed alone, a
 # redis-op request would fall into the synthetic-probe path and be answered "OK" for nothing done.
-ACTIONS = ("redis-synthetic-probe", "redis-op")
+# canvas-publish opens or closes a room's time-boxed publishing window (scripts/canvas_publish.py). It names a
+# room and a number of minutes and nothing else: the keys it reads, the filter and the bucket are the server's.
+ACTIONS = ("redis-synthetic-probe", "redis-op", "canvas-publish")
+# The actions whose senders are the ACCESS LIST's principals, not SENDERS.
+ACL_ACTIONS = ("redis-op", "canvas-publish")
 
 # A request id is the only thing taken from the row, so its grammar is closed and narrow.
 _REQ_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{3,63}$")
@@ -181,6 +187,9 @@ def parse_request(row):
         "enc": field(payload, "enc"),
         "count": field(payload, "count"),
         "after": field(payload, "after"),
+        # canvas-publish only. Judged by canvas_publish.open_window, never used here.
+        "room": field(payload, "room"),
+        "minutes": field(payload, "minutes"),
         # haudit only. Ignored by every other op. The manifest in val is digests and lengths;
         # redis_gov refuses anything else and never copies a stored string into the result.
         "gen": field(payload, "gen"),
@@ -211,7 +220,7 @@ def repeated_keys(payload) -> list:
 def recognised(req, acl) -> bool:
     """A sender this worker answers at all. For redis-op that is the ACCESS LIST, which the controller
     owns; for the probe it is SENDERS, unchanged."""
-    if req.get("action") == "redis-op":
+    if req.get("action") in ACL_ACTIONS:
         return bool(redis_gov.principal(acl, req.get("claimed_sender")))
     return req.get("claimed_sender") in SENDERS
 
@@ -310,7 +319,7 @@ def refusals(req, now, already, acl=None) -> list:
     # is a claim anyone can append (Cursor on 237562f), so for git the board only silences a repeat notice.
     if req["req_id"] in already and req.get("channel", "board") != "git":
         out.append("already answered: a RESULT row for this request id is on the board")
-    if req.get("action") == "redis-op" and req.get("repeated"):
+    if req.get("action") in ACL_ACTIONS and req.get("repeated"):
         out.append("ambiguous: the field(s) %s appear more than once"
                    % ", ".join(safe(k)[:20] for k in req["repeated"][:5]))
     return out
@@ -355,7 +364,7 @@ def reply_to(req) -> str:
         return claimed
     # A redis-op sender the access list knows is answered under its own tag - which the grammar of
     # an ACL key already guarantees is pipe-free and short. Anything else is "ALL", as before.
-    if req.get("action") == "redis-op" and redis_gov.principal(redis_gov.load_acl(), claimed):
+    if req.get("action") in ACL_ACTIONS and redis_gov.principal(redis_gov.load_acl(), claimed):
         return claimed if re.match(r"^[a-z0-9][a-z0-9._-]{0,63}$", claimed) else "ALL"
     return "ALL"
 
@@ -519,6 +528,46 @@ def handle(rows, conn, now=None, append=None, max_per_run=MAX_PER_RUN, clock=tim
             out["capped"] += 1
             continue
         budget -= 1
+
+        if req["action"] == "canvas-publish":
+            # ONE ROW, claimed first, like a redis-op: opening a window twice would be refused anyway (SET NX),
+            # but a second RESULT under one Row_ID is the duplicate every marker here exists to prevent.
+            started = time.time()
+            marker = run_marker(req)
+            try:
+                claimed = conn.set(marker, "%s|%d" % (safe(req["row_id"])[:100] or "-", int(clock())),
+                                   nx=True, ex=DONE_TTL_SECONDS)
+            except Exception as error:                                   # noqa: BLE001
+                out["errors"].append(req["req_id"])
+                out["refused"].append({"req_id": req["req_id"],
+                                       "why": ["could not claim the run marker (%s); not run" % type(error).__name__]})
+                continue
+            if not claimed:
+                state, age = marker_state(conn, marker, clock)
+                budget = _claimed(req, state, age, conn, append, already, out, budget, acl, clock)
+                continue
+            try:
+                result = canvas_publish.open_window(conn, req.get("room"), req.get("minutes"),
+                                                    redis_gov.principal(acl, req["claimed_sender"]), now,
+                                                    os.environ.get("CANVAS_BUCKET", ""))
+                status, text = "OK", canvas_publish.summarise(result)
+            except canvas_publish.Refused as why:
+                status, text = "REFUSED", "REFUSED. %s" % why
+            except Exception as error:                                   # noqa: BLE001
+                status, text = "ERROR", "ERROR. The window could not be set (%s); nothing opened." % type(error).__name__
+                out["errors"].append(req["req_id"])
+            if append:
+                if _mark_answering(conn, req):
+                    append(row_for(RESULT_ACTION, req, text,
+                                   ("%s canvas-publish %s" % (status, safe(req.get("room"))[:40]))[:100]))
+                    _mark_answered(conn, req)
+                else:
+                    out["errors"].append(req["req_id"])
+            already.add(req["req_id"])
+            out["answered"].append({"req_id": req["req_id"], "status": status, "op": "canvas-publish",
+                                    "key": canvas_publish.window_key(safe(req.get("room"))[:40]),
+                                    "latency_ms": int((time.time() - started) * 1000)})
+            continue
 
         if req["action"] == "redis-op" and (req.get("op") or "").strip().lower() == redis_gov.VERIFY_OP:
             # The public Sheet is not the haudit route. Do not run the manifest and do not publish

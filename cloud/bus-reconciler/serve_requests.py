@@ -221,7 +221,7 @@ def main() -> int:
             one_pass(conn, env, execution, with_git=True,
                      renew=lambda: keep_lock(conn, me, lock_ttl))
             return 0
-        return live(conn, env, execution, me, until, interval, lock_ttl)
+        return live_with_canvas(conn, env, execution, me, until, interval, lock_ttl)
     finally:
         drop_lock(conn, me)
 
@@ -271,6 +271,30 @@ def live(conn, env, execution, me, until, interval, lock_ttl) -> int:
         time.sleep(interval)
     log.info("live mode ended after %d passes", passes)
     return 0
+
+
+def live_with_canvas(conn, env, execution, me, until, interval, lock_ttl, start=None) -> int:
+    """live(), with the canvas publisher (scripts/canvas_publish.py) beside it while CANVAS_BUCKET is set.
+
+    BESIDE THE LOOP, ON ITS OWN THREAD: one pass starts with a board read that can take minutes, and the
+    canvas has to move every few seconds. It runs only inside a live run, which is the execution holding
+    gov:worker:lock, and it stops when that run ends - so one worker publishes at a time, and a window
+    still open in Redis is picked up by the next live run. Unset, nothing starts and nothing changes."""
+    import canvas_publish                                                # noqa: PLC0415
+    bucket = os.environ.get("CANVAS_BUCKET", "")
+    # The lease, asked before every upload: a run that lost gov:worker:lock publishes nothing more (Aya on c633373).
+    publisher = (start or canvas_publish.start)(conn, bucket, log,
+                                                holds=lambda: _text(conn.get(WORKER_LOCK_KEY)) == me)
+    if publisher is not None:
+        log.info("canvas publisher: open windows every %ds to gs://%s/rooms/", canvas_publish.PUBLISH_SECONDS, bucket)
+    elif bucket:
+        log.error("CANVAS_BUCKET is not a bucket name; the canvas publisher is not started")
+    try:
+        return live(conn, env, execution, me, until, interval, lock_ttl)
+    finally:
+        if publisher is not None:
+            publisher.stop.set()
+            publisher.thread.join(timeout=15)
 
 
 def live_deadline(until, started, max_minutes):

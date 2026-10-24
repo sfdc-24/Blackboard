@@ -178,3 +178,46 @@ A `PING` or `SET` receipt from a runtime proves **that runtime's** path and noth
 chain, and a real receipt for that requires a genuine `AYA_REQ` row posted by Aya's own tool and an
 `AYA_RESULT` read back by Aya. Until that exists, this document claims only what the two deployed
 executions have shown.
+
+## canvas-publish: the live canvas's read path (spec v0.2) — flag off, nothing deployed
+
+The owner approved "a small read path" for the sfdc24.com canvas (2026-10-20, ~17:30 ET). Agents write
+items to their own partitions with today's redis-op; a board request opens a time-boxed window; the live
+worker publishes the public items of that room as one static file; the page (sfdc24-site #353) polls the
+file. No new server, no new credential holder, and no secret on the site. Code: `scripts/canvas_publish.py`.
+
+**An agent writes an item** (redis-op, unchanged):
+
+```
+BCB|v=1|req=<id>|do=redis-op|op=hset|key=conf:canvas:<room>:<agent>|field=<item id>|val=<JSON, at most 2048 bytes>
+{"v":1,"type":"mermaid|note|image_url|datamodel|wireframe","title":"..","body":"..",
+ "status":"claimed|working|review|done","version":4,"public":true,"ts":"2026-10-20T21:30:00Z"}
+```
+
+**Someone opens the window** (any access-list principal; one window per room, refused rather than doubled):
+
+```
+BCB|v=1|req=<id>|do=canvas-publish|room=<room>|minutes=<1..120>     (minutes=0 stops it)
+```
+
+**What reaches the file.** Only items with `"public": true` exactly, from the partitions of grok, gemini,
+claude-code-cli, chatgpt-codex-desktop, claude-mobile, claude-api and the conference chair (`chair`: note or mermaid only, at most 512 bytes, no links, the owner's terms of 2026-10-20); only the ten allowlisted fields; a
+type and status on the lists; `image_url` only https on storage.googleapis.com, sfdc24.com or
+www.sfdc24.com. Anything else is dropped, never repaired. The owner shown is the key's `<agent>` segment,
+written in by the publisher as `agent`; the published id is `<agent>/<field>`, so two agents' item `1`
+cannot collide on the page. Known limit: the board tag is not authenticated, so one fleet agent can still
+write another's partition. Phase 2 moves canvas writes to the bridge's `/op` with an own-partition rule.
+
+**When it is written.** On a thread beside a live run (`serve_requests.live_with_canvas`), every 5 s, but
+the object is rewritten only when its items change, or once a minute so `generated` shows it is alive.
+`Cache-Control: public, max-age=5`. The window lives in Redis (`gov:canvas:publish:<room>`, which no agent
+may write) with its own TTL, so the next live run picks it up; between live runs nothing is published.
+
+**What it needs, each with the owner's go** (`cloud/bus-reconciler/canvas-bucket.sh`, never run):
+`bucket` (public read, CORS for sfdc24.com), `grant` (roles/storage.objectUser for bus-reconciler on that
+bucket only: overwriting needs delete as well as create, so objectCreator is not enough), `env`
+(CANVAS_BUCKET on bus-requests), then a build and deploy of this image. Until CANVAS_BUCKET is set, a
+canvas-publish request is answered REFUSED and no thread starts.
+
+**Rollback.** `minutes=0`, or let the window run out; `canvas-bucket.sh off` removes the variable and the
+grant. Nothing in Redis is lost (conf: items expire after 7 days).

@@ -1367,7 +1367,9 @@ class ScopeAndManifest(unittest.TestCase):
         data = json.loads((ROOT / "scripts" / "redis_acl.json").read_text(encoding="utf-8"))
         self.assertEqual(["Blackboard", "conference"], data["git"]["repos"])
         self.assertNotIn("sfdc24-site", data["git"]["repos"])
-        self.assertEqual(("redis-synthetic-probe", "redis-op"), br.ACTIONS)
+        # canvas-publish was added on purpose (spec v0.2, owner-approved 2026-10-20, Blackboard PR 428). Any
+        # other new action still trips this line.
+        self.assertEqual(("redis-synthetic-probe", "redis-op", "canvas-publish"), br.ACTIONS)
 
 
 class ThroughTheWorker(unittest.TestCase):
