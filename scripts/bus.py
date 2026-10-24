@@ -222,6 +222,55 @@ def read_rows(env, title="Blackboard - Alpha DB", tries=4,
     raise SystemExit("bus never returned rows")
 
 
+# ---- SENDER CHECK (gas-bus/Code.js senderCheck_) ------------------------------------------------
+#
+# The gateway stamps column L of every sheetRow append with what it could confirm about the writer:
+# verified / mismatch / bad-token / unverified. A writer that RUNS AS a Google service account (Cloud
+# Run, a GCE VM) can prove it with an ID token from its own metadata server: the account it already
+# runs as, so no key, no secret and no IAM grant is added. Off unless BUS_SENDER_TOKEN=metadata, so a
+# laptop or box writer is unchanged and simply stays "unverified".
+
+SENDER_AUDIENCE = "sfdc24-blackboard-bus"
+SENDER_COLUMN = 11
+_METADATA_IDENTITY = ("http://metadata.google.internal/computeMetadata/v1/instance/"
+                      "service-accounts/default/identity?audience=%s&format=full")
+
+
+def sender_token(audience=None, opener=None):
+    """An ID token for this workload's own service account, or None. Never raises, never logs it."""
+    if os.environ.get("BUS_SENDER_TOKEN", "").strip().lower() != "metadata":
+        return None
+    aud = audience or os.environ.get("BUS_SENDER_AUDIENCE") or SENDER_AUDIENCE
+    req = urllib.request.Request(_METADATA_IDENTITY % urllib.parse.quote(aud, safe=""),
+                                 headers={"Metadata-Flavor": "Google"})
+    try:
+        with (opener or urllib.request.urlopen)(req, timeout=5) as resp:
+            tok = resp.read().decode("ascii", "replace").strip()
+    except Exception:
+        return None
+    return tok if tok.count(".") == 2 else None
+
+
+def with_sender_token(payload, audience=None, opener=None):
+    """The append payload with id_token added when this workload can mint one; otherwise unchanged."""
+    tok = sender_token(audience, opener)
+    if not tok:
+        return payload
+    out = dict(payload)
+    out["id_token"] = tok
+    return out
+
+
+def sender_check(row):
+    """Column L as the gateway stamped it: ('verified', 'who=...') etc., or ('unstamped', '') for rows
+    written before the check existed (or with SENDER_CHECK=off). Readers decide what to trust."""
+    cell = str(row[SENDER_COLUMN]) if isinstance(row, (list, tuple)) and len(row) > SENDER_COLUMN else ""
+    if not cell.startswith("sender="):
+        return ("unstamped", "")
+    head, _, rest = cell[len("sender="):].partition(";")
+    return (head, rest)
+
+
 def main():
     env = load_env()
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 25

@@ -135,6 +135,13 @@ function doPost(e) {
 function handleAppend_(body, cfg) {
   if (!body.title) return jsonOut_({ ok: false, error: 'title is required.' }, 400);
 
+  // SENDER CHECK: decided BEFORE the lock, because verifying a token is a network call and the lock
+  // is held by every writer on the fleet. The stamp goes into the row; a caller cannot pre-fill it.
+  const sender = Array.isArray(body.sheetRow) ? senderCheck_(body) : null;
+  if (sender && sender.refuse) {
+    return jsonOut_({ ok: false, error: 'SENDER_REFUSED', sender: sender.stamp }, 403);
+  }
+
   const lock = LockService.getScriptLock();
   const gotLock = lock.tryLock(20000);
   if (!gotLock) {
@@ -157,7 +164,7 @@ function handleAppend_(body, cfg) {
       const ss = SpreadsheetApp.openById(file.getId());
       const sheet = body.sheetName ? ss.getSheetByName(body.sheetName) : ss.getSheets()[0];
       if (!sheet) return jsonOut_({ ok: false, error: 'Sheet tab not found: ' + body.sheetName }, 400);
-      const row = body.sheetRow || [nowStamp_(), body.text || ''];
+      const row = sender ? stampSender_(body.sheetRow, sender.stamp) : (body.sheetRow || [nowStamp_(), body.text || '']);
       // PY-01: checked UNDER THE LOCK, so two racing retries cannot both pass the check.
       const dup = Array.isArray(body.sheetRow) ? findDuplicate_(sheet, body.sheetRow) : null;
       if (dup) {
@@ -169,8 +176,12 @@ function handleAppend_(body, cfg) {
         const trigger = maybeTriggerWorker_(body.sheetRow);
         if (trigger !== 'off' && trigger !== 'not-a-request') {
           return jsonOut_({ ok: true, fileId: file.getId(), title: file.getName(), appendedAt: nowStamp_(),
-                            worker: trigger });
+                            worker: trigger, sender: sender ? sender.stamp : undefined });
         }
+      }
+      if (sender) {
+        return jsonOut_({ ok: true, fileId: file.getId(), title: file.getName(), appendedAt: nowStamp_(),
+                          sender: sender.stamp });
       }
     } else {
       return jsonOut_({ ok: false, error: 'Unsupported file type for append: ' + mime }, 400);
@@ -224,6 +235,119 @@ function findDuplicate_(sheet, sheetRow) {
 function bcbId_(payload) {
   const m = /(?:^|\|)id=([A-Za-z0-9._-]{1,200})(?:\||$)/.exec(String(payload == null ? '' : payload));
   return m ? m[1] : '';
+}
+
+// ---- SENDER CHECK: WHO ACTUALLY WROTE THIS ROW ------------------------------
+//
+// THE GAP (owner, 2026-10-24: "the board doesn't confirm which agent actually sent a row. fix that").
+// Every writer holds the ONE shared BUS_SECRET, and handleAppend_ wrote sheetRow verbatim. So the
+// Source_Tag in column C and the from= in the payload were whatever the caller typed: any agent
+// could post as any other, and nothing on the row said so. docs/BUS-SECURITY-HARDENING.md calls
+// this G2 and parks the real close (per-agent keys) on the GCP migration.
+//
+// THIS CLOSES WHAT CAN BE CLOSED WITH NOTHING NEW: no secret, no key, no IAM grant. The gateway
+// now stamps column L (Sender_Check, the 12th cell, blank padding on every live row until now) and
+// echoes the stamp as `sender` in the response. A caller cannot pre-fill it; column L is overwritten.
+//
+//   sender=verified;who=<email>        an ID token Google signed for THIS audience, for an account
+//                                      SENDER_IDENTITIES allows to write under the column C tag
+//   sender=mismatch;claimed=<C>;...    column C disagrees with the payload's from=, or a verified
+//                                      account is not allowed the tag it claimed
+//   sender=bad-token;why=<reason>      a token was sent and failed (never echoed: it is a credential)
+//   sender=unverified                  the shared secret alone - today, every laptop and box writer
+//
+// FLAG, NOT REJECT, by default, so nothing breaks mid-day. Script Property SENDER_CHECK:
+//   absent or 'flag'  stamp every row (default)
+//   'enforce'         ALSO refuse mismatch and bad-token with 403 SENDER_REFUSED (unverified passes)
+//   'off'             the old behaviour, byte for byte: nothing stamped, nothing checked
+//
+// The token rides in the body as `id_token` (Apps Script cannot read request headers). It is checked
+// with Google's own tokeninfo endpoint over the script.external_request scope this project already
+// holds. Cloud Run and VM writers mint one from their metadata server with the service account they
+// already run as (scripts/bus.py sender_token), which is what makes "no new IAM" true.
+
+// Reviewable in git, deliberately NOT a Script Property: who may write under which tag is a reviewed
+// decision, and a property can be edited in a browser by someone who never opens a PR. Emails are the
+// service accounts scripts/agent_roster.json records as each instance's gcp_identity.
+const SENDER_IDENTITIES = {
+  'bus-reconciler@sfdc24.iam.gserviceaccount.com': ['bus-reconciler', 'redis-probe'],
+  'waker-gemini@sfdc24.iam.gserviceaccount.com': ['gemini'],
+  'waker-claude-api@sfdc24.iam.gserviceaccount.com': ['claude-api'],
+  'pi1-cli@sfdc24.iam.gserviceaccount.com': ['pi1-cli'],
+};
+const SENDER_AUDIENCE_DEFAULT = 'sfdc24-blackboard-bus';
+const SENDER_COLUMN = 11;   // L, zero-based
+const GOOGLE_ISSUERS = ['accounts.google.com', 'https://accounts.google.com'];
+
+function senderCheck_(body) {
+  const props = PropertiesService.getScriptProperties();
+  const mode = String(props.getProperty('SENDER_CHECK') || 'flag').trim().toLowerCase();
+  if (mode === 'off') return null;
+  const enforce = mode === 'enforce';
+  const claimed = cleanTag_(body.sheetRow[2]);
+  const from = cleanTag_(bcbField_(body.sheetRow[5], 'from'));
+
+  if (from && claimed && from !== claimed) {
+    return { stamp: 'sender=mismatch;claimed=' + claimed + ';from=' + from, refuse: enforce };
+  }
+  if (!body.id_token) return { stamp: 'sender=unverified', refuse: false };
+
+  const audience = props.getProperty('SENDER_AUDIENCE') || SENDER_AUDIENCE_DEFAULT;
+  const who = verifyIdToken_(String(body.id_token), audience);
+  if (who.error) return { stamp: 'sender=bad-token;why=' + who.error, refuse: enforce };
+  const allowed = Object.prototype.hasOwnProperty.call(SENDER_IDENTITIES, who.email)
+    ? SENDER_IDENTITIES[who.email] : [];
+  if (allowed.indexOf(claimed) === -1) {
+    return { stamp: 'sender=mismatch;claimed=' + claimed + ';token=' + who.email, refuse: enforce };
+  }
+  return { stamp: 'sender=verified;who=' + who.email, refuse: false };
+}
+
+// {email} or {error}. The reason names the check, never the token or Google's raw answer.
+function verifyIdToken_(token, audience) {
+  if (!/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(token) || token.length > 4096) {
+    return { error: 'shape' };
+  }
+  let resp;
+  try {
+    resp = UrlFetchApp.fetch('https://oauth2.googleapis.com/tokeninfo', {
+      method: 'post', payload: { id_token: token }, muteHttpExceptions: true,
+    });
+  } catch (err) {
+    return { error: 'tokeninfo-unreachable' };
+  }
+  if (resp.getResponseCode() !== 200) return { error: 'rejected-by-google' };
+  let c;
+  try { c = JSON.parse(resp.getContentText()); } catch (err) { return { error: 'tokeninfo-not-json' }; }
+  if (GOOGLE_ISSUERS.indexOf(String(c.iss)) === -1) return { error: 'issuer' };
+  if (String(c.aud) !== audience) return { error: 'audience' };
+  // tokeninfo answers email_verified as the STRING "true"; the boolean is accepted too, nothing else.
+  if (!(c.email_verified === 'true' || c.email_verified === true)) return { error: 'email-unverified' };
+  const exp = Number(c.exp);
+  if (!(exp * 1000 > Date.now())) return { error: 'expired' };
+  const email = String(c.email || '').trim().toLowerCase();
+  if (!email) return { error: 'no-email' };
+  return { email: email };
+}
+
+// The row as written: at least 12 cells, column L overwritten with the stamp. Never shortens a row.
+function stampSender_(sheetRow, stamp) {
+  const row = sheetRow.slice();
+  while (row.length <= SENDER_COLUMN) row.push('');
+  row[SENDER_COLUMN] = stamp;
+  return row;
+}
+
+// A BCB field by name - the field, never a substring of another (as bcbId_ does for id=).
+function bcbField_(payload, name) {
+  const re = new RegExp('(?:^|\\|)' + name + '=([^|]{0,200})(?:\\||$)');
+  const m = re.exec(String(payload == null ? '' : payload));
+  return m ? m[1] : '';
+}
+
+// Lower-case, trimmed, and only the characters a tag is made of, so a stamp cannot carry a | or ;.
+function cleanTag_(v) {
+  return String(v == null ? '' : v).trim().toLowerCase().replace(/[^a-z0-9._@-]/g, '').slice(0, 80);
 }
 
 // ---- PY-02: A REQUEST STARTS THE WORKER, NO POLLING ---------------------
