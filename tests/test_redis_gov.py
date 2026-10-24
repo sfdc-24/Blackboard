@@ -61,6 +61,13 @@ class FakeRedis:
             self.ttls.pop(key, None)        # Redis: SET without KEEPTTL discards the key's expiry
         return True
 
+    def incr(self, key):
+        self._need(key, "string")
+        value = int(self.data.get(key) or 0) + 1        # Redis: a missing key counts from nought
+        self.data[key] = str(value)
+        self._bump(key)
+        return value
+
     def delete(self, key):
         existed = key in self.data
         self.data.pop(key, None)
@@ -430,6 +437,68 @@ class EveryActionIsAudited(unittest.TestCase):
         self.assertEqual("", read_entry["old"])
 
 
+class WhoACallerSaysItActsFor(unittest.TestCase):
+    """redis_gov.said: two CLAIMS recorded beside the verified actor, for the conference chair, which writes
+    under its own identity for a persona that has none (conference docs/PERSONA-WRITE-CONFIRMATION-A1.md)."""
+
+    KEY, RID = "conf:persona:20261014:claude", "CLAUDE-TOOL-set-20261014T160000Z-a1b2c3d4"
+
+    def chair(self, conn, op, key, val="", author="claude", rid=None):
+        return gov.execute(conn, ACL, "conference-chair", "bridge:conference-chair@x", op, key, raw_value=val,
+                           claimed_author=author, request_id=self.RID if rid is None else rid)
+
+    def test_absent_an_entry_is_exactly_what_it_always_was(self):
+        conn = FakeRedis()
+        run(conn, "grok", "set", "fleet:x", val="1")
+        run(conn, "grok", "get", "fleet:x")
+        run(conn, "grok", "set", "gov:x", val="1")
+        for entry in conn.audit():
+            self.assertEqual({"at", "actor", "raw_tag", "via", "op", "key", "field", "ok", "reason", "old_sha", "old_len",
+                              "old", "new_sha", "new_len", "new", "acl"}, set(entry))
+
+    def test_a_write_a_read_and_a_refusal_each_record_both_beside_the_verified_actor(self):
+        conn = FakeRedis()
+        self.assertTrue(self.chair(conn, "set", self.KEY, "note")["ok"])
+        self.assertTrue(self.chair(conn, "get", self.KEY)["ok"])
+        self.assertIn("refused", self.chair(conn, "set", "fleet:x", "v"))
+        self.assertEqual(["1", "1", "0"], [e["ok"] for e in conn.audit()])
+        for entry in conn.audit():
+            self.assertEqual(("conference-chair", "claude", self.RID, "bridge:conference-chair@x"),
+                             (entry["actor"], entry["claimed_author"], entry["request_id"], entry["via"]))
+            self.assertTrue(all(isinstance(v, str) for v in entry.values()), "every value a string")
+        self.assertEqual("note", conn.get(self.KEY))
+
+    def test_a_claim_is_never_an_identity(self):
+        """Saying it acts for the owner gives the chair nothing the chair does not have."""
+        conn = FakeRedis()
+        result = self.chair(conn, "set", "fleet:inbox:grok", "v", author="owner")
+        self.assertEqual("conference-chair may not write under that key", result["refused"])
+        self.assertEqual(("conference-chair", "owner", "0"), tuple(conn.audit()[-1][k] for k in ("actor", "claimed_author", "ok")))
+        self.assertIsNone(conn.get("fleet:inbox:grok"))
+
+    def test_a_claim_of_the_wrong_shape_is_refused_before_anything_runs_and_is_not_recorded(self):
+        for author, rid in (("Claude", None), ("c", None), ("x" * 33, None), ("cl aude", None), ("claude\n", None),
+                            ("1claude", None), (7, None), (["claude"], None), ("claude", "id with space"),
+                            ("claude", "x" * 121), ("claude", "id\n"), ("claude", "-id"), ("claude", 7)):
+            conn = FakeRedis()
+            result = self.chair(conn, "set", self.KEY, "note", author=author, rid=rid)
+            self.assertIn("refused", result, (author, rid))
+            self.assertIsNone(conn.get(self.KEY), (author, rid))
+            [entry] = conn.audit()
+            self.assertEqual("0", entry["ok"])
+            self.assertNotIn("claimed_author", entry, "a refused claim is not written into the audit")
+            self.assertNotIn("request_id", entry)
+
+    def test_one_of_the_two_alone_is_recorded_alone(self):
+        conn = FakeRedis()
+        gov.execute(conn, ACL, "grok", "REQ-1", "set", "fleet:x", raw_value="1", request_id="REQ-1")
+        entry = conn.audit()[-1]
+        self.assertEqual("REQ-1", entry["request_id"])
+        self.assertNotIn("claimed_author", entry)
+        self.assertEqual({}, gov.said())
+        self.assertEqual({"claimed_author": "claude"}, gov.said("claude"))
+
+
 class TheWriteAndItsAuditStayTogether(unittest.TestCase):
     """Redis does NOT roll back an EXEC. These are the cases that would otherwise lie."""
 
@@ -615,6 +684,89 @@ class TheServerSetsTheTTL(unittest.TestCase):
         conn = FakeRedis()
         run(conn, "grok", "set", "fleet:x", val="1")
         self.assertNotIn(gov.AUDIT_STREAM, conn.ttls)
+
+
+
+class AnHoursCountIsKeptInRedis(unittest.TestCase):
+    """hourly(): one count across 3,600 seconds, shared by every process on the same Redis.
+
+    A UTC hour boundary does not open a new window (the 01:59:50 / 02:00:00 defect)."""
+
+    HOUR = 1791993600.0                 # 2026-10-14 16:00:00Z
+
+    def test_it_counts_to_the_ceiling_and_the_window_starts_again_after_3600_seconds(self):
+        conn = FakeRedis()
+        said = [gov.hourly(conn, "chair:canvas", self.HOUR + n, 3) for n in range(5)]
+        self.assertEqual([True, True, True, False, False], said)
+        self.assertEqual("5", conn.get("gov:quota:chair:canvas:n"), "a refusal is counted too")
+        self.assertFalse(gov.hourly(conn, "chair:canvas", self.HOUR + 3599, 3), "3,599s is the same window")
+        self.assertTrue(gov.hourly(conn, "chair:canvas", self.HOUR + 3600, 3), "3,600s opens the next")
+        self.assertEqual("1", conn.get("gov:quota:chair:canvas:n"))
+        self.assertTrue(gov.hourly(conn, "chair:persona", self.HOUR, 3), "each name has its own count")
+
+    def test_ten_seconds_into_the_next_clock_hour_is_still_the_same_window(self):
+        """20 at 16:59:50 and another at 17:00:00 must not both be allowed."""
+        conn = FakeRedis()
+        start = self.HOUR + 3590
+        self.assertEqual([True] * 20, [gov.hourly(conn, "chair:canvas", start, 20) for _ in range(20)])
+        self.assertFalse(gov.hourly(conn, "chair:canvas", start + 10, 20))
+        self.assertEqual("21", conn.get("gov:quota:chair:canvas:n"), "the refusal is counted in the same window")
+
+    def test_the_count_and_its_expiry_land_in_one_multi_and_a_later_count_does_not_slide_it(self):
+        conn, queued = FakeRedis(), []
+        real = conn.pipeline
+
+        def watched(transaction=True):
+            pipe = real(transaction)
+            self.assertTrue(transaction)
+            original = pipe.execute
+
+            def execute(raise_on_error=True):
+                queued.extend(name for name, _, _ in pipe.queue)
+                return original(raise_on_error)
+            pipe.execute = execute
+            return pipe
+        conn.pipeline = watched
+        gov.hourly(conn, "chair:canvas", self.HOUR, 20)
+        self.assertEqual(["set", "delete", "incr", "expire"], queued, "open the window in one transaction")
+        self.assertEqual(gov.QUOTA_TTL_SECONDS, conn.ttls["gov:quota:chair:canvas:n"])
+        self.assertEqual(gov.QUOTA_TTL_SECONDS, conn.ttls["gov:quota:chair:canvas:t"])
+        self.assertEqual(3600, gov.QUOTA_TTL_SECONDS)
+        queued.clear()
+        gov.hourly(conn, "chair:canvas", self.HOUR + 10, 20)
+        self.assertEqual(["incr"], queued, "a later count does not refresh the expiry")
+        self.assertEqual(repr(self.HOUR), conn.get("gov:quota:chair:canvas:t"))
+        self.assertEqual(3600, conn.ttls["gov:quota:chair:canvas:t"])
+
+    def test_what_redis_raises_reaches_the_caller(self):
+        conn = FakeRedis()
+        conn.fail_next["incr"] = ConnectionError("dropped")
+        with self.assertRaises(ConnectionError):
+            gov.hourly(conn, "chair:canvas", self.HOUR, 20)
+
+    def test_a_repeated_request_id_is_claimed_once_and_can_be_released(self):
+        conn = FakeRedis()
+        self.assertTrue(gov.once(conn, "chair:canvas", "req-1"))
+        self.assertFalse(gov.once(conn, "chair:canvas", "req-1"))
+        self.assertTrue(gov.once(conn, "chair:persona", "req-1"), "each name has its own claim")
+        self.assertEqual(gov.ONCE_TTL_SECONDS, conn.ttls["gov:once:chair:canvas:req-1"])
+        gov.release(conn, "chair:canvas", "req-1")
+        self.assertTrue(gov.once(conn, "chair:canvas", "req-1"))
+        with self.assertRaises(gov.Refused):
+            gov.once(conn, "chair:canvas", "an id with spaces")
+
+    def test_a_name_is_a_name_and_the_key_is_one_no_caller_may_write(self):
+        conn = FakeRedis()
+        for name in ("", "Chair", "chair canvas", "chair:*", "x", 7, "a" * 49):
+            with self.assertRaises(gov.Refused, msg=repr(name)):
+                gov.hourly(conn, name, self.HOUR, 20)
+        self.assertEqual({}, conn.data)
+        for key in ("gov:quota:chair:canvas:n", "gov:quota:chair:canvas:t", "gov:once:chair:canvas:req-1"):
+            for agent in ("conference-chair", "claude-code-cli", "owner"):
+                for op in ("set", "del"):
+                    result = run(conn, agent, op, key, val="0")
+                    self.assertIn("refused", result, (agent, op, key))
+            self.assertIsNone(conn.get(key), "nobody resets the count")
 
 
 class XrangeAfterACursor(unittest.TestCase):
