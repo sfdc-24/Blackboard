@@ -1228,7 +1228,10 @@ class TheOpEndpoint(unittest.TestCase):
                      "HTTP://X.EXAMPLE", "ftp://x", "WWW.EXAMPLE.COM", "JavaScript:alert(1)", "A HREF b",
                      "flowchart LR\n  A-->B\n  Click A go",
                      "see [the plan](notes.md)", "see [the plan](/rooms/demo)", "![diagram](pic.png)",
-                     "[x](../secret)", "http&#58;//evil.example/a", "http%3A%2F%2Fevil.example/a",
+                     "[x](../secret)",
+                     "see [the plan][1]", "see [the plan][]", "see [the plan] [1]",
+                     "see [the plan]\n[the plan]: ../notes.md", "[1]: notes.md", "  [ref]: /rooms/demo",
+                     "http&#58;//evil.example/a", "http%3A%2F%2Fevil.example/a",
                      "http%253A%252F%252Fevil.example/a",
                      "flowchart LR\n  A[\"http#3a;#2f;#2f;evil.example\"]-->B",
                      "flowchart LR\n  A[\"&#58;//evil.example\"]-->B",
@@ -1275,8 +1278,8 @@ class TheOpEndpoint(unittest.TestCase):
             self.now = NOW + n
             self.assertEqual(200, self.chair(self.post_item(field="idea-%d" % n, request="c-%d" % n), conn=conn)[0], n)
             self.assertEqual(200, self.chair(dict(write, request="p-%d" % n), conn=conn)[0], n)
-        self.assertEqual(("20", "20"), (conn.get("gov:quota:chair:canvas:n"),
-                                        conn.get("gov:quota:chair:persona:n")))
+        self.assertEqual((20, 20), (conn.zcard("gov:quota:chair:canvas:z"),
+                                    conn.zcard("gov:quota:chair:persona:z")))
         for fresh in range(3):                  # a cold start, a second instance, another cold start
             bridge_op._SPENT.clear()
             bridge_op._CANVAS_SPENT.clear()
@@ -1289,7 +1292,9 @@ class TheOpEndpoint(unittest.TestCase):
         self.assertEqual(40, len(conn.audit()), "the refused ones never reached the governor")
         bridge_op._SPENT.clear()
         bridge_op._CANVAS_SPENT.clear()
-        self.now = NOW + 3600                   # 3,600s after the first count: the next window
+        # The hour ROLLS from each count, and the three refusals were counted too (at NOW+1000..1002),
+        # so room returns only once a full hour has passed since the last of them.
+        self.now = NOW + 1002 + 3601
         self.assertEqual(200, self.chair(self.post_item(field="next-hour", request="next-c"), conn=conn)[0])
         self.assertEqual(200, self.chair(dict(write, request="next-p"), conn=conn)[0])
 
@@ -1304,19 +1309,19 @@ class TheOpEndpoint(unittest.TestCase):
         code, out = self.chair(self.post_item(field="late", request="edge-late"), conn=conn)
         self.assertEqual((429, {"error": "quota", "executed": False}), (code, self.said(out)))
         self.assertIsNone(conn.hget(self.CANVAS, "late"))
-        self.assertEqual("21", conn.get("gov:quota:chair:canvas:n"))
+        self.assertEqual(21, conn.zcard("gov:quota:chair:canvas:z"))
 
     def test_a_replayed_request_does_not_write_or_charge(self):
         code, out = self.chair(self.post_item(request="same-id"))
         self.assertEqual(200, code, out)
         conn = self.conn
         spent = list(bridge_op._CANVAS_SPENT)
-        count = conn.get("gov:quota:chair:canvas:n")
+        count = conn.zcard("gov:quota:chair:canvas:z")
         code, out = self.chair(self.post_item(field="idea-2", request="same-id"), conn=conn)
         self.assertEqual((409, {"error": "replay", "executed": False}), (code, self.said(out)))
         self.assertIsNone(conn.hget(self.CANVAS, "idea-2"))
         self.assertEqual(spent, list(bridge_op._CANVAS_SPENT))
-        self.assertEqual(count, conn.get("gov:quota:chair:canvas:n"))
+        self.assertEqual(count, conn.zcard("gov:quota:chair:canvas:z"))
         self.assertEqual(200, self.chair({"op": "get", "key": self.KEY, "request": "same-id"}, conn=conn)[0],
                          "a read does not consume the id")
 
@@ -1328,17 +1333,17 @@ class TheOpEndpoint(unittest.TestCase):
             self.assertEqual(200, self.chair(self.post_item(field="idea-%d" % n, request="m-%d" % n), conn=conn)[0], n)
         self.now = NOW + 3600 + 60              # 17:01Z: still inside the memory window
         self.assertEqual(429, self.chair(self.post_item(field="early", request="m-early"), conn=conn)[0])
-        self.assertEqual("20", conn.get("gov:quota:chair:canvas:n"), "a flood memory refuses costs Redis nothing")
+        self.assertEqual(20, conn.zcard("gov:quota:chair:canvas:z"), "a flood memory refuses costs Redis nothing")
 
     def test_if_redis_cannot_count_nothing_is_written(self):
         conn = gov_tests.FakeRedis()
-        conn.fail_next["incr"] = ConnectionError("dropped")
+        conn.fail_next["zadd"] = ConnectionError("dropped")
         code, out = self.chair(self.post_item(), conn=conn)
         self.assertEqual((503, {"error": "redis unreachable", "executed": False}), (code, self.said(out)))
         self.assertEqual((None, []), (conn.hget(self.CANVAS, "idea-1"), conn.audit()))
         self.assertIn("could not count the chair's hour (ConnectionError)", self.log)
         self.assertNotIn("dropped", self.log)
-        conn.fail_next["incr"] = ConnectionError("dropped")
+        conn.fail_next["zadd"] = ConnectionError("dropped")
         write = {"op": "set", "key": self.KEY, "val": self.b64("v"), "enc": "b64"}
         self.assertEqual(503, self.chair(write, conn=conn)[0])
         self.assertIsNone(conn.get(self.KEY))

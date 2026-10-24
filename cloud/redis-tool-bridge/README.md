@@ -97,15 +97,16 @@ governed ops, after the source is verified"). **D1 has not been given. Nothing h
   day for one listed persona, `conf:persona:<yyyymmdd>:<persona>`, the day being today or yesterday in UTC and
   the persona one of those in its own line of `callers.json` (today: `claude`). Its principal may read and write
   `conf:persona:` and nothing else; a value there is at most 512 bytes and expires in 24 hours; this instance
-  takes at most 20 chair writes an hour, counted in Redis for 3,600 seconds from the first count
-  (`gov:quota:chair:persona:n` and `:t`, so a restart, a scale-to-zero, or the turn of a UTC hour does not
-  reset it) and in memory over the last 3,600 seconds. The canvas posts have their own 20, kept the same way
-  (`gov:quota:chair:canvas:n`). A repeated request id is not written and is not charged (`gov:once:`). Aya's runtime
+  takes at most 20 chair writes in any rolling 3,600 seconds, counted in Redis as a log of count moments
+  (`gov:quota:chair:persona:z`, so a restart, a scale-to-zero, the turn of a UTC hour, or the edge of the
+  window itself does not reset it) and in memory over the last 3,600 seconds. The canvas posts have their own
+  20, kept the same way (`gov:quota:chair:canvas:z`). A repeated request id is not written and is not charged (`gov:once:`). Aya's runtime
   account's line says `"for": "probe"`: `/probe` as before, and a 403 on `/op`.
 - **The canvas (the owner, directly, 2026-10-20; board row `CLAUDE-MOBILE-OWNER-CHAIR-CANVAS-20261020T2252Z`).** The
   chair may also `hset` its own slot of the room named on its line, `conf:canvas:workshop:chair` (the owner named that room Workshop), with author `chair`: one item,
   at most 512 bytes, the canvas's own members, type `note` or `mermaid`, `public` true, and nothing that is a link
-  (a scheme, `www.`, Mermaid's `click` or `href`, a Markdown link or image, including one hidden in a
+  (a scheme, `www.`, Mermaid's `click` or `href`, a Markdown link or image - inline, reference-style or a
+  reference definition - including one hidden in a
   percent-encoding, an HTML entity or Mermaid's `#60;` codes). At most 20 posts an hour, counted apart from the persona writes.
   So its principal may also write `conf:canvas:`; the door narrows that to the `:chair` slot of `workshop`. Every other room is refused. Every refusal is
   before any connection. Stopping on "Hold on, team" is the chair's: the bridge does not hear the call.

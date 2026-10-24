@@ -77,6 +77,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import unicodedata
 from pathlib import Path
 
@@ -321,8 +322,8 @@ def decode_value(raw: str, enc: str, acl: dict, key: str = "") -> str:
 
 # --------------------------------------------------------------------------------------- an hour's count
 
-QUOTA_KEY = "gov:quota:%s:%s"           # what is counted, then "n" (the count) or "t" (when the window opened)
-QUOTA_TTL_SECONDS = 3600                # the window, from its first count; a later count does not slide it
+QUOTA_KEY = "gov:quota:%s:%s"           # what is counted, then "z": the rolling log of count moments
+QUOTA_TTL_SECONDS = 3600                # the span of the rolling window, and the log's expiry
 ONCE_KEY = "gov:once:%s:%s"             # what was claimed, then the request id
 ONCE_TTL_SECONDS = 7200                 # a repeat of that id stays a repeat past the hour
 _QUOTA_NAME = re.compile(r"[a-z][a-z0-9:-]{1,47}")
@@ -334,56 +335,35 @@ def _quota_name(name: str) -> str:
     return name
 
 
-def _quota_start(raw):
-    """The epoch the window opened, or None when there is no window to keep."""
-    if raw is None:
-        return None
-    try:
-        return float(_text(raw).strip())
-    except ValueError:
-        return None
-
-
 def hourly(conn, name: str, now: float, ceiling: int) -> bool:
-    """Count one more `name` inside a window of QUOTA_TTL_SECONDS measured from the first count in it.
+    """Count one more `name`. True while no more than `ceiling` counts fall inside the
+    QUOTA_TTL_SECONDS ending now.
 
-    True while the count is at most `ceiling`. The window is not a UTC hour: twenty at 01:59:50 and a
-    fresh process at 02:00:00 share one count. Opening the window writes its start, resets the count
-    and sets both expiries in one MULTI; a later count is one INCR and does not refresh the expiry,
-    so the window cannot be slid forward. A refusal is counted too. Both keys are under gov:, which
-    PROTECTED keeps from every caller of execute(). A watched key that changes is retried. Anything
-    else Redis raises goes to the caller."""
+    THE WINDOW ROLLS. A window measured from its first count has an edge, and Aya measured the
+    edge on 1816baf: 19 writes at its last seconds and 20 more just past it were 39 inside ten
+    seconds. So the log is a sorted set of count moments: counts older than the span are dropped,
+    this one is added, and the size afterwards is the answer, all in one MULTI, so two counters
+    cannot both see the gap. A refusal is counted too. The key is under gov:, which PROTECTED
+    keeps from every caller of execute(). Anything Redis raises goes to the caller."""
     name = _quota_name(name)
     try:
         now = float(now)
     except (TypeError, ValueError):
         raise Refused("a quota clock is a number of seconds")
-    count_key, start_key = QUOTA_KEY % (name, "n"), QUOTA_KEY % (name, "t")
-    for _ in range(8):
-        pipe = conn.pipeline(transaction=True)
-        try:
-            pipe.watch(start_key)
-            pipe.watch(count_key)
-            start = _quota_start(pipe.get(start_key))
-            fresh = start is None or now - start >= QUOTA_TTL_SECONDS
-            pipe.multi()
-            if fresh:
-                pipe.set(start_key, repr(now), ex=QUOTA_TTL_SECONDS)
-                pipe.delete(count_key)
-                pipe.incr(count_key)
-                pipe.expire(count_key, QUOTA_TTL_SECONDS)
-            else:
-                pipe.incr(count_key)
-            results = pipe.execute()
-            count = results[-2] if fresh else results[-1]
-            return int(count) <= int(ceiling)
-        except Exception as error:
-            if type(error).__name__ == "WatchError":
-                continue
-            raise
-        finally:
-            pipe.reset()
-    raise Refused("the quota changed while it was being counted")
+    key = QUOTA_KEY % (name, "z")
+    # Two counts on the same clock reading must be two members, so the moment alone is not the member.
+    member = "%s:%s" % (repr(now), secrets.token_hex(8))
+    pipe = conn.pipeline(transaction=True)
+    try:
+        pipe.multi()
+        pipe.zremrangebyscore(key, "-inf", now - QUOTA_TTL_SECONDS)
+        pipe.zadd(key, {member: now})
+        pipe.zcard(key)
+        pipe.expire(key, QUOTA_TTL_SECONDS)
+        results = pipe.execute()
+    finally:
+        pipe.reset()
+    return int(results[2]) <= int(ceiling)
 
 
 def once(conn, name: str, request_id: str) -> bool:

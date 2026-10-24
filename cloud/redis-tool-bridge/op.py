@@ -98,18 +98,20 @@ THE BODY
                           no persona's name serves here.
         the value         one canvas item, at most CANVAS_VALUE_BYTES: a JSON object of the canvas's own
                           members, type note or mermaid, public true, and nothing in it that is a link (canvas_refusal):
-                          a scheme, a Markdown link or image, or the same after percent-decoding, HTML entities and
-                          Mermaid's #60; codes are unfolded.
+                          a scheme, a Markdown link or image - inline, reference-style or a reference definition -
+                          or the same after percent-decoding, HTML entities and Mermaid's #60; codes are unfolded.
         the ceiling       CHAIR_CANVAS_PER_HOUR posts an hour, apart from the persona writes': a 429 (THE HOUR).
     Each is refused before any connection, with "executed": false. 'Hold on, team' is the chair's to keep: the
     bridge does not hear the call.
 
     THE HOUR, KEPT IN REDIS (Gemini on e6433ea, GROK-407FIX-428REV-0225Z: the service scales to zero, and a count
     kept only in memory starts again at nought with every new instance). Each ceiling is held twice:
-        in Redis          redis_gov.hourly, a window of 3,600 seconds from the first count in it
-                          (gov:quota:chair:<what>:n and :t), so a restart, a scale-to-zero or a second instance
-                          shares one count, and the turn of a UTC hour does not open another. The keys are under
-                          gov:, which redis_gov PROTECTS, so no caller of /op can reset them.
+        in Redis          redis_gov.hourly, a ROLLING window: at most the ceiling inside any 3,600 seconds
+                          (gov:quota:chair:<what>:z, a log of count moments), so a restart, a scale-to-zero or
+                          a second instance shares one count, the turn of a UTC hour does not open another, and
+                          the window's own edge is not fresh room (Aya on 1816baf: 19 at the edge of a from-first-
+                          count window plus 20 past it were 39 in ten seconds). The key is under gov:, which
+                          redis_gov PROTECTS, so no caller of /op can reset it.
         in memory         take(), the last 3,600 seconds, per instance: a flood it refuses costs Redis nothing.
     A post is counted before it is written, so one that then fails is still spent: the count errs toward fewer
     posts, never more. If Redis cannot count, nothing is written: a 503 with "executed": false.
@@ -166,11 +168,14 @@ CANVAS_REQUIRED = ("v", "type", "title", "body", "status", "version", "public")
 _CANVAS_KEY = re.compile(r"conf:canvas:([a-z0-9][a-z0-9-]{1,39}):chair")
 _ROOM = re.compile(r"[a-z0-9][a-z0-9-]{1,39}")   # the same room grammar as the publisher
 _CANVAS_ITEM = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,47}")
-# A scheme, a bare www. host, Mermaid's click and href, or a Markdown link or image with no scheme.
+# A scheme, a bare www. host, Mermaid's click and href, or a Markdown link or image with no scheme -
+# inline `[text](target)`, reference-style `[text][ref]` / `[text][]`, or a definition line `[ref]: target`.
 _LINKISH = re.compile(
-    r"(?i)://|\bwww\.|\b(?:javascript|data|mailto|vbscript):|\bhref\b|\bclick\s"
+    r"(?im)://|\bwww\.|\b(?:javascript|data|mailto|vbscript):|\bhref\b|\bclick\s"
     r"|!\[[^\]\n]*\]"
-    r"|\[[^\]\n]*\]\s*\(")
+    r"|\[[^\]\n]*\]\s*\("
+    r"|\[[^\]\n]*\]\s*\["
+    r"|^[ \t]*\[[^\]\n]+\]:")
 _ENTITY = re.compile(r"(?i)&#?[a-z0-9]+;")
 _MERMAID_CODE = re.compile(r"#([0-9a-fA-F]{1,6});")
 _CANVAS_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
