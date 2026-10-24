@@ -120,7 +120,10 @@ class ChairSlot(unittest.TestCase):
                      {"body": "JavaScript:alert(1)"}, {"body": "b" * 500},
                      {"body": "see [the plan](notes.md)"}, {"body": "see [the plan](/rooms/demo)"},
                      {"body": "![diagram](pic.png)"}, {"title": "[x](y)"},
-                     {"body": "[x](../secret)"}):
+                     {"body": "[x](../secret)"},
+                     {"body": "see [the plan][1]"}, {"body": "see [the plan][]"}, {"title": "[x] [y]"},
+                     {"body": "see [the plan]\n[the plan]: ../notes.md"}, {"body": "[1]: notes.md"},
+                     {"body": "notes first\n  [ref]: /rooms/demo"}):
             self.assertIsNone(cp.clean_item("chair", "idea-1", item(**over)), over)
             if "type" not in over:              # as a note: a link is text there; a Mermaid body is checked for all
                 self.assertIsNone(cp.clean_item("chair", "idea-1", item(**dict(over, type="note"))), over)
@@ -501,9 +504,31 @@ class Upload(unittest.TestCase):
             seen.append(req)
             return Resp()
 
+        fetched = []
         with self.assertRaises(cp.Aborted):
-            cp.gcs_upload("sfdc24-canvas", "rooms/demo.json", b"{}", lambda: "tok", opener, allow=lambda: False)
+            cp.gcs_upload("sfdc24-canvas", "rooms/demo.json", b"{}",
+                          lambda: fetched.append(1) or "tok", opener, allow=lambda: False)
         self.assertEqual(seen, [])
+        self.assertEqual(fetched, [], "no token is fetched for an upload the fence already stopped")
+
+    def test_a_fence_that_fails_during_token_retrieval_still_aborts(self):
+        """The token call is an HTTP round trip and can take seconds. A stop, a deletion, a lost lease,
+        an expiry or a privacy revocation landing in that gap must abort: the token fetch is the last
+        slow step before the bytes are committed, and nothing can retract them after (Aya on 07fa54d)."""
+        seen, state = [], {"allowed": True}
+
+        def opener(req, timeout):
+            seen.append(req)
+            raise AssertionError("the upload must not be sent")
+
+        def token():
+            state["allowed"] = False            # the world changes while the token is being fetched
+            return "tok"
+
+        with self.assertRaises(cp.Aborted):
+            cp.gcs_upload("sfdc24-canvas", "rooms/demo.json", b"{}", token, opener,
+                          allow=lambda: state["allowed"])
+        self.assertEqual(seen, [], "nothing was sent: the fence was asked again after the token came back")
 
     def test_the_token_is_kept_until_a_minute_before_it_expires(self):
         calls, clock = [], {"t": 1000.0}

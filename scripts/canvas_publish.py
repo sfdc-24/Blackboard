@@ -75,11 +75,14 @@ AGENTS = ("grok", "gemini", "claude-code-cli", "chatgpt-codex-desktop", "claude-
 CHAIR = "chair"
 CHAIR_TYPES = ("note", "mermaid")
 CHAIR_BYTES = 512
-# A relative Markdown link or image (`[label](notes.md)`, `![alt](pic.png)`) is a link with no scheme.
+# A relative Markdown link or image is a link with no scheme: inline (`[label](notes.md)`, `![alt](pic.png)`),
+# reference-style (`[label][ref]`, `[label][]`), or a reference definition line (`[ref]: notes.md`).
 _LINKISH = re.compile(
-    r"(?i)://|\bwww\.|\b(?:javascript|data|mailto|vbscript):|\bhref\b|\bclick\s"
+    r"(?im)://|\bwww\.|\b(?:javascript|data|mailto|vbscript):|\bhref\b|\bclick\s"
     r"|!\[[^\]\n]*\]"
-    r"|\[[^\]\n]*\]\s*\(")
+    r"|\[[^\]\n]*\]\s*\("
+    r"|\[[^\]\n]*\]\s*\["
+    r"|^[ \t]*\[[^\]\n]+\]:")
 # MERMAID (mermaid_ok). The diagram kinds a body may open with: sequenceDiagram (KaTeX labels), architecture
 # (icon text), gantt and xychart (render loops) are left out on purpose, after their advisories.
 MERMAID_KINDS = ("flowchart", "graph", "erDiagram", "classDiagram", "stateDiagram", "stateDiagram-v2",
@@ -340,8 +343,11 @@ class Token:
 def gcs_upload(bucket: str, name: str, data: bytes, token, opener=urllib.request.urlopen, allow=None) -> int:
     """One multipart upload, so the object's Cache-Control is set in the same call as its bytes.
 
-    `allow`, when given, is asked again after the body is built and before the request is sent. An upload
-    that has been entered still sends nothing once the fence has failed."""
+    `allow`, when given, is asked again after the body is built AND after the token has been fetched,
+    right before the request is sent. The token call can block for seconds (it is an HTTP round trip to
+    the metadata server), and a stop, a deletion, a lost lease, an expiry or a privacy revocation landing
+    during it must still abort: once the bytes are sent they are committed, and no later check can
+    retract them (Aya on 07fa54d)."""
     boundary = "canvas" + secrets.token_hex(8)
     meta = json.dumps({"name": name, "contentType": "application/json", "cacheControl": CACHE_CONTROL})
     body = (("--%s\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n%s\r\n--%s\r\n"
@@ -349,10 +355,13 @@ def gcs_upload(bucket: str, name: str, data: bytes, token, opener=urllib.request
     body += data + ("\r\n--%s--\r\n" % boundary).encode("utf-8")
     if allow is not None and not allow():
         raise Aborted()
+    auth = "Bearer " + token()
+    if allow is not None and not allow():
+        raise Aborted()
     url = ("https://storage.googleapis.com/upload/storage/v1/b/%s/o?uploadType=multipart"
            % urllib.parse.quote(bucket, safe=""))
     req = urllib.request.Request(url, data=body, method="POST", headers={
-        "Authorization": "Bearer " + token(), "Content-Type": "multipart/related; boundary=" + boundary})
+        "Authorization": auth, "Content-Type": "multipart/related; boundary=" + boundary})
     with opener(req, timeout=10) as resp:
         return resp.status
 
