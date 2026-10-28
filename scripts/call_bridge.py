@@ -18,6 +18,16 @@ and named nobody, so no card went up. A continuity turn with a task word and no 
 the next floor.granted in the same turn_id, read ahead within the page; else the last voice granted the floor in this
 room, kept in gov:callbridge:last:<room> for LAST_SECONDS. Neither known: nothing is claimed.
 
+A VOICE THAT SAYS IT CANNOT CLAIMS THE ASK (the owner's demo, 2026-10-28 09:14 ET,
+CLAUDE-ACTIONS-1313Z-20261028T1328Z: an ask for a picture got no claim and the voice told his guest "I can't pull an
+image"). The owner's last turn with words is kept in gov:callbridge:asked:<room> for ASKED_SECONDS. A line the chair
+wrote to conf:side:<yyyymmdd> for one of the room's voices (by=chair, voice, room, text: conference
+chair/conf_chair/side_lines.py) that says "I can't", "I cannot", "I'm not able", "I'm unable", "I don't have the
+tools" or "I have no way" claims that turn for the voice's agent, under the same ask id a named claim of that turn
+would have, so the two are one claim. Read from gov:callbridge:side:<room>. It needs the chair's side lines ON for the
+room (CONF_REDIS_SIDE_VOICE, CONF_REDIS_SIDE_VOICE_ROOMS); with them off there is nothing to read and this claims
+nothing.
+
 WHAT GOES ON THE PUBLIC CARD, AND WHAT DOES NOT. The canvas file is world-readable (canvas_publish.py). His words can
 name a client, its brands or its staff. On that call he saw only empty "Claimed by" shells and asked to see what the
 work is, so the card carries a one-line SUMMARY built from his words by an allowlist, never a blocklist: from the start
@@ -66,6 +76,11 @@ LAST_SECONDS = 15 * 60
 SUMMARY_WORDS = 14
 SUMMARY_CHARS = 70          # with "claimed: " it fits canvas_publish.ACTIVITY_MAX (80)
 FOLLOW = "continuity"
+ASKED_KEY = "gov:callbridge:asked:%s"
+SIDE_CURSOR_KEY = "gov:callbridge:side:%s"
+SIDE_KEY = "conf:side:%s"
+ASKED_SECONDS = 3 * 60
+SIDE_BY = "chair"
 
 # The room's voices, by the chair's persona ids, and the fleet agent each one's work goes to: the canonical ids of
 # fleet:inbox (cloud/drive-intake ALIASES, agreed 2026-10-09) and of the canvas slots (canvas_publish.AGENTS).
@@ -89,7 +104,21 @@ TASK = re.compile(
     r"(?i)\b(?:build|draft|make|create|write|design|mock(?:\s+up)?|prototype|add|fix|check|review|draw|diagram|"
     r"sketch|list|find|research|compare|summari[sz]e|update|set\s+up|put|post|show\s+me|work\s+on|look\s+into|"
     r"prepare|plan|test|verify|deploy|open|wire|map|outline|estimate|"
-    r"cent(?:er|re)|align|remove|delete|replace|edit|rename|resize)\b")
+    r"cent(?:er|re)|align|remove|delete|replace|edit|rename|resize|"
+    # The owner's demo, 2026-10-28 09:14 ET (CLAUDE-ACTIONS-1313Z-20261028T1328Z): an ask for a picture of a chair got
+    # no claim, and the voice told his guest "I can't pull an image". Asking for something to be shown counts.
+    r"pull|get|bring|show|pictures?|images?)\b")
+
+
+# A VOICE SAYING IT CANNOT (refusal). The chair writes every line a voice speaks to conf:side:<yyyymmdd> (conference
+# chair/conf_chair/side_lines.py: by=chair, voice=<persona id>, room, text). When a voice answers the owner's last turn
+# with one of these, his ask is that voice's work: it is claimed as if he had named it, under the same ask id, so a
+# named claim and a refusal claim of the same turn are one claim. Only the first person: "Codex can't" is not a refusal.
+REFUSAL = re.compile(
+    r"(?i)\bI(?:\s+(?:can(?:no|['’]|\s+no)t|am\s+(?:not\s+able|unable)|"
+    r"do\s+not\s+have\s+(?:a\s+way|(?:the\s+)?(?:tools?|ability|access|means))|"
+    r"don['’]t\s+have\s+(?:a\s+way|(?:the\s+)?(?:tools?|ability|access|means))|have\s+no\s+way)|"
+    r"['’]m\s+(?:not\s+able|unable))\b")
 
 
 # THE SUMMARY'S WORDS (summary). Common English and the words of building a page or a plan. Left out on purpose: words
@@ -106,7 +135,7 @@ ask asks asked tell say
 make made build add put get set show give take keep move change update fix check review test verify draft write
 create design mock prototype draw diagram sketch list find research compare summarize summarise post open wire map
 outline estimate prepare plan deploy center centre align remove delete drop hide replace rename resize swap clean
-start stop finish send share look work run try use bring turn see read edit improve simplify shorten expand
+start stop finish send share look work run try use bring turn see read edit improve simplify shorten expand pull
 page pages homepage site website home hero header footer banner menu nav navigation link links button buttons form
 forms field fields section sections column columns row rows card cards grid layout panel tab tabs modal popup
 text title titles heading headline subtitle copy line lines word words paragraph caption label labels logo icon icons
@@ -183,6 +212,14 @@ def follow_up(fields: dict) -> bool:
     if not said.strip() or not TASK.search(said):
         return False
     return not any(pattern.search(said) for pattern in NAMES.values())
+
+
+def refusal(fields: dict, room: str):
+    """The fleet agent whose voice said, in this room, that it cannot do something, or None. A side-channel entry the
+    chair wrote (by=chair) for one of the room's voices (side_lines.entry)."""
+    if fields.get("by") != SIDE_BY or fields.get("room") != room or fields.get("voice") not in AGENT_OF:
+        return None
+    return AGENT_OF[fields["voice"]] if REFUSAL.search(fields.get("text") or "") else None
 
 
 # A word (with its apostrophes and hyphens: it's, one-line), a number, or the end of a sentence.
@@ -305,6 +342,10 @@ class Bridge:
                 continue
             if fields.get("kind") == "floor.granted" and fields.get("actor_id") in AGENT_OF:
                 self.conn.set(LAST_KEY % room, AGENT_OF[fields["actor_id"]], ex=LAST_SECONDS)
+            if (fields.get("kind") == "turn.started" and fields.get("actor_id") not in ("", None, "chair")
+                    and (fields.get("utterance") or "").strip()):
+                self.conn.set(ASKED_KEY % room, json.dumps({"entry": entry_id, "said": fields["utterance"],
+                                                             "at": stamp(now)}, sort_keys=True), ex=ASKED_SECONDS)
             agents = asks_in(fields)
             if not agents and follow_up(fields):
                 holder = self._holder(room, fields.get("turn_id"), entries[index + 1:])
@@ -316,6 +357,41 @@ class Bridge:
                 if ask:
                     claimed.append(ask)
             self.conn.set(CURSOR_KEY % room, entry_id, ex=TTL_SECONDS)
+        if self.holds():
+            claimed.extend(self._refusals(room, now))
+        return claimed
+
+    def _refusals(self, room: str, now) -> list:
+        """A voice's "I can't" to the owner's last turn (ASKED_SECONDS) claims that turn for the voice's agent.
+        Reads today's side channel (UTC, as side_lines names it) from this room's own cursor; a stream seen for the
+        first time is read from LOOKBACK_SECONDS back only. Nothing is claimed without his last turn."""
+        key = SIDE_KEY % now.strftime("%Y%m%d")
+        cursor_key = SIDE_CURSOR_KEY % room
+        cursor = _text(self.conn.get(cursor_key))
+        if cursor:
+            entries = self.conn.xrange(key, min=cursor, max="+", count=PAGE + 1)
+        else:
+            start = int((now.timestamp() - LOOKBACK_SECONDS) * 1000)
+            entries = self.conn.xrange(key, min="%d-0" % max(0, start), max="+", count=PAGE)
+        claimed = []
+        for entry_id, raw in entries or ():
+            entry_id = _text(entry_id)
+            if entry_id == cursor:
+                continue
+            agent = refusal(_fields(raw), room)
+            if agent:
+                try:
+                    asked = json.loads(_text(self.conn.get(ASKED_KEY % room)) or "null")
+                except ValueError:
+                    asked = None
+                # Only a line said AFTER his turn answers it: both ids are the same Redis server's clock.
+                if isinstance(asked, dict) and asked.get("entry") and _after(entry_id, str(asked["entry"])):
+                    if not self.holds():
+                        return claimed
+                    ask = self._claim(room, str(asked["entry"]), agent, str(asked.get("said") or ""), now)
+                    if ask:
+                        claimed.append(ask)
+            self.conn.set(cursor_key, entry_id, ex=TTL_SECONDS)
         return claimed
 
     def _holder(self, room, turn_id, ahead):
@@ -408,6 +484,16 @@ class Bridge:
                 # A Redis flap costs one tick, never the meeting.
                 self.log.warning("call bridge tick failed (%s)", type(error).__name__)
             self.stop.wait(interval)
+
+
+def _after(entry_id: str, other: str) -> bool:
+    """Stream id entry_id comes after other (ms-seq, compared as numbers). Unreadable ids are never after."""
+    try:
+        a = tuple(int(part) for part in entry_id.split("-", 1))
+        b = tuple(int(part) for part in other.split("-", 1))
+    except (AttributeError, ValueError):
+        return False
+    return a > b
 
 
 def _row(row):

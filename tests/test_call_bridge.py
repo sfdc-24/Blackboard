@@ -439,6 +439,99 @@ class FollowUp(unittest.TestCase):
         self.assertEqual(1, len(self.conn.streams["fleet:inbox:grok"]))
 
 
+class ShownAndRefused(unittest.TestCase):
+    """The owner's demo, 2026-10-28 09:14 ET: an ask for a picture got no claim, and the voice said it could not."""
+
+    def setUp(self):
+        self.conn = FakeRedis()
+        open_window(self.conn)
+        self.bridge = cb.Bridge(self.conn, LOG, lambda: True, clock=lambda: NOW)
+        self.side = "conf:side:%s" % NOW.strftime("%Y%m%d")
+
+    def say(self, voice, text, seconds_ago=5, room=ROOM, by="chair"):
+        return self.conn.xadd(self.side, {"by": by, "voice": voice, "room": room, "text": text,
+                                          "at": cb.stamp(NOW)}, entry_id=at(seconds_ago))
+
+    def claimed(self, agent):
+        return {k: json.loads(v) for k, v in self.conn.hgetall(cp.PARTITION % ("workshop", agent)).items()}
+
+    def test_asks_to_pull_get_bring_or_show_a_picture_or_image_are_tasks(self):
+        for said in ("Claude, pull up a picture of a chair.", "Grok, get me an image of a chair.",
+                     "Codex, bring the diagram back.", "Gemini, show the plan.", "Claude, a picture please.",
+                     "Grok, two images of the logo."):
+            self.assertTrue(cb.TASK.search(said), said)
+        self.assertEqual(cb.asks_in({"kind": "turn.started", "actor_id": "owner-1", "reason": "vocative",
+                                     "utterance": "Claude, pull up a picture of a chair."}), ["claude-code-cli"])
+
+    def test_pull_is_a_plain_word_on_the_card(self):
+        self.assertTrue(cb.summary("Claude, pull up a picture of a chair.").startswith("Pull up a picture"))
+
+    def test_what_is_a_refusal(self):
+        for said in ("I can't pull an image.", "Sorry, I cannot do that.", "I can\u2019t open files.",
+                     "I'm not able to fetch that.", "I am unable to browse.", "I don't have the tools for that.",
+                     "I do not have access to it.", "I have no way to draw.", "I can not do it."):
+            self.assertEqual(cb.refusal({"by": "chair", "voice": "grok", "room": ROOM, "text": said}, ROOM), "grok",
+                             said)
+        for said in ("Codex can't do that.", "Sure, I can do that.", "I candidly think so.", "You can't miss it.",
+                     "I can do it now."):
+            self.assertIsNone(cb.refusal({"by": "chair", "voice": "grok", "room": ROOM, "text": said}, ROOM), said)
+
+    def test_only_the_chair_s_line_for_a_room_voice_in_this_room(self):
+        base = {"by": "chair", "voice": "claude", "room": ROOM, "text": "I can't pull an image."}
+        self.assertEqual(cb.refusal(base, ROOM), "claude-code-cli")
+        self.assertIsNone(cb.refusal(dict(base, by="grok"), ROOM))
+        self.assertIsNone(cb.refusal(dict(base, voice="owner"), ROOM))
+        self.assertIsNone(cb.refusal(dict(base, room="conf-other"), ROOM))
+
+    def test_a_voice_that_cannot_claims_his_last_turn_for_its_agent(self):
+        entry = turn(self.conn, "Could someone find a chair for the guest?", reason="everyone", seconds_ago=10)
+        self.say("claude", "I can't pull an image.", seconds_ago=5)
+        claimed = self.bridge.tick()
+        ask = cb.ask_id(ROOM, entry, "claude-code-cli")
+        self.assertEqual(claimed, [ask])
+        self.assertEqual(self.claimed("claude-code-cli")[ask]["status"], "claimed")
+        inbox = self.conn.streams["fleet:inbox:claude-code-cli"]
+        self.assertIn("find a chair for the guest", inbox[-1][1]["text"])
+
+    def test_a_named_ask_and_its_refusal_are_one_claim(self):
+        turn(self.conn, "Claude, pull up a picture of a chair.", seconds_ago=10)
+        self.say("claude", "I can't pull an image.", seconds_ago=5)
+        self.assertEqual(len(self.bridge.tick()), 1)
+        self.assertEqual(self.bridge.tick(), [])
+        self.assertEqual(len(self.claimed("claude-code-cli")), 1)
+        self.assertEqual(len(self.conn.streams["fleet:inbox:claude-code-cli"]), 1)
+
+    def test_no_turn_of_his_no_claim_and_a_plain_answer_claims_nothing(self):
+        self.say("grok", "I can't pull an image.", seconds_ago=5)
+        self.assertEqual(self.bridge.tick(), [])
+        turn(self.conn, "How are you all?", reason="everyone", seconds_ago=4)
+        self.say("grok", "Fine, thank you.", seconds_ago=2)
+        self.assertEqual(self.bridge.tick(), [])
+        self.assertEqual(self.claimed("grok"), {})
+
+    def test_a_line_said_before_his_turn_never_claims_it(self):
+        self.say("grok", "I can't pull an image.", seconds_ago=20)
+        turn(self.conn, "Grok, how are you?", seconds_ago=10)
+        self.assertEqual(self.bridge.tick(), [])
+        self.assertEqual(self.claimed("grok"), {})
+
+    def test_nothing_while_the_window_is_shut_or_the_lease_is_not_ours(self):
+        turn(self.conn, "Could someone find a chair?", reason="everyone", seconds_ago=10)
+        self.say("gemini", "I cannot do that.", seconds_ago=5)
+        self.assertEqual(cb.Bridge(self.conn, LOG, lambda: False, clock=lambda: NOW).tick(), [])
+        self.assertEqual(self.claimed("gemini"), {})
+
+    def test_its_keys_are_under_gov_and_expire(self):
+        turn(self.conn, "Could someone find a chair?", reason="everyone", seconds_ago=10)
+        self.say("codex", "I cannot do that.", seconds_ago=5)
+        self.bridge.tick()
+        for key in (cb.ASKED_KEY % ROOM, cb.SIDE_CURSOR_KEY % ROOM):
+            self.assertTrue(key.startswith("gov:"), key)
+            self.assertIn(key, self.conn.store)
+            self.assertTrue(self.conn.ttls[key], key)
+        self.assertEqual(self.conn.ttls[cb.ASKED_KEY % ROOM], cb.ASKED_SECONDS)
+
+
 class Clock(unittest.TestCase):
     def test_eastern_time_follows_daylight_saving(self):
         self.assertEqual("10:02 ET", cb.eastern(NOW))
