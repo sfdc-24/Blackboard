@@ -77,6 +77,18 @@ ASKED_SECONDS = 3 * 60
 SIDE_BY = "chair"
 LATENCY_KEY = "gov:callbridge:latency:%s"
 TARGET_SECONDS = 3 * 60     # O3: the agent's own card within 3 minutes of the ask
+# THE DOORBELL (O3 gap 1, the owner's orders of 2026-10-28: "the real agent wakes"). fleet:inbox is passive: nothing
+# reads it on a push. Every doorbell the fleet already runs reads the BOARD: claude-code-cli's claude_cli_inbox.py
+# --wait, the cloud agent-waker jobs (agent_waker.addressed_to) and scripts/fleet_doorbell.py --agent grok|codex|
+# gemini. So a claim also rings the agent with ONE board row addressed to its tag, Row_ID WAKE_PREFIX + ask, through
+# the worker's own append path (append.py and its read-back), never retried: gov:callbridge:rung:<ask> is taken
+# with SET NX before the append is tried. Queued in RING_KEY by the claim, sent by the next tick. Only when the run
+# was given a `ring` (serve_requests: CALL_BRIDGE_RING=on); otherwise nothing is queued and nothing changes.
+# The row carries the allowlisted summary only, never his words: those stay in fleet:inbox.
+RING_KEY = "gov:callbridge:ring"
+RUNG_KEY = "gov:callbridge:rung:%s"
+WAKE_PREFIX = "CALLBRIDGE-WAKE-"
+RING_MAX = 10              # rows rung per tick at most; the rest wait for the next tick
 
 # The room's voices, by the chair's persona ids, and the fleet agent each one's work goes to: the canonical ids of
 # fleet:inbox (cloud/drive-intake ALIASES, agreed 2026-10-09) and of the canvas slots (canvas_publish.AGENTS).
@@ -205,6 +217,23 @@ def done_card(agent: str, claimed_at, now) -> dict:
                 eastern(claimed_at), eastern(now), minutes)}
 
 
+def wake_row(ask: str, agent: str, room: str, claimed_at) -> dict:
+    """The board row that rings the agent: a row spec for scripts/append.py, addressed to the agent's own tag (its
+    Target_Surface and to=), phase ASK so every doorbell wakes on it. Pipes and newlines out (bus_request.safe).
+    Never a word of the owner's (Aya's privacy hold on 922e8da): only who, when and where; his ask is in Redis
+    fleet:inbox:<agent>."""
+    import bus_request                                                   # noqa: PLC0415
+    safe = bus_request.safe
+    text = ("Work for %s from the room, asked at %s (your inbox has the ask). Put your own In the making card in conf:canvas:%s:%s now "
+            "(target: up within 3 minutes of the ask), do the work, then reply answers=%s. The full ask is in "
+            "fleet:inbox:%s." % (NAME_OF[agent], eastern(claimed_at), room, agent, ask, agent))
+    row_id = safe(WAKE_PREFIX + ask)[:120]
+    return {"row_id": row_id, "source_tag": "bus-reconciler", "target_surface": agent, "action_type": "ASK",
+            "category": "OPEN", "project_tag": "Blackboard", "gist": safe("Call ask for %s" % NAME_OF[agent]),
+            "payload": "BCB|v=1|id=%s|phase=ASK|from=bus-reconciler|to=%s|ask=%s|text=%s" % (
+                row_id, agent, safe(ask), safe(text))}
+
+
 def inbox_text(ask: str, agent: str, room: str, said: str, now) -> str:
     return ("CALL ASK %s from the owner, said in the conference room at %s (%s): %s -- Answer with a board row "
             "answers=%s. Your canvas card %s in conf:canvas:%s:%s turns done when that row lands; post your own "
@@ -213,8 +242,9 @@ def inbox_text(ask: str, agent: str, room: str, said: str, now) -> str:
 
 
 class Bridge:
-    def __init__(self, conn, log, holds, clock=None, canvas_room=CANVAS_ROOM):
+    def __init__(self, conn, log, holds, clock=None, canvas_room=CANVAS_ROOM, ring=None):
         self.conn, self.log, self.holds = conn, log, holds
+        self.ring = ring
         self.clock = clock or (lambda: datetime.datetime.now(datetime.timezone.utc))
         self.canvas_room = canvas_room
         self.stop = threading.Event()
@@ -239,9 +269,41 @@ class Bridge:
         claimed = []
         for room in self.streams():
             claimed.extend(self._room(room, now))
+        if self.ring is not None and self.holds():
+            self.ring_pending()
         if self.holds():
             self.watch(now)
         return claimed
+
+    def ring_pending(self) -> list:
+        """Ring each queued claim's agent with its one board row. At most once per ask, never retried: the rung
+        marker is taken first, so an append that fails or is unconfirmed is logged and left for a person."""
+        rung = []
+        for raw_ask, raw in sorted((self.conn.hgetall(RING_KEY) or {}).items())[:RING_MAX]:
+            ask = _text(raw_ask)
+            if not self.holds():
+                break
+            taken = self.conn.set(RUNG_KEY % ask, stamp(self.clock()), nx=True, ex=TTL_SECONDS)
+            self.conn.hdel(RING_KEY, ask)
+            if not taken:
+                continue                                     # rung before: never twice
+            try:
+                info = json.loads(_text(raw))
+                claimed_at = datetime.datetime.strptime(info["claimed_at"], "%Y-%m-%dT%H:%M:%SZ").replace(
+                    tzinfo=datetime.timezone.utc)
+                spec = wake_row(ask, info["agent"], info.get("room") or self.canvas_room, claimed_at)
+            except (ValueError, KeyError, TypeError):
+                self.log.warning("call bridge: %s ring entry unreadable; not rung", ask)
+                continue
+            try:
+                self.ring(spec)
+            except (Exception, SystemExit) as error:                     # noqa: BLE001
+                self.log.error("call bridge: %s ring for %s NOT confirmed (%s); not retried", ask, info["agent"],
+                               type(error).__name__)
+                continue
+            self.log.info("call bridge: %s rang %s with %s", ask, info["agent"], spec["row_id"])
+            rung.append(ask)
+        return rung
 
     def watch(self, now) -> list:
         """ASK TO AGENT CARD, measured (O3: the real agent puts its card up within TARGET_SECONDS). For each open
@@ -387,6 +449,10 @@ class Bridge:
             pipe.hset(OPEN_KEY, ask, json.dumps({"agent": agent, "claimed_at": stamp(now), "room": self.canvas_room},
                                                 sort_keys=True))
             pipe.expire(OPEN_KEY, TTL_SECONDS)
+            if self.ring is not None:
+                pipe.hset(RING_KEY, ask, json.dumps({"agent": agent, "claimed_at": stamp(now),
+                                                     "room": self.canvas_room}, sort_keys=True))
+                pipe.expire(RING_KEY, TTL_SECONDS)
             pipe.execute()
         finally:
             pipe.reset()
@@ -404,7 +470,9 @@ class Bridge:
         done = []
         for row in rows or ():
             payload, sender = _row(row)
-            answered = [part.strip() for part in re.split(r"[;,\s]+", _field(payload, "answers")) if part.strip()]
+            # A reply to the wake row (answers=CALLBRIDGE-WAKE-<ask>, as the agent-waker writes it) answers the ask.
+            answered = [part.strip()[len(WAKE_PREFIX):] if part.strip().startswith(WAKE_PREFIX) else part.strip()
+                        for part in re.split(r"[;,\s]+", _field(payload, "answers")) if part.strip()]
             for ask in answered:
                 if ask not in stored or ask in done:
                     continue
@@ -475,11 +543,12 @@ def _field(payload, name):
     return bus_request.field(payload, name)
 
 
-def start(conn, log, holds):
-    """The bridge on its own thread, or None without a way to ask for the lease."""
+def start(conn, log, holds, ring=None):
+    """The bridge on its own thread, or None without a way to ask for the lease. `ring`: the doorbell's board append
+    (one row spec), or None for no doorbell."""
     if holds is None:
         return None
-    bridge = Bridge(conn, log, holds)
+    bridge = Bridge(conn, log, holds, ring=ring)
     thread = threading.Thread(target=bridge.run, name="call-bridge", daemon=True)
     thread.start()
     bridge.thread = thread

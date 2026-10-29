@@ -285,7 +285,8 @@ def live_with_canvas(conn, env, execution, me, until, interval, lock_ttl, start=
 
     THE CALL BRIDGE (scripts/call_bridge.py) runs beside it, on its own thread, only with CALL_BRIDGE=on and a
     publisher running: its cards reach the page only through the publisher. Its done flips read the board rows
-    each pass already read (one_pass `settle`). Off, or without the flag, nothing starts: the rollback is the flag."""
+    each pass already read (one_pass `settle`). Off, or without the flag, nothing starts: the rollback is the flag.
+    CALL_BRIDGE_RING=on adds the doorbell: each claim rings its agent with one board row (call_bridge.wake_row)."""
     import canvas_publish                                                # noqa: PLC0415
     environ = os.environ if environ is None else environ
     bucket = environ.get("CANVAS_BUCKET", "")
@@ -299,7 +300,17 @@ def live_with_canvas(conn, env, execution, me, until, interval, lock_ttl, start=
     bridge = None
     if publisher is not None and environ.get("CALL_BRIDGE", "").strip().lower() == "on":
         import call_bridge                                               # noqa: PLC0415
-        bridge = (start_bridge or call_bridge.start)(conn, log, holds)
+        # THE DOORBELL (O3 gap 1): with CALL_BRIDGE_RING=on as well, each claim rings its agent with one board
+        # row through this worker's own append path, asked under the lease. Off (the default): no ring, no change.
+        ring = None
+        if environ.get("CALL_BRIDGE_RING", "").strip().lower() == "on":
+            write = appender(env)
+
+            def ring(spec):
+                if not holds():
+                    raise LockLost("gov:worker:lock is not ours; %s not written" % spec.get("row_id"))
+                return write(spec)
+        bridge = (start_bridge or call_bridge.start)(conn, log, holds, **({"ring": ring} if ring else {}))
         if bridge is not None:
             log.info("call bridge: on, room asks become claimed cards in conf:canvas:%s", bridge.canvas_room)
     try:

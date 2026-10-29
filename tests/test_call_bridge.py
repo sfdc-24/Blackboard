@@ -603,5 +603,158 @@ class InTheMakingAndLatency(unittest.TestCase):
         self.assertIsNone(self.latency(ask))
 
 
+def board_row(spec, ts):
+    """A row as the board returns it (Row_ID, Timestamp, Source, Target, Action, Payload, ...)."""
+    return [spec["row_id"], ts, spec["source_tag"], spec["target_surface"], spec["action_type"], spec["payload"],
+            spec["category"], spec["project_tag"], spec["gist"], ""]
+
+
+class Doorbell(unittest.TestCase):
+    """O3 gap 1 (owner orders 2026-10-28): the claim RINGS the real agent with one board row its doorbell reads,
+    never twice, never with his words, and its reply settles the ask. End to end, ask to the agent's card is measured."""
+
+    def setUp(self):
+        self.conn = FakeRedis()
+        open_window(self.conn)
+        self.rung = []
+
+    def ringing(self, clock=None, holds=True, fail=False):
+        def ring(spec):
+            if fail:
+                raise SystemExit(1)                                       # append.py: read-back unconfirmed
+            self.rung.append(spec)
+        lease = holds if callable(holds) else (lambda: holds)
+        return cb.Bridge(self.conn, LOG, lease, clock=clock or (lambda: NOW), ring=ring)
+
+    def test_without_a_ring_nothing_is_queued_and_nothing_changes(self):
+        turn(self.conn, "Codex, draft the queue flow for the vans.")
+        bridge(self.conn).tick()
+        self.assertEqual({}, self.conn.hgetall(cb.RING_KEY))
+
+    def test_a_claim_rings_its_agent_once_with_a_row_addressed_to_it(self):
+        turn(self.conn, "Codex, draft the price sheet for the client's Port-au-Prince store. Ask Marie Dupont first.")
+        b = self.ringing()
+        [ask] = b.tick()
+        [spec] = self.rung
+        self.assertEqual(("CALLBRIDGE-WAKE-" + ask, "chatgpt-codex-desktop", "ASK", "bus-reconciler"),
+                         (spec["row_id"], spec["target_surface"], spec["action_type"], spec["source_tag"]))
+        self.assertIn("|phase=ASK|", spec["payload"])
+        self.assertIn("|to=chatgpt-codex-desktop|", spec["payload"])
+        self.assertIn("answers=%s" % ask, spec["payload"])
+        self.assertIn("fleet:inbox:chatgpt-codex-desktop", spec["payload"])
+        for word in ("Port", "Prince", "client", "Marie", "Dupont", "draft", "price", "sheet", "store"):
+            self.assertNotIn(word, json.dumps(spec), "no word of his on the board: it stays in the inbox")
+        self.assertEqual(7, spec["payload"].count("|"), "eight fields, no stray pipe")
+        b.tick()
+        self.ringing().tick()
+        self.assertEqual(1, len(self.rung), "rung once, whatever the run")
+        self.assertEqual({}, self.conn.hgetall(cb.RING_KEY))
+
+    def test_a_failed_ring_is_logged_and_never_retried(self):
+        turn(self.conn, "Gemini, compare the two plans.")
+        with self.assertLogs(LOG, level="ERROR") as logs:
+            [ask] = self.ringing(fail=True).tick()
+        self.assertIn("NOT confirmed", " ".join(logs.output))
+        self.ringing().tick()
+        self.assertEqual([], self.rung)
+        self.assertIsNotNone(self.conn.get(cb.RUNG_KEY % ask))
+
+    def test_no_ring_once_the_lease_is_lost(self):
+        turn(self.conn, "Grok, list the risks.")
+        calls = iter([True, True, True, False, False, False, False])
+        self.ringing(holds=lambda: next(calls, False)).tick()
+        self.assertEqual([], self.rung)
+
+    def test_the_wake_reply_settles_the_ask(self):
+        turn(self.conn, "Gemini, compare the two plans.")
+        [ask] = self.ringing().tick()
+        later = NOW + datetime.timedelta(minutes=4)
+        done = bridge(self.conn, clock=lambda: later).settle(
+            [row("gemini", "BCB|v=1|id=GEMINI-REPLY|from=gemini|answers=CALLBRIDGE-WAKE-%s|wakerreply=1" % ask)])
+        self.assertEqual([ask], done)
+        self.assertEqual("done", card(self.conn, "gemini", ask)["status"])
+
+    def test_every_doorbell_rings_on_it(self):
+        import agent_waker
+        import fleet_doorbell as fd
+        for agent, said, door in (("chatgpt-codex-desktop", "Codex, draft the queue flow.", "codex"),
+                                  ("grok", "Grok, list the risks.", "grok"),
+                                  ("gemini", "Gemini, compare the two plans.", "gemini")):
+            self.rung.clear()
+            conn = self.conn = FakeRedis()
+            open_window(conn)
+            turn(conn, said)
+            self.ringing().tick()
+            [spec] = self.rung
+            r = board_row(spec, "2026-10-24T14:02:01Z")
+            since = NOW - datetime.timedelta(minutes=1)
+            self.assertEqual(1, len(fd.new_rows([r], since, door)), door)
+            self.assertEqual(1, len(fd.new_rows([r], since, door, calls_only=True)), door)
+            self.assertTrue(fd.is_wake(r))
+            others = [a for a in fd.AGENTS if a != door]
+            for other in others:
+                self.assertEqual([], fd.new_rows([r], since, other), (door, other))
+            self.assertTrue(agent_waker.addressed_to(r, agent if agent != "chatgpt-codex-desktop" else agent), agent)
+
+    def test_end_to_end_ask_to_the_agents_card_is_measured_against_three_minutes(self):
+        """The whole path in one clock: his ask lands in the room stream 10 s before the bridge's tick; the tick
+        claims and rings; the agent's doorbell (fleet_doorbell, 30 s poll) sees the wake row on its next poll; the
+        agent puts its own card up; the next tick measures ask-to-card. Each step's delay is a stated assumption."""
+        import fleet_doorbell as fd
+        said_at = NOW - datetime.timedelta(seconds=10)
+        turn(self.conn, "Codex, draft the queue flow for the vans.", seconds_ago=10)
+        [ask] = self.ringing().tick()                                     # tick at NOW: claim + ring
+        [spec] = self.rung
+        landed = NOW + datetime.timedelta(seconds=5)                      # append + read-back
+        polled = NOW + datetime.timedelta(seconds=30)                     # doorbell poll every 30 s
+        heard = fd.new_rows([board_row(spec, landed.strftime("%Y-%m-%dT%H:%M:%SZ"))],
+                            NOW - datetime.timedelta(seconds=1), "codex")
+        self.assertEqual(1, len(heard))
+        card_at = polled + datetime.timedelta(seconds=40)                 # the agent writes its card
+        own = {"v": 1, "type": "note", "status": "working", "public": True, "version": 1,
+               "ts": card_at.strftime("%Y-%m-%dT%H:%M:%SZ"), "title": "In the making: queue flow", "body": "x"}
+        self.conn.hset(cp.PARTITION % ("workshop", "chatgpt-codex-desktop"), "queue-flow", json.dumps(own))
+        tick_at = card_at + datetime.timedelta(seconds=10)
+        self.assertEqual([ask], self.ringing(clock=lambda: tick_at).watch(tick_at))
+        got = json.loads(self.conn.get(cb.LATENCY_KEY % ask))
+        self.assertTrue(got["on_time"])
+        self.assertEqual(70, got["seconds"], "claim to card")
+        end_to_end = (card_at - said_at).total_seconds()
+        self.assertEqual(80, end_to_end)
+        self.assertLessEqual(end_to_end, cb.TARGET_SECONDS)
+
+
+class DoorbellInTheLiveRun(unittest.TestCase):
+    def test_the_ring_is_handed_to_the_bridge_only_with_call_bridge_ring_on(self):
+        import serve_requests as sr
+        got = []
+
+        class Worker:
+            canvas_room = "workshop"
+            stop = mock.Mock()
+            thread = mock.Mock()
+            settle = None
+
+        start = lambda conn, bucket, log, holds: Worker()                                    # noqa: E731
+
+        def start_bridge(conn, log, holds, **kw):
+            got.append(kw)
+            return Worker()
+        with mock.patch.object(sr, "live", return_value=0), mock.patch.object(sr, "appender", return_value=print):
+            for env, has in (({"CANVAS_BUCKET": "b", "CALL_BRIDGE": "on", "CALL_BRIDGE_RING": "on"}, True),
+                             ({"CANVAS_BUCKET": "b", "CALL_BRIDGE": "on"}, False),
+                             ({"CANVAS_BUCKET": "b", "CALL_BRIDGE": "on", "CALL_BRIDGE_RING": "1"}, False)):
+                got.clear()
+                conn = FakeRedis()
+                sr.live_with_canvas(conn, {}, "", "me", NOW, 10, 300, start=start, start_bridge=start_bridge,
+                                    environ=env)
+                self.assertEqual(has, "ring" in got[-1], env)
+            conn = FakeRedis()
+            sr.live_with_canvas(conn, {}, "", "me", NOW, 10, 300, start=start, start_bridge=start_bridge,
+                                environ={"CANVAS_BUCKET": "b", "CALL_BRIDGE": "on", "CALL_BRIDGE_RING": "on"})
+            with self.assertRaises(sr.LockLost):
+                got[-1]["ring"]({"row_id": "CALLBRIDGE-WAKE-call-000000000000"})   # lock not "me": no write
+
+
 if __name__ == "__main__":
     unittest.main()
