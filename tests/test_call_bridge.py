@@ -935,8 +935,10 @@ class GoAheadAt1117(unittest.TestCase):
     """The owner's test call, 2026-10-29 11:17 ET (room conf-<his 16 hex>-42c62aad): he set out the work, told the voice
     to "do it", the voice said "Got it", and no card went up. No canvas window was open, so the bridge never read the
     call; and "do it" names nobody and has no task word. Now a go-ahead confirms his last ask, and the bridge opens
-    the window for its claim, so the "In the making" card is up seconds after "do it"."""
-    WORK = "The firm files its returns in one desktop tool; the hard part is pulling the year-end numbers out of it."
+    the window for its claim, so the "In the making" card is up seconds after "do it". Since db84811 (Aya's binding
+    hold on d2d1618) the ask a go-ahead confirms must be a task ask: a task word or a voice's name in it."""
+    WORK = ("Map out how the firm files its returns in one desktop tool; the hard part is pulling the year-end "
+            "numbers out of it.")
 
     def setUp(self):
         self.conn = FakeRedis()
@@ -960,9 +962,7 @@ class GoAheadAt1117(unittest.TestCase):
         self.assertFalse(cb.go_ahead(dict(f, utterance="do it", kind="floor.granted")))
 
     def test_the_1117_case_do_it_to_the_voice_holding_the_floor_puts_its_card_up_with_no_window_open(self):
-        self.granted("gemini", "t-1", seconds_ago=60)
-        turn(self.conn, self.WORK, reason="continuity", seconds_ago=50, turn_id="t-2")   # no task word, no name
-        self.granted("gemini", "t-2", seconds_ago=48)
+        turn(self.conn, self.WORK, reason="continuity", seconds_ago=50, turn_id="t-2")   # a task word, no name
         go = turn(self.conn, "Gemini, do it.", reason="vocative", seconds_ago=20, turn_id="t-3")
         self.granted("gemini", "t-3", seconds_ago=18)
         self.assertEqual([], cp.active_windows(self.conn, NOW), "as on the call: no window open")
@@ -980,6 +980,17 @@ class GoAheadAt1117(unittest.TestCase):
         self.assertEqual(cb.event_time(go).strftime("%Y-%m-%dT%H:%M:%S.%fZ"), opened["asked_at"],
                          "its three minutes run from the go-ahead")
 
+    def test_a_task_ask_to_the_voice_holding_the_floor_is_claimed_at_once_and_do_it_adds_no_second(self):
+        self.granted("gemini", "t-1", seconds_ago=60)
+        said = turn(self.conn, self.WORK, reason="continuity", seconds_ago=50, turn_id="t-2")
+        self.granted("gemini", "t-2", seconds_ago=48)
+        turn(self.conn, "Do it.", reason="continuity", seconds_ago=20, turn_id="t-3")
+        [ask] = self.opened().tick()
+        self.assertEqual("claimed", card(self.conn, "gemini", ask)["status"])
+        self.assertEqual(1, len(self.conn.streams["fleet:inbox:gemini"]))
+        self.assertEqual(cb.event_time(said).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                         json.loads(self.conn.hgetall(cb.OPEN_KEY)[ask])["asked_at"], "timed from the ask")
+
     def test_no_word_of_his_on_the_public_card_or_the_page(self):
         said = "Gemini, map the client's Port-au-Prince stores for Marie Dupont."
         turn(self.conn, "Map the Port-au-Prince stores for Marie Dupont, the client's buyer.", reason="continuity",
@@ -993,7 +1004,8 @@ class GoAheadAt1117(unittest.TestCase):
         self.assertIn("Dupont", self.conn.streams["fleet:inbox:gemini"][0][1]["text"], "every word, in Redis only")
         del said
 
-    def test_go_ahead_names_nobody_then_the_floor_holder_then_who_the_ask_named(self):
+    def test_the_voice_his_ask_named_wins_over_the_floor_holder(self):
+        """Aya's binding hold on d2d1618: the floor holder (up to 15 min old) could override the named voice."""
         turn(self.conn, "Codex, here is the flow I mean.", reason="vocative", seconds_ago=40, turn_id="t-1")
         turn(self.conn, "Go ahead.", reason="continuity", seconds_ago=20, turn_id="t-2")
         [ask] = self.opened().tick()
@@ -1005,7 +1017,8 @@ class GoAheadAt1117(unittest.TestCase):
         turn(conn2, "Do it.", reason="continuity", seconds_ago=20, turn_id="t-2")
         self.granted("grok", "t-2", seconds_ago=18)
         [ask] = self.opened().tick()
-        self.assertIsNotNone(card(conn2, "grok", ask), "the voice holding the floor for the go-ahead takes it")
+        self.assertIsNotNone(card(conn2, "chatgpt-codex-desktop", ask), "the voice his ask named takes it")
+        self.assertNotIn(cp.PARTITION % ("workshop", "grok"), conn2.hashes, "never the floor holder")
 
     def test_a_go_ahead_for_an_ask_already_claimed_is_the_same_claim(self):
         turn(self.conn, "Gemini, draw the five boxes.", seconds_ago=40, turn_id="t-1")
@@ -1025,12 +1038,13 @@ class GoAheadAt1117(unittest.TestCase):
         self.assertEqual(1, len(asks))
         self.assertEqual(1, len(self.conn.hashes[cp.PARTITION % ("workshop", "gemini")]))
 
-    def test_a_go_ahead_with_no_ask_in_reach_still_puts_the_holders_card_up(self):
+    def test_a_go_ahead_with_no_pending_task_claims_nothing_even_with_a_floor_holder(self):
+        """Aya's binding hold on d2d1618: no pending task still claimed "do it" for the holder."""
         self.granted("gemini", "t-1", seconds_ago=30)
         turn(self.conn, "Do it.", reason="continuity", seconds_ago=20, turn_id="t-2")
-        [ask] = self.opened().tick()
-        self.assertEqual("claimed", card(self.conn, "gemini", ask)["status"])
-        self.assertIn("Do it", self.conn.streams["fleet:inbox:gemini"][0][1]["text"])
+        self.assertEqual([], self.opened().tick())
+        self.assertNotIn("fleet:inbox:gemini", self.conn.streams)
+        self.assertEqual([], cp.active_windows(self.conn, NOW), "and no window")
 
     def test_a_go_ahead_with_nobody_to_give_it_to_claims_nothing_and_opens_nothing(self):
         turn(self.conn, "Do it.", reason="continuity", seconds_ago=20, turn_id="t-2")
@@ -1069,15 +1083,298 @@ class GoAheadAt1117(unittest.TestCase):
         self.assertEqual([], self.opened().tick())
         self.assertEqual([], cp.active_windows(self.conn, NOW))
         turn(self.conn, "Gemini, do it.", seconds_ago=5)
-        [ask] = self.opened().tick()
-        self.assertIn("Gemini, do it", self.conn.streams["fleet:inbox:gemini"][0][1]["text"],
-                      "the old ask is not what a go-ahead confirms")
+        self.assertEqual([], self.opened().tick(), "the old ask is not what a go-ahead confirms")
 
     def test_its_new_keys_are_under_gov_and_expire(self):
         turn(self.conn, self.WORK, reason="continuity", seconds_ago=50, turn_id="t-1")
         self.opened().tick()
         self.assertTrue((cb.PENDING_KEY % ROOM).startswith("gov:"))
         self.assertEqual(cb.PENDING_SECONDS, self.conn.ttls[cb.PENDING_KEY % ROOM])
+        self.granted("gemini", "t-9", seconds_ago=5)
+        self.opened().tick()
+        self.assertTrue((cb.LAST_AT_KEY % ROOM).startswith("gov:"))
+        self.assertEqual(cb.LAST_SECONDS, self.conn.ttls[cb.LAST_AT_KEY % ROOM])
+
+
+class BoundedPublication(unittest.TestCase):
+    """Aya's source hold on d2d1618, point 1: the window the bridge opened by itself published every public:true item
+    already in the room's partitions. The bridge's window is scoped: only the claim's own cards leave Redis."""
+
+    def setUp(self):
+        self.conn = FakeRedis()
+        old = {"v": 1, "type": "note", "status": "done", "public": True, "version": 4, "ts": "2026-10-23T20:00:00Z",
+               "title": "Yesterday's card", "body": "x"}
+        self.conn.hset(cp.PARTITION % ("workshop", "grok"), "yesterday", json.dumps(old))
+        self.conn.hset(cp.PARTITION % ("workshop", "gemini"), "older", json.dumps(old))
+        self.b = cb.Bridge(self.conn, LOG, lambda: True, clock=lambda: NOW, bucket="sfdc24-canvas")
+
+    def published(self):
+        raw = self.conn.get(cp.WINDOW_PREFIX + "workshop")
+        return [i["id"] for i in cp.snapshot(self.conn, "workshop", NOW, scope=cp.scope_of(self.conn, "workshop",
+                                                                                             raw))["items"]]
+
+    def test_the_bridges_window_publishes_its_claim_and_nothing_older(self):
+        turn(self.conn, "Gemini, draw the five boxes.", seconds_ago=20)
+        [ask] = self.b.tick()
+        self.assertTrue(cp.read_window(self.conn, "workshop")["scoped"])
+        self.assertEqual(["gemini/" + ask], self.published())
+
+    def test_the_agents_own_card_for_that_ask_is_published_and_nothing_else_it_writes(self):
+        turn(self.conn, "Gemini, draw the five boxes.", seconds_ago=20)
+        [ask] = self.b.tick()
+        own = {"v": 1, "type": "note", "status": "working", "public": True, "version": 1, "ask": ask,
+               "ts": "2026-10-24T14:02:30Z", "title": "In the making: five boxes", "body": "x"}
+        other = dict(own, ask="call-000000000000", title="Something else")
+        loose = {k: v for k, v in own.items() if k != "ask"}
+        slot = cp.PARTITION % ("workshop", "gemini")
+        self.conn.hset(slot, "boxes", json.dumps(own))
+        self.conn.hset(slot, "other", json.dumps(other))
+        self.conn.hset(slot, "loose", json.dumps(loose))
+        self.conn.hset(cp.PARTITION % ("workshop", "grok"), "boxes", json.dumps(own))   # another slot naming it
+        self.assertEqual(["gemini/boxes", "gemini/" + ask], sorted(self.published()))
+
+    def test_each_claim_in_its_window_adds_its_own_card(self):
+        turn(self.conn, "Gemini, draw the five boxes.", seconds_ago=20)
+        turn(self.conn, "Codex, list the risks.", seconds_ago=10)
+        asks = self.b.tick()
+        self.assertEqual(2, len(asks))
+        self.assertEqual(sorted(["gemini/" + asks[0], "chatgpt-codex-desktop/" + asks[1]]), sorted(self.published()))
+
+    def test_a_window_opened_by_a_board_ask_publishes_the_room_as_before_and_is_not_scoped(self):
+        cp.open_window(self.conn, "workshop", 30, "claude-code-cli", NOW, "sfdc24-canvas")
+        turn(self.conn, "Gemini, draw the five boxes.", seconds_ago=20)
+        [ask] = self.b.tick()
+        self.assertNotIn("scoped", cp.read_window(self.conn, "workshop"))
+        self.assertEqual(sorted(["gemini/" + ask, "gemini/older", "grok/yesterday"]), sorted(self.published()))
+        gen = cp.read_window(self.conn, "workshop")["gen"]
+        self.assertEqual({}, self.conn.hgetall(cp.scope_key("workshop", gen)), "nothing listed on someone else's")
+
+    def test_a_scoped_window_whose_list_is_gone_publishes_nothing(self):
+        turn(self.conn, "Gemini, draw the five boxes.", seconds_ago=20)
+        self.b.tick()
+        gen = cp.read_window(self.conn, "workshop")["gen"]
+        self.conn.hashes.pop(cp.scope_key("workshop", gen))
+        self.assertEqual([], self.published())
+        self.assertEqual(frozenset(), cp.scope_of(self.conn, "workshop", '{"scoped": "yes"}'), "unreadable: none")
+
+    def test_the_publisher_uploads_only_the_scoped_items(self):
+        turn(self.conn, "Gemini, draw the five boxes.", seconds_ago=20)
+        [ask] = self.b.tick()
+        sent = []
+        pub = cp.Publisher(self.conn, "sfdc24-canvas", lambda bucket, name, data, allow=None: sent.append(data), LOG,
+                           clock=lambda: NOW, holds=lambda: True)
+        self.assertEqual(["workshop"], pub.tick())
+        self.assertEqual(["gemini/" + ask], [i["id"] for i in json.loads(sent[-1])["items"]])
+
+    def test_its_keys_are_under_gov_and_end_with_the_window(self):
+        turn(self.conn, "Gemini, draw the five boxes.", seconds_ago=20)
+        self.b.tick()
+        key = cp.scope_key("workshop", cp.read_window(self.conn, "workshop")["gen"])
+        self.assertTrue(key.startswith("gov:"))
+        self.assertEqual(cp.MAX_MINUTES * 60, self.conn.ttls[key])
+
+
+class WakeConfirmed(unittest.TestCase):
+    """Aya's source hold on d2d1618, point 2: a ring is not a wake. The agent must take the claim (an ACK row, finished
+    work, or its own card) within ACK_SECONDS; else one more ring; else the record and the card say it did not wake.
+    The bridge launches nothing."""
+
+    def setUp(self):
+        self.conn = FakeRedis()
+        open_window(self.conn)
+        self.rung = []
+        turn(self.conn, "Gemini, compare the two plans for the Port-au-Prince store.", seconds_ago=10)
+        [self.ask] = self.at(NOW).tick()
+
+    def at(self, moment):
+        return cb.Bridge(self.conn, LOG, lambda: True, clock=lambda: moment, ring=self.rung.append)
+
+    def wake(self):
+        return json.loads(self.conn.get(cb.WAKE_KEY % self.ask))
+
+    def later(self, seconds):
+        moment = NOW + datetime.timedelta(seconds=seconds)
+        self.at(moment).tick()
+        return moment
+
+    def ack(self, sender="gemini", extra="phase=ACK|from=gemini", target=None):
+        return row(sender, "BCB|v=1|id=GEMINI-ACK|%s|answers=%s|text=claim taken" % (
+            extra, target or cb.WAKE_PREFIX + self.ask))
+
+    def test_rung_once_and_recorded(self):
+        self.assertEqual(1, len(self.rung))
+        self.assertEqual(("rung", "gemini"), (self.wake()["state"], self.wake()["agent"]))
+
+    def test_no_ack_in_time_rings_once_more_then_marks_it_did_not_wake(self):
+        self.later(cb.ACK_SECONDS - 1)
+        self.assertEqual(1, len(self.rung), "not before ACK_SECONDS")
+        self.later(cb.ACK_SECONDS)
+        self.assertEqual(2, len(self.rung))
+        self.assertEqual(cb.WAKE_PREFIX + self.ask + cb.RERING_SUFFIX, self.rung[1]["row_id"])
+        self.assertIn("|id=%s|" % self.rung[1]["row_id"], self.rung[1]["payload"])
+        self.assertEqual("rerung", self.wake()["state"])
+        self.later(2 * cb.ACK_SECONDS)
+        self.assertEqual("no_wake", self.wake()["state"])
+        got = card(self.conn, "gemini", self.ask)
+        self.assertEqual(("Waiting: Gemini did not wake", cb.NO_WAKE, 2, "claimed"),
+                         (got["title"], got["activity"], got["version"], got["status"]))
+        self.assertIsNotNone(cp.clean_item("gemini", self.ask, json.dumps(got)), "the page shows it")
+        for word in ("Port", "Prince", "compare", "plans", "store"):
+            self.assertNotIn(word, json.dumps(got))
+        self.later(10 * cb.ACK_SECONDS)
+        self.assertEqual(2, len(self.rung), "never a third ring")
+
+    def test_an_ack_row_from_the_agent_is_the_wake_and_stops_the_second_ring(self):
+        moment = NOW + datetime.timedelta(seconds=40)
+        self.at(moment).settle([self.ack()])
+        self.assertEqual(("acked", "GEMINI-ACK"), (self.wake()["state"], self.wake()["acked_by"]))
+        self.later(5 * cb.ACK_SECONDS)
+        self.assertEqual(1, len(self.rung))
+        self.assertEqual("claimed in the room", card(self.conn, "gemini", self.ask)["activity"])
+
+    def test_a_waker_relay_a_refusal_or_another_agents_row_is_not_an_ack(self):
+        moment = NOW + datetime.timedelta(seconds=40)
+        b = self.at(moment)
+        b.settle([self.ack(extra="phase=RESULT|from=gemini|wakerreply=1|evidence=STATED")])
+        b.settle([self.ack(extra="phase=ACK|from=gemini|text=STATUS: REFUSED")])
+        b.settle([self.ack(sender="grok", extra="phase=ACK|from=grok")])
+        b.settle([self.ack(extra="phase=ASK|from=gemini")])
+        self.assertEqual("rung", self.wake()["state"])
+
+    def test_its_own_card_for_the_ask_is_the_wake(self):
+        own = {"v": 1, "type": "note", "status": "working", "public": True, "version": 1, "ask": self.ask,
+               "ts": "2026-10-24T14:02:30Z", "title": "In the making: the comparison", "body": "x"}
+        self.conn.hset(cp.PARTITION % ("workshop", "gemini"), "comparison", json.dumps(own))
+        self.later(30)
+        self.assertEqual(("acked", "card"), (self.wake()["state"], self.wake()["acked_by"]))
+        self.later(5 * cb.ACK_SECONDS)
+        self.assertEqual(1, len(self.rung))
+
+    def test_an_ack_to_the_second_ring_counts_and_a_late_one_puts_the_card_back(self):
+        self.later(cb.ACK_SECONDS)
+        self.at(NOW).settle([self.ack(target=cb.WAKE_PREFIX + self.ask + cb.RERING_SUFFIX)])
+        self.assertEqual("acked", self.wake()["state"])
+        conn = self.conn
+        self.setUp()
+        del conn
+        self.later(cb.ACK_SECONDS)
+        self.later(2 * cb.ACK_SECONDS)
+        self.at(NOW + datetime.timedelta(seconds=300)).settle([self.ack()])
+        self.assertEqual(("acked", True), (self.wake()["state"], self.wake()["late"]))
+        got = card(self.conn, "gemini", self.ask)
+        self.assertEqual(("claimed in the room", 3), (got["activity"], got["version"]))
+
+    def test_its_result_after_no_wake_still_turns_the_card_done_with_a_newer_version(self):
+        self.later(cb.ACK_SECONDS)
+        self.later(2 * cb.ACK_SECONDS)
+        done = row("gemini", "BCB|v=1|id=GEMINI-DONE|phase=RESULT|from=gemini|answers=%s|text=compared" % self.ask)
+        self.assertEqual([self.ask], self.at(NOW + datetime.timedelta(seconds=400)).settle([done]))
+        got = card(self.conn, "gemini", self.ask)
+        self.assertEqual(("done", 3), (got["status"], got["version"]))
+
+    def test_the_latency_record_carries_the_wake(self):
+        self.later(cb.ACK_SECONDS)
+        self.later(2 * cb.ACK_SECONDS)
+        self.later(4 * cb.ACK_SECONDS)
+        self.assertEqual("no_wake", json.loads(self.conn.get(cb.LATENCY_KEY % self.ask))["wake"])
+
+    def test_without_a_ring_no_wake_is_tracked(self):
+        conn = FakeRedis()
+        open_window(conn)
+        turn(conn, "Gemini, compare the two plans.", seconds_ago=10)
+        [ask] = bridge(conn).tick()
+        later = NOW + datetime.timedelta(seconds=10 * cb.ACK_SECONDS)
+        bridge(conn, clock=lambda: later).tick()
+        self.assertIsNone(conn.get(cb.WAKE_KEY % ask))
+        self.assertEqual("claimed in the room", card(conn, "gemini", ask)["activity"])
+
+    def test_its_key_is_under_gov_and_expires(self):
+        self.assertTrue((cb.WAKE_KEY % self.ask).startswith("gov:"))
+        self.assertEqual(cb.TTL_SECONDS, self.conn.ttls[cb.WAKE_KEY % self.ask])
+
+
+class GoAheadBinding(unittest.TestCase):
+    """Aya's binding hold on d2d1618, point 3: a go-ahead confirms a validated pending TASK ask, for the voice
+    assigned when he made it; absent, ambiguous or stale, nothing is claimed."""
+
+    def setUp(self):
+        self.conn = FakeRedis()
+        open_window(self.conn)
+
+    def granted(self, persona, turn_id, seconds_ago):
+        return turn(self.conn, None, reason="", actor=persona, seconds_ago=seconds_ago, kind="floor.granted",
+                    turn_id=turn_id)
+
+    def pending(self):
+        raw = self.conn.get(cb.PENDING_KEY % ROOM)
+        return json.loads(raw) if raw else None
+
+    def test_what_is_a_task_ask(self):
+        f = {"kind": "turn.started", "actor_id": "owner-1", "reason": "continuity"}
+        for said in ("Map the flow.", "Gemini, what do you think?", "Show me the numbers."):
+            self.assertTrue(cb.task_ask(dict(f, utterance=said)), said)
+        for said in ("That is how it works today.", "Do it.", "Gemini, do it.", ""):
+            self.assertFalse(cb.task_ask(dict(f, utterance=said)), said)
+
+    def test_a_turn_with_no_task_word_and_no_name_is_not_pending_and_do_it_claims_nothing(self):
+        self.granted("gemini", "t-1", seconds_ago=60)
+        turn(self.conn, "The team logs every call by hand.", reason="continuity", seconds_ago=50, turn_id="t-2")
+        self.granted("gemini", "t-2", seconds_ago=48)
+        turn(self.conn, "Do it.", reason="continuity", seconds_ago=20, turn_id="t-3")
+        self.assertEqual([], bridge(self.conn).tick())
+        self.assertIsNone(self.pending())
+
+    def test_the_pending_ask_keeps_its_stable_id_and_assigned_voice(self):
+        turn(self.conn, "Codex, map the queue.", seconds_ago=30, turn_id="t-1")
+        bridge(self.conn).tick()
+        got = self.pending()
+        self.assertEqual((at(30), ["chatgpt-codex-desktop"], True), (got["entry"], got["agents"], got["named"]))
+
+    def test_a_go_ahead_naming_another_voice_than_his_ask_is_ambiguous_and_claims_nothing_new(self):
+        turn(self.conn, "Codex, here is the flow I mean.", seconds_ago=40, turn_id="t-1")
+        turn(self.conn, "Gemini, do it.", seconds_ago=20, turn_id="t-2")
+        bridge(self.conn).tick()
+        self.assertNotIn(cp.PARTITION % ("workshop", "gemini"), self.conn.hashes)
+        self.assertNotIn(cp.PARTITION % ("workshop", "chatgpt-codex-desktop"), self.conn.hashes)
+
+    def test_an_unnamed_task_ask_goes_to_the_voice_he_was_talking_to_then_not_to_the_floor_at_the_go_ahead(self):
+        self.granted("gemini", "t-1", seconds_ago=60)
+        turn(self.conn, "Map the flow on the page.", reason="continuity", seconds_ago=50, turn_id="t-2")
+        self.granted("gemini", "t-2", seconds_ago=48)
+        self.granted("grok", "t-3", seconds_ago=30)                             # the floor moved on
+        turn(self.conn, "Do it.", reason="continuity", seconds_ago=20, turn_id="t-4")
+        self.granted("grok", "t-4", seconds_ago=18)
+        asks = bridge(self.conn).tick()
+        self.assertNotIn(cp.PARTITION % ("workshop", "grok"), self.conn.hashes, "never the go-ahead's floor holder")
+        self.assertTrue(any(card(self.conn, "gemini", a) for a in asks))
+
+    def test_a_stale_floor_assigns_nobody_and_only_a_named_go_ahead_claims(self):
+        self.conn.set(cb.LAST_KEY % ROOM, "grok")
+        self.conn.set(cb.LAST_AT_KEY % ROOM, at(cb.FLOOR_FRESH_SECONDS + 60))
+        turn(self.conn, "Map the flow on the page.", reason="continuity", seconds_ago=50, turn_id="t-2")
+        turn(self.conn, "Do it.", reason="continuity", seconds_ago=20, turn_id="t-3")
+        self.assertEqual([], bridge(self.conn).tick())
+        self.assertEqual([], self.pending()["agents"])
+        turn(self.conn, "Gemini, do it.", seconds_ago=5, turn_id="t-4")
+        [ask] = bridge(self.conn).tick()
+        self.assertIsNotNone(card(self.conn, "gemini", ask))
+
+    def test_a_follow_up_never_goes_to_a_stale_floor(self):
+        self.granted("grok", "t-0", seconds_ago=cb.FLOOR_FRESH_SECONDS + 60)
+        turn(self.conn, "Map the flow on the page.", reason="continuity", seconds_ago=50, turn_id="t-2")
+        self.assertEqual([], bridge(self.conn).tick())
+        conn = self.conn = FakeRedis()
+        open_window(conn)
+        self.granted("grok", "t-0", seconds_ago=cb.FLOOR_FRESH_SECONDS - 60)
+        turn(conn, "Map the flow on the page.", reason="continuity", seconds_ago=50, turn_id="t-2")
+        [ask] = bridge(conn).tick()
+        self.assertIsNotNone(card(conn, "grok", ask), "granted within FLOOR_FRESH_SECONDS: his")
+
+    def test_a_pending_record_without_its_assignment_binds_nothing(self):
+        self.conn.set(cb.PENDING_KEY % ROOM, json.dumps({"entry": at(40), "said": "draw it"}))
+        self.granted("gemini", "t-1", seconds_ago=30)
+        turn(self.conn, "Gemini, do it.", seconds_ago=20, turn_id="t-2")
+        self.assertEqual([], bridge(self.conn).tick())
 
 
 if __name__ == "__main__":

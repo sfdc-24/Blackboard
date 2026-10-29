@@ -45,6 +45,15 @@ every mermaid body line by line and DROPS the item unless all of it is plain dia
                       markdown strings in backticks, KaTeX's $$, icons)
     and no more than  MERMAID_LINES lines
 A dropped item is not repaired, as everywhere here. The rule is the same for every agent's slot.
+
+A SCOPED WINDOW publishes named items only (Aya's source hold on d2d1618: a window the call bridge opened by
+itself published every public:true item already sitting in the room's partitions). A window opened with a scope
+carries "scoped": true in its own value, fixed at open, and its items are listed in gov:canvas:scope:<room>:<gen>
+(under gov:, no agent may write it; it lives as long as the window can). While it is open only these leave
+Redis: an item whose published id "<agent>/<field>" is listed, and that same agent's item whose "ask" value is
+the listed field (the agent's own card for that ask). Nothing older and nothing else, whatever its public flag.
+A scoped window with no list publishes nothing. A window opened by a board ask (do=canvas-publish) is not
+scoped, as before: its opener chose to publish the room.
 """
 from __future__ import annotations
 
@@ -61,6 +70,7 @@ import urllib.request
 FORMAT = "proto-canvas/1"
 PARTITION = "conf:canvas:%s:%s"
 WINDOW_PREFIX = "gov:canvas:publish:"
+SCOPE_PREFIX = "gov:canvas:scope:"
 MAX_MINUTES = 120
 PUBLISH_SECONDS = 5
 # A file whose items have not changed is rewritten this often anyway, so "generated" shows the publisher is
@@ -213,8 +223,9 @@ def image_ok(url: str) -> bool:
             and (parts.hostname or "") in IMAGE_HOSTS and parts.port in (None, 443))
 
 
-def snapshot(conn, room: str, generated, until=None) -> dict:
-    """The room file: every public item of every allowlisted agent, in a stable order."""
+def snapshot(conn, room: str, generated, until=None, scope=None) -> dict:
+    """The room file: every public item of every allowlisted agent, in a stable order. `scope` (a scoped
+    window's list, scope_of): only the listed items and the cards bound to them (module docstring)."""
     items = []
     for agent in AGENTS:
         stored = conn.hgetall(PARTITION % (room, agent)) or {}
@@ -223,12 +234,56 @@ def snapshot(conn, room: str, generated, until=None) -> dict:
             if raw is None:
                 raw = stored.get(item_id.encode("utf-8"))
             published = clean_item(agent, item_id, raw)
-            if published:
+            if published and (scope is None or in_scope(scope, agent, item_id, raw)):
                 items.append(published)
     doc = {"format": FORMAT, "v": 1, "room": room, "generated": stamp(generated), "items": items[:MAX_ITEMS]}
     if until is not None:
         doc["until"] = stamp(until)
     return doc
+
+
+def in_scope(scope, agent: str, item_id: str, raw) -> bool:
+    """Listed by id, or that agent's own card for a listed field (its "ask" value)."""
+    if "%s/%s" % (agent, _text(item_id)) in scope:
+        return True
+    try:
+        bound = json.loads(_text(raw)).get("ask")
+    except (TypeError, ValueError, AttributeError):
+        return False
+    return isinstance(bound, str) and bool(bound) and "%s/%s" % (agent, bound) in scope
+
+
+def scope_key(room: str, gen: str) -> str:
+    return SCOPE_PREFIX + "%s:%s" % (room, gen)
+
+
+def scope_of(conn, room: str, raw):
+    """None for a window that publishes the room (opened by a board ask), else the frozenset of item ids a scoped
+    window may publish. Fails closed: a scoped window whose list cannot be read publishes nothing."""
+    try:
+        held = json.loads(_text(raw)) if raw else None
+    except (TypeError, ValueError):
+        return frozenset()
+    if not isinstance(held, dict) or "scoped" not in held:
+        return None
+    if held.get("scoped") is not True or not isinstance(held.get("gen"), str):
+        return frozenset()
+    return frozenset(_text(k) for k in (conn.hgetall(scope_key(room, held["gen"])) or {}))
+
+
+def scope_add(conn, room: str, item: str, by: str, now) -> bool:
+    """List one more item on a SCOPED window that `by` opened. Never on anyone else's window and never on an
+    unscoped one: True only when it is listed."""
+    agent, _, field = (item or "").partition("/")
+    if agent not in AGENTS or not ITEM_ID.fullmatch(field):
+        return False
+    held = read_window(conn, room)
+    if not held or held.get("scoped") is not True or held.get("by") != by or not isinstance(held.get("gen"), str):
+        return False
+    key = scope_key(room, held["gen"])
+    conn.hset(key, item, stamp(now))
+    conn.expire(key, MAX_MINUTES * 60)
+    return True
 
 
 def content_digest(doc) -> str:
@@ -243,11 +298,13 @@ def window_key(room: str) -> str:
     return WINDOW_PREFIX + room
 
 
-def open_window(conn, room, minutes, by: str, now, bucket: str) -> dict:
+def open_window(conn, room, minutes, by: str, now, bucket: str, scope=None) -> dict:
     """Open (minutes 1..120) or close (minutes 0) a room's publishing window. Raises Refused.
 
     ONE WINDOW PER ROOM, set with SET NX: a second request while one is open is refused, never doubled and
-    never extended, so an ask cannot keep a room publishing past the time its opener chose."""
+    never extended, so an ask cannot keep a room publishing past the time its opener chose.
+
+    `scope` (a list of "<agent>/<field>" ids): a SCOPED window, which publishes only those (module docstring)."""
     room = (room or "").strip()
     if not ROOM.fullmatch(room):
         raise Refused("room= must be 2 to 40 characters of a-z, 0-9 and hyphens")
@@ -263,12 +320,17 @@ def open_window(conn, room, minutes, by: str, now, bucket: str) -> dict:
     until = now + datetime.timedelta(minutes=count)
     # `gen` makes a stop and a reopen a different window even when `until` is unchanged, so a snapshot
     # taken under the old window cannot be written into the new one.
-    value = json.dumps({"by": by, "gen": secrets.token_hex(8), "room": room, "until": stamp(until)},
-                       sort_keys=True)
+    gen = secrets.token_hex(8)
+    held = {"by": by, "gen": gen, "room": room, "until": stamp(until)}
+    if scope is not None:
+        held["scoped"] = True
+    value = json.dumps(held, sort_keys=True)
     if not conn.set(window_key(room), value, nx=True, ex=count * 60):
         held = read_window(conn, room)
         raise Refused("room %s is already publishing until %s; send minutes=0 to stop it first"
                       % (room, held["until"] if held else "an unreadable time"))
+    for item in scope or ():
+        scope_add(conn, room, item, by, now)
     return {"ok": True, "room": room, "until": stamp(until), "minutes": count,
             "file": "gs://%s/rooms/%s.json" % (bucket, room)}
 
@@ -415,7 +477,7 @@ class Publisher:
         if not self.may_write(room) or self._window_raw(room) != raw:
             return False
         try:
-            fresh = snapshot(self.conn, room, self.clock(), opened)
+            fresh = snapshot(self.conn, room, self.clock(), opened, scope_of(self.conn, room, raw))
         except Exception as error:                                       # noqa: BLE001
             self.log.warning("canvas %s: the window or the lease could not be read (%s)", room, type(error).__name__)
             return False
@@ -449,7 +511,7 @@ class Publisher:
             opened = _until_of(raw, now)
             if opened is None:
                 return False
-            prior_doc = snapshot(self.conn, room, self.clock(), opened)
+            prior_doc = snapshot(self.conn, room, self.clock(), opened, scope_of(self.conn, room, raw))
         except Exception as error:                                       # noqa: BLE001
             self.log.warning("canvas %s: the window or the lease could not be read (%s)", room, type(error).__name__)
             return False
@@ -464,7 +526,7 @@ class Publisher:
             if opened is None or not self.may_write(room):
                 return False
             try:
-                doc = snapshot(self.conn, room, self.clock(), opened)
+                doc = snapshot(self.conn, room, self.clock(), opened, scope_of(self.conn, room, raw))
             except Exception as error:                                   # noqa: BLE001
                 self.log.warning("canvas %s: the window or the lease could not be read (%s)", room, type(error).__name__)
                 return False
