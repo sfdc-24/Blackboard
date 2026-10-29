@@ -139,6 +139,8 @@ on:
       - "tests/test_canvas_publish.py"
       - "scripts/call_bridge.py"
       - "tests/test_call_bridge.py"
+      - "scripts/fleet_doorbell.py"
+      - "tests/test_fleet_doorbell.py"
       - "cloud/bus-reconciler/redis_archive.py"
       - "cloud/bus-reconciler/archive.sh"
       - "tests/test_redis_archive.py"
@@ -259,6 +261,8 @@ on:
       - "tests/test_canvas_publish.py"
       - "scripts/call_bridge.py"
       - "tests/test_call_bridge.py"
+      - "scripts/fleet_doorbell.py"
+      - "tests/test_fleet_doorbell.py"
       - "cloud/bus-reconciler/redis_archive.py"
       - "cloud/bus-reconciler/archive.sh"
       - "tests/test_redis_archive.py"
@@ -1139,6 +1143,7 @@ jobs:
                       "test_live_mode:cloud/bus-reconciler/serve_requests.py" \
                       "test_canvas_publish:scripts/canvas_publish.py" \
                       "test_call_bridge:scripts/call_bridge.py" \
+                      "test_fleet_doorbell:scripts/fleet_doorbell.py" \
                       "test_redis_archive:cloud/bus-reconciler/redis_archive.py" \
                       "test_redis_inbox:scripts/redis_inbox.py" \
                       "test_bridge_client:scripts/bridge_client.py"; do
