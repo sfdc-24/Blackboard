@@ -184,7 +184,7 @@ class Claim(unittest.TestCase):
         self.assertRegex(ask, r"^call-[0-9a-f]{12}$")
         got = card(self.conn, "chatgpt-codex-desktop", ask)
         self.assertEqual(("claimed", 1, "2026-10-24T14:02:00Z"), (got["status"], got["version"], got["ts"]))
-        self.assertEqual("Claimed by Codex, 10:02 ET", got["title"])
+        self.assertEqual("In the making: Draft the ... flow for the", got["title"])
         self.assertIsNotNone(cp.clean_item("chatgpt-codex-desktop", ask, json.dumps(got)), "the publisher takes it")
         [(_, entry)] = self.conn.streams["fleet:inbox:chatgpt-codex-desktop"]
         self.assertEqual("call-bridge", entry["by"])
@@ -200,7 +200,7 @@ class Claim(unittest.TestCase):
             self.assertNotIn(word, published)
         self.assertIn(ask, published)
         got = card(self.conn, "chatgpt-codex-desktop", ask)
-        self.assertTrue(got["body"].startswith("Draft the price sheet for the ... store. Ask ... first. Claimed in the room at 10:02"), got)
+        self.assertTrue(got["body"].startswith("Draft the price sheet for the ... store. Ask ... first. Asked in the room at 10:02"), got)
         self.assertEqual("claimed: Draft the price sheet for the ... store. Ask ... first", got["activity"])
         [(_, entry)] = self.conn.streams["fleet:inbox:chatgpt-codex-desktop"]
         self.assertIn("Port-au-Prince", entry["text"], "the agent still gets every word, in Redis")
@@ -598,6 +598,63 @@ class InTheLiveRun(unittest.TestCase):
                 raise RuntimeError("redis flap")
             sr.one_pass(None, {}, "", with_git=False, quiet=True, settle=boom)
             self.assertEqual(2, handle.call_count)
+
+
+class InTheMakingAndLatency(unittest.TestCase):
+    """O3 (owner orders 2026-10-28 8:46 PM ET): the card says what is being made, and the time from the ask to the
+    agent's OWN card is measured against 3 minutes."""
+
+    def setUp(self):
+        self.conn = FakeRedis()
+        open_window(self.conn)
+
+    def claim(self):
+        turn(self.conn, "Codex, draft the queue flow for the vans.")
+        [ask] = bridge(self.conn).tick()
+        return ask
+
+    def latency(self, ask):
+        raw = self.conn.get(cb.LATENCY_KEY % ask)
+        return json.loads(raw) if raw else None
+
+    def test_without_words_the_title_still_says_in_the_making(self):
+        got = cb.claimed_card("gemini", NOW, "")
+        self.assertEqual("In the making: Gemini's work from the room", got["title"])
+        self.assertIsNotNone(cp.clean_item("gemini", "call-000000000000", json.dumps(got)))
+
+    def test_the_agent_card_within_three_minutes_is_measured_on_time(self):
+        ask = self.claim()
+        own = {"v": 1, "type": "note", "status": "working", "public": True, "version": 1,
+               "ts": "2026-10-24T14:03:30Z", "title": "In the making: queue flow", "body": "x"}
+        self.conn.hset(cp.PARTITION % ("workshop", "chatgpt-codex-desktop"), "queue-flow", json.dumps(own))
+        later = NOW + datetime.timedelta(seconds=100)
+        self.assertEqual([ask], bridge(self.conn, clock=lambda: later).watch(later))
+        got = self.latency(ask)
+        self.assertEqual(("queue-flow", 90, True), (got["card"], got["seconds"], got["on_time"]))
+        self.assertEqual([], bridge(self.conn, clock=lambda: later).watch(later), "kept once")
+
+    def test_no_card_after_three_minutes_is_kept_once_as_late_then_measured_when_it_comes(self):
+        ask = self.claim()
+        late = NOW + datetime.timedelta(seconds=200)
+        self.assertEqual([ask], bridge(self.conn, clock=lambda: late).watch(late))
+        self.assertEqual(("", False), (self.latency(ask)["card"], self.latency(ask)["on_time"]))
+        self.assertEqual([], bridge(self.conn, clock=lambda: late).watch(late), "late is kept once")
+        own = {"v": 1, "type": "note", "status": "working", "public": True, "version": 1,
+               "ts": "2026-10-24T14:06:00Z", "title": "In the making: queue flow", "body": "x"}
+        self.conn.hset(cp.PARTITION % ("workshop", "chatgpt-codex-desktop"), "queue-flow", json.dumps(own))
+        got_at = NOW + datetime.timedelta(seconds=250)
+        bridge(self.conn, clock=lambda: got_at).watch(got_at)
+        self.assertEqual(("queue-flow", 240, False), (self.latency(ask)["card"], self.latency(ask)["seconds"],
+                                                       self.latency(ask)["on_time"]))
+
+    def test_the_bridge_card_and_older_cards_are_not_the_agents_card(self):
+        ask = self.claim()
+        old = {"v": 1, "type": "note", "status": "done", "public": True, "version": 3,
+               "ts": "2026-10-24T13:00:00Z", "title": "Earlier", "body": "x"}
+        self.conn.hset(cp.PARTITION % ("workshop", "chatgpt-codex-desktop"), "earlier", json.dumps(old))
+        soon = NOW + datetime.timedelta(seconds=60)
+        self.assertEqual([], bridge(self.conn, clock=lambda: soon).watch(soon))
+        self.assertIsNone(self.latency(ask))
 
 
 if __name__ == "__main__":

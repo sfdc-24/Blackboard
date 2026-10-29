@@ -81,6 +81,8 @@ SIDE_CURSOR_KEY = "gov:callbridge:side:%s"
 SIDE_KEY = "conf:side:%s"
 ASKED_SECONDS = 3 * 60
 SIDE_BY = "chair"
+LATENCY_KEY = "gov:callbridge:latency:%s"
+TARGET_SECONDS = 3 * 60     # O3: the agent's own card within 3 minutes of the ask
 
 # The room's voices, by the chair's persona ids, and the fleet agent each one's work goes to: the canonical ids of
 # fleet:inbox (cloud/drive-intake ALIASES, agreed 2026-10-09) and of the canvas slots (canvas_publish.AGENTS).
@@ -271,12 +273,15 @@ def summary(said: str) -> str:
 
 
 def claimed_card(agent: str, now, asked: str = "") -> dict:
+    """The card that goes up seconds after the ask (O3, the owner's orders of 2026-10-28 8:46 PM ET: "an 'In the
+    making' card up within 3 minutes"). Titled with WHAT is being made (the allowlisted summary), never only who;
+    the page shows its live "In the making" timer for a claimed card (sfdc24-site assets/proto-canvas.js inMaking)."""
     name = NAME_OF[agent]
     lead = "%s. " % asked if asked else ""
     return {"v": 1, "type": "note", "status": "claimed", "public": True, "version": 1, "ts": stamp(now),
             "activity": "claimed: %s" % asked if asked else "claimed in the room",
-            "title": "Claimed by %s, %s" % (name, eastern(now)),
-            "body": "%sClaimed in the room at %s. %s's card for this work follows here when it is done." % (
+            "title": ("In the making: %s" % asked) if asked else "In the making: %s's work from the room" % name,
+            "body": "%sAsked in the room at %s. %s has it; its own card for this work replaces this one." % (
                 lead, eastern(now), name)}
 
 
@@ -325,7 +330,61 @@ class Bridge:
         claimed = []
         for room in self.streams():
             claimed.extend(self._room(room, now))
+        if self.holds():
+            self.watch(now)
         return claimed
+
+    def watch(self, now) -> list:
+        """ASK TO AGENT CARD, measured (O3: the real agent puts its card up within TARGET_SECONDS). For each open
+        ask, the agent's own card is any public item in the agent's slot of the claim's canvas room, under another
+        field than the bridge's, with a ts at or after the claim. The first one seen is kept once in
+        gov:callbridge:latency:<ask> ({agent, claimed_at, card, card_at, seconds, on_time}); an ask past
+        TARGET_SECONDS with no card is kept once as late (card empty). Read only of the canvas: nothing it
+        writes is public. Returns the asks measured on this pass."""
+        measured = []
+        for raw_ask, raw in (self.conn.hgetall(OPEN_KEY) or {}).items():
+            ask = _text(raw_ask)
+            key = LATENCY_KEY % ask
+            try:
+                info = json.loads(_text(raw))
+                claimed_at = datetime.datetime.strptime(info["claimed_at"], "%Y-%m-%dT%H:%M:%SZ").replace(
+                    tzinfo=datetime.timezone.utc)
+                agent, room = info["agent"], info.get("room") or self.canvas_room
+            except (ValueError, KeyError, TypeError):
+                continue
+            seen = self.conn.get(key)
+            if seen and json.loads(_text(seen)).get("card"):
+                continue                                     # measured: kept once
+            first = None
+            for raw_field, raw_item in (self.conn.hgetall(canvas_publish.PARTITION % (room, agent)) or {}).items():
+                field = _text(raw_field)
+                if field == ask:
+                    continue
+                try:
+                    item = json.loads(_text(raw_item))
+                    at = datetime.datetime.strptime(str(item.get("ts", ""))[:19], "%Y-%m-%dT%H:%M:%S").replace(
+                        tzinfo=datetime.timezone.utc)
+                except (ValueError, TypeError, AttributeError):
+                    continue
+                if item.get("public") is True and at >= claimed_at.replace(microsecond=0) and \
+                        (first is None or at < first[1]):
+                    first = (field, at)
+            waited = (now - claimed_at).total_seconds()
+            if first is not None:
+                seconds = max(0, int((first[1] - claimed_at).total_seconds()))
+                record = {"agent": agent, "claimed_at": info["claimed_at"], "card": first[0],
+                          "card_at": stamp(first[1]), "seconds": seconds, "on_time": seconds <= TARGET_SECONDS}
+                self.conn.set(key, json.dumps(record, sort_keys=True), ex=TTL_SECONDS)
+                self.log.info("call bridge: %s agent card %s after %d s (%s)", ask, first[0], seconds,
+                              "on time" if seconds <= TARGET_SECONDS else "late")
+                measured.append(ask)
+            elif waited > TARGET_SECONDS and not seen:
+                record = {"agent": agent, "claimed_at": info["claimed_at"], "card": "", "card_at": "",
+                          "seconds": int(waited), "on_time": False}
+                self.conn.set(key, json.dumps(record, sort_keys=True), ex=TTL_SECONDS)
+                self.log.warning("call bridge: %s no card from %s after %d s", ask, agent, int(waited))
+                measured.append(ask)
+        return measured
 
     def _room(self, room: str, now) -> list:
         key = "v1:conf:%s:events" % room
