@@ -20,6 +20,12 @@ Nothing new is reached: the bus pair every agent already holds (bus.load_env), r
 
 THE BOOKMARK (FLEET_DOORBELL_BOOKMARK_DIR, default ~) is per agent, moves only after the rows are printed, and a
 failed read never moves it - claude_cli_inbox's rules, whose helpers this uses.
+
+THE WAKE, TAKEN (call_bridge.py THE WAKE, CONFIRMED: the bridge marks an agent "did not wake" unless it posts
+phase=ACK answers=CALLBRIDGE-WAKE-<ask> from its own tag within 90 s). For the agents in ACK_WIRED (Grok only, for
+now), a wake row is ACKed (scripts/wake_ack.py) the moment it is seen, BEFORE it is printed and the work starts:
+one ACK per ask (the second ring, a replay or a restart posts none; the asks taken are kept beside the bookmark),
+never retried. --peek (nothing is taken) and --no-ack post nothing. The other runners reuse wake_ack.Acker.
 """
 from __future__ import annotations
 
@@ -31,6 +37,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import claude_cli_inbox as base  # noqa: E402
+import wake_ack  # noqa: E402
 
 # An agent's names in an address list, and the sender tags that are its own rows. Whole names only.
 AGENTS = {
@@ -40,6 +47,9 @@ AGENTS = {
 }
 WAKE_PREFIX = "CALLBRIDGE-WAKE-"            # call_bridge.WAKE_PREFIX
 INFO_PHASES = {"RESULT", "AYA_RESULT", "DONE", "ACK", "RECEIPT", "AYA_RECEIPT"}
+# The runners whose doorbell takes the call bridge's wake itself, and the board tag each ACK is signed with.
+# Codex (via Aya) and Gemini (via claude-code-cli) take theirs in their own runners until they are wired here.
+ACK_WIRED = {"grok": "grok"}
 PHASE = re.compile(r"(?:^|\|)\s*phase=([^|]*)", re.I)
 ROW_ID = re.compile(r"(?:^|\|)\s*id=([^|]*)", re.I)
 
@@ -87,9 +97,22 @@ def new_rows(rows, since, agent: str, calls_only: bool = False) -> list:
     return sorted(found, key=lambda pair: pair[0])
 
 
-def check(read, agent: str, path: Path = None, peek: bool = False, calls_only: bool = False, out=None):
+def acked_path(agent: str) -> Path:
+    """The asks this agent's doorbell has ACKed, kept beside its bookmark so a restart never ACKs one twice."""
+    return bookmark(agent).with_name(".fleet-doorbell-%s-acked.json" % agent)
+
+
+def acker_for(agent: str, post=None, path: Path = None, clock=None, log=None):
+    """The wake ACK for a wired agent (ACK_WIRED), or None. `post` defaults to the board append path."""
+    if agent not in ACK_WIRED:
+        return None
+    return wake_ack.Acker(ACK_WIRED[agent], AGENTS[agent]["names"], post or wake_ack.append_spec,
+                          path=path or acked_path(agent), clock=clock, log=log)
+
+
+def check(read, agent: str, path: Path = None, peek: bool = False, calls_only: bool = False, out=None, ack=None):
     """Print the agent's new rows and (unless `peek`) move its bookmark past them. How many, or None on a failed
-    read (the bookmark stays)."""
+    read (the bookmark stays). `ack` (an Acker): each wake row is ACKed before it is printed; never under peek."""
     path = path or bookmark(agent)
     out = out or print
     since = base.baseline(path, out)
@@ -100,6 +123,8 @@ def check(read, agent: str, path: Path = None, peek: bool = False, calls_only: b
         return None
     found = new_rows(rows or [], since, agent, calls_only)
     for ts, row in found:
+        if ack is not None and not peek and is_wake(row):
+            ack(row)                                     # taken first, then the work: the bridge sees it in seconds
         out(("RING " if is_wake(row) else "") + base.line(ts, row))
     if found and not peek:
         path.write_text(found[-1][0].isoformat(), encoding="utf-8")
@@ -109,7 +134,7 @@ def check(read, agent: str, path: Path = None, peek: bool = False, calls_only: b
 def main(argv) -> int:
     if "--agent" not in argv or argv[argv.index("--agent") + 1:][:1] == [] or \
             argv[argv.index("--agent") + 1] not in AGENTS:
-        print("usage: fleet_doorbell.py --agent grok|codex|gemini [--peek] [--wait SECONDS] [--calls-only]")
+        print("usage: fleet_doorbell.py --agent grok|codex|gemini [--peek] [--wait SECONDS] [--calls-only] [--no-ack]")
         return 2
     agent = argv[argv.index("--agent") + 1]
     calls_only = "--calls-only" in argv
@@ -121,13 +146,14 @@ def main(argv) -> int:
     def read(since):
         return bus.read_rows(env, since=base.since_arg(since))["rows"]
 
+    ack = None if "--no-ack" in argv or "--peek" in argv else acker_for(agent)
     if "--wait" in argv:
         every = max(5.0, float(argv[argv.index("--wait") + 1]))
         while True:
-            if check(read, agent, calls_only=calls_only):
+            if check(read, agent, calls_only=calls_only, ack=ack):
                 return 0
             time.sleep(every)
-    count = check(read, agent, peek="--peek" in argv, calls_only=calls_only)
+    count = check(read, agent, peek="--peek" in argv, calls_only=calls_only, ack=ack)
     if count is None:
         return 2
     if count == 0:
