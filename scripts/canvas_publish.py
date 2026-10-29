@@ -371,6 +371,113 @@ def gcs_upload(bucket: str, name: str, data: bytes, token, opener=urllib.request
         return resp.status
 
 
+# ------------------------------------------------------------------------------------------- his calls
+
+# THE OWNER'S CALLS KEEP THE PAGE'S ROOM PUBLISHING. The owner, directly to claude-code-cli, 2026-10-29 ~21:17Z:
+# "yes, keep the publish window open during my calls", then "yes, move it to the cloud". So while one of his
+# calls is under way, this worker opens CALL_ROOM itself, CALL_MINUTES at a time, and closes the window it
+# opened once no call is. Nothing else changes: the same window key, the same filter, the same file.
+#
+# WHAT SAYS A CALL IS UNDER WAY is the chair's own record, v1:conf:<room>:state (conference
+# chair/conf_chair/redis_state.py): `updated_at` on every write, `closed`="1" once the chair closes the call.
+# Only the chair writes v1:conf: - redis_gov refuses that namespace to every agent - so an agent cannot fake a
+# call to open the page. A record not written for CALL_IDLE_SECONDS counts as over, so a chair that died
+# without closing does not keep the page publishing.
+#
+# WHOSE CALLS: rooms of the family in CANVAS_CALL_FAMILY ("conf-<16 hex>", the chair's
+# CONF_REDIS_CHECK_OWNER), set on the job, never committed: this repository is public. Unset, this is off.
+#
+# NEVER ANOTHER OPENER'S WINDOW. A window someone asked for is left as it is, open or closed; the rule only
+# opens when none is open (SET NX, as for an ask) and only closes one whose "by" is CALL_BY, compare-and-delete.
+CALL_ROOM = "workshop"           # the room the conference page shows (the chair's CONF_CANVAS_URL)
+CALL_MINUTES = 15                # reopened while the call lasts; lapses on its own if this worker stops
+CALL_IDLE_SECONDS = 600
+CALL_SCAN_SECONDS = 15
+CALL_BY = "owner-call"
+CALL_FAMILY = re.compile(r"^conf-[0-9a-f]{16}$")
+STATE_PREFIX = "v1:conf:"
+STATE_SUFFIX = ":state"
+
+
+def call_family(environ) -> str:
+    """CANVAS_CALL_FAMILY when it is a room family, else "" (off)."""
+    value = str((environ or {}).get("CANVAS_CALL_FAMILY", "") or "").strip()
+    return value if CALL_FAMILY.fullmatch(value) else ""
+
+
+def live_call(conn, family: str, now) -> str:
+    """The most recently written of his rooms whose chair record says a call is under way, or ""."""
+    if not CALL_FAMILY.fullmatch(family or ""):
+        return ""
+    room_rule = re.compile(r"^%s-[0-9a-f]{8}$" % re.escape(family))
+    best = (None, "")
+    for key in conn.scan_iter(match="%s%s-*%s" % (STATE_PREFIX, family, STATE_SUFFIX), count=500):
+        name = _text(key)
+        room = name[len(STATE_PREFIX):-len(STATE_SUFFIX)]
+        if not room_rule.fullmatch(room):
+            continue
+        state = conn.hgetall(name) or {}
+        state = {_text(k): _text(v) for k, v in state.items()}
+        if state.get("closed") == "1":
+            continue
+        try:
+            at = int(state.get("updated_at", ""))
+        except ValueError:
+            continue
+        age = now.timestamp() - at
+        if 0 <= age <= CALL_IDLE_SECONDS and (best[0] is None or at > best[0]):
+            best = (at, room)
+    return best[1]
+
+
+def keep_call_window(conn, family: str, now, bucket: str) -> str:
+    """One round: "opened", "open", "closed" or "idle". Raises only what Redis raises."""
+    held = read_window(conn, CALL_ROOM)
+    is_open = _until_of(json.dumps(held), now) is not None if held else False
+    if live_call(conn, family, now):
+        if is_open:
+            return "open"
+        if held is not None:                 # an expired value the TTL has not removed yet: ours, or nobody's
+            _drop_if_ours(conn)
+        try:
+            open_window(conn, CALL_ROOM, CALL_MINUTES, CALL_BY, now, bucket)
+        except Refused:
+            return "open"                    # an ask opened it between the read and the SET NX
+        return "opened"
+    if held is not None:                     # closed only if it is still the one this rule opened
+        return "closed" if _drop_if_ours(conn) else "idle"
+    return "idle"
+
+
+def _drop_if_ours(conn) -> bool:
+    """Delete the window only while it is still the one this rule opened (WATCH, then MULTI)."""
+    key = window_key(CALL_ROOM)
+    with conn.pipeline() as pipe:
+        try:
+            pipe.watch(key)
+            raw = _text(pipe.get(key) or "")
+            try:
+                by = (json.loads(raw) if raw else {}).get("by")
+            except (TypeError, ValueError, AttributeError):
+                by = None
+            if by != CALL_BY:
+                pipe.unwatch()
+                return False
+            pipe.multi()
+            pipe.delete(key)
+            pipe.execute()
+            return True
+        except WatchError:
+            return False
+
+
+try:                                          # redis-py's, where it is installed; a stand-in for the tests
+    from redis.exceptions import WatchError
+except ImportError:                           # pragma: no cover - the image installs redis
+    class WatchError(Exception):
+        pass
+
+
 # -------------------------------------------------------------------------------------------- publisher
 
 class Publisher:
@@ -381,12 +488,33 @@ class Publisher:
     upload must not commit after a stop, a deletion, a lost lease or an expiry, and a reopen or a privacy
     change must not publish the old bytes). The send asks again after it has been entered."""
 
-    def __init__(self, conn, bucket, upload, log, clock=None, holds=None):
+    def __init__(self, conn, bucket, upload, log, clock=None, holds=None, family=""):
         self.conn, self.bucket, self.upload, self.log = conn, bucket, upload, log
         self.clock = clock or (lambda: datetime.datetime.now(datetime.timezone.utc))
         self.holds = holds
         self.last = {}          # room -> (digest, time of the last write)
         self.stop = threading.Event()
+        self.family = family if CALL_FAMILY.fullmatch(family or "") else ""
+        self.call_at = None     # when his calls were last looked at
+        self.call_said = None   # the last round's answer, so the log says each change once
+
+    def calls(self) -> str:
+        """His calls' round, every CALL_SCAN_SECONDS, only while this worker provably holds the lease."""
+        now = self.clock()
+        if not self.family or (self.call_at and (now - self.call_at).total_seconds() < CALL_SCAN_SECONDS):
+            return ""
+        self.call_at = now
+        try:
+            if self.holds is None or not self.holds():
+                return ""
+            said = keep_call_window(self.conn, self.family, now, self.bucket)
+        except Exception as error:                                       # noqa: BLE001 - the TYPE only
+            self.log.warning("canvas %s: his calls could not be read (%s)", CALL_ROOM, type(error).__name__)
+            return ""
+        if said in ("opened", "closed") or said != self.call_said:
+            self.log.info("canvas %s: his call window %s", CALL_ROOM, said)
+        self.call_said = said
+        return said
 
     def may_write(self, room) -> bool:
         """The publisher is running, the lease is this worker's, and the room's window is open now."""
@@ -490,6 +618,7 @@ class Publisher:
 
     def tick(self) -> list:
         """Write the rooms whose content changed, or whose keepalive is due. Returns the rooms written."""
+        self.calls()
         now = self.clock()
         written = []
         for room, _until in active_windows(self.conn, now):
@@ -507,19 +636,23 @@ class Publisher:
             self.stop.wait(interval)
 
 
-def start(conn, bucket, log, upload=None, holds=None):
+def start(conn, bucket, log, upload=None, holds=None, family=None):
     """The publisher on its own thread, or None when no bucket is configured.
 
     ITS OWN CLOCK, NOT THE LIVE LOOP'S. One pass of the request loop begins with a board read that can take
     minutes, so publishing between passes would stall the canvas for as long as the board does.
 
-    `holds` is required: without a way to ask whether the lease is still this worker's, nothing starts."""
+    `holds` is required: without a way to ask whether the lease is still this worker's, nothing starts.
+    `family` defaults to CANVAS_CALL_FAMILY from the environment (his calls' window; "" is off)."""
     if not BUCKET.fullmatch(bucket or "") or holds is None:
         return None
     if upload is None:
         token = Token()
         upload = lambda b, n, d, allow=None: gcs_upload(b, n, d, token, allow=allow)  # noqa: E731
-    publisher = Publisher(conn, bucket, upload, log, holds=holds)
+    if family is None:
+        import os                                                        # noqa: PLC0415
+        family = call_family(os.environ)
+    publisher = Publisher(conn, bucket, upload, log, holds=holds, family=family)
     thread = threading.Thread(target=publisher.run, name="canvas-publish", daemon=True)
     thread.start()
     publisher.thread = thread

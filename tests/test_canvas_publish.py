@@ -583,6 +583,234 @@ class Upload(unittest.TestCase):
         self.assertFalse(pub.thread.is_alive())
 
 
+FAMILY = "conf-0123456789abcdef"
+HIS_ROOM = FAMILY + "-a1b2c3d4"
+
+
+class CallRedis(FakeRedis):
+    """FakeRedis with the WATCH/MULTI pipeline the compare-and-delete uses. `race` runs between the WATCH
+    and the EXEC, the way another writer would; a watched key it changes fails the EXEC."""
+
+    def __init__(self):
+        super().__init__()
+        self.race = None
+
+    def pipeline(self):
+        conn = self
+
+        class Pipe:
+            def __enter__(self):
+                self.watched, self.queued, self.before = None, [], None
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def watch(self, key):
+                self.watched, self.before = key, conn.store.get(key)
+
+            def unwatch(self):
+                self.watched = None
+
+            def get(self, key):
+                return conn.store.get(key)
+
+            def multi(self):
+                pass
+
+            def delete(self, key):
+                self.queued.append(key)
+
+            def execute(self):
+                if conn.race:
+                    conn.race()
+                if self.watched is not None and conn.store.get(self.watched) != self.before:
+                    raise cp.WatchError()
+                for key in self.queued:
+                    conn.delete(key)
+                return [1] * len(self.queued)
+        return Pipe()
+
+
+def call_state(conn, room=HIS_ROOM, at=NOW, closed=False):
+    key = cp.STATE_PREFIX + room + cp.STATE_SUFFIX
+    conn.store[key] = "x"                  # SCAN finds it; the hash holds the record
+    conn.hashes[key] = {"room_id": room, "updated_at": str(int(at.timestamp()))}
+    if closed:
+        conn.hashes[key]["closed"] = "1"
+
+
+class HisCalls(unittest.TestCase):
+    """The owner, 2026-10-29: the page's room publishes while one of his calls is under way."""
+
+    def setUp(self):
+        self.conn, self.up, self.t = CallRedis(), Uploads(), {"now": NOW}
+        self.log = mock.Mock()
+        self.lease = {"held": True}
+        self.pub = cp.Publisher(self.conn, "sfdc24-canvas", self.up, self.log, clock=lambda: self.t["now"],
+                                holds=lambda: self.lease["held"], family=FAMILY)
+        put(self.conn, "grok", "1", item(), room=cp.CALL_ROOM)
+
+    def later(self, seconds):
+        self.t["now"] = self.t["now"] + datetime.timedelta(seconds=seconds)
+
+    def window(self):
+        return cp.read_window(self.conn, cp.CALL_ROOM)
+
+    def test_a_live_call_opens_the_page_room_and_it_publishes_in_the_same_tick(self):
+        call_state(self.conn)
+        self.assertEqual(self.pub.tick(), [cp.CALL_ROOM])
+        held = self.window()
+        self.assertEqual(held["by"], cp.CALL_BY)
+        self.assertEqual(self.conn.ttls[cp.window_key(cp.CALL_ROOM)], cp.CALL_MINUTES * 60)
+        self.assertEqual(self.up.calls[-1][1], "rooms/%s.json" % cp.CALL_ROOM)
+
+    def test_an_open_window_is_kept_as_it_is_while_the_call_goes_on(self):
+        call_state(self.conn)
+        self.assertEqual(self.pub.calls(), "opened")
+        before = self.conn.store[cp.window_key(cp.CALL_ROOM)]
+        self.later(cp.CALL_SCAN_SECONDS)
+        call_state(self.conn, at=self.t["now"])
+        self.assertEqual(self.pub.calls(), "open")
+        self.assertEqual(self.conn.store[cp.window_key(cp.CALL_ROOM)], before, "not reopened under a new gen")
+
+    def test_no_call_opens_nothing(self):
+        self.assertEqual(self.pub.tick(), [])
+        self.assertIsNone(self.window())
+
+    def test_a_closed_call_closes_the_window_this_rule_opened(self):
+        call_state(self.conn)
+        self.pub.tick()
+        call_state(self.conn, closed=True)
+        self.later(cp.CALL_SCAN_SECONDS)
+        self.assertEqual(self.pub.calls(), "closed")
+        self.assertIsNone(self.window())
+
+    def test_a_record_left_unwritten_counts_as_over(self):
+        call_state(self.conn)
+        self.pub.tick()
+        self.later(cp.CALL_IDLE_SECONDS + 1)
+        self.assertEqual(self.pub.calls(), "closed")
+        self.assertIsNone(self.window())
+
+    def test_a_long_call_gets_the_window_again_when_it_lapses(self):
+        call_state(self.conn)
+        self.pub.tick()
+        self.later(cp.CALL_MINUTES * 60 + 1)
+        call_state(self.conn, at=self.t["now"])          # the call is still being written
+        self.assertEqual(self.pub.calls(), "opened")
+        self.assertGreater(cp._until_of(json.dumps(self.window()), self.t["now"]), self.t["now"])
+
+    def test_a_window_someone_asked_for_is_never_touched(self):
+        cp.open_window(self.conn, cp.CALL_ROOM, "30", "aya", NOW, "sfdc24-canvas")
+        before = self.conn.store[cp.window_key(cp.CALL_ROOM)]
+        call_state(self.conn)
+        self.assertEqual(self.pub.calls(), "open")
+        call_state(self.conn, closed=True)
+        self.later(cp.CALL_SCAN_SECONDS)
+        self.assertEqual(self.pub.calls(), "idle")
+        self.assertEqual(self.conn.store[cp.window_key(cp.CALL_ROOM)], before)
+
+    def test_a_window_replaced_before_the_delete_is_kept(self):
+        call_state(self.conn)
+        self.pub.tick()
+        call_state(self.conn, closed=True)
+
+        def an_ask_lands():
+            self.conn.store[cp.window_key(cp.CALL_ROOM)] = json.dumps(
+                {"by": "aya", "gen": "g2", "room": cp.CALL_ROOM, "until": "2026-10-20T23:00:00Z"})
+        self.conn.race = an_ask_lands
+        self.later(cp.CALL_SCAN_SECONDS)
+        self.assertEqual(self.pub.calls(), "idle")
+        self.assertEqual(self.window()["by"], "aya")
+
+    def test_an_ask_that_wins_the_race_to_open_is_left_open(self):
+        call_state(self.conn)
+        real = cp.open_window
+
+        def raced(conn, room, minutes, by, now, bucket):
+            real(conn, room, "30", "aya", now, bucket)
+            return real(conn, room, minutes, by, now, bucket)
+        with mock.patch.object(cp, "open_window", side_effect=raced):
+            self.assertEqual(self.pub.calls(), "open")
+        self.assertEqual(self.window()["by"], "aya")
+
+    def test_only_his_family_counts(self):
+        for room in ("conf-fedcba9876543210-a1b2c3d4", FAMILY + "-a1b2c3d", FAMILY + "-A1B2C3D4",
+                     FAMILY + "-a1b2c3d4-x", "workshop"):
+            conn = CallRedis()
+            call_state(conn, room=room)
+            self.assertEqual(cp.live_call(conn, FAMILY, NOW), "", room)
+        conn = CallRedis()
+        call_state(conn)
+        self.assertEqual(cp.live_call(conn, FAMILY, NOW), HIS_ROOM)
+
+    def test_unreadable_or_future_records_do_not_count(self):
+        call_state(self.conn)
+        self.conn.hashes[cp.STATE_PREFIX + HIS_ROOM + cp.STATE_SUFFIX]["updated_at"] = "soon"
+        self.assertEqual(cp.live_call(self.conn, FAMILY, NOW), "")
+        call_state(self.conn, at=NOW + datetime.timedelta(seconds=60))
+        self.assertEqual(cp.live_call(self.conn, FAMILY, NOW), "")
+
+    def test_off_without_a_family(self):
+        for family in ("", None, "conf-short", "conf-0123456789ABCDEF", "workshop"):
+            pub = cp.Publisher(self.conn, "sfdc24-canvas", self.up, self.log, clock=lambda: NOW,
+                               holds=lambda: True, family=family)
+            call_state(self.conn)
+            self.assertEqual(pub.calls(), "", family)
+            self.assertIsNone(self.window())
+            self.assertEqual(cp.live_call(self.conn, family or "", NOW), "")
+        self.assertEqual(cp.call_family({"CANVAS_CALL_FAMILY": " %s " % FAMILY}), FAMILY)
+        self.assertEqual(cp.call_family({}), "")
+        self.assertEqual(cp.call_family({"CANVAS_CALL_FAMILY": "conf-*"}), "")
+
+    def test_nothing_opens_without_the_lease(self):
+        call_state(self.conn)
+        self.lease["held"] = False
+        self.assertEqual(self.pub.calls(), "")
+        self.assertIsNone(self.window())
+
+    def test_his_calls_are_looked_at_every_scan_interval_not_every_tick(self):
+        call_state(self.conn)
+        self.assertEqual(self.pub.calls(), "opened")
+        self.conn.delete(cp.window_key(cp.CALL_ROOM))
+        self.later(cp.CALL_SCAN_SECONDS - 1)
+        self.assertEqual(self.pub.calls(), "")
+        self.assertIsNone(self.window())
+        self.later(1)
+        self.assertEqual(self.pub.calls(), "opened")
+
+    def test_a_redis_failure_costs_one_round_and_names_only_its_type(self):
+        call_state(self.conn)
+        with mock.patch.object(self.conn, "scan_iter", side_effect=OSError("secret-host:6378")):
+            self.assertEqual(self.pub.calls(), "")
+        said = " ".join(str(c) for c in self.log.warning.call_args_list)
+        self.assertIn("OSError", said)
+        self.assertNotIn("secret-host", said)
+
+    def test_start_takes_the_family_from_the_environment(self):
+        with mock.patch.dict(cp_os().environ, {"CANVAS_CALL_FAMILY": FAMILY}):
+            pub = cp.start(CallRedis(), "sfdc24-canvas", mock.Mock(), upload=Uploads(), holds=lambda: False)
+        pub.stop.set()
+        pub.thread.join(timeout=10)
+        self.assertEqual(pub.family, FAMILY)
+        with mock.patch.dict(cp_os().environ, {}, clear=False):
+            cp_os().environ.pop("CANVAS_CALL_FAMILY", None)
+            pub = cp.start(CallRedis(), "sfdc24-canvas", mock.Mock(), upload=Uploads(), holds=lambda: False)
+        pub.stop.set()
+        pub.thread.join(timeout=10)
+        self.assertEqual(pub.family, "")
+
+    def test_no_agent_can_write_the_record_that_opens_the_page(self):
+        import redis_gov                                                 # noqa: PLC0415
+        self.assertIn(cp.STATE_PREFIX, redis_gov.PROTECTED)
+
+
+def cp_os():
+    import os                                                            # noqa: PLC0415
+    return os
+
+
 def req_row(req="CANVAS-0001", source="grok", extra="|room=demo|minutes=30", at="2026-10-20T21:58:00Z"):
     payload = "BCB|v=1|req=%s|do=canvas-publish%s" % (req, extra)
     return ["GROK-" + req, at, source, "bus-reconciler", "AYA_REQ", payload, "OPEN", "Blackboard", "g", ""]
