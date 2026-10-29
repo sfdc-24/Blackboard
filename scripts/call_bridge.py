@@ -403,50 +403,61 @@ class Bridge:
         id, asked_at), not the bridge's tick, to the moment this pass READ the card back, so intake and poll delays
         are inside the measure; the card's own ts is kept beside it as card_ts, a stated time. The doorbell row is
         not counted as a wake: only the card the agent wrote is. Kept once in gov:callbridge:latency:<ask> ({agent,
-        asked_at, claimed_at, card, card_ts, read_at, seconds, on_time}); an ask past TARGET_SECONDS with no card is
+        asked_at, claimed_at, card, card_ts, read_at, seconds, waited, on_time}); an ask past TARGET_SECONDS with no card is
         kept once as late (card empty) and measured again when its card comes. Read only of the canvas."""
         measured = []
         for raw_ask, raw in (self.conn.hgetall(OPEN_KEY) or {}).items():
-            ask = _text(raw_ask)
-            key = LATENCY_KEY % ask
-            try:
-                info = json.loads(_text(raw))
-                claimed_at = datetime.datetime.strptime(info["claimed_at"], "%Y-%m-%dT%H:%M:%SZ").replace(
-                    tzinfo=datetime.timezone.utc)
-                asked_at = (datetime.datetime.strptime(info["asked_at"], "%Y-%m-%dT%H:%M:%S.%fZ").replace(
-                    tzinfo=datetime.timezone.utc) if info.get("asked_at") else claimed_at)
-                agent, room = info["agent"], info.get("room") or self.canvas_room
-            except (ValueError, KeyError, TypeError):
-                continue
-            seen = self.conn.get(key)
-            if seen and json.loads(_text(seen)).get("card"):
-                continue                                     # measured: kept once
-            first = None
-            for raw_field, raw_item in (self.conn.hgetall(canvas_publish.PARTITION % (room, agent)) or {}).items():
-                field = _text(raw_field)
-                try:
-                    item = json.loads(_text(raw_item))
-                except (ValueError, TypeError):
-                    continue
-                if owns(field, item, ask):
-                    first = (field, str(item.get("ts", "")))
-                    break
-            waited = (now - asked_at).total_seconds()
-            base = {"agent": agent, "asked_at": stamp(asked_at), "claimed_at": info["claimed_at"]}
-            if first is not None:
-                seconds = max(0, int(waited))
-                record = dict(base, card=first[0], card_ts=first[1], read_at=stamp(now), seconds=seconds,
-                              on_time=seconds <= TARGET_SECONDS)
-                self.conn.set(key, json.dumps(record, sort_keys=True), ex=TTL_SECONDS)
-                self.log.info("call bridge: %s agent card %s read %d s after the ask (%s)", ask, first[0], seconds,
-                              "on time" if seconds <= TARGET_SECONDS else "late")
-                measured.append(ask)
-            elif waited > TARGET_SECONDS and not seen:
-                record = dict(base, card="", card_ts="", read_at=stamp(now), seconds=int(waited), on_time=False)
-                self.conn.set(key, json.dumps(record, sort_keys=True), ex=TTL_SECONDS)
-                self.log.warning("call bridge: %s no card from %s %d s after the ask", ask, agent, int(waited))
-                measured.append(ask)
+            if self._measure(_text(raw_ask), raw, now):
+                measured.append(_text(raw_ask))
         return measured
+
+    def _measure(self, ask, raw, now, settling=False) -> bool:
+        """One open ask's ask-to-card record (see watch). The deadline is compared on the exact wait, never the
+        whole seconds kept for reading (Aya's hold on 717f423: 180.001 s is late), and the exact wait is kept beside
+        it as waited. settling: its RESULT is closing the ask now, so the record is written whatever it shows (the
+        card read now, or none: card empty, never on time), before the open record goes (Aya's hold on 717f423)."""
+        key = LATENCY_KEY % ask
+        try:
+            info = json.loads(_text(raw))
+            claimed_at = datetime.datetime.strptime(info["claimed_at"], "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=datetime.timezone.utc)
+            asked_at = (datetime.datetime.strptime(info["asked_at"], "%Y-%m-%dT%H:%M:%S.%fZ").replace(
+                tzinfo=datetime.timezone.utc) if info.get("asked_at") else claimed_at)
+            agent, room = info["agent"], info.get("room") or self.canvas_room
+        except (ValueError, KeyError, TypeError):
+            return False
+        seen = self.conn.get(key)
+        if seen and json.loads(_text(seen)).get("card"):
+            return False                                     # measured: kept once
+        first = None
+        for raw_field, raw_item in (self.conn.hgetall(canvas_publish.PARTITION % (room, agent)) or {}).items():
+            field = _text(raw_field)
+            try:
+                item = json.loads(_text(raw_item))
+            except (ValueError, TypeError):
+                continue
+            if owns(field, item, ask):
+                first = (field, str(item.get("ts", "")))
+                break
+        waited = max(0.0, (now - asked_at).total_seconds())
+        on_time = waited <= TARGET_SECONDS
+        base = {"agent": agent, "asked_at": stamp(asked_at), "claimed_at": info["claimed_at"],
+                "read_at": stamp(now), "seconds": int(waited), "waited": round(waited, 3)}
+        if settling:
+            base["settled_at"] = stamp(now)
+        if first is not None:
+            record = dict(base, card=first[0], card_ts=first[1], on_time=on_time)
+            self.conn.set(key, json.dumps(record, sort_keys=True), ex=TTL_SECONDS)
+            self.log.info("call bridge: %s agent card %s read %.3f s after the ask (%s)", ask, first[0], waited,
+                          "on time" if on_time else "late")
+            return True
+        if (not on_time or settling) and not seen:
+            record = dict(base, card="", card_ts="", on_time=False)
+            self.conn.set(key, json.dumps(record, sort_keys=True), ex=TTL_SECONDS)
+            self.log.warning("call bridge: %s no card from %s %.3f s after the ask%s", ask, agent, waited,
+                             " (settled)" if settling else "")
+            return True
+        return False
 
     def _room(self, room: str, now) -> list:
         key = "v1:conf:%s:events" % room
@@ -637,6 +648,7 @@ class Bridge:
                 tags = ANSWERS_FROM.get(agent, ())
                 if sender not in tags and (_field(payload, "from") or "").strip().lower() not in tags:
                     continue
+                self._measure(ask, stored[ask], now, settling=True)   # the timing is kept before the ask closes
                 self._flip(ask, agent, room, claimed_at, now)
                 done.append(ask)
         return done

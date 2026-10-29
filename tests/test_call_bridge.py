@@ -648,6 +648,93 @@ class InTheMakingAndLatency(unittest.TestCase):
         self.assertEqual((210, False), (got["seconds"], got["on_time"]), "60 s after the claim, 210 s after his ask")
 
 
+
+class AyasHoldsOn717f423(unittest.TestCase):
+    """Aya's check of 717f423 (2026-10-29 07:51 UTC), two holds: (a) the 3-minute deadline was compared on whole
+    seconds, so a card read 180.001 s after the ask counted as on time; (b) a RESULT that settled the ask before the
+    next watch pass deleted the open record and the ask-to-card timing with it."""
+
+    AGENT = "chatgpt-codex-desktop"
+
+    def setUp(self):
+        self.conn = FakeRedis()
+        open_window(self.conn)
+        turn(self.conn, "Codex, draft the queue flow for the vans.", seconds_ago=10)
+        [self.ask] = bridge(self.conn).tick()                      # his ask at NOW - 10 s, claimed at NOW
+        self.said_at = NOW - datetime.timedelta(seconds=10)
+
+    def own_card(self):
+        own = {"v": 1, "type": "note", "status": "working", "public": True, "version": 1, "ask": self.ask,
+               "ts": "2026-10-24T14:03:00Z", "title": "In the making: queue flow", "body": "x"}
+        self.conn.hset(cp.PARTITION % ("workshop", self.AGENT), "queue-flow", json.dumps(own))
+
+    def latency(self):
+        raw = self.conn.get(cb.LATENCY_KEY % self.ask)
+        return json.loads(raw) if raw else None
+
+    def result(self):
+        return row("codex", "BCB|v=1|id=CODEX-DONE|phase=RESULT|from=codex|answers=CALLBRIDGE-WAKE-%s|text=drafted"
+                   % self.ask)
+
+    def test_a_card_read_180_001_seconds_after_the_ask_is_late(self):
+        self.own_card()
+        at = self.said_at + datetime.timedelta(seconds=180, milliseconds=1)
+        self.assertEqual([self.ask], bridge(self.conn, clock=lambda: at).watch(at))
+        got = self.latency()
+        self.assertEqual((False, 180, 180.001), (got["on_time"], got["seconds"], got["waited"]),
+                         "late by 1 ms is late; the whole seconds are only for reading")
+
+    def test_a_card_read_exactly_at_180_seconds_is_on_time(self):
+        self.own_card()
+        at = self.said_at + datetime.timedelta(seconds=180)
+        bridge(self.conn, clock=lambda: at).watch(at)
+        self.assertEqual((True, 180.0), (self.latency()["on_time"], self.latency()["waited"]))
+
+    def test_no_card_at_180_001_seconds_is_kept_as_late(self):
+        at = self.said_at + datetime.timedelta(seconds=180, milliseconds=1)
+        self.assertEqual([self.ask], bridge(self.conn, clock=lambda: at).watch(at))
+        self.assertEqual(("", False), (self.latency()["card"], self.latency()["on_time"]))
+
+    def test_a_result_before_the_watch_pass_keeps_the_timing(self):
+        self.own_card()
+        at = self.said_at + datetime.timedelta(seconds=70)
+        self.assertEqual([self.ask], bridge(self.conn, clock=lambda: at).settle([self.result()]))
+        self.assertIsNone(self.conn.hget(cb.OPEN_KEY, self.ask), "the ask is closed")
+        got = self.latency()
+        self.assertIsNotNone(got, "its ask-to-card timing outlives the open record")
+        self.assertEqual(("queue-flow", 70, True, stamp_of(at)), (got["card"], got["seconds"], got["on_time"],
+                                                                  got["settled_at"]))
+        self.assertEqual([], bridge(self.conn, clock=lambda: at).watch(at), "nothing left open to measure")
+
+    def test_a_result_with_no_card_of_its_own_is_kept_and_never_on_time(self):
+        at = self.said_at + datetime.timedelta(seconds=40)
+        bridge(self.conn, clock=lambda: at).settle([self.result()])
+        got = self.latency()
+        self.assertEqual(("", False, 40), (got["card"], got["on_time"], got["seconds"]))
+
+    def test_a_timing_already_measured_is_not_rewritten_at_settlement(self):
+        self.own_card()
+        first = self.said_at + datetime.timedelta(seconds=50)
+        bridge(self.conn, clock=lambda: first).watch(first)
+        before = self.latency()
+        later = self.said_at + datetime.timedelta(seconds=400)
+        bridge(self.conn, clock=lambda: later).settle([self.result()])
+        self.assertEqual(before, self.latency())
+
+    def test_a_late_record_then_a_result_with_its_card_measures_the_card(self):
+        late = self.said_at + datetime.timedelta(seconds=200)
+        bridge(self.conn, clock=lambda: late).watch(late)
+        self.own_card()
+        done = self.said_at + datetime.timedelta(seconds=230)
+        bridge(self.conn, clock=lambda: done).settle([self.result()])
+        got = self.latency()
+        self.assertEqual(("queue-flow", 230, False), (got["card"], got["seconds"], got["on_time"]))
+
+
+def stamp_of(moment):
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def board_row(spec, ts):
     """A row as the board returns it (Row_ID, Timestamp, Source, Target, Action, Payload, ...)."""
     return [spec["row_id"], ts, spec["source_tag"], spec["target_surface"], spec["action_type"], spec["payload"],
