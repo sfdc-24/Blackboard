@@ -8,6 +8,7 @@ Run: python tests/test_call_bridge.py
 import datetime
 import fnmatch
 import json
+import re
 import logging
 import sys
 import unittest
@@ -192,29 +193,27 @@ class Claim(unittest.TestCase):
         self.assertIn("answers=%s" % ask, entry["text"])
         self.assertIn(ask, self.conn.hgetall(cb.OPEN_KEY))
 
-    def test_the_public_card_carries_his_ask_in_plain_words_only(self):
-        turn(self.conn, "Codex, draft the price sheet for the client's Port-au-Prince store. Ask Marie Dupont first.")
+    def test_no_word_of_his_reaches_the_public_canvas(self):
+        """O2 and Aya's privacy hold on 922e8da: the claimed and the done card carry who and when, never what he said."""
+        said = "Codex, draft the price sheet for the client's Port-au-Prince store. Ask Marie Dupont first."
+        turn(self.conn, said)
         [ask] = bridge(self.conn).tick()
-        published = json.dumps(cp.snapshot(self.conn, "workshop", NOW))
-        for word in ("Port", "Prince", "client", "Marie", "Dupont"):
-            self.assertNotIn(word, published)
-        self.assertIn(ask, published)
-        got = card(self.conn, "chatgpt-codex-desktop", ask)
-        self.assertTrue(got["body"].startswith("Draft the price sheet for the ... store. Ask ... first. Claimed in the room at 10:02"), got)
-        self.assertEqual("claimed: Draft the price sheet for the ... store. Ask ... first", got["activity"])
+        words = [w for w in re.findall(r"[A-Za-z][A-Za-z'-]+", said) if w.lower() not in ("codex", "the", "for", "first")]
+        claimed = card(self.conn, "chatgpt-codex-desktop", ask)
+        self.assertEqual("claimed in the room", claimed["activity"])
+        self.assertEqual("Claimed in the room at 10:02 ET. Codex's card for this work follows here when it is done.",
+                         claimed["body"])
+        later = NOW + datetime.timedelta(minutes=3)
+        bridge(self.conn, clock=lambda: later).settle([row("chatgpt-codex-desktop",
+                                                            "BCB|v=1|from=chatgpt-codex-desktop|answers=%s|text=ok" % ask)])
+        done = card(self.conn, "chatgpt-codex-desktop", ask)
+        self.assertEqual(("done", "answered on the board"), (done["status"], done["activity"]))
+        published = json.dumps(cp.snapshot(self.conn, "workshop", NOW)) + json.dumps(claimed) + json.dumps(done)
+        for word in words:
+            self.assertNotIn(word, published, word)
+        self.assertNotIn("asked", json.loads(self.conn.hgetall(cb.OPEN_KEY).get(ask) or "{}"), "nor kept beside the card")
         [(_, entry)] = self.conn.streams["fleet:inbox:chatgpt-codex-desktop"]
         self.assertIn("Port-au-Prince", entry["text"], "the agent still gets every word, in Redis")
-
-    def test_the_done_card_keeps_the_summary(self):
-        turn(self.conn, "Grok, center the homepage hero.")
-        [ask] = bridge(self.conn).tick()
-        later = NOW + datetime.timedelta(minutes=3)
-        bridge(self.conn, clock=lambda: later).settle([row("grok", "BCB|v=1|from=grok|answers=%s|text=ok" % ask)])
-        got = card(self.conn, "grok", ask)
-        self.assertEqual("done", got["status"])
-        self.assertTrue(got["body"].startswith("Center the homepage hero. Claimed in the room at 10:02 ET"), got)
-        self.assertEqual("done: Center the homepage hero", got["activity"])
-        self.assertIsNotNone(cp.clean_item("grok", ask, json.dumps(got)))
 
     def test_once_per_ask_however_often_it_is_read(self):
         turn(self.conn, "Codex, draft the queue flow.")
@@ -315,57 +314,6 @@ class Done(unittest.TestCase):
         self.assertEqual([], self.settle([None, "text", [], ["only", "two"]]))
 
 
-class Summary(unittest.TestCase):
-    """The public line is built by an allowlist: a word not on PLAIN, or a Title Case word inside a sentence, is a '...'."""
-
-    def test_plain_asks_read_as_said(self):
-        self.assertEqual("Center the homepage hero and remove the work section",
-                         cb.summary("Grok, center the homepage hero and remove the work section."))
-        self.assertEqual("I know but it's a simple html update. You just center it",
-                         cb.summary("I know, but it's a simple HTML update. You just center it..."))
-        self.assertEqual("Make a page with 3 columns", cb.summary("make a page with 3 columns"))
-
-    def test_names_places_brands_possessives_and_long_numbers_never_pass(self):
-        cases = {
-            "Codex, draft the price sheet for the client's Port-au-Prince store.": ("client", "Port", "Prince"),
-            "Gemini, can you research Marie Dupont at Acme Corp?": ("Marie", "Dupont", "Acme", "Corp"),
-            "update the Main Street Store page. IBM wants it.": ("Main", "Street", "Store", "IBM"),
-            "Claude, build a page for Apple, call 5551234.": ("Apple", "5551234"),
-            "Grok, draft a note to Will and Rose.": ("Will", "Rose"),
-        }
-        self.assertEqual("Update the ... page", cb.summary("update the Main Street Store page."))
-        for said, banned in cases.items():
-            line = cb.summary(said)
-            for word in banned:
-                self.assertNotIn(word, line, (said, line))
-            self.assertIn("...", line, said)
-
-    def test_the_sentence_with_the_task_word_is_where_it_starts(self):
-        self.assertEqual("So ... I need you to draft the plan", cb.summary("Okay. So, Claude, I need you to draft the plan."))
-        self.assertEqual("Can you research ... at", cb.summary("Hello there. Gemini, can you research Marie Dupont at Acme?"))
-
-    def test_short_one_line_no_pipe_and_nothing_without_a_task(self):
-        line = cb.summary("Claude, build " + "the big page and " * 20)
-        self.assertLessEqual(len(line), cb.SUMMARY_CHARS)
-        self.assertLessEqual(len(cb.summary("build " + "x" * 300)), cb.SUMMARY_CHARS)
-        long = cb.summary("prepare " + "documents integration dashboard " * 5)
-        self.assertLessEqual(len(long), cb.SUMMARY_CHARS)
-        self.assertTrue(long.startswith("Prepare documents integration") and long.endswith(" ..."), long)
-        self.assertNotIn("|", cb.summary("Grok, build the page | then the footer"))
-        self.assertNotIn("\n", cb.summary("Grok, build the page\nthen the footer"))
-        self.assertEqual("", cb.summary("Codex, what do you think?"))
-        self.assertEqual("", cb.summary(""))
-        self.assertTrue(cp.activity_ok("claimed: " + line))
-
-    def test_every_plain_word_is_lower_case_and_one_word(self):
-        for word in cb.PLAIN:
-            self.assertEqual(word, word.lower(), word)
-            self.assertRegex(word, r"^[a-z]+(?:['-][a-z]+)*$")
-        for name in ("will", "may", "mark", "bill", "rose", "grace", "hope", "joy", "apple", "grok", "claude",
-                     "codex", "gemini", "abdus"):
-            self.assertNotIn(name, cb.PLAIN)
-
-
 class FollowUp(unittest.TestCase):
     """CLAUDE-MOBILE-BRIDGE-CONTINUITY: his follow-up to the voice holding the floor names nobody and is still an ask."""
     SAID = "I know, but it's a simple HTML update. You just center it."
@@ -396,7 +344,7 @@ class FollowUp(unittest.TestCase):
         [ask] = bridge(self.conn).tick()
         got = card(self.conn, "grok", ask)
         self.assertEqual("claimed", got["status"])
-        self.assertTrue(got["body"].startswith("I know but it's a simple html update. You just center it."), got)
+        self.assertNotIn("html", got["body"].lower() + got["activity"].lower(), "none of his words on the card")
         self.assertIsNone(self.conn.hget(cp.PARTITION % ("workshop", "chatgpt-codex-desktop"), ask))
         self.assertIn(self.SAID.split(".")[0], self.conn.streams["fleet:inbox:grok"][0][1]["text"])
 
@@ -462,9 +410,6 @@ class ShownAndRefused(unittest.TestCase):
             self.assertTrue(cb.TASK.search(said), said)
         self.assertEqual(cb.asks_in({"kind": "turn.started", "actor_id": "owner-1", "reason": "vocative",
                                      "utterance": "Claude, pull up a picture of a chair."}), ["claude-code-cli"])
-
-    def test_pull_is_a_plain_word_on_the_card(self):
-        self.assertTrue(cb.summary("Claude, pull up a picture of a chair.").startswith("Pull up a picture"))
 
     def test_what_is_a_refusal(self):
         for said in ("I can't pull an image.", "Sorry, I cannot do that.", "I can\u2019t open files.",
