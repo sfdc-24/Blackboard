@@ -257,6 +257,10 @@ def open_window(conn, room, minutes, by: str, now, bucket: str) -> dict:
     count = int(text)
     if count == 0:
         existed = bool(conn.delete(window_key(room)))
+        if room == CALL_ROOM:
+            # A STOP HOLDS FOR THE CALL (Aya on 0fde974: the next scan of the same call reopened it). The marker
+            # is bound to the call live when it is next looked at, and kept until that call is over.
+            conn.set(CALL_STOP_KEY, json.dumps({"by": by, "at": stamp(now)}, sort_keys=True), ex=CALL_STOP_SECONDS)
         return {"ok": True, "room": room, "stopped": existed}
     if not BUCKET.fullmatch(bucket or ""):
         raise Refused("no public canvas bucket is configured on this worker (CANVAS_BUCKET); nothing opened")
@@ -394,6 +398,11 @@ CALL_MINUTES = 15                # reopened while the call lasts; lapses on its 
 CALL_IDLE_SECONDS = 600
 CALL_SCAN_SECONDS = 15
 CALL_BY = "owner-call"
+# A stop of CALL_ROOM (minutes=0, anyone's) holds until the call it was made in is over.
+CALL_STOP_KEY = "gov:canvas:call-stop:" + CALL_ROOM
+CALL_STOP_SECONDS = 4 * 60 * 60
+# The live worker's lease (cloud/bus-reconciler/serve_requests.py WORKER_LOCK_KEY): WATCHed by every write here.
+LEASE_KEY = "gov:worker:lock"
 CALL_FAMILY = re.compile(r"^conf-[0-9a-f]{16}$")
 STATE_PREFIX = "v1:conf:"
 STATE_SUFFIX = ":state"
@@ -430,45 +439,89 @@ def live_call(conn, family: str, now) -> str:
     return best[1]
 
 
-def keep_call_window(conn, family: str, now, bucket: str) -> str:
-    """One round: "opened", "open", "closed" or "idle". Raises only what Redis raises."""
+def keep_call_window(conn, family: str, now, bucket: str, fence) -> str:
+    """One round: "opened", "open", "closed", "stopped" or "idle". Raises only what Redis raises.
+
+    `fence()` says this worker may still write governance state: the publisher is not stopped and the lease
+    is provably its own. Every write below is made in MULTI with gov:worker:lock WATCHed after fence() said
+    yes, so a lease that moves before EXEC writes nothing (Aya on 0fde974: a lease lost during the scan, and
+    a stopped publisher, still opened the window)."""
+    live = live_call(conn, family, now)
+    stop = _json_of(conn.get(CALL_STOP_KEY))
+    if stop is not None:
+        if not live or (stop.get("call") and stop["call"] != live):
+            _fenced(conn, fence, (CALL_STOP_KEY,), lambda pipe: [("delete", CALL_STOP_KEY)])
+            if live:
+                stop = None                  # a new call: the old stop is spent
+        elif not stop.get("call"):
+            bound = dict(stop, call=live)
+            _fenced(conn, fence, (CALL_STOP_KEY,), lambda pipe: [
+                ("set", CALL_STOP_KEY, json.dumps(bound, sort_keys=True), CALL_STOP_SECONDS, False)])
+    if live and stop is not None:
+        _drop_ours(conn, fence)              # never ours to keep open past someone's stop
+        return "stopped"
     held = read_window(conn, CALL_ROOM)
     is_open = _until_of(json.dumps(held), now) is not None if held else False
-    if live_call(conn, family, now):
+    if live:
         if is_open:
             return "open"
         if held is not None:                 # an expired value the TTL has not removed yet: ours, or nobody's
-            _drop_if_ours(conn)
-        try:
-            open_window(conn, CALL_ROOM, CALL_MINUTES, CALL_BY, now, bucket)
-        except Refused:
-            return "open"                    # an ask opened it between the read and the SET NX
-        return "opened"
+            _drop_ours(conn, fence)
+        if not BUCKET.fullmatch(bucket or ""):
+            return "idle"
+        until = now + datetime.timedelta(minutes=CALL_MINUTES)
+        value = json.dumps({"by": CALL_BY, "gen": secrets.token_hex(8), "room": CALL_ROOM, "until": stamp(until)},
+                           sort_keys=True)
+        done = _fenced(conn, fence, (window_key(CALL_ROOM), CALL_STOP_KEY), lambda pipe: (
+            None if pipe.get(CALL_STOP_KEY) else
+            [("set", window_key(CALL_ROOM), value, CALL_MINUTES * 60, True)]))
+        if done is None:
+            return "idle"                    # not ours to write now: no lease, stopped, raced or a stop landed
+        return "opened" if done and done[0] else "open"
     if held is not None:                     # closed only if it is still the one this rule opened
-        return "closed" if _drop_if_ours(conn) else "idle"
+        return "closed" if _drop_ours(conn, fence) else "idle"
     return "idle"
 
 
-def _drop_if_ours(conn) -> bool:
-    """Delete the window only while it is still the one this rule opened (WATCH, then MULTI)."""
+def _json_of(raw):
+    try:
+        value = json.loads(_text(raw)) if raw else None
+    except (TypeError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _drop_ours(conn, fence) -> bool:
+    """Delete the window only while it is still the one this rule opened, and only while fenced."""
     key = window_key(CALL_ROOM)
+    done = _fenced(conn, fence, (key,), lambda pipe: (
+        [("delete", key)] if (_json_of(pipe.get(key)) or {}).get("by") == CALL_BY else None))
+    return bool(done)
+
+
+def _fenced(conn, fence, keys, plan):
+    """Run `plan(pipe)`'s writes in one MULTI while the lease, `keys` and fence() all hold. The results, or None.
+
+    WATCH first (the lease and `keys`), then `plan` (reads only, through the pipe; returns the writes, or None
+    to write nothing), then fence(), then EXEC: a lease or key that moved after the WATCH fails the EXEC
+    (WatchError), and nothing is written."""
     with conn.pipeline() as pipe:
         try:
-            pipe.watch(key)
-            raw = _text(pipe.get(key) or "")
-            try:
-                by = (json.loads(raw) if raw else {}).get("by")
-            except (TypeError, ValueError, AttributeError):
-                by = None
-            if by != CALL_BY:
+            pipe.watch(LEASE_KEY, *keys)
+            writes = plan(pipe)
+            if not writes or not fence():
                 pipe.unwatch()
-                return False
+                return None
             pipe.multi()
-            pipe.delete(key)
-            pipe.execute()
-            return True
+            for op in writes:
+                if op[0] == "set":
+                    _, key, value, ex, nx = op
+                    pipe.set(key, value, ex=ex, nx=nx)
+                else:
+                    pipe.delete(op[1])
+            return pipe.execute()
         except WatchError:
-            return False
+            return None
 
 
 try:                                          # redis-py's, where it is installed; a stand-in for the tests
@@ -498,6 +551,10 @@ class Publisher:
         self.call_at = None     # when his calls were last looked at
         self.call_said = None   # the last round's answer, so the log says each change once
 
+    def may_govern(self) -> bool:
+        """This worker may still write a window: not stopped, and the lease provably its own."""
+        return not self.stop.is_set() and self.holds is not None and bool(self.holds())
+
     def calls(self) -> str:
         """His calls' round, every CALL_SCAN_SECONDS, only while this worker provably holds the lease."""
         now = self.clock()
@@ -507,7 +564,7 @@ class Publisher:
         try:
             if self.holds is None or not self.holds():
                 return ""
-            said = keep_call_window(self.conn, self.family, now, self.bucket)
+            said = keep_call_window(self.conn, self.family, now, self.bucket, self.may_govern)
         except Exception as error:                                       # noqa: BLE001 - the TYPE only
             self.log.warning("canvas %s: his calls could not be read (%s)", CALL_ROOM, type(error).__name__)
             return ""

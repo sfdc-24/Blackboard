@@ -585,11 +585,12 @@ class Upload(unittest.TestCase):
 
 FAMILY = "conf-0123456789abcdef"
 HIS_ROOM = FAMILY + "-a1b2c3d4"
+ME = "bus-requests-me"
 
 
 class CallRedis(FakeRedis):
-    """FakeRedis with the WATCH/MULTI pipeline the compare-and-delete uses. `race` runs between the WATCH
-    and the EXEC, the way another writer would; a watched key it changes fails the EXEC."""
+    """FakeRedis with redis-py's WATCH/MULTI pipeline. `race` runs just before EXEC, the way another writer
+    would; any WATCHed key it changes fails the EXEC with WatchError and nothing queued is written."""
 
     def __init__(self):
         super().__init__()
@@ -600,35 +601,43 @@ class CallRedis(FakeRedis):
 
         class Pipe:
             def __enter__(self):
-                self.watched, self.queued, self.before = None, [], None
+                self.watched, self.queued = {}, None
                 return self
 
             def __exit__(self, *exc):
                 return False
 
-            def watch(self, key):
-                self.watched, self.before = key, conn.store.get(key)
+            def watch(self, *keys):
+                self.watched = {k: conn.store.get(k) for k in keys}
 
             def unwatch(self):
-                self.watched = None
+                self.watched = {}
 
             def get(self, key):
                 return conn.store.get(key)
 
             def multi(self):
-                pass
+                self.queued = []
+
+            def set(self, key, value, ex=None, nx=False):
+                self.queued.append(("set", key, value, ex, nx))
 
             def delete(self, key):
-                self.queued.append(key)
+                self.queued.append(("delete", key))
 
             def execute(self):
                 if conn.race:
-                    conn.race()
-                if self.watched is not None and conn.store.get(self.watched) != self.before:
+                    race, conn.race = conn.race, None
+                    race()
+                if any(conn.store.get(k) != v for k, v in self.watched.items()):
                     raise cp.WatchError()
-                for key in self.queued:
-                    conn.delete(key)
-                return [1] * len(self.queued)
+                out = []
+                for op in self.queued:
+                    if op[0] == "set":
+                        out.append(conn.set(op[1], op[2], nx=op[4], ex=op[3]))
+                    else:
+                        out.append(conn.delete(op[1]))
+                return out
         return Pipe()
 
 
@@ -645,10 +654,10 @@ class HisCalls(unittest.TestCase):
 
     def setUp(self):
         self.conn, self.up, self.t = CallRedis(), Uploads(), {"now": NOW}
+        self.conn.store[cp.LEASE_KEY] = ME
         self.log = mock.Mock()
-        self.lease = {"held": True}
         self.pub = cp.Publisher(self.conn, "sfdc24-canvas", self.up, self.log, clock=lambda: self.t["now"],
-                                holds=lambda: self.lease["held"], family=FAMILY)
+                                holds=lambda: self.conn.store.get(cp.LEASE_KEY) == ME, family=FAMILY)
         put(self.conn, "grok", "1", item(), room=cp.CALL_ROOM)
 
     def later(self, seconds):
@@ -656,6 +665,10 @@ class HisCalls(unittest.TestCase):
 
     def window(self):
         return cp.read_window(self.conn, cp.CALL_ROOM)
+
+    def round(self, seconds=None):
+        self.later(cp.CALL_SCAN_SECONDS if seconds is None else seconds)
+        return self.pub.calls()
 
     def test_a_live_call_opens_the_page_room_and_it_publishes_in_the_same_tick(self):
         call_state(self.conn)
@@ -665,32 +678,29 @@ class HisCalls(unittest.TestCase):
         self.assertEqual(self.conn.ttls[cp.window_key(cp.CALL_ROOM)], cp.CALL_MINUTES * 60)
         self.assertEqual(self.up.calls[-1][1], "rooms/%s.json" % cp.CALL_ROOM)
 
+    def test_no_call_opens_nothing(self):
+        self.assertEqual(self.pub.tick(), [])
+        self.assertIsNone(self.window())
+
     def test_an_open_window_is_kept_as_it_is_while_the_call_goes_on(self):
         call_state(self.conn)
         self.assertEqual(self.pub.calls(), "opened")
         before = self.conn.store[cp.window_key(cp.CALL_ROOM)]
-        self.later(cp.CALL_SCAN_SECONDS)
-        call_state(self.conn, at=self.t["now"])
-        self.assertEqual(self.pub.calls(), "open")
+        call_state(self.conn, at=self.t["now"] + datetime.timedelta(seconds=cp.CALL_SCAN_SECONDS))
+        self.assertEqual(self.round(), "open")
         self.assertEqual(self.conn.store[cp.window_key(cp.CALL_ROOM)], before, "not reopened under a new gen")
-
-    def test_no_call_opens_nothing(self):
-        self.assertEqual(self.pub.tick(), [])
-        self.assertIsNone(self.window())
 
     def test_a_closed_call_closes_the_window_this_rule_opened(self):
         call_state(self.conn)
         self.pub.tick()
         call_state(self.conn, closed=True)
-        self.later(cp.CALL_SCAN_SECONDS)
-        self.assertEqual(self.pub.calls(), "closed")
+        self.assertEqual(self.round(), "closed")
         self.assertIsNone(self.window())
 
     def test_a_record_left_unwritten_counts_as_over(self):
         call_state(self.conn)
         self.pub.tick()
-        self.later(cp.CALL_IDLE_SECONDS + 1)
-        self.assertEqual(self.pub.calls(), "closed")
+        self.assertEqual(self.round(cp.CALL_IDLE_SECONDS + 1), "closed")
         self.assertIsNone(self.window())
 
     def test_a_long_call_gets_the_window_again_when_it_lapses(self):
@@ -707,8 +717,7 @@ class HisCalls(unittest.TestCase):
         call_state(self.conn)
         self.assertEqual(self.pub.calls(), "open")
         call_state(self.conn, closed=True)
-        self.later(cp.CALL_SCAN_SECONDS)
-        self.assertEqual(self.pub.calls(), "idle")
+        self.assertEqual(self.round(), "idle")
         self.assertEqual(self.conn.store[cp.window_key(cp.CALL_ROOM)], before)
 
     def test_a_window_replaced_before_the_delete_is_kept(self):
@@ -720,20 +729,137 @@ class HisCalls(unittest.TestCase):
             self.conn.store[cp.window_key(cp.CALL_ROOM)] = json.dumps(
                 {"by": "aya", "gen": "g2", "room": cp.CALL_ROOM, "until": "2026-10-20T23:00:00Z"})
         self.conn.race = an_ask_lands
-        self.later(cp.CALL_SCAN_SECONDS)
-        self.assertEqual(self.pub.calls(), "idle")
+        self.assertEqual(self.round(), "idle")
         self.assertEqual(self.window()["by"], "aya")
 
     def test_an_ask_that_wins_the_race_to_open_is_left_open(self):
         call_state(self.conn)
-        real = cp.open_window
-
-        def raced(conn, room, minutes, by, now, bucket):
-            real(conn, room, "30", "aya", now, bucket)
-            return real(conn, room, minutes, by, now, bucket)
-        with mock.patch.object(cp, "open_window", side_effect=raced):
-            self.assertEqual(self.pub.calls(), "open")
+        self.conn.race = lambda: cp.open_window(self.conn, cp.CALL_ROOM, "30", "aya", NOW, "sfdc24-canvas")
+        self.assertEqual(self.pub.calls(), "idle")
         self.assertEqual(self.window()["by"], "aya")
+
+    # --- Aya's cycle-1 HOLD on 0fde974: a stop holds for the call; writes are fenced on the lease and the stop.
+
+    def test_a_stop_during_his_call_holds_until_that_call_is_over(self):
+        call_state(self.conn)
+        self.assertEqual(self.pub.calls(), "opened")
+        cp.open_window(self.conn, cp.CALL_ROOM, "0", "owner", self.t["now"], "sfdc24-canvas")
+        for _ in range(4):
+            call_state(self.conn, at=self.t["now"] + datetime.timedelta(seconds=cp.CALL_SCAN_SECONDS))
+            self.assertEqual(self.round(), "stopped")
+            self.assertIsNone(self.window(), "the same call does not reopen what was stopped")
+        self.assertEqual(cp._json_of(self.conn.store[cp.CALL_STOP_KEY])["call"], HIS_ROOM)
+        call_state(self.conn, closed=True)
+        self.assertEqual(self.round(), "idle")
+        self.assertNotIn(cp.CALL_STOP_KEY, self.conn.store, "the stop ends with its call")
+        call_state(self.conn, room=FAMILY + "-0000ffff", at=self.t["now"] + datetime.timedelta(seconds=15))
+        self.assertEqual(self.round(), "opened", "his next call opens again")
+
+    def test_a_stop_bound_to_one_call_does_not_hold_the_next(self):
+        call_state(self.conn)
+        self.pub.calls()
+        cp.open_window(self.conn, cp.CALL_ROOM, "0", "owner", self.t["now"], "sfdc24-canvas")
+        call_state(self.conn, at=self.t["now"] + datetime.timedelta(seconds=15))
+        self.assertEqual(self.round(), "stopped")
+        call_state(self.conn, closed=True)
+        call_state(self.conn, room=FAMILY + "-0000ffff", at=self.t["now"] + datetime.timedelta(seconds=15))
+        self.assertEqual(self.round(), "opened")
+        self.assertNotIn(cp.CALL_STOP_KEY, self.conn.store)
+
+    def test_a_stop_made_between_his_calls_does_not_hold_the_next_call(self):
+        cp.open_window(self.conn, cp.CALL_ROOM, "0", "claude-code-cli", NOW, "sfdc24-canvas")
+        self.assertEqual(self.pub.calls(), "idle")
+        self.assertNotIn(cp.CALL_STOP_KEY, self.conn.store, "a stop with no call live is spent at once")
+        call_state(self.conn, at=self.t["now"] + datetime.timedelta(seconds=cp.CALL_SCAN_SECONDS))
+        self.assertEqual(self.round(), "opened")
+
+    def test_a_stop_that_lands_before_the_watch_is_read_inside_it(self):
+        call_state(self.conn)
+        real = cp.read_window
+
+        def read_then_stop(conn, room):
+            held = real(conn, room)
+            self.conn.store[cp.CALL_STOP_KEY] = json.dumps({"by": "owner", "at": "x"})
+            return held
+        with mock.patch.object(cp, "read_window", side_effect=read_then_stop):
+            self.assertEqual(self.pub.calls(), "idle")
+        self.assertIsNone(self.window())
+
+    def test_another_opener_s_lapsed_window_is_not_overwritten_before_its_ttl_ends(self):
+        cp.open_window(self.conn, cp.CALL_ROOM, "1", "aya", NOW, "sfdc24-canvas")
+        before = self.conn.store[cp.window_key(cp.CALL_ROOM)]
+        self.later(120)                                  # its until has passed; the fake's TTL never fires
+        call_state(self.conn, at=self.t["now"])
+        self.assertEqual(self.pub.calls(), "open")
+        self.assertEqual(self.conn.store[cp.window_key(cp.CALL_ROOM)], before)
+
+    def test_a_stop_only_of_the_page_room_is_remembered(self):
+        cp.open_window(self.conn, "demo", "0", "owner", NOW, "sfdc24-canvas")
+        self.assertNotIn(cp.CALL_STOP_KEY, self.conn.store)
+        cp.open_window(self.conn, cp.CALL_ROOM, "0", "owner", NOW, "sfdc24-canvas")
+        self.assertEqual(self.conn.ttls[cp.CALL_STOP_KEY], cp.CALL_STOP_SECONDS)
+
+    def test_a_stop_that_lands_just_before_the_open_wins(self):
+        call_state(self.conn)
+        self.conn.race = lambda: self.conn.set(cp.CALL_STOP_KEY, json.dumps({"by": "owner", "at": "x"}))
+        self.assertEqual(self.pub.calls(), "idle")
+        self.assertIsNone(self.window())
+
+    def test_a_lease_lost_during_the_scan_opens_nothing(self):
+        call_state(self.conn)
+        real = cp.live_call
+
+        def scan_then_lose(*a):
+            room = real(*a)
+            self.conn.store[cp.LEASE_KEY] = "bus-requests-other"
+            return room
+        with mock.patch.object(cp, "live_call", side_effect=scan_then_lose):
+            self.assertEqual(self.pub.calls(), "idle")
+        self.assertIsNone(self.window())
+
+    def test_a_lease_lost_between_the_watch_and_the_write_opens_nothing(self):
+        call_state(self.conn)
+        self.conn.race = lambda: self.conn.store.__setitem__(cp.LEASE_KEY, "bus-requests-other")
+        self.assertEqual(self.pub.calls(), "idle")
+        self.assertIsNone(self.window())
+
+    def test_a_lease_lost_closes_nothing_either(self):
+        call_state(self.conn)
+        self.pub.calls()
+        call_state(self.conn, closed=True)
+        self.conn.race = lambda: self.conn.store.__setitem__(cp.LEASE_KEY, "bus-requests-other")
+        self.assertEqual(self.round(), "idle")
+        self.assertEqual(self.window()["by"], cp.CALL_BY, "the next lease holder closes it, or its TTL does")
+
+    def test_a_stopped_publisher_opens_nothing(self):
+        call_state(self.conn)
+        self.pub.stop.set()
+        self.assertEqual(self.pub.calls(), "idle")
+        self.assertIsNone(self.window())
+        self.assertFalse(self.pub.may_govern())
+
+    def test_a_publisher_stopped_mid_round_opens_nothing(self):
+        call_state(self.conn)
+        real = cp.live_call
+
+        def scan_then_stop(*a):
+            room = real(*a)
+            self.pub.stop.set()
+            return room
+        with mock.patch.object(cp, "live_call", side_effect=scan_then_stop):
+            self.assertEqual(self.pub.calls(), "idle")
+        self.assertIsNone(self.window())
+
+    def test_keep_call_window_writes_nothing_when_fenced_off(self):
+        call_state(self.conn)
+        self.assertEqual(cp.keep_call_window(self.conn, FAMILY, NOW, "sfdc24-canvas", lambda: False), "idle")
+        self.assertIsNone(self.window())
+        self.assertEqual(cp.keep_call_window(self.conn, FAMILY, NOW, "sfdc24-canvas", lambda: True), "opened")
+        call_state(self.conn, closed=True)
+        self.assertEqual(cp.keep_call_window(self.conn, FAMILY, NOW, "sfdc24-canvas", lambda: False), "idle")
+        self.assertEqual(self.window()["by"], cp.CALL_BY)
+
+    # ---
 
     def test_only_his_family_counts(self):
         for room in ("conf-fedcba9876543210-a1b2c3d4", FAMILY + "-a1b2c3d", FAMILY + "-A1B2C3D4",
@@ -766,7 +892,7 @@ class HisCalls(unittest.TestCase):
 
     def test_nothing_opens_without_the_lease(self):
         call_state(self.conn)
-        self.lease["held"] = False
+        self.conn.store[cp.LEASE_KEY] = "bus-requests-other"
         self.assertEqual(self.pub.calls(), "")
         self.assertIsNone(self.window())
 
@@ -774,11 +900,9 @@ class HisCalls(unittest.TestCase):
         call_state(self.conn)
         self.assertEqual(self.pub.calls(), "opened")
         self.conn.delete(cp.window_key(cp.CALL_ROOM))
-        self.later(cp.CALL_SCAN_SECONDS - 1)
-        self.assertEqual(self.pub.calls(), "")
+        self.assertEqual(self.round(cp.CALL_SCAN_SECONDS - 1), "")
         self.assertIsNone(self.window())
-        self.later(1)
-        self.assertEqual(self.pub.calls(), "opened")
+        self.assertEqual(self.round(1), "opened")
 
     def test_a_redis_failure_costs_one_round_and_names_only_its_type(self):
         call_state(self.conn)
@@ -801,9 +925,14 @@ class HisCalls(unittest.TestCase):
         pub.thread.join(timeout=10)
         self.assertEqual(pub.family, "")
 
-    def test_no_agent_can_write_the_record_that_opens_the_page(self):
+    def test_the_lease_key_is_the_live_worker_s(self):
+        import serve_requests as sr                                       # noqa: PLC0415
+        self.assertEqual(cp.LEASE_KEY, sr.WORKER_LOCK_KEY)
+
+    def test_no_agent_can_write_the_records_that_open_or_hold_the_page(self):
         import redis_gov                                                 # noqa: PLC0415
         self.assertIn(cp.STATE_PREFIX, redis_gov.PROTECTED)
+        self.assertTrue(cp.CALL_STOP_KEY.startswith("gov:") and "gov:" in redis_gov.PROTECTED)
 
 
 def cp_os():
