@@ -27,6 +27,7 @@ import logging
 import os
 import sys
 import tempfile
+import threading
 import time
 
 sys.path.insert(0, "/app")
@@ -142,11 +143,21 @@ def guarded(append, renew):
     return write
 
 
+# append.py reads its row file from the process-global sys.argv. The request loop and the call bridge's doorbell
+# (its own thread) both append, so the swap and the append are one critical section (Aya's hold on 5d41cb5, item 2):
+# a concurrent append never reads the other's row file.
+APPEND_LOCK = threading.Lock()
+
+
 def appender(env):
     """Append one row spec through append.py, so the write and its read-back are the fleet's one path."""
     import append                                                        # noqa: PLC0415
 
     def write(spec):
+        with APPEND_LOCK:
+            _write(spec)
+
+    def _write(spec):
         handle, path = tempfile.mkstemp(suffix=".json", prefix="row-")
         os.close(handle)
         try:

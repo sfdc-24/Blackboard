@@ -217,6 +217,43 @@ def done_card(agent: str, claimed_at, now) -> dict:
                 eastern(claimed_at), eastern(now), minutes)}
 
 
+def event_time(entry_id: str):
+    """When the owner's turn landed in the room stream: the ms part of its Redis stream id (the server's clock), or
+    None. O3's three minutes start here, not at the bridge's tick (Aya's hold on 5d41cb5, item 5)."""
+    try:
+        ms = int(str(entry_id).split("-", 1)[0])
+    except (TypeError, ValueError):
+        return None
+    return datetime.datetime.fromtimestamp(ms / 1000.0, tz=datetime.timezone.utc)
+
+
+# COMPLETION, not any reply (Aya's hold on 5d41cb5, item 1). A row flips an ask Done only when it reports finished
+# work: phase RESULT or DONE, not a waker's relayed model answer (agent_waker: wakerreply=1, evidence=STATED), not a
+# refusal, a hold or a request. A wake reply or an "I can't" leaves the card In the making.
+COMPLETE_PHASES = ("RESULT", "DONE")
+NOT_DONE = re.compile(r"(?i)(?:^|\|)\s*(?:wakerreply=1|evidence=STATED)\s*(?:\||$)"
+                      r"|STATUS:\s*(?:REFUSED|BLOCKED|HOLD|STUCK|NEED_HELP|PARTIAL|ASK)\b")
+
+
+def completes(payload: str) -> bool:
+    phase = (_field(payload, "phase") or "").strip().upper()
+    return phase in COMPLETE_PHASES and not NOT_DONE.search(payload or "")
+
+
+BRIDGE_ACTIVITIES = ("claimed in the room", "answered on the board")
+
+
+def owns(field: str, item: dict, ask: str) -> bool:
+    """The agent's own card FOR THIS ASK (Aya's hold on 5d41cb5, item 4): under the ask's id, or naming it in "ask",
+    and not one of the bridge's own claimed/done cards. Any other new card in the slot, another claim's card included,
+    is not this ask's card."""
+    if not isinstance(item, dict) or item.get("public") is not True:
+        return False
+    if item.get("activity") in BRIDGE_ACTIVITIES:
+        return False
+    return field == ask or str(item.get("ask") or "") == ask
+
+
 def wake_row(ask: str, agent: str, room: str, claimed_at) -> dict:
     """The board row that rings the agent: a row spec for scripts/append.py, addressed to the agent's own tag (its
     Target_Surface and to=), phase ASK so every doorbell wakes on it. Pipes and newlines out (bus_request.safe).
@@ -225,8 +262,8 @@ def wake_row(ask: str, agent: str, room: str, claimed_at) -> dict:
     import bus_request                                                   # noqa: PLC0415
     safe = bus_request.safe
     text = ("Work for %s from the room, asked at %s (your inbox has the ask). Put your own In the making card in conf:canvas:%s:%s now "
-            "(target: up within 3 minutes of the ask), do the work, then reply answers=%s. The full ask is in "
-            "fleet:inbox:%s." % (NAME_OF[agent], eastern(claimed_at), room, agent, ask, agent))
+            "(target: up within 3 minutes of the ask; its field or its ask value is %s), do the work, then reply with a RESULT row answers=%s. The full ask is in "
+            "fleet:inbox:%s." % (NAME_OF[agent], eastern(claimed_at), room, agent, ask, ask, agent))
     row_id = safe(WAKE_PREFIX + ask)[:120]
     return {"row_id": row_id, "source_tag": "bus-reconciler", "target_surface": agent, "action_type": "ASK",
             "category": "OPEN", "project_tag": "Blackboard", "gist": safe("Call ask for %s" % NAME_OF[agent]),
@@ -235,7 +272,7 @@ def wake_row(ask: str, agent: str, room: str, claimed_at) -> dict:
 
 
 def inbox_text(ask: str, agent: str, room: str, said: str, now) -> str:
-    return ("CALL ASK %s from the owner, said in the conference room at %s (%s): %s -- Answer with a board row "
+    return ("CALL ASK %s from the owner, said in the conference room at %s (%s): %s -- Answer with a RESULT board row "
             "answers=%s. Your canvas card %s in conf:canvas:%s:%s turns done when that row lands; post your own "
             "card under the canvas rules for what the work is." % (
                 ask, eastern(now), stamp(now), said[:ASK_CHARS].replace("|", "/"), ask, ask, room, agent))
@@ -306,12 +343,14 @@ class Bridge:
         return rung
 
     def watch(self, now) -> list:
-        """ASK TO AGENT CARD, measured (O3: the real agent puts its card up within TARGET_SECONDS). For each open
-        ask, the agent's own card is any public item in the agent's slot of the claim's canvas room, under another
-        field than the bridge's, with a ts at or after the claim. The first one seen is kept once in
-        gov:callbridge:latency:<ask> ({agent, claimed_at, card, card_at, seconds, on_time}); an ask past
-        TARGET_SECONDS with no card is kept once as late (card empty). Read only of the canvas: nothing it
-        writes is public. Returns the asks measured on this pass."""
+        """ASK TO AGENT CARD, measured (O3: the real agent puts its card up within TARGET_SECONDS of HIS ask).
+        Correlated (Aya's hold on 5d41cb5): only the agent's own card for THIS ask counts (owns()), never the
+        bridge's card, another claim's card or an unrelated new card. Timed from the owner's event (the room stream
+        id, asked_at), not the bridge's tick, to the moment this pass READ the card back, so intake and poll delays
+        are inside the measure; the card's own ts is kept beside it as card_ts, a stated time. The doorbell row is
+        not counted as a wake: only the card the agent wrote is. Kept once in gov:callbridge:latency:<ask> ({agent,
+        asked_at, claimed_at, card, card_ts, read_at, seconds, on_time}); an ask past TARGET_SECONDS with no card is
+        kept once as late (card empty) and measured again when its card comes. Read only of the canvas."""
         measured = []
         for raw_ask, raw in (self.conn.hgetall(OPEN_KEY) or {}).items():
             ask = _text(raw_ask)
@@ -320,6 +359,8 @@ class Bridge:
                 info = json.loads(_text(raw))
                 claimed_at = datetime.datetime.strptime(info["claimed_at"], "%Y-%m-%dT%H:%M:%SZ").replace(
                     tzinfo=datetime.timezone.utc)
+                asked_at = (datetime.datetime.strptime(info["asked_at"], "%Y-%m-%dT%H:%M:%S.%fZ").replace(
+                    tzinfo=datetime.timezone.utc) if info.get("asked_at") else claimed_at)
                 agent, room = info["agent"], info.get("room") or self.canvas_room
             except (ValueError, KeyError, TypeError):
                 continue
@@ -329,31 +370,27 @@ class Bridge:
             first = None
             for raw_field, raw_item in (self.conn.hgetall(canvas_publish.PARTITION % (room, agent)) or {}).items():
                 field = _text(raw_field)
-                if field == ask:
-                    continue
                 try:
                     item = json.loads(_text(raw_item))
-                    at = datetime.datetime.strptime(str(item.get("ts", ""))[:19], "%Y-%m-%dT%H:%M:%S").replace(
-                        tzinfo=datetime.timezone.utc)
-                except (ValueError, TypeError, AttributeError):
+                except (ValueError, TypeError):
                     continue
-                if item.get("public") is True and at >= claimed_at.replace(microsecond=0) and \
-                        (first is None or at < first[1]):
-                    first = (field, at)
-            waited = (now - claimed_at).total_seconds()
+                if owns(field, item, ask):
+                    first = (field, str(item.get("ts", "")))
+                    break
+            waited = (now - asked_at).total_seconds()
+            base = {"agent": agent, "asked_at": stamp(asked_at), "claimed_at": info["claimed_at"]}
             if first is not None:
-                seconds = max(0, int((first[1] - claimed_at).total_seconds()))
-                record = {"agent": agent, "claimed_at": info["claimed_at"], "card": first[0],
-                          "card_at": stamp(first[1]), "seconds": seconds, "on_time": seconds <= TARGET_SECONDS}
+                seconds = max(0, int(waited))
+                record = dict(base, card=first[0], card_ts=first[1], read_at=stamp(now), seconds=seconds,
+                              on_time=seconds <= TARGET_SECONDS)
                 self.conn.set(key, json.dumps(record, sort_keys=True), ex=TTL_SECONDS)
-                self.log.info("call bridge: %s agent card %s after %d s (%s)", ask, first[0], seconds,
+                self.log.info("call bridge: %s agent card %s read %d s after the ask (%s)", ask, first[0], seconds,
                               "on time" if seconds <= TARGET_SECONDS else "late")
                 measured.append(ask)
             elif waited > TARGET_SECONDS and not seen:
-                record = {"agent": agent, "claimed_at": info["claimed_at"], "card": "", "card_at": "",
-                          "seconds": int(waited), "on_time": False}
+                record = dict(base, card="", card_ts="", read_at=stamp(now), seconds=int(waited), on_time=False)
                 self.conn.set(key, json.dumps(record, sort_keys=True), ex=TTL_SECONDS)
-                self.log.warning("call bridge: %s no card from %s after %d s", ask, agent, int(waited))
+                self.log.warning("call bridge: %s no card from %s %d s after the ask", ask, agent, int(waited))
                 measured.append(ask)
         return measured
 
@@ -446,7 +483,9 @@ class Bridge:
                       json.dumps(claimed_card(agent, now), sort_keys=True))
             pipe.xadd(INBOX_KEY % agent, {"by": BY, "text": inbox_text(ask, agent, self.canvas_room, said, now),
                                           "at": stamp(now)})
-            pipe.hset(OPEN_KEY, ask, json.dumps({"agent": agent, "claimed_at": stamp(now), "room": self.canvas_room},
+            asked = event_time(entry_id)
+            pipe.hset(OPEN_KEY, ask, json.dumps({"agent": agent, "claimed_at": stamp(now), "room": self.canvas_room,
+                                                 "asked_at": asked.strftime("%Y-%m-%dT%H:%M:%S.%fZ") if asked else ""},
                                                 sort_keys=True))
             pipe.expire(OPEN_KEY, TTL_SECONDS)
             if self.ring is not None:
@@ -470,7 +509,9 @@ class Bridge:
         done = []
         for row in rows or ():
             payload, sender = _row(row)
-            # A reply to the wake row (answers=CALLBRIDGE-WAKE-<ask>, as the agent-waker writes it) answers the ask.
+            if not completes(payload):
+                continue                                     # a reply, a refusal or a waker's STATED answer: not Done
+            # A completion answering the wake row (answers=CALLBRIDGE-WAKE-<ask>) answers the ask.
             answered = [part.strip()[len(WAKE_PREFIX):] if part.strip().startswith(WAKE_PREFIX) else part.strip()
                         for part in re.split(r"[;,\s]+", _field(payload, "answers")) if part.strip()]
             for ask in answered:

@@ -205,7 +205,7 @@ class Claim(unittest.TestCase):
                          claimed["body"])
         later = NOW + datetime.timedelta(minutes=3)
         bridge(self.conn, clock=lambda: later).settle([row("chatgpt-codex-desktop",
-                                                            "BCB|v=1|from=chatgpt-codex-desktop|answers=%s|text=ok" % ask)])
+                                                            "BCB|v=1|phase=RESULT|from=chatgpt-codex-desktop|answers=%s|text=ok" % ask)])
         done = card(self.conn, "chatgpt-codex-desktop", ask)
         self.assertEqual(("done", "answered on the board"), (done["status"], done["activity"]))
         published = json.dumps(cp.snapshot(self.conn, "workshop", NOW)) + json.dumps(claimed) + json.dumps(done)
@@ -290,11 +290,11 @@ class Done(unittest.TestCase):
         self.assertEqual([], self.settle([row("aya", payload)]), "flipped once")
 
     def test_an_answer_among_several_ids_counts(self):
-        payload = "BCB|v=1|id=X|from=chatgpt-codex-desktop|answers=OTHER-1;%s,OTHER-2|text=ok" % self.ask
+        payload = "BCB|v=1|id=X|phase=RESULT|from=chatgpt-codex-desktop|answers=OTHER-1;%s,OTHER-2|text=ok" % self.ask
         self.assertEqual([self.ask], self.settle([row("chatgpt-codex-desktop", payload)]))
 
     def test_another_agent_s_row_does_not_flip_it(self):
-        payload = "BCB|v=1|id=GROK-X|from=grok|answers=%s|text=done" % self.ask
+        payload = "BCB|v=1|id=GROK-X|phase=RESULT|from=grok|answers=%s|text=done" % self.ask
         self.assertEqual([], self.settle([row("grok", payload)]))
         self.assertEqual("claimed", card(self.conn, "chatgpt-codex-desktop", self.ask)["status"])
 
@@ -302,13 +302,25 @@ class Done(unittest.TestCase):
         own = {"v": 1, "type": "mermaid", "status": "done", "public": True, "version": 3, "ts": "x",
                "title": "Queue flow", "body": "flowchart LR\n  a-->b\n"}
         self.conn.hset(cp.PARTITION % ("workshop", "chatgpt-codex-desktop"), self.ask, json.dumps(own))
-        self.settle([row("aya", "BCB|v=1|id=X|from=aya|answers=%s|text=done" % self.ask)])
+        self.settle([row("aya", "BCB|v=1|id=X|phase=RESULT|from=aya|answers=%s|text=done" % self.ask)])
         self.assertEqual(own, card(self.conn, "chatgpt-codex-desktop", self.ask))
         self.assertNotIn(self.ask, self.conn.hgetall(cb.OPEN_KEY))
 
     def test_no_flip_without_the_lease(self):
-        payload = "BCB|v=1|id=X|from=aya|answers=%s|text=done" % self.ask
+        payload = "BCB|v=1|id=X|phase=RESULT|from=aya|answers=%s|text=done" % self.ask
         self.assertEqual([], bridge(self.conn, holds=False).settle([row("aya", payload)]))
+
+    def test_a_reply_that_is_not_finished_work_never_flips_it(self):
+        """Aya's hold on 5d41cb5, item 1: a waker's STATED answer, a refusal, a hold or a plain reply is not Done."""
+        for payload in ("BCB|v=1|id=X|from=aya|answers=%s|text=on it",
+                        "BCB|v=1|id=X|phase=ASK|from=aya|answers=%s|text=need Redis access",
+                        "BCB|v=1|id=X|phase=RESULT|from=aya|answers=%s|wakerreply=1|evidence=STATED|text=REPLY: ok",
+                        "BCB|v=1|id=X|phase=RESULT|from=aya|answers=%s|evidence=STATED|text=I think so",
+                        "BCB|v=1|id=X|phase=RESULT|from=aya|answers=%s|text=I cannot do this. STATUS: REFUSED",
+                        "BCB|v=1|id=X|phase=RESULT|from=aya|answers=%s|text=waiting. STATUS: HOLD NEXT_OWNER: grok"):
+            self.assertEqual([], self.settle([row("aya", payload % self.ask)]), payload)
+        self.assertEqual("claimed", card(self.conn, "chatgpt-codex-desktop", self.ask)["status"])
+        self.assertIn(self.ask, self.conn.hgetall(cb.OPEN_KEY))
 
     def test_rows_that_are_not_rows_are_passed_over(self):
         self.assertEqual([], self.settle([None, "text", [], ["only", "two"]]))
@@ -570,13 +582,16 @@ class InTheMakingAndLatency(unittest.TestCase):
 
     def test_the_agent_card_within_three_minutes_is_measured_on_time(self):
         ask = self.claim()
-        own = {"v": 1, "type": "note", "status": "working", "public": True, "version": 1,
+        own = {"v": 1, "type": "note", "status": "working", "public": True, "version": 1, "ask": ask,
                "ts": "2026-10-24T14:03:30Z", "title": "In the making: queue flow", "body": "x"}
         self.conn.hset(cp.PARTITION % ("workshop", "chatgpt-codex-desktop"), "queue-flow", json.dumps(own))
         later = NOW + datetime.timedelta(seconds=100)
         self.assertEqual([ask], bridge(self.conn, clock=lambda: later).watch(later))
         got = self.latency(ask)
-        self.assertEqual(("queue-flow", 90, True), (got["card"], got["seconds"], got["on_time"]))
+        # from HIS ask (the stream entry, 10 s before the tick) to this read-back, not from the tick
+        self.assertEqual(("queue-flow", 110, True), (got["card"], got["seconds"], got["on_time"]))
+        self.assertEqual(("2026-10-24T14:01:50Z", "2026-10-24T14:03:30Z", "2026-10-24T14:03:40Z"),
+                         (got["asked_at"], got["card_ts"], got["read_at"]))
         self.assertEqual([], bridge(self.conn, clock=lambda: later).watch(later), "kept once")
 
     def test_no_card_after_three_minutes_is_kept_once_as_late_then_measured_when_it_comes(self):
@@ -587,10 +602,10 @@ class InTheMakingAndLatency(unittest.TestCase):
         self.assertEqual([], bridge(self.conn, clock=lambda: late).watch(late), "late is kept once")
         own = {"v": 1, "type": "note", "status": "working", "public": True, "version": 1,
                "ts": "2026-10-24T14:06:00Z", "title": "In the making: queue flow", "body": "x"}
-        self.conn.hset(cp.PARTITION % ("workshop", "chatgpt-codex-desktop"), "queue-flow", json.dumps(own))
+        self.conn.hset(cp.PARTITION % ("workshop", "chatgpt-codex-desktop"), ask, json.dumps(own))
         got_at = NOW + datetime.timedelta(seconds=250)
         bridge(self.conn, clock=lambda: got_at).watch(got_at)
-        self.assertEqual(("queue-flow", 240, False), (self.latency(ask)["card"], self.latency(ask)["seconds"],
+        self.assertEqual((ask, 260, False), (self.latency(ask)["card"], self.latency(ask)["seconds"],
                                                        self.latency(ask)["on_time"]))
 
     def test_the_bridge_card_and_older_cards_are_not_the_agents_card(self):
@@ -601,6 +616,34 @@ class InTheMakingAndLatency(unittest.TestCase):
         soon = NOW + datetime.timedelta(seconds=60)
         self.assertEqual([], bridge(self.conn, clock=lambda: soon).watch(soon))
         self.assertIsNone(self.latency(ask))
+
+    def test_an_unrelated_new_card_or_another_claim_is_not_this_asks_card(self):
+        """Aya's hold on 5d41cb5, item 4: only the agent's card for THIS ask counts."""
+        ask = self.claim()
+        turn(self.conn, "Codex, list the open risks.", seconds_ago=5)
+        [other] = bridge(self.conn).tick()
+        unrelated = {"v": 1, "type": "note", "status": "working", "public": True, "version": 1,
+                     "ts": "2026-10-24T14:02:30Z", "title": "Something else", "body": "x"}
+        for_other = dict(unrelated, ask=other)
+        slot = cp.PARTITION % ("workshop", "chatgpt-codex-desktop")
+        self.conn.hset(slot, "something-else", json.dumps(unrelated))
+        self.conn.hset(slot, "risks", json.dumps(for_other))
+        soon = NOW + datetime.timedelta(seconds=60)
+        self.assertEqual([other], bridge(self.conn, clock=lambda: soon).watch(soon))
+        self.assertIsNone(self.latency(ask), "the other claim's card and an unrelated card do not count for it")
+        self.assertEqual("risks", self.latency(other)["card"])
+
+    def test_the_three_minutes_start_at_his_ask_not_at_the_tick(self):
+        """Aya's hold on 5d41cb5, item 5: an ask the bridge picked up late is late by the owner's clock."""
+        turn(self.conn, "Codex, draft the queue flow for the vans.", seconds_ago=150)
+        [ask] = bridge(self.conn).tick()
+        own = {"v": 1, "type": "note", "status": "working", "public": True, "version": 1, "ask": ask,
+               "ts": "2026-10-24T14:02:50Z", "title": "In the making: queue flow", "body": "x"}
+        self.conn.hset(cp.PARTITION % ("workshop", "chatgpt-codex-desktop"), "queue-flow", json.dumps(own))
+        later = NOW + datetime.timedelta(seconds=60)
+        bridge(self.conn, clock=lambda: later).watch(later)
+        got = self.latency(ask)
+        self.assertEqual((210, False), (got["seconds"], got["on_time"]), "60 s after the claim, 210 s after his ask")
 
 
 def board_row(spec, ts):
@@ -665,13 +708,17 @@ class Doorbell(unittest.TestCase):
         self.ringing(holds=lambda: next(calls, False)).tick()
         self.assertEqual([], self.rung)
 
-    def test_the_wake_reply_settles_the_ask(self):
+    def test_a_waker_reply_to_the_wake_row_is_not_done_but_a_result_is(self):
+        """Aya's hold on 5d41cb5, items 1 and 3: the doorbell and a waker's relayed reply are not finished work."""
         turn(self.conn, "Gemini, compare the two plans.")
         [ask] = self.ringing().tick()
         later = NOW + datetime.timedelta(minutes=4)
-        done = bridge(self.conn, clock=lambda: later).settle(
-            [row("gemini", "BCB|v=1|id=GEMINI-REPLY|from=gemini|answers=CALLBRIDGE-WAKE-%s|wakerreply=1" % ask)])
-        self.assertEqual([ask], done)
+        waker = ("BCB|v=1|id=GEMINI-REPLY|phase=RESULT|from=gemini|wakerreply=1|answers=CALLBRIDGE-WAKE-%s|"
+                 "evidence=STATED|text=REPLY: I cannot read the repo" % ask)
+        self.assertEqual([], bridge(self.conn, clock=lambda: later).settle([row("gemini", waker)]))
+        self.assertEqual("claimed", card(self.conn, "gemini", ask)["status"])
+        result = "BCB|v=1|id=GEMINI-DONE|phase=RESULT|from=gemini|answers=CALLBRIDGE-WAKE-%s|text=compared" % ask
+        self.assertEqual([ask], bridge(self.conn, clock=lambda: later).settle([row("gemini", result)]))
         self.assertEqual("done", card(self.conn, "gemini", ask)["status"])
 
     def test_every_doorbell_rings_on_it(self):
@@ -711,17 +758,16 @@ class Doorbell(unittest.TestCase):
                             NOW - datetime.timedelta(seconds=1), "codex")
         self.assertEqual(1, len(heard))
         card_at = polled + datetime.timedelta(seconds=40)                 # the agent writes its card
-        own = {"v": 1, "type": "note", "status": "working", "public": True, "version": 1,
+        own = {"v": 1, "type": "note", "status": "working", "public": True, "version": 1, "ask": ask,
                "ts": card_at.strftime("%Y-%m-%dT%H:%M:%SZ"), "title": "In the making: queue flow", "body": "x"}
         self.conn.hset(cp.PARTITION % ("workshop", "chatgpt-codex-desktop"), "queue-flow", json.dumps(own))
         tick_at = card_at + datetime.timedelta(seconds=10)
         self.assertEqual([ask], self.ringing(clock=lambda: tick_at).watch(tick_at))
         got = json.loads(self.conn.get(cb.LATENCY_KEY % ask))
         self.assertTrue(got["on_time"])
-        self.assertEqual(70, got["seconds"], "claim to card")
-        end_to_end = (card_at - said_at).total_seconds()
-        self.assertEqual(80, end_to_end)
-        self.assertLessEqual(end_to_end, cb.TARGET_SECONDS)
+        self.assertEqual(90, got["seconds"], "his ask to the card read back, poll delays inside")
+        self.assertEqual((tick_at - said_at).total_seconds(), got["seconds"])
+        self.assertLessEqual(got["seconds"], cb.TARGET_SECONDS)
 
 
 class DoorbellInTheLiveRun(unittest.TestCase):
@@ -754,6 +800,44 @@ class DoorbellInTheLiveRun(unittest.TestCase):
                                 environ={"CANVAS_BUCKET": "b", "CALL_BRIDGE": "on", "CALL_BRIDGE_RING": "on"})
             with self.assertRaises(sr.LockLost):
                 got[-1]["ring"]({"row_id": "CALLBRIDGE-WAKE-call-000000000000"})   # lock not "me": no write
+
+
+class OneAppendAtATime(unittest.TestCase):
+    """Aya's hold on 5d41cb5, item 2: append.py reads its row file from the process-global sys.argv, and the request
+    loop and the bridge's doorbell thread both append. The swap and the append are one critical section."""
+
+    def test_concurrent_appends_each_write_their_own_row(self):
+        import threading
+        import time as clock
+        import types
+        import serve_requests as sr
+        state = {"inside": 0, "most": 0}
+        wrote = []
+        guard = threading.Lock()
+
+        def main():
+            with guard:
+                state["inside"] += 1
+                state["most"] = max(state["most"], state["inside"])
+            path = sys.argv[1]
+            clock.sleep(0.02)                                            # another thread would swap argv here
+            with open(sys.argv[1], encoding="utf-8") as fh:
+                wrote.append((path == sys.argv[1], json.load(fh)["row_id"]))
+            with guard:
+                state["inside"] -= 1
+        fake = types.SimpleNamespace(main=main)
+        with mock.patch.dict(sys.modules, {"append": fake}):
+            write = sr.appender({})
+            ids = ["ROW-%d" % n for n in range(6)]
+            threads = [threading.Thread(target=write, args=({"row_id": i, "action_type": "ASK"},)) for i in ids]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        self.assertEqual(1, state["most"], "never two appends at once")
+        self.assertEqual(sorted(ids), sorted(r for _, r in wrote))
+        self.assertTrue(all(same for same, _ in wrote))
+        self.assertNotIn("append.py", sys.argv[0])
 
 
 if __name__ == "__main__":
