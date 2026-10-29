@@ -321,7 +321,10 @@ def live_with_canvas(conn, env, execution, me, until, interval, lock_ttl, start=
                 if not holds():
                     raise LockLost("gov:worker:lock is not ours; %s not written" % spec.get("row_id"))
                 return write(spec)
-        bridge = (start_bridge or call_bridge.start)(conn, log, holds, **({"ring": ring} if ring else {}))
+        # The publisher's bucket goes too: the bridge's first claim in a call opens the canvas window itself
+        # (the owner's 11:17 ET test call on 2026-10-29 had no window, so nothing read his "do it").
+        bridge = (start_bridge or call_bridge.start)(conn, log, holds, bucket=bucket,
+                                                      **({"ring": ring} if ring else {}))
         if bridge is not None:
             log.info("call bridge: on, room asks become claimed cards in conf:canvas:%s", bridge.canvas_room)
     try:

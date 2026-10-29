@@ -28,6 +28,23 @@ would have, so the two are one claim. Read from gov:callbridge:side:<room>. It n
 room (CONF_REDIS_SIDE_VOICE, CONF_REDIS_SIDE_VOICE_ROOMS); with them off there is nothing to read and this claims
 nothing.
 
+"DO IT" CONFIRMS THE ASK BEFORE IT (the owner's test call, 2026-10-29 11:17 ET, room conf-<his 16 hex>-42c62aad):
+he described the work, then told a voice to "do it"; the voice said "Got it" and no card went up. Two causes, both
+measured: (1) no canvas window was open for the room, so the live bridge never read the call at all (no cursor kept
+for that room; the last window had closed at 01:26Z); (2) "do it" names nobody and has no task word, so even a
+bridge that read it would claim nothing. Now: an owner turn that is only a go-ahead ("do it", "go ahead", "yes, do
+that", "please do", "go for it", "make it so", with "okay", "yes", "please", "now" and a voice's name around it)
+confirms the most recent ask of his in the room (gov:callbridge:pending:<room>, his last turn with words that was
+not itself a go-ahead, kept PENDING_SECONDS). It is claimed for the voice he named in the go-ahead, else the voice
+holding the floor (as a follow-up), else the voice named in the ask it confirms. The claim is made under the
+CONFIRMED ask's entry, so an ask already claimed for that agent is never claimed twice, and its three minutes run
+from the go-ahead. With no ask in reach it is still claimed for that voice, with the go-ahead as the ask.
+AND THE WINDOW OPENS ITSELF: given the publisher's bucket, the bridge reads the room streams whether or not a window
+is open, and the first claim that finds the canvas room shut opens it (canvas_publish.open_window, WINDOW_MINUTES,
+by call-bridge), so its "In the making" card is on the page seconds after the ask. Without a bucket (the old call),
+nothing changes: no window, no read. An entry older than LOOKBACK_SECONDS is never claimed, cursor or not, so a
+call that went by while the window was shut is never replayed into a new window.
+
 WHAT GOES ON THE PUBLIC CARD, AND WHAT DOES NOT. The canvas file is world-readable (canvas_publish.py), and the
 owner's words in a call never go there (his order O2, 2026-10-28; Aya's AYA-PR436-OWNERWORDS-PRIVACY-HOLD-
 20261029T0055Z). The claimed and done cards say who has the ask and when, in the bridge's own words, and nothing
@@ -89,6 +106,10 @@ RING_KEY = "gov:callbridge:ring"
 RUNG_KEY = "gov:callbridge:rung:%s"
 WAKE_PREFIX = "CALLBRIDGE-WAKE-"
 RING_MAX = 10              # rows rung per tick at most; the rest wait for the next tick
+PENDING_KEY = "gov:callbridge:pending:%s"
+PENDING_SECONDS = 10 * 60  # a go-ahead confirms an ask of his made at most this long before it
+WINDOW_MINUTES = 120       # canvas_publish.MAX_MINUTES: a window the bridge opens for a claim
+GO_WORDS = 12              # a go-ahead is a short turn; a longer one is an ask of its own
 
 # The room's voices, by the chair's persona ids, and the fleet agent each one's work goes to: the canonical ids of
 # fleet:inbox (cloud/drive-intake ALIASES, agreed 2026-10-09) and of the canvas slots (canvas_publish.AGENTS).
@@ -186,6 +207,37 @@ def follow_up(fields: dict) -> bool:
     return not any(pattern.search(said) for pattern in NAMES.values())
 
 
+# A GO-AHEAD: the whole turn is a confirmation. Fillers may come before and after; a voice's name may be anywhere.
+_FILL = r"(?:ok(?:ay)?|yes|yeah|yep|yup|sure|great|perfect|good|cool|alright|all\s+right|right|so|then|and|now|just|" \
+        r"please|thanks?|thank\s+you|sounds?\s+good|that['’]?s\s+(?:good|great|fine|it)|go|let['’]?s)"
+_GO = (r"(?:(?:please\s+)?(?:go\s+ahead(?:\s+and\s+do\s+(?:it|that|this))?|do\s+(?:it|that|this|so)|go\s+for\s+it|"
+       r"make\s+it\s+so|please\s+do|proceed|ship\s+it|run\s+with\s+it|yes\s+please|let['’]?s\s+do\s+(?:it|that)|"
+       r"start\s+(?:it|on\s+it)|get\s+(?:it|that)\s+done|you\s+can\s+do\s+(?:it|that)))")
+GO_AHEAD = re.compile(r"(?i)^(?:%s\s+)*%s(?:\s+%s)*$" % (_FILL, _GO, _FILL))
+
+
+def go_ahead(fields: dict) -> bool:
+    """An owner turn that is only a go-ahead ("do it", "go ahead", "yes, do that"), names stripped out."""
+    if fields.get("kind") != "turn.started" or fields.get("actor_id") in ("", None, "chair"):
+        return False
+    said = fields.get("utterance") or ""
+    for pattern in NAMES.values():
+        said = pattern.sub(" ", said)
+    words = re.sub(r"[^\w'’]+", " ", said).split()
+    return 0 < len(words) <= GO_WORDS and bool(GO_AHEAD.match(" ".join(words)))
+
+
+def named_in(said: str) -> list:
+    """The agents his words name, in the order he named them (possessives name nobody)."""
+    found = sorted((match.start(), AGENT_OF[persona]) for persona, pattern in NAMES.items()
+                   for match in pattern.finditer(said or ""))
+    agents = []
+    for _, agent in found:
+        if agent not in agents:
+            agents.append(agent)
+    return agents
+
+
 def refusal(fields: dict, room: str):
     """The fleet agent whose voice said, in this room, that it cannot do something, or None. A side-channel entry the
     chair wrote (by=chair) for one of the room's voices (side_lines.entry)."""
@@ -279,9 +331,11 @@ def inbox_text(ask: str, agent: str, room: str, said: str, now) -> str:
 
 
 class Bridge:
-    def __init__(self, conn, log, holds, clock=None, canvas_room=CANVAS_ROOM, ring=None):
+    def __init__(self, conn, log, holds, clock=None, canvas_room=CANVAS_ROOM, ring=None, bucket=None):
         self.conn, self.log, self.holds = conn, log, holds
         self.ring = ring
+        # The publisher's bucket: given, the bridge reads every call and opens the canvas window for its first claim.
+        self.bucket = bucket
         self.clock = clock or (lambda: datetime.datetime.now(datetime.timezone.utc))
         self.canvas_room = canvas_room
         self.stop = threading.Event()
@@ -301,7 +355,7 @@ class Bridge:
     def tick(self) -> list:
         """One pass over every conference stream. Returns the asks claimed."""
         now = self.clock()
-        if not self.window_open(now) or not self.holds():
+        if not self.holds() or (not self.bucket and not self.window_open(now)):
             return []
         claimed = []
         for room in self.streams():
@@ -407,20 +461,41 @@ class Bridge:
         for index, (entry_id, fields) in enumerate(entries):
             if entry_id == cursor:
                 continue
+            if _stale(entry_id, now):
+                # Said while nothing read the call (a shut window, a stopped run): never replayed, cursor or not.
+                self.conn.set(CURSOR_KEY % room, entry_id, ex=TTL_SECONDS)
+                continue
             if fields.get("kind") == "floor.granted" and fields.get("actor_id") in AGENT_OF:
                 self.conn.set(LAST_KEY % room, AGENT_OF[fields["actor_id"]], ex=LAST_SECONDS)
-            if (fields.get("kind") == "turn.started" and fields.get("actor_id") not in ("", None, "chair")
-                    and (fields.get("utterance") or "").strip()):
-                self.conn.set(ASKED_KEY % room, json.dumps({"entry": entry_id, "said": fields["utterance"],
-                                                             "at": stamp(now)}, sort_keys=True), ex=ASKED_SECONDS)
-            agents = asks_in(fields)
-            if not agents and follow_up(fields):
-                holder = self._holder(room, fields.get("turn_id"), entries[index + 1:])
-                agents = [holder] if holder else []
+            said = fields.get("utterance") or ""
+            confirms, asked_entry = None, None
+            if go_ahead(fields):
+                # "Do it": the ask it confirms, and who it is for (module docstring).
+                confirms = self._pending(room)
+                agents = named_in(said) or [a for a in [self._holder(room, fields.get("turn_id"),
+                                                                     entries[index + 1:])] if a]
+                if not agents and confirms:
+                    agents = named_in(confirms["said"])
+                if confirms:
+                    asked_entry = entry_id
+                    said = "%s -- then, to go ahead: %s" % (confirms["said"], said)
+                # A voice's "I can't" after a go-ahead answers the ask it confirmed: the same claim, never a second.
+                self._asked(room, confirms["entry"] if confirms else entry_id, said, now)
+            else:
+                agents = asks_in(fields)
+                if not agents and follow_up(fields):
+                    holder = self._holder(room, fields.get("turn_id"), entries[index + 1:])
+                    agents = [holder] if holder else []
+                if fields.get("kind") == "turn.started" and fields.get("actor_id") not in ("", None, "chair") \
+                        and said.strip():
+                    self._asked(room, entry_id, said, now)
+                    self.conn.set(PENDING_KEY % room, json.dumps({"entry": entry_id, "said": said}, sort_keys=True),
+                                  ex=PENDING_SECONDS)
             for agent in agents:
                 if not self.holds():
                     return claimed
-                ask = self._claim(room, entry_id, agent, fields.get("utterance") or "", now)
+                ask = self._claim(room, confirms["entry"] if confirms else entry_id, agent, said, now,
+                                  asked_entry=asked_entry)
                 if ask:
                     claimed.append(ask)
             self.conn.set(CURSOR_KEY % room, entry_id, ex=TTL_SECONDS)
@@ -446,7 +521,7 @@ class Bridge:
             if entry_id == cursor:
                 continue
             agent = refusal(_fields(raw), room)
-            if agent:
+            if agent and not _stale(entry_id, now):
                 try:
                     asked = json.loads(_text(self.conn.get(ASKED_KEY % room)) or "null")
                 except ValueError:
@@ -461,6 +536,36 @@ class Bridge:
             self.conn.set(cursor_key, entry_id, ex=TTL_SECONDS)
         return claimed
 
+    def _asked(self, room, entry_id, said, now) -> None:
+        self.conn.set(ASKED_KEY % room, json.dumps({"entry": entry_id, "said": said, "at": stamp(now)}, sort_keys=True),
+                      ex=ASKED_SECONDS)
+
+    def _pending(self, room):
+        """{entry, said}: his last ask in this room that was not a go-ahead, kept PENDING_SECONDS, or None."""
+        try:
+            held = json.loads(_text(self.conn.get(PENDING_KEY % room)) or "null")
+        except (TypeError, ValueError):
+            return None
+        if isinstance(held, dict) and held.get("entry") and isinstance(held.get("said"), str):
+            return {"entry": str(held["entry"]), "said": held["said"]}
+        return None
+
+    def open_if_shut(self, now) -> bool:
+        """The canvas room's window, opened for a claim when it is shut and the bridge has the bucket. True when it
+        is open after this. A window someone else opened first (SET NX) is theirs and is left as it is."""
+        if self.window_open(now):
+            return True
+        if not self.bucket or not self.holds():
+            return False
+        try:
+            canvas_publish.open_window(self.conn, self.canvas_room, WINDOW_MINUTES, BY, now, self.bucket)
+        except canvas_publish.Refused as refused:
+            self.log.info("call bridge: window for %s not opened (%s)", self.canvas_room, refused)
+            return self.window_open(now)
+        self.log.info("call bridge: opened the %s canvas window for %d min for a claim", self.canvas_room,
+                      WINDOW_MINUTES)
+        return True
+
     def _holder(self, room, turn_id, ahead):
         """Whose a follow-up is: the voice granted the floor for that same turn later in this page, else the last voice
         granted the floor in this room (LAST_SECONDS), else nobody."""
@@ -472,10 +577,14 @@ class Bridge:
         last = _text(self.conn.get(LAST_KEY % room))
         return last if last in NAME_OF else None
 
-    def _claim(self, room, entry_id, agent, said, now):
+    def _claim(self, room, entry_id, agent, said, now, asked_entry=None):
+        """`entry_id` names the ask (one ask, one agent); `asked_entry`, when given, is the turn its three minutes
+        run from (a go-ahead confirming an earlier ask)."""
         ask = ask_id(room, entry_id, agent)
         if not self.conn.set(ASK_KEY % ask, stamp(now), nx=True, ex=TTL_SECONDS):
             return None                                      # claimed before: never twice
+        if self.bucket:
+            self.open_if_shut(now)
         pipe = self.conn.pipeline(transaction=True)
         try:
             pipe.multi()
@@ -483,7 +592,7 @@ class Bridge:
                       json.dumps(claimed_card(agent, now), sort_keys=True))
             pipe.xadd(INBOX_KEY % agent, {"by": BY, "text": inbox_text(ask, agent, self.canvas_room, said, now),
                                           "at": stamp(now)})
-            asked = event_time(entry_id)
+            asked = event_time(asked_entry or entry_id)
             pipe.hset(OPEN_KEY, ask, json.dumps({"agent": agent, "claimed_at": stamp(now), "room": self.canvas_room,
                                                  "asked_at": asked.strftime("%Y-%m-%dT%H:%M:%S.%fZ") if asked else ""},
                                                 sort_keys=True))
@@ -561,6 +670,12 @@ class Bridge:
             self.stop.wait(interval)
 
 
+def _stale(entry_id: str, now) -> bool:
+    """An entry said more than LOOKBACK_SECONDS before `now` (its stream id's clock). Unreadable ids are not stale."""
+    said = event_time(entry_id)
+    return said is not None and (now - said).total_seconds() > LOOKBACK_SECONDS
+
+
 def _after(entry_id: str, other: str) -> bool:
     """Stream id entry_id comes after other (ms-seq, compared as numbers). Unreadable ids are never after."""
     try:
@@ -584,12 +699,12 @@ def _field(payload, name):
     return bus_request.field(payload, name)
 
 
-def start(conn, log, holds, ring=None):
+def start(conn, log, holds, ring=None, bucket=None):
     """The bridge on its own thread, or None without a way to ask for the lease. `ring`: the doorbell's board append
-    (one row spec), or None for no doorbell."""
+    (one row spec), or None for no doorbell. `bucket`: the publisher's, so a claim can open the canvas window."""
     if holds is None:
         return None
-    bridge = Bridge(conn, log, holds, ring=ring)
+    bridge = Bridge(conn, log, holds, ring=ring, bucket=bucket)
     thread = threading.Thread(target=bridge.run, name="call-bridge", daemon=True)
     thread.start()
     bridge.thread = thread

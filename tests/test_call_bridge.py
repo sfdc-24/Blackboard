@@ -510,13 +510,15 @@ class InTheLiveRun(unittest.TestCase):
                 self.settle = lambda rows: events.append(("settle", rows))
 
         start = lambda conn, bucket, log, holds: Worker("publisher") if bucket else None     # noqa: E731
-        start_bridge = lambda conn, log, holds: Worker("bridge")                             # noqa: E731
+        handed = []
+        start_bridge = lambda conn, log, holds, **kw: handed.append(kw) or Worker("bridge")  # noqa: E731
         seen = []
         live = lambda *a: seen.append(a[7] if len(a) > 7 else None) or 0                    # noqa: E731
         with mock.patch.object(sr, "live", side_effect=live):
             sr.live_with_canvas(None, {}, "", "me", NOW, 10, 300, start=start, start_bridge=start_bridge,
                                 environ={"CANVAS_BUCKET": "sfdc24-canvas", "CALL_BRIDGE": "on"})
             self.assertIsNotNone(seen[-1])
+            self.assertEqual("sfdc24-canvas", handed[-1].get("bucket"), "the bridge gets the publisher's bucket")
             seen[-1](["row"])
             self.assertIn(("settle", ["row"]), events)
             self.assertIn(("stop", "bridge"), events)
@@ -838,6 +840,157 @@ class OneAppendAtATime(unittest.TestCase):
         self.assertEqual(sorted(ids), sorted(r for _, r in wrote))
         self.assertTrue(all(same for same, _ in wrote))
         self.assertNotIn("append.py", sys.argv[0])
+
+
+
+
+class GoAheadAt1117(unittest.TestCase):
+    """The owner's test call, 2026-10-29 11:17 ET (room conf-<his 16 hex>-42c62aad): he set out the work, told the voice
+    to "do it", the voice said "Got it", and no card went up. No canvas window was open, so the bridge never read the
+    call; and "do it" names nobody and has no task word. Now a go-ahead confirms his last ask, and the bridge opens
+    the window for its claim, so the "In the making" card is up seconds after "do it"."""
+    WORK = "The firm files its returns in one desktop tool; the hard part is pulling the year-end numbers out of it."
+
+    def setUp(self):
+        self.conn = FakeRedis()
+
+    def granted(self, persona, turn_id, seconds_ago):
+        return turn(self.conn, None, reason="", actor=persona, seconds_ago=seconds_ago, kind="floor.granted",
+                    turn_id=turn_id)
+
+    def opened(self, b=None):
+        return b or cb.Bridge(self.conn, LOG, lambda: True, clock=lambda: NOW, bucket="sfdc24-canvas")
+
+    def test_what_is_a_go_ahead(self):
+        f = {"kind": "turn.started", "actor_id": "owner-1", "reason": "continuity"}
+        for said in ("do it", "Do it.", "Gemini, do it.", "Okay, go ahead.", "Yes, do that please.", "go for it",
+                     "Yes please.", "Please do.", "OK Gemini, go ahead and do it now.", "Make it so."):
+            self.assertTrue(cb.go_ahead(dict(f, utterance=said)), said)
+        for said in ("What do you think?", "I did it already.", "Do you have it?", "", "Don't do it.",
+                     "Do it in red and add a legend, then post it to the page and tell me when it is done please"):
+            self.assertFalse(cb.go_ahead(dict(f, utterance=said)), said)
+        self.assertFalse(cb.go_ahead(dict(f, utterance="do it", actor_id="chair")))
+        self.assertFalse(cb.go_ahead(dict(f, utterance="do it", kind="floor.granted")))
+
+    def test_the_1117_case_do_it_to_the_voice_holding_the_floor_puts_its_card_up_with_no_window_open(self):
+        self.granted("gemini", "t-1", seconds_ago=60)
+        turn(self.conn, self.WORK, reason="continuity", seconds_ago=50, turn_id="t-2")   # no task word, no name
+        self.granted("gemini", "t-2", seconds_ago=48)
+        go = turn(self.conn, "Gemini, do it.", reason="vocative", seconds_ago=20, turn_id="t-3")
+        self.granted("gemini", "t-3", seconds_ago=18)
+        self.assertEqual([], cp.active_windows(self.conn, NOW), "as on the call: no window open")
+        [ask] = self.opened().tick()
+        got = card(self.conn, "gemini", ask)
+        self.assertEqual(("claimed", "In the making: Gemini's work from the room"), (got["status"], got["title"]))
+        self.assertEqual(["workshop"], [room for room, _ in cp.active_windows(self.conn, NOW)], "the window opened")
+        self.assertEqual("call-bridge", cp.read_window(self.conn, "workshop")["by"])
+        self.assertIn("gemini/" + ask, [item["id"] for item in cp.snapshot(self.conn, "workshop", NOW)["items"]],
+                      "the card is in what the publisher puts on the page")
+        [(_, entry)] = self.conn.streams["fleet:inbox:gemini"]
+        self.assertIn("year-end numbers", entry["text"], "the agent gets the ask he confirmed")
+        self.assertIn("do it", entry["text"])
+        opened = json.loads(self.conn.hgetall(cb.OPEN_KEY)[ask])
+        self.assertEqual(cb.event_time(go).strftime("%Y-%m-%dT%H:%M:%S.%fZ"), opened["asked_at"],
+                         "its three minutes run from the go-ahead")
+
+    def test_no_word_of_his_on_the_public_card_or_the_page(self):
+        said = "Gemini, map the client's Port-au-Prince stores for Marie Dupont."
+        turn(self.conn, "Map the Port-au-Prince stores for Marie Dupont, the client's buyer.", reason="continuity",
+             seconds_ago=40, turn_id="t-1")
+        turn(self.conn, "Gemini, do it.", seconds_ago=20, turn_id="t-2")
+        [ask] = self.opened().tick()
+        published = json.dumps(cp.snapshot(self.conn, "workshop", NOW)) + json.dumps(card(self.conn, "gemini", ask))
+        for word in ("Port", "Prince", "Marie", "Dupont", "client", "buyer", "stores", "Map", "do it"):
+            self.assertNotIn(word, published, word)
+        self.assertNotIn("said", self.conn.hgetall(cb.OPEN_KEY)[ask])
+        self.assertIn("Dupont", self.conn.streams["fleet:inbox:gemini"][0][1]["text"], "every word, in Redis only")
+        del said
+
+    def test_go_ahead_names_nobody_then_the_floor_holder_then_who_the_ask_named(self):
+        turn(self.conn, "Codex, here is the flow I mean.", reason="vocative", seconds_ago=40, turn_id="t-1")
+        turn(self.conn, "Go ahead.", reason="continuity", seconds_ago=20, turn_id="t-2")
+        [ask] = self.opened().tick()
+        self.assertIsNotNone(card(self.conn, "chatgpt-codex-desktop", ask), "nobody holding: the voice his ask named")
+        conn2 = FakeRedis()
+        self.conn = conn2
+        self.granted("grok", "t-1", seconds_ago=45)
+        turn(conn2, "Codex, here is the flow I mean.", reason="vocative", seconds_ago=40, turn_id="t-1")
+        turn(conn2, "Do it.", reason="continuity", seconds_ago=20, turn_id="t-2")
+        self.granted("grok", "t-2", seconds_ago=18)
+        [ask] = self.opened().tick()
+        self.assertIsNotNone(card(conn2, "grok", ask), "the voice holding the floor for the go-ahead takes it")
+
+    def test_a_go_ahead_for_an_ask_already_claimed_is_the_same_claim(self):
+        turn(self.conn, "Gemini, draw the five boxes.", seconds_ago=40, turn_id="t-1")
+        turn(self.conn, "Gemini, do it.", seconds_ago=20, turn_id="t-2")
+        asks = self.opened().tick()
+        self.assertEqual(1, len(asks))
+        self.assertEqual(1, len(self.conn.streams["fleet:inbox:gemini"]))
+        self.assertEqual(1, len(self.conn.hashes[cp.PARTITION % ("workshop", "gemini")]))
+
+    def test_a_refusal_after_the_go_ahead_is_the_same_claim_never_a_second(self):
+        side = cb.SIDE_KEY % NOW.strftime("%Y%m%d")
+        turn(self.conn, self.WORK, reason="continuity", seconds_ago=50, turn_id="t-1")
+        turn(self.conn, "Gemini, do it.", seconds_ago=20, turn_id="t-2")
+        self.conn.xadd(side, {"by": "chair", "voice": "gemini", "room": ROOM, "text": "I can't do that from here."},
+                       entry_id=at(15))
+        asks = self.opened().tick()
+        self.assertEqual(1, len(asks))
+        self.assertEqual(1, len(self.conn.hashes[cp.PARTITION % ("workshop", "gemini")]))
+
+    def test_a_go_ahead_with_no_ask_in_reach_still_puts_the_holders_card_up(self):
+        self.granted("gemini", "t-1", seconds_ago=30)
+        turn(self.conn, "Do it.", reason="continuity", seconds_ago=20, turn_id="t-2")
+        [ask] = self.opened().tick()
+        self.assertEqual("claimed", card(self.conn, "gemini", ask)["status"])
+        self.assertIn("Do it", self.conn.streams["fleet:inbox:gemini"][0][1]["text"])
+
+    def test_a_go_ahead_with_nobody_to_give_it_to_claims_nothing_and_opens_nothing(self):
+        turn(self.conn, "Do it.", reason="continuity", seconds_ago=20, turn_id="t-2")
+        self.assertEqual([], self.opened().tick())
+        self.assertEqual([], cp.active_windows(self.conn, NOW))
+
+    def test_an_ask_older_than_the_pending_reach_is_not_confirmed(self):
+        turn(self.conn, "Codex, here is the flow I mean.", seconds_ago=40, turn_id="t-1")
+        self.opened().tick()
+        self.conn.store.pop(cb.PENDING_KEY % ROOM)                              # its TTL ran out
+        turn(self.conn, "Go ahead.", reason="continuity", seconds_ago=5, turn_id="t-2")
+        self.assertEqual([], self.opened().tick())
+
+    def test_without_the_bucket_nothing_changes_no_window_no_read(self):
+        turn(self.conn, "Gemini, draw the five boxes.", seconds_ago=20)
+        self.assertEqual([], bridge(self.conn).tick())
+        self.assertEqual([], cp.active_windows(self.conn, NOW))
+        self.assertNotIn("fleet:inbox:gemini", self.conn.streams)
+
+    def test_a_window_someone_opened_is_kept_as_it_is(self):
+        open_window(self.conn, minutes=30)
+        before = self.conn.get(cp.WINDOW_PREFIX + "workshop")
+        turn(self.conn, "Gemini, draw the five boxes.", seconds_ago=20)
+        self.assertEqual(1, len(self.opened().tick()))
+        self.assertEqual(before, self.conn.get(cp.WINDOW_PREFIX + "workshop"))
+
+    def test_no_window_is_opened_without_the_lease(self):
+        turn(self.conn, "Gemini, draw the five boxes.", seconds_ago=20)
+        b = cb.Bridge(self.conn, LOG, lambda: False, clock=lambda: NOW, bucket="sfdc24-canvas")
+        self.assertEqual([], b.tick())
+        self.assertEqual([], cp.active_windows(self.conn, NOW))
+
+    def test_a_call_that_went_by_while_nothing_read_it_is_never_replayed(self):
+        self.conn.set(cb.CURSOR_KEY % ROOM, at(3600))                          # read an hour ago, then shut
+        turn(self.conn, "Gemini, draw the five boxes.", seconds_ago=cb.LOOKBACK_SECONDS + 30)
+        self.assertEqual([], self.opened().tick())
+        self.assertEqual([], cp.active_windows(self.conn, NOW))
+        turn(self.conn, "Gemini, do it.", seconds_ago=5)
+        [ask] = self.opened().tick()
+        self.assertIn("Gemini, do it", self.conn.streams["fleet:inbox:gemini"][0][1]["text"],
+                      "the old ask is not what a go-ahead confirms")
+
+    def test_its_new_keys_are_under_gov_and_expire(self):
+        turn(self.conn, self.WORK, reason="continuity", seconds_ago=50, turn_id="t-1")
+        self.opened().tick()
+        self.assertTrue((cb.PENDING_KEY % ROOM).startswith("gov:"))
+        self.assertEqual(cb.PENDING_SECONDS, self.conn.ttls[cb.PENDING_KEY % ROOM])
 
 
 if __name__ == "__main__":
