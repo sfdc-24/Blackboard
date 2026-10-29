@@ -793,6 +793,61 @@ class HisCalls(unittest.TestCase):
         self.assertEqual(self.pub.calls(), "open")
         self.assertEqual(self.conn.store[cp.window_key(cp.CALL_ROOM)], before)
 
+    def newer_stop_after_the_read(self):
+        """The first read of the stop marker returns what is there; a newer stop lands right after it."""
+        real, fired = self.conn.get, []
+
+        def get(key):
+            value = real(key)
+            if key == cp.CALL_STOP_KEY and not fired:
+                fired.append(1)
+                self.conn.store[cp.CALL_STOP_KEY] = json.dumps({"by": "owner", "at": "newer"})
+            return value
+        return mock.patch.object(self.conn, "get", side_effect=get)
+
+    def test_a_newer_stop_landing_before_the_old_one_is_spent_is_kept_and_nothing_opens(self):
+        call_state(self.conn)
+        self.pub.calls()
+        cp.open_window(self.conn, cp.CALL_ROOM, "0", "owner", self.t["now"], "sfdc24-canvas")
+        call_state(self.conn, at=self.t["now"] + datetime.timedelta(seconds=15))
+        self.assertEqual(self.round(), "stopped")                      # bound to HIS_ROOM
+        call_state(self.conn, closed=True)
+        call_state(self.conn, room=FAMILY + "-0000ffff", at=self.t["now"] + datetime.timedelta(seconds=15))
+        with self.newer_stop_after_the_read():
+            self.assertEqual(self.round(), "stopped")
+        self.assertIsNone(self.window(), "the round that met a newer stop does not open")
+        self.assertEqual(cp._json_of(self.conn.store[cp.CALL_STOP_KEY])["at"], "newer", "the newer stop is kept")
+        self.assertEqual(self.round(), "stopped", "and it then holds the call it is bound to")
+        self.assertEqual(cp._json_of(self.conn.store[cp.CALL_STOP_KEY])["call"], FAMILY + "-0000ffff")
+
+    def test_a_newer_stop_landing_before_a_spent_stop_is_cleared_with_no_call_is_kept(self):
+        cp.open_window(self.conn, cp.CALL_ROOM, "0", "owner", NOW, "sfdc24-canvas")
+        with self.newer_stop_after_the_read():
+            self.assertEqual(self.pub.calls(), "idle")
+        self.assertEqual(cp._json_of(self.conn.store[cp.CALL_STOP_KEY])["at"], "newer")
+
+    def test_a_newer_stop_landing_before_the_bind_is_not_overwritten(self):
+        call_state(self.conn)
+        cp.open_window(self.conn, cp.CALL_ROOM, "0", "owner", NOW, "sfdc24-canvas")
+        with self.newer_stop_after_the_read():
+            self.assertEqual(self.pub.calls(), "stopped")
+        held = cp._json_of(self.conn.store[cp.CALL_STOP_KEY])
+        self.assertEqual(held["at"], "newer")
+        self.assertNotIn("call", held, "bound on a later round, from what is there then")
+        self.assertIsNone(self.window())
+
+    def test_a_stop_not_confirmed_removed_keeps_the_round_from_opening(self):
+        call_state(self.conn)
+        self.pub.calls()
+        cp.open_window(self.conn, cp.CALL_ROOM, "0", "owner", self.t["now"], "sfdc24-canvas")
+        call_state(self.conn, at=self.t["now"] + datetime.timedelta(seconds=15))
+        self.round()
+        call_state(self.conn, closed=True)
+        call_state(self.conn, room=FAMILY + "-0000ffff", at=self.t["now"] + datetime.timedelta(seconds=15))
+        self.conn.race = lambda: self.conn.store.__setitem__(cp.LEASE_KEY, "bus-requests-other")
+        self.assertEqual(self.round(), "stopped")
+        self.assertIsNone(self.window())
+
     def test_a_stop_only_of_the_page_room_is_remembered(self):
         cp.open_window(self.conn, "demo", "0", "owner", NOW, "sfdc24-canvas")
         self.assertNotIn(cp.CALL_STOP_KEY, self.conn.store)

@@ -447,16 +447,24 @@ def keep_call_window(conn, family: str, now, bucket: str, fence) -> str:
     yes, so a lease that moves before EXEC writes nothing (Aya on 0fde974: a lease lost during the scan, and
     a stopped publisher, still opened the window)."""
     live = live_call(conn, family, now)
-    stop = _json_of(conn.get(CALL_STOP_KEY))
+    seen = conn.get(CALL_STOP_KEY)
+    stop = _json_of(seen)
     if stop is not None:
+        # THE MARKER IS CHANGED ONLY AS IT WAS READ (Aya on 73c049f: a newer stop landing between this read and
+        # the WATCH was deleted, and the same round opened). Under the WATCH it must still be `seen`; a newer
+        # one is kept as it is, and this round neither opens nor closes.
+        def unchanged(pipe):
+            return pipe.get(CALL_STOP_KEY) == seen
         if not live or (stop.get("call") and stop["call"] != live):
-            _fenced(conn, fence, (CALL_STOP_KEY,), lambda pipe: [("delete", CALL_STOP_KEY)])
-            if live:
-                stop = None                  # a new call: the old stop is spent
+            spent = _fenced(conn, fence, (CALL_STOP_KEY,), lambda pipe: (
+                [("delete", CALL_STOP_KEY)] if unchanged(pipe) else None))
+            if not spent:
+                return "stopped" if live else "idle"
+            stop = None                      # removed, confirmed: the old stop is spent
         elif not stop.get("call"):
-            bound = dict(stop, call=live)
-            _fenced(conn, fence, (CALL_STOP_KEY,), lambda pipe: [
-                ("set", CALL_STOP_KEY, json.dumps(bound, sort_keys=True), CALL_STOP_SECONDS, False)])
+            bound = json.dumps(dict(stop, call=live), sort_keys=True)
+            _fenced(conn, fence, (CALL_STOP_KEY,), lambda pipe: (
+                [("set", CALL_STOP_KEY, bound, CALL_STOP_SECONDS, False)] if unchanged(pipe) else None))
     if live and stop is not None:
         _drop_ours(conn, fence)              # never ours to keep open past someone's stop
         return "stopped"
