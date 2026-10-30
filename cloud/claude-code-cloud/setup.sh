@@ -1,0 +1,404 @@
+#!/usr/bin/env bash
+# Stage C1 infrastructure for the Console route (Blackboard #306): a DRAFT that prints every command by default.
+#
+#   bash cloud/claude-code-cloud/setup.sh            # DRY RUN: reads, prints the plan, changes nothing
+#   CCC_OWNER_GO=<board Row_ID> CCC_CURSOR_GO_SHA=<40-hex commit> \
+#     CCC_BROKER_TAG=<40-hex SHA> CCC_JOB_TAG=<40-hex SHA> bash cloud/claude-code-cloud/setup.sh --apply
+#
+# --apply refuses, before any cloud call, unless:
+#   - CCC_OWNER_GO names the owner's GO row for this stage (where he confirms Codex's AGREE on #306 and his Console
+#     key, which this script cannot check);
+#   - CCC_CURSOR_GO_SHA is the full commit Cursor gave an exact-head GO, it is this checkout's HEAD, and this script
+#     is unmodified from it (#306: an exact-head GO on every code PR before deployment).
+# Then every read runs before the first change (create-or-refuse): each resource this script creates must be ABSENT;
+# each secret it grants on (ANTHROPIC_API_KEY_CLOUD, which the owner creates with its value first, BUS_URL and
+# BUS_SECRET) must be PRESENT with an enabled latest version; both images must be tagged with a full commit SHA and
+# pushed (CCC_BROKER_TAG, CCC_JOB_TAG: the merged main SHA each was built from); the project number must resolve (it
+# names the broker's URL); and board-watcher's identity must resolve. Anything else -
+# present, missing, or a read that fails for another reason - refuses with nothing changed. So a rerun after a
+# partial apply refuses too: the owner looks at what exists before anything more is created. Nothing here deletes,
+# and no existing runtime is modified. Changes to existing resources: a reader added on each of the three secrets,
+# and one conditional binding (datastore.user, ccc-receipts only) added to the project's IAM policy. The receipts
+# live in a new ccc-receipts database, not a collection in the existing (default) one as #306 rev 5 says: see the
+# README. C2 resources
+# (the GitHub App keys' readers) are listed but NOT applied in C1.
+set -euo pipefail
+# gcloud never asks anything here. A prompt answered during a dry run could change the project (a describe of a
+# disabled API offers to enable it and retry), so every prompt takes its default and API enablement is never offered
+# (Copilot on d3ec70d). A disabled API then reads as UNKNOWN, and the preflight refuses.
+export CLOUDSDK_CORE_DISABLE_PROMPTS=1 CLOUDSDK_CORE_SHOULD_PROMPT_TO_ENABLE_API=false
+
+PROJECT="${CCC_PROJECT:-sfdc24}"
+REGION="${CCC_REGION:-us-central1}"
+JOB_SA="claude-code-cloud@${PROJECT}.iam.gserviceaccount.com"
+BROKER_SA="ccc-broker@${PROJECT}.iam.gserviceaccount.com"
+REG="${REGION}-docker.pkg.dev/${PROJECT}/cloud-run-source-deploy"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+APPLY=0
+PRINT_FROM=1
+require_reviewed() {   # require_reviewed <mode>: the owner's GO, Cursor's exact-head GO, and this script unedited
+  if [ -z "${CCC_OWNER_GO:-}" ]; then
+    echo "REFUSED: $1 needs CCC_OWNER_GO=<the owner's GO Row_ID for Stage C1>; nothing was changed." >&2
+    exit 2
+  fi
+  if ! [[ "${CCC_CURSOR_GO_SHA:-}" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "REFUSED: $1 needs CCC_CURSOR_GO_SHA=<the full commit Cursor gave GO>; nothing was changed." >&2
+    exit 2
+  fi
+  HEAD_SHA="$(git -C "$HERE" rev-parse HEAD 2>/dev/null || true)"
+  if [ "$HEAD_SHA" != "$CCC_CURSOR_GO_SHA" ]; then
+    echo "REFUSED: this checkout is at ${HEAD_SHA:-no commit}, not Cursor's GO ${CCC_CURSOR_GO_SHA}; nothing was changed." >&2
+    exit 2
+  fi
+  if ! git -C "$HERE" diff --quiet HEAD -- "$HERE/setup.sh"; then
+    echo "REFUSED: setup.sh differs from ${CCC_CURSOR_GO_SHA}, the commit Cursor reviewed; nothing was changed." >&2
+    exit 2
+  fi
+}
+if [ "${1:-}" = "--print-from" ]; then
+  # After a failed apply: print step N and every step after it, in order, and change nothing (Codex P1 and Copilot on
+  # 5a98651). The owner checks the failed resource first, then runs these by hand.
+  if ! [[ "${2:-}" =~ ^[1-9][0-9]*$ ]]; then echo "usage: setup.sh --print-from <step number>" >&2; exit 2; fi
+  # The printed commands are only right with the same inputs as the apply: a bare --print-from would print :UNSET
+  # images and the default project (Codex P1 on 27e1f5a). failed_at prints the full line to run.
+  if ! [[ "${CCC_BROKER_TAG:-}" =~ ^[0-9a-f]{40}$ && "${CCC_JOB_TAG:-}" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "REFUSED: --print-from needs the same CCC_BROKER_TAG and CCC_JOB_TAG (and CCC_PROJECT, CCC_REGION if set) as the apply; use the exact line the failed apply printed." >&2
+    exit 2
+  fi
+  # The continuation is part of the apply: it prints only from the reviewed, unedited script (Copilot on c439e16).
+  require_reviewed --print-from
+  PRINT_FROM="$2"
+elif [ "${1:-}" = "--apply" ]; then
+  require_reviewed --apply
+  APPLY=1
+elif [ -n "${1:-}" ]; then
+  echo "usage: setup.sh [--apply | --print-from <step>]" >&2
+  exit 2
+fi
+
+echo "Stage C1, project ${PROJECT}, region ${REGION}. $([ "$APPLY" = 1 ] && echo "APPLYING under GO ${CCC_OWNER_GO} at ${CCC_CURSOR_GO_SHA}" || echo "DRY RUN: nothing is changed")"
+
+# 0. Every read, before any change.
+state() {   # state <describe command...>: PRESENT, ABSENT (gcloud itself said not found) or UNKNOWN
+  local err
+  if err="$("$@" 2>&1 >/dev/null)"; then
+    echo PRESENT
+  elif grep -q '(gcloud\.' <<<"$err" && grep -qiE 'NOT_FOUND|not found|could not be found|cannot find|does not exist' <<<"$err"; then
+    echo ABSENT
+  else
+    echo UNKNOWN
+  fi
+}
+ready_state() {   # ready_state <describe command...>: the Ready condition's status (True, False, Unknown) or UNREAD
+  local out types="" statuses="" i
+  local -a t s
+  out="$("$@" --format='value(status.conditions[].type,status.conditions[].status)' 2>/dev/null)" || { echo UNREAD; return 0; }
+  IFS=$'\t' read -r types statuses <<<"${out//$'\r'/}" || true
+  IFS=';' read -ra t <<<"$types"
+  IFS=';' read -ra s <<<"$statuses"
+  for i in "${!t[@]}"; do
+    if [ "${t[$i]}" = Ready ]; then
+      case "${s[$i]:-}" in True|False|Unknown) echo "${s[$i]}" ;; *) echo UNREAD ;; esac
+      return 0
+    fi
+  done
+  echo UNREAD
+}
+PROBLEMS=()
+expect() {  # expect <ABSENT|PRESENT> <what> <describe command...>
+  local want="$1" what="$2"; shift 2
+  local got
+  got="$(state "$@")"
+  echo "READ: ${what}: ${got} (needs ${want})"
+  [ "$got" = "$want" ] || PROBLEMS+=("${what} is ${got}, needs ${want}")
+}
+expect ABSENT "service account claude-code-cloud" gcloud iam service-accounts describe "$JOB_SA" --project "$PROJECT"
+expect ABSENT "service account ccc-broker" gcloud iam service-accounts describe "$BROKER_SA" --project "$PROJECT"
+# Each secret a runtime binds as :latest must already hold an enabled version: Cloud Run checks it at deploy time
+# (Copilot on 21ff80e). The owner creates ANTHROPIC_API_KEY_CLOUD with its value first; only the version's state is
+# read here, never a value.
+for s in ANTHROPIC_API_KEY_CLOUD BUS_URL BUS_SECRET; do
+  expect PRESENT "secret ${s}" gcloud secrets describe "$s" --project "$PROJECT"
+  version="$(gcloud secrets versions describe latest --secret "$s" --project "$PROJECT" --format='value(state)' 2>/dev/null || true)"
+  echo "READ: secret ${s} latest version: ${version:-none}"
+  [ "$version" = "ENABLED" ] || PROBLEMS+=("secret ${s} has no enabled latest version (read: '${version}')")
+done
+expect ABSENT "Firestore database ccc-receipts" gcloud firestore databases describe --database ccc-receipts --project "$PROJECT"
+expect ABSENT "Cloud Run service ccc-broker" gcloud run services describe ccc-broker --project "$PROJECT" --region "$REGION"
+expect ABSENT "Cloud Run job claude-code-cloud" gcloud run jobs describe claude-code-cloud --project "$PROJECT" --region "$REGION"
+# The job is told the broker's URL when it is created (Copilot on 80d4820): Cloud Run injects no other service's URL,
+# and the job's account has no role that could look it up. A service's deterministic URL is
+# https://<service>-<project number>.<region>.run.app, and the job uses it as its ID-token audience too.
+PROJECT_NUMBER="$(gcloud projects describe "$PROJECT" --format='value(projectNumber)' 2>/dev/null || true)"
+if [[ "$PROJECT_NUMBER" =~ ^[0-9]+$ ]]; then
+  BROKER_URL="https://ccc-broker-${PROJECT_NUMBER}.${REGION}.run.app"
+  echo "READ: project ${PROJECT} is number ${PROJECT_NUMBER}; the broker will be ${BROKER_URL}"
+else
+  PROBLEMS+=("project ${PROJECT}'s number did not resolve (read: '${PROJECT_NUMBER}')")
+  BROKER_URL="<broker URL: project number unresolved>"
+fi
+# board-watcher's identity is read live, because the service-account plan may have moved it to its own account.
+WATCHER_SA="$(gcloud run jobs describe board-watcher --project "$PROJECT" --region "$REGION" \
+  --format='value(spec.template.spec.template.spec.serviceAccountName)' 2>/dev/null || true)"
+SA_SHAPE='^[a-z0-9-]+@[a-z0-9-]+\.iam\.gserviceaccount\.com$|^[0-9]+-compute@developer\.gserviceaccount\.com$'
+if [[ "$WATCHER_SA" =~ $SA_SHAPE ]]; then
+  echo "READ: board-watcher runs as ${WATCHER_SA}"
+else
+  PROBLEMS+=("board-watcher's identity did not resolve (read: '${WATCHER_SA}')")
+  WATCHER_SA="<board-watcher identity: unresolved>"
+fi
+# Both images must be tagged with a full commit SHA and already pushed (Codex P1 on 21ff80e: an UNSET tag failed the
+# deploy only after the accounts, secret and database were created; Codex and Cursor on 80d4820: `latest`, `v1` or an
+# older release must not pass). The shape rejects every non-SHA tag; it does not prove the SHA is on main.
+TAG_SHAPE='^[0-9a-f]{40}$'
+for image in "ccc-broker CCC_BROKER_TAG" "claude-code-cloud CCC_JOB_TAG"; do
+  name="${image% *}"; var="${image#* }"; tag="${!var:-}"
+  if [[ "$tag" =~ $TAG_SHAPE ]]; then
+    expect PRESENT "image ${name}:${tag}" gcloud artifacts docker images describe "${REG}/${name}:${tag}"
+  else
+    echo "READ: image ${name}: no valid tag in ${var}"
+    PROBLEMS+=("image ${name} has no full commit SHA tag: set ${var} to the 40-hex merged main SHA it was built from")
+  fi
+done
+if [ "${#PROBLEMS[@]}" -gt 0 ]; then
+  for p in "${PROBLEMS[@]}"; do echo "PREFLIGHT: $p" >&2; done
+  if [ "$APPLY" = 1 ]; then
+    echo "REFUSED: the preflight reads do not match a clean C1 start; nothing was changed." >&2
+    exit 3
+  fi
+  echo "DRY RUN: --apply would REFUSE on the preflight above." >&2
+fi
+
+# Every step is numbered in order, so a failed apply can say exactly where it stopped and print the rest.
+STEP_N=0
+quoted() {   # the argv, shell-quoted, so a printed command runs exactly as written (Codex P1, Copilot on 27e1f5a)
+  local out="" a
+  for a in "$@"; do out+="$(printf '%q' "$a") "; done
+  printf '%s' "${out% }"
+}
+recovery_line() {   # recovery_line <first step>: the --print-from command, with every input the apply was given
+  printf 'CCC_OWNER_GO=%s CCC_CURSOR_GO_SHA=%s CCC_PROJECT=%s CCC_REGION=%s CCC_BROKER_TAG=%s CCC_JOB_TAG=%s bash cloud/claude-code-cloud/setup.sh --print-from %s' \
+    "$(quoted "${CCC_OWNER_GO:-}")" "$(quoted "${CCC_CURSOR_GO_SHA:-}")" "$(quoted "$PROJECT")" "$(quoted "$REGION")" \
+    "$(quoted "${CCC_BROKER_TAG:-}")" "$(quoted "${CCC_JOB_TAG:-}")" "$1"
+}
+CUR_DEPLOY=0
+CUR_JOB=0
+CUR_PROBE=()
+CUR_REPAIR=()
+failed_at() {   # failed_at <description> <how to check it> [<step to continue from> <why>]
+  local from="${3:-$STEP_N}"
+  echo "FAILED at step ${STEP_N}: $1. Steps 1 to $((STEP_N - 1)) are applied; nothing after this one ran." >&2
+  if [ "$CUR_JOB" = 1 ]; then
+    # Existence is not readiness (Codex P1 on d3ec70d). A create refused while IAM propagates can leave a job whose
+    # Ready condition is False, and binding the watcher to it would leave a job no run can use. So every failure of the
+    # job create is described again here, and the job counts as created only when it reads Ready True. One that
+    # exists but is not ready is repaired with `run jobs update` and the same flags, then read again, before step N+1.
+    local got ready="n/a"
+    got="$(state "${CUR_PROBE[@]}")"
+    [ "$got" != PRESENT ] || ready="$(ready_state "${CUR_PROBE[@]}")"
+    echo "A describe of the job now reads: ${got}, Ready ${ready}." >&2
+    case "$got/$ready" in
+      PRESENT/True)
+        from=$((STEP_N + 1))
+        echo "${4:-The job exists and is ready, so step ${STEP_N} is not repeated.} Check it: $2" >&2 ;;
+      PRESENT/*)
+        # No continuation is printed here (Cursor NO-GO and Codex on f3c65f9): the next step binds the watcher to
+        # this job, and a recovery line for it would be run. Recovery stays on the repair. --print-from for a
+        # later step reads the job again itself and refuses until it is Ready True.
+        echo "The job exists but is not ready, so it is not done being created, and step ${STEP_N} is not repeated: a create would fail on the existing job. Once the grants are effective, repair it with:" >&2
+        echo "  $(quoted "${CUR_REPAIR[@]}")" >&2
+        echo "Then describe it again: $2 --format='value(status.conditions[].type,status.conditions[].status)'" >&2
+        echo "Nothing after step ${STEP_N} is printed until that reads Ready True. If it still does not after the repair, stop and read its condition's message. Once it does, ask this script for the steps after ${STEP_N} with the same inputs as this apply: it reads the job again and refuses while it is not Ready True." >&2
+        exit 1 ;;
+      ABSENT/*)
+        from="$STEP_N"
+        echo "The job does not exist, so step ${STEP_N} itself is run again once the grants are effective. Check it: $2" >&2 ;;
+      *)
+        from="$STEP_N"
+        echo "Whether the job exists could not be read, so nothing is assumed. Check it first: $2. If it exists and reads Ready True, start from step $((STEP_N + 1)) instead; if it exists and is not ready, repair it with \`$(quoted "${CUR_REPAIR[@]}")\` first. Never run a create twice." >&2 ;;
+    esac
+  elif [ "$CUR_DEPLOY" = 1 ]; then
+    # Every failure of the broker deploy, on any path (waits exhausted, a non-IAM error), is described and points back
+    # to the deploy itself: a failed deploy can leave the service without a ready revision, so "already applied, go
+    # on" would skip it (Cursor NO-GO on 75cd35a).
+    from="$STEP_N"
+    echo "The deploy failed. A describe of the service now reads: $(state "${CUR_PROBE[@]}"). A failed deploy can leave the service without a ready revision. Once the grants are effective, re-run this step: \`run deploy\` updates an existing service. Do not go on to the invoker binding until the describe shows a ready revision. Check it: $2" >&2
+  elif [ -n "${4:-}" ]; then
+    echo "$4 Check it: $2" >&2
+  else
+    echo "The server may or may not have applied step ${STEP_N}. Check it first: $2" >&2
+    echo "If the check shows step ${STEP_N} already applied, start from step $((STEP_N + 1)) instead; never run a create twice." >&2
+  fi
+  echo "Then finish in order with the commands this prints (step ${from} onward):" >&2
+  echo "  $(recovery_line "$from")" >&2
+  exit 1
+}
+
+step() {   # step <description> <how to check it> -- <command...>   (runs once; never retried)
+  local what="$1" check="$2"; shift 3
+  STEP_N=$((STEP_N + 1))
+  CUR_DEPLOY=0
+  CUR_JOB=0
+  if [ "$APPLY" = 1 ]; then
+    echo "APPLY: [${STEP_N}] $what"
+    "$@" || failed_at "$what" "$check"
+  elif [ "$STEP_N" -ge "$PRINT_FROM" ]; then
+    printf 'DRY RUN: [%s] %s\n    %s\n' "$STEP_N" "$what" "$(quoted "$@")"
+  fi
+}
+
+# New service accounts and new grants take minutes to take effect everywhere (IAM is eventually consistent). A step
+# that names a new account, or reads a new grant, can be refused meanwhile: a binding on a just-created account
+# (Codex P1 on 5a98651), and the deploy and job create that read the new secret grants (Copilot on b6fa11e). Those
+# steps are retried after each wait in CCC_IAM_WAITS (seconds), but only on an IAM-pending error (IAM_PENDING below),
+# and a create only while a describe CONFIRMS it is still absent (--create; an inconclusive describe stops). Any other failure, such as a lost answer
+# that may have followed a change, stops at once with failed_at, because repeating a create there could hide a
+# partial deployment (Copilot on 5a98651). Bindings are idempotent. Nothing else is retried.
+IAM_WAITS="${CCC_IAM_WAITS-30 60 90 120 180}"   # unset: the default; set but empty: refused
+[[ "$IAM_WAITS" =~ ^[0-9]+( [0-9]+)*$ ]] || { echo "REFUSED: CCC_IAM_WAITS must be seconds separated by spaces." >&2; exit 2; }
+IAM_PENDING='PERMISSION_DENIED|[Pp]ermission( .*)? denied|[Ss]ervice account .* does not exist|does not exist\. Please verify|INVALID_ARGUMENT: .*(member|[Ss]ervice account)'
+step_after_iam() {   # step_after_iam [--create | --deploy] <description> <how to check it> -- <command...>
+  # --create / --deploy: the check is a describe of what the command creates. A permission error does not prove
+  # nothing was created (a failed deploy can leave the service), so just before any retry, AFTER the wait, it is
+  # described, and the command is re-sent only on a confirmed not-found (Cursor on 27e1f5a and de83893).
+  # If it exists: a job (--create) is done being created only when it reads Ready True (Codex P1 on d3ec70d); then
+  # recovery continues at the next step, and a job that is not ready is repaired with `run jobs update` first
+  # (failed_at). A service a failed deploy left may have no ready revision, and `run deploy` updates it, so recovery
+  # re-runs THIS step (--deploy) and never moves on to the invoker binding first. Bindings are idempotent and need no
+  # probe.
+  local create=0 deploy=0
+  if [ "$1" = "--create" ]; then create=1; shift; elif [ "$1" = "--deploy" ]; then create=1; deploy=1; shift; fi
+  local what="$1" check="$2"; shift 3
+  if [ "$create" = 1 ] && [ "$deploy" = 0 ]; then
+    # The repair for a job that exists but is not ready: the same command with `update` in place of `create`.
+    local a
+    CUR_REPAIR=()
+    for a in "$@"; do
+      if [ "$a" = create ] && [ "${#CUR_REPAIR[@]}" = 3 ]; then CUR_REPAIR+=(update); else CUR_REPAIR+=("$a"); fi
+    done
+  fi
+  STEP_N=$((STEP_N + 1))
+  if [ "$APPLY" != 1 ]; then
+    if [ "$create" = 1 ] && [ "$deploy" = 0 ] && [ "$PRINT_FROM" -gt "$STEP_N" ]; then
+      # A continuation past the job create is printed only for a job that reads Ready True now (Cursor NO-GO and
+      # Codex on f3c65f9): the steps after it bind the watcher to it.
+      local -a job
+      local now_ready
+      read -ra job <<<"$check"
+      now_ready="$(ready_state "${job[@]}")"
+      if [ "$now_ready" != True ]; then
+        echo "REFUSED: --print-from ${PRINT_FROM} is past step ${STEP_N}, the job create, and the job reads Ready ${now_ready}, not True. Nothing is printed. Repair or create the job first (start from step ${STEP_N}), and read it again: ${check}" >&2
+        exit 4
+      fi
+      echo "READ: the claude-code-cloud job reads Ready True, so the steps after ${STEP_N} are printed."
+    fi
+    if [ "$STEP_N" -ge "$PRINT_FROM" ]; then
+      printf 'DRY RUN: [%s] %s\n    %s\n    (retried after %s s, only while IAM is still propagating%s)\n' \
+        "$STEP_N" "$what" "$(quoted "$@")" "$IAM_WAITS" "$([ "$create" = 1 ] && echo ', and only while the resource is still absent')"
+    fi
+    return 0
+  fi
+  echo "APPLY: [${STEP_N}] $what"
+  local wait out probe
+  read -ra probe <<<"$check"
+  CUR_DEPLOY="$deploy"
+  CUR_JOB=$((create && !deploy))
+  CUR_PROBE=("${probe[@]}")
+  for wait in $IAM_WAITS ""; do
+    if out="$("$@" 2>&1)"; then printf '%s\n' "$out"; return 0; fi
+    printf '%s\n' "$out" >&2
+    if ! grep -qE "$IAM_PENDING" <<<"$out"; then failed_at "$what" "$check"; fi
+    [ -n "$wait" ] || break
+    echo "APPLY: [${STEP_N}] $what was refused while IAM propagates. Retrying in ${wait}s." >&2
+    sleep "$wait"
+    if [ "$create" = 1 ]; then
+      # Described AFTER the wait, just before the retry, so a resource that appeared meanwhile is seen (Cursor on
+      # de83893). Retry only on a CONFIRMED not-found; a describe that fails for any other reason (network,
+      # permission) is unknown, and unknown stops for a person to look (Codex P1 on 708b0a2).
+      case "$(state "${probe[@]}")" in
+        PRESENT)
+          if [ "$deploy" = 1 ]; then
+            failed_at "$what (the service now exists, so the deploy is not re-sent automatically)" "$check"
+          else
+            failed_at "$what" "$check" "$((STEP_N + 1))" \
+              "Step ${STEP_N} reported an error, but what it creates now exists and reads Ready True, so it is not repeated: a permission error does not prove nothing was created."
+          fi ;;
+        ABSENT) ;;
+        *) failed_at "$what" "$check" "$STEP_N" \
+          "Step ${STEP_N} reported an error, and a describe could not tell whether what it creates exists, so it is not retried." ;;
+      esac
+    fi
+  done
+  failed_at "$what (still refused after waits of ${IAM_WAITS} s)" "$check"
+}
+
+# 1. Two service accounts. Neither gets an unconditional project-level role; the broker's one project-policy binding
+#    is conditioned on a single database (step 3).
+step "service account for the agent job" "gcloud iam service-accounts describe ${JOB_SA} --project ${PROJECT}" -- \
+  gcloud iam service-accounts create claude-code-cloud --project "$PROJECT" \
+    --display-name "claude-code-cloud (Console agent job, Blackboard #306)"
+step "service account for the broker" "gcloud iam service-accounts describe ${BROKER_SA} --project ${PROJECT}" -- \
+  gcloud iam service-accounts create ccc-broker --project "$PROJECT" \
+    --display-name "ccc-broker (board and GitHub writes for the agent, Blackboard #306)"
+
+# 2. Secrets: one ADDED reader each (secret-level grants, never project-level). This neither reads nor removes any
+#    other binding, so it cannot show the reader is the only one; BUS_URL and BUS_SECRET already have other readers.
+#    The owner creates each secret and its value in his own terminal before this runs (the preflight checks it);
+#    this script never handles a value.
+step_after_iam "add the agent job as a reader of the Console key" "gcloud secrets get-iam-policy ANTHROPIC_API_KEY_CLOUD --project ${PROJECT}" -- \
+  gcloud secrets add-iam-policy-binding ANTHROPIC_API_KEY_CLOUD --project "$PROJECT" \
+    --member "serviceAccount:${JOB_SA}" --role roles/secretmanager.secretAccessor
+for s in BUS_URL BUS_SECRET; do
+  step_after_iam "add the broker as a reader of ${s} (not granted to the agent job)" "gcloud secrets get-iam-policy ${s} --project ${PROJECT}" -- \
+    gcloud secrets add-iam-policy-binding "$s" --project "$PROJECT" \
+      --member "serviceAccount:${BROKER_SA}" --role roles/secretmanager.secretAccessor
+done
+echo "C2 ONLY, not applied in C1: GITHUB_APP_READONLY_PRIVATE_KEY (App 5148538) -> a separate clone identity, never ${JOB_SA} (Blackboard #309); GITHUB_APP_BROKER_PRIVATE_KEY (App 5148612) -> ${BROKER_SA}"
+
+# 3. Receipts: a SEPARATE named Firestore database in Toronto (owner's rule: Canadian regions first). The broker is
+#    granted that database alone, by an IAM condition on its exact name (Google's per-database form; a prefix would
+#    also cover ccc-receipts-backup and the like), so it can never touch the (default) database where the chair keeps
+#    its call checkpoints.
+step "Firestore database for broker receipts (Toronto)" "gcloud firestore databases describe --database ccc-receipts --project ${PROJECT}" -- \
+  gcloud firestore databases create --project "$PROJECT" --database ccc-receipts \
+    --location northamerica-northeast2 --type firestore-native
+step_after_iam "the broker may use only the ccc-receipts database" "gcloud projects get-iam-policy ${PROJECT}" -- \
+  gcloud projects add-iam-policy-binding "$PROJECT" \
+    --member "serviceAccount:${BROKER_SA}" --role roles/datastore.user \
+    --condition "title=ccc-receipts-only,expression=resource.name==\"projects/${PROJECT}/databases/ccc-receipts\""
+
+# 4. The broker: private service, C1 operation post_receipt only. The image is built from a merged main SHA.
+step_after_iam --deploy "deploy ccc-broker (no public invoker)" "gcloud run services describe ccc-broker --project ${PROJECT} --region ${REGION}" -- \
+  gcloud run deploy ccc-broker --project "$PROJECT" --region "$REGION" \
+    --image "${REG}/ccc-broker:${CCC_BROKER_TAG:-UNSET}" --service-account "$BROKER_SA" \
+    --no-allow-unauthenticated --ingress all --min-instances 0 --max-instances 2 \
+    --set-env-vars CCC_STAGE=C1 \
+    --set-secrets BUS_URL=BUS_URL:latest,BUS_SECRET=BUS_SECRET:latest
+# This ADDS the job as an invoker. Allow policies are inherited, so a project-, folder- or organization-level
+# run.invoker (and owner or editor) also reaches the broker: the binding does not make the job its only caller
+# (Codex P2 on ee71826). The broker image must check the caller itself (README, "Who can call the broker").
+step_after_iam "add the agent job as an invoker of the broker" "gcloud run services get-iam-policy ccc-broker --project ${PROJECT} --region ${REGION}" -- \
+  gcloud run services add-iam-policy-binding ccc-broker --project "$PROJECT" --region "$REGION" \
+    --member "serviceAccount:${JOB_SA}" --role roles/run.invoker
+
+# 5. The agent job: max-retries 0, one task, bounded time. In C1 the only tool is post_receipt (#306, Boundary 3),
+#    which calls the broker at CCC_BROKER_URL with an ID token for that audience.
+step_after_iam --create "create the claude-code-cloud job" "gcloud run jobs describe claude-code-cloud --project ${PROJECT} --region ${REGION}" -- \
+  gcloud run jobs create claude-code-cloud --project "$PROJECT" --region "$REGION" \
+    --image "${REG}/claude-code-cloud:${CCC_JOB_TAG:-UNSET}" --service-account "$JOB_SA" \
+    --max-retries 0 --tasks 1 --task-timeout 600s --memory 1Gi --cpu 1 \
+    --set-env-vars "CCC_STAGE=C1,CCC_MAX_TURNS=4,CCC_MAX_BUDGET_USD=0.50,CCC_BROKER_URL=${BROKER_URL},CCC_BROKER_AUDIENCE=${BROKER_URL}" \
+    --set-secrets ANTHROPIC_API_KEY=ANTHROPIC_API_KEY_CLOUD:latest
+
+# 6. board-watcher (resolved in step 0) may start the new job and pass each run its envelope. The envelope travels as
+#    a per-execution override, which needs run.jobs.runWithOverrides; run.invoker has only run.jobs.run (Codex P1 on
+#    80d4820). The role also holds run.executions.cancel, and is bound on this job alone.
+step_after_iam "board-watcher (${WATCHER_SA}) may run the claude-code-cloud job with its envelope" "gcloud run jobs get-iam-policy claude-code-cloud --project ${PROJECT} --region ${REGION}" -- \
+  gcloud run jobs add-iam-policy-binding claude-code-cloud --project "$PROJECT" --region "$REGION" \
+    --member "serviceAccount:${WATCHER_SA}" --role roles/run.jobsExecutorWithOverrides
+
+echo "Not in this script, by design:"
+echo "  - the board-watcher claude-code-cloud route: a code PR, reviewed and released on its own;"
+echo "  - the job and broker images: built from a merged main SHA;"
+echo "  - any Console key value, and any GitHub App key, which the owner stores himself."
