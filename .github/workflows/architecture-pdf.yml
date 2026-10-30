@@ -10,6 +10,9 @@ on:
       - "docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260925.pdf.sha256"
       - "docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260926.pdf"
       - "docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260926.pdf.sha256"
+      - "docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260926-2.pdf"
+      - "docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260926-2.pdf.sha256"
+      - "tools/architecture_verdicts.py"
       - "tools/build_sfdc24_architecture_pdf.py"
       - "tools/requirements-architecture-pdf.txt"
   push:
@@ -22,6 +25,9 @@ on:
       - "docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260925.pdf.sha256"
       - "docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260926.pdf"
       - "docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260926.pdf.sha256"
+      - "docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260926-2.pdf"
+      - "docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260926-2.pdf.sha256"
+      - "tools/architecture_verdicts.py"
       - "tools/build_sfdc24_architecture_pdf.py"
       - "tools/requirements-architecture-pdf.txt"
 
@@ -110,14 +116,14 @@ jobs:
           must_fail("verdict stated in free text",
                     lambda: load(adr.replace("- `p1.prod` R5b serves 100%", "- `p1.prod` #272 pending; R5b serves 100%", 1)))
           PY
-      - name: The 2026-09-25 edition stays pinned as a historical artifact
-        run: sha256sum --check docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260925.pdf.sha256
+      - name: Earlier editions stay pinned as historical artifacts
+        run: sha256sum --check docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260925.pdf.sha256 docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260926.pdf.sha256
       - name: Validate the ADR contract and rebuild the current edition twice, byte for byte
         shell: bash
         run: |
           set -euo pipefail
-          artifact="docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260926.pdf"
-          attestation="docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260926.pdf.sha256"
+          artifact="docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260926-2.pdf"
+          attestation="docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260926-2.pdf.sha256"
           sha256sum --check "$attestation"
           cp "$artifact" /tmp/committed.pdf
           python tools/build_sfdc24_architecture_pdf.py

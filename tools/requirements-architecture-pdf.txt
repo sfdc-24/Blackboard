@@ -1,2 +1,2 @@
-# Reproduce docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260926.pdf from a clean checkout.
+# Reproduce docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260926-2.pdf from a clean checkout.
 reportlab==4.2.5
