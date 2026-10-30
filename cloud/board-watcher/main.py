@@ -191,10 +191,22 @@ def _call(method, url, token, body=None):
         return json.loads(r.read().decode("utf-8") or "{}")
 
 
+def execution_running(latest) -> bool:
+    """Whether the job's newest execution is still running.
+
+    An execution that failed before it started reports a completionStatus and NO
+    completionTime. Measured 2026-10-30 on gemini-waker-rcz5p, killed on Oct 27
+    by a container image import timeout:
+        {"name": "gemini-waker-rcz5p", "createTime": "...", "completionStatus": "EXECUTION_FAILED"}
+    Reading completionTime alone counted that as running forever, so every tick
+    skipped gemini-waker and held its rows: 158 asks to Gemini over three days,
+    nothing logged. Either field means it is over."""
+    return bool(latest) and not latest.get("completionTime") and not latest.get("completionStatus")
+
+
 def job_running(job, token) -> bool:
     got = _call("GET", RUN_API % (PROJECT, REGION, job), token)
-    latest = got.get("latestCreatedExecution") or {}
-    return bool(latest) and not latest.get("completionTime")
+    return execution_running(got.get("latestCreatedExecution") or {})
 
 
 def start_job(job, token) -> str:

@@ -350,3 +350,26 @@ class PendingUntilTheJobFinishes(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExecutionRunning(unittest.TestCase):
+    """A dead execution must never read as a running one: that skips the route forever."""
+
+    def test_failed_before_start_is_not_running(self):
+        # The exact latestCreatedExecution the Run v2 API returned for gemini-waker on 2026-10-30.
+        latest = {"name": "gemini-waker-rcz5p", "createTime": "2026-10-27T16:40:05.138051Z",
+                  "completionStatus": "EXECUTION_FAILED"}
+        self.assertFalse(w.execution_running(latest))
+
+    def test_finished_with_a_completion_time_is_not_running(self):
+        self.assertFalse(w.execution_running({"name": "x", "completionTime": "2026-10-27T16:36:46Z",
+                                              "completionStatus": "EXECUTION_SUCCEEDED"}))
+
+    def test_cancelled_is_not_running(self):
+        self.assertFalse(w.execution_running({"name": "x", "completionStatus": "EXECUTION_CANCELLED"}))
+
+    def test_started_and_unfinished_is_running(self):
+        self.assertTrue(w.execution_running({"name": "x", "createTime": "2026-10-30T14:00:00Z"}))
+
+    def test_no_execution_is_not_running(self):
+        self.assertFalse(w.execution_running({}))
