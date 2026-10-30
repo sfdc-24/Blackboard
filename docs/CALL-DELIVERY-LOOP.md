@@ -36,10 +36,9 @@ stateDiagram-v2
     pointed --> working: agent's writer, working card v2
     working --> done: agent's real card v3 + board answers=call-id
     working --> routed: agent cannot do it, card says where it went
-    pointed --> overdue: no working card 180 s after claim
-    working --> overdue: no done or routed 15 min after claim
+    pointed --> overdue: card still the v1 claim 180 s after the claim
     routed --> done: the builder lane delivers, answers=call-id
-    overdue --> working: agent picks it up late, only while the call window is open
+    overdue --> working: agent picks it up late, only while the call has not ended
     claimed --> expired: the chair closed the call, or the room moved to a newer session
     pointed --> expired: the chair closed the call, or the room moved to a newer session
     overdue --> expired: the chair closed the call, or the room moved to a newer session
@@ -48,7 +47,7 @@ stateDiagram-v2
 ```
 
 `expired` is terminal. Once an ask is expired, no wake, no pickup and no card write may reopen it
-(gemini-vscode challenge 3: a late waker must not resurrect a dead call; challenge 4: a cancelled call must not
+(gemini-vscode challenge 3: a late waker must not resurrect a dead call; challenge 4: an ended call must not
 keep waking agents and spending model calls). `working` and `routed` asks that were already accepted keep their
 own path when the call ends: the work was started and its card stays honest.
 
@@ -59,8 +58,8 @@ own path when the call ends: the work was started and its card stays honest.
 | `working` | the agent's own writer | card v2, `status=working`, `activity` names what it is doing | Real work started. The page shows it. |
 | `done` | the agent's own writer | card v3 with the deliverable (`mermaid` for a diagram ask, `note` otherwise), then a board row `answers=<call id>` | The bridge closes the open entry. It never overwrites a card above v1 (`call_bridge._flip`). |
 | `routed` | the agent's own writer | card v2, `type=note`, `status=review`, body says which lane will build it and that it is **not done**; board row `routes=<call id>`, **never `answers=`** | Honest: a model cannot deploy, fix or wire. `answers=` would flip the card to done, so a routed reply must not use it. |
-| `overdue` | call relay | board row to the agent, `cc=aya` (the outcome owner), once, best effort; it is also the second ring for an agent whose pointer was lost | Silence becomes visible within 180 s instead of at the end of the call. |
-| `expired` | call relay, only on the chair's own record that the ask's call ended (`v1:conf:<room>:state` `closed=1` for the ask's `session_epoch`, or a newer epoch); a closed publish window is not evidence | card `type=note`, `status=review`, body "Not started: the call ended", version above every earlier card; `gov:callbridge:open` entry removed; board row `expires=<call id>`, never `answers=` | The call window closed, or the call was cancelled, before the agent started. Terminal. |
+| `overdue` | call relay | board row to the agent, `cc=aya` (the outcome owner), once, best effort, only while the card is still the untouched v1 claim (or absent) 180 s after the claim; it is also the second ring for an agent whose pointer was lost | Silence becomes visible within 180 s instead of at the end of the call. A `working` card is not flagged in v1: a stall flag for `working` is deferred (section 6). |
+| `expired` | call relay, only on the chair's own record that the ask's call ended: `v1:conf:<room>:state` has `closed=1` and `closed_epoch` equal to the ask's `session_epoch`, or a `session_epoch` different from the ask's; a closed publish window is not evidence, and an ask with no recorded room or epoch never expires | card `type=note`, `status=review`, title "Not started: the call ended", body "Asked in the room at <time>. The call ended before <name> started this, so it is closed and not done.", version above every earlier card; `gov:callbridge:open` entry removed; board row `expires=<call id>`, never `answers=` | The chair ended the ask's call session, or started a newer one, before the agent started. Terminal. There is no cancel path in v1. |
 
 Card versions only go up. A card is never moved back to a lower version.
 
@@ -97,6 +96,7 @@ never the owner's words.
 | A delivered card always gets its `answers=` row | The waker cursor records `card_written` with the card version **before** the board append (gemini-vscode challenge 2). Recovery acts only on a **deliverable**: a call id the cursor recorded as `card_written` with `status=done`, whose published card at that id is also `status=done`. It reads the board for the waker's own reply id and appends it only if it is absent. A working, routed or expired card is never recovered into `answers=`: `settle` closes any ask an `answers=` row names, whatever the card says (Cursor NO-GO on 47fb0787). |
 | A dead call stays dead | `expired` is terminal and is checked before every wake and every card write, both in the relay and in the waker. The relay expires an ask still `claimed`, `pointed` or `overdue` only when the chair's record says its call ended. It WATCHes the card, the open set, `gov:worker:lock` and the call's state key, and re-checks the lock and the end under WATCH, so a lost lock or a reopened call aborts the write. The bridge's `_flip` re-reads the card under WATCH too, so its done card never lands over an expired one. A chair that died never closes its record: its asks stay open and go overdue, never expired. |
 | The owner's words never reach the public sheet or page | The pointer has no text. The agent's card holds words the agent chose for a public page (`canvas_publish` rules). |
+| Stall while `working` | **Deferred in v1, stated:** the relay flags only an untouched claim. A `working` card with no `done` or `routed` is visible on the page but gets no overdue row yet. |
 | Cancel | **Deferred in v1, stated:** no authenticated private cancel source exists yet, so the chair's end of call is the only expiry trigger. When one exists it must be authenticated and private, per Aya's hold (AYA-HELPER-DESIGN-HOLD point 5): the public canvas is a cue, never a cancel. |
 | Redis is never the only copy | The pointer and the answer are board rows. The ask text stays in the inbox stream, which `redis_archive` already mirrors. |
 
