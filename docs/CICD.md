@@ -88,6 +88,19 @@ two reviewed stamped builds to exercise the automated rollback gate.
    deploy/rollback and live source-identity receipts remain open; the build
    identity implementation has offline regression coverage.
 
+6. **`blackboard-production` is not pipeline-deployable, and no longer offered.**
+   It holds `sweepDraftsToEndpointV2` and has no `doGet` at all, so its `/exec`
+   cannot answer the `?health=build` assertion every run ends on.
+   `gas_build_identity.PROJECTS` always refused it ("sweeper is not a gateway"),
+   but both workflows still listed it, so the dispatch dropdown offered a choice
+   that fails on every run and the push matrix carried a leg that could only go
+   red — and it failed *after* the deployment-binding step, not before reaching
+   it. The lists now match the contract, and
+   `tests/test_staging_target.py::WorkflowProjectContract` fails if they drift
+   apart again. Its staging copy stays in `gas_staging_targets.json` as the
+   reviewed record of a real deployment; deploying it needs a reviewed no-op
+   `doGet` and an entry in `PROJECTS` first, which is a separate change.
+
 Both workflows require the recorded staging IDs and an exact matching `/exec`
 URL, then verify the deployment belongs to that script before mutation.
 The reviewed inventory is `scripts/gas_staging_targets.json`; replacements
