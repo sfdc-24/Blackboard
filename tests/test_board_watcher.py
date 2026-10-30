@@ -373,3 +373,12 @@ class ExecutionRunning(unittest.TestCase):
 
     def test_no_execution_is_not_running(self):
         self.assertFalse(w.execution_running({}))
+
+    def test_live_statuses_are_running(self):
+        # The same field reports a live execution; reading it as finished would start a second copy.
+        for status in ("EXECUTION_RUNNING", "EXECUTION_PENDING"):
+            with self.subTest(status=status):
+                self.assertTrue(w.execution_running({"name": "x", "completionStatus": status}))
+
+    def test_unspecified_status_without_a_time_is_running(self):
+        self.assertTrue(w.execution_running({"name": "x", "completionStatus": "COMPLETION_STATUS_UNSPECIFIED"}))

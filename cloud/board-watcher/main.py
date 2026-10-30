@@ -191,6 +191,9 @@ def _call(method, url, token, body=None):
         return json.loads(r.read().decode("utf-8") or "{}")
 
 
+TERMINAL_STATUSES = ("EXECUTION_SUCCEEDED", "EXECUTION_FAILED", "EXECUTION_CANCELLED")
+
+
 def execution_running(latest) -> bool:
     """Whether the job's newest execution is still running.
 
@@ -200,8 +203,14 @@ def execution_running(latest) -> bool:
         {"name": "gemini-waker-rcz5p", "createTime": "...", "completionStatus": "EXECUTION_FAILED"}
     Reading completionTime alone counted that as running forever, so every tick
     skipped gemini-waker and held its rows: 158 asks to Gemini over three days,
-    nothing logged. Either field means it is over."""
-    return bool(latest) and not latest.get("completionTime") and not latest.get("completionStatus")
+    nothing logged. A completionTime, or a TERMINAL completionStatus, means it
+    is over. The same field also reads EXECUTION_RUNNING and EXECUTION_PENDING
+    for a live execution, so any other status, or none, still counts as
+    running: a live job read as idle would be started twice (Cursor NO-GO on
+    6659056f)."""
+    if not latest or latest.get("completionTime"):
+        return False
+    return latest.get("completionStatus") not in TERMINAL_STATUSES
 
 
 def job_running(job, token) -> bool:
