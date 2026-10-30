@@ -1,28 +1,25 @@
-"""The steps of a call ask for claude-code-cli (v5, Oct 30), against the O3 bridge (grok/doorbell-wake-ack d832f9c +
-Aya's repair 91656b12, carried on main 0b752b4). Aya's action list: AYA-FINISH-RESUME-20261030T133945Z-CLI.
+"""The steps of a call ask for claude-code-cli (v5.1, Oct 30), against the O3 bridge (grok/doorbell-wake-ack d832f9c +
+Aya's repair 91656b12 + the owner-approved 6a/6b bridge source, carried on main 0b752b4).
+Corrections for Aya's PR 441 intake HOLD (8570, 8659); plan: PR 441 comment 6533487332.
 
+  python call_ask.py migrate [--legacy <old cli_call_state.json>]
+      Only when no v2 state exists: a bounded replay (call_migrate.replay) of the governed inbox from the legacy
+      cursor minus 24 h, at most 25 pages of 20, judged against one full board read. Writes the state, or refuses.
   python call_ask.py accept <ask> --expect mermaid --brief "lead to quote"
-      1. Private reads, sent together with fresh ids: the inbox (governed xrange of fleet:inbox:claude-code-cli
-         after the cursor) and the bridge's protected open record (hgetall gov:callbridge:open). The entry must be
-         by=call-bridge with task_id=<ask>, and the open record must name this agent: gov: is written only by the
-         bridge. The origin is the record's claimed_at, stored once.
-      2. Content provenance: a governed xrange of the chair's protected v1:conf:<conference_room>:events finds
-         the entry whose ask_id(room, entry id, agent) is this ask, and its utterance must match the words the
-         inbox carries (the reconciler quotes 200 characters at most: a prefix match, stated as such).
-      3. The O3 ACK row (wake_ack.ack_spec: phase=ACK, event=worker.accepted, task_id, receipt_id), one stable id,
-         INTENT saved first (laptop_post.send). The task is ACCEPTED only when that row is CONFIRMED.
+      Reads only protected keys (gov:, written by the bridge alone), under fresh ids, never a cursor: the per-ask
+      state (gov:callbridge:state:<ask>, must be open and name this agent), the said digest and the said parts
+      (6a). The parts must rebuild words whose sha256 is the digest: the WHOLE ask. (A governed read quotes the inbox
+      text at 200 characters, so the inbox is not the source.) Then the O3 ACK row (wake_ack.ack_spec).
   python call_ask.py done <ask> <card.json>         card.json = {"type", "title", "body", "summary"}
-      Before CARD and before DONE: a fresh private status read. The ask open in gov:callbridge:open -> go on.
-      Gone -> closed elsewhere: CANCELLED before the card was sent; CANCELLED_AFTER_WRITE with one withdraw
-      (the same field, public:false, so the publisher drops it) after. No answer -> UNKNOWN_AUTH, nothing posted.
-      The card must be the expected type and pass the publisher's own clean_item; its canonical hash and the
-      sanitizer blob are stored. STORED needs the reconciler's OK; PUBLISHED needs the public item to hash the
-      same. Then the RESULT row answers=<ask> (CLAUDE-DONE-<ask>) closes the claim.
+      A fresh private state read before CARD and before DONE. open: go on. done or cancelled (an owner "cancel" in
+      the room, 6b): stop; with a card request already made, CANCELLING, a withdrawal that is final only once the
+      CARD answer is known AND the withdraw's answer row lands after it (the reconciler applies requests in row
+      order). Unknown CARD past the deadline: FAILED_CARD_MAY_BE_LIVE, escalated, never called withdrawn.
+      DONE carries status_op=<the read before it>; one more read after it: cancelled before DONE means
+      DONE_SUPERSEDED handling (the card comes down the same way), never acceptance.
   python call_ask.py legacy <ask> close|abandon     LEGACY_OPEN -> HISTORICAL_CLOSED | EXPIRED (no rows)
-  python call_ask.py migrate                       the older state, rebuilt by bounded replay (call_migrate.py)
-What this does NOT judge: whether the diagram is the one he asked for. It records the brief, the card and its hash;
-the semantic check and the browser render are the independent verifier's. Exit 0 done, 2 stopped (state kept,
-rerun safe), 4 lock busy, 6 re-plan (the task changed while waiting).
+Not judged here: whether the diagram is the one he asked for (the verifier's), or the browser render.
+Exit 0 done, 2 stopped (state kept, rerun safe), 4 lock busy, 5 no state (run migrate), 6 re-plan.
 """
 import argparse
 import datetime as dt
@@ -38,6 +35,7 @@ import urllib.request
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import call_state as cs             # noqa: E402
+import call_migrate as cm           # noqa: E402
 import laptop_post as lp            # noqa: E402  (pins and imports the Blackboard scripts)
 import board_row                    # noqa: E402
 import canvas_publish               # noqa: E402
@@ -47,13 +45,14 @@ import wake_ack                     # noqa: E402
 
 TAG = "claude-code-cli"
 ASK = re.compile(r"^call-[0-9a-f]{12}$")
+ASK_IN_TEXT = re.compile(r"\bCALL ASK (call-[0-9a-f]{12})\b")
 TO = "aya;grok;claude-chat"
 CANVAS = "https://storage.googleapis.com/sfdc24-canvas/rooms/workshop.json"
 PARTITION = canvas_publish.PARTITION % ("workshop", TAG)
 INBOX = call_bridge.INBOX_KEY % TAG
-OPEN_KEY = call_bridge.OPEN_KEY
-MAX_AGE, PUBLISH_WAIT, ANSWER_WAIT, EVENT_PAGES = 2 * 3600, 90, 120, 3
-WORDS = re.compile(r"\): (.*) -- Answer with a RESULT board row", re.S)
+MAX_AGE, PUBLISH_WAIT, ANSWER_WAIT = 2 * 3600, 90, 120
+MIGRATE_PAGES = 25
+MAX_PARTS = -(-call_bridge.ASK_CHARS // call_bridge.SAID_PART_CHARS)
 
 
 def utc():
@@ -76,10 +75,11 @@ def board_cells(rid, action, payload, gist, to=TO):
             "Conference", gist, ""]
 
 
-def result_row(rid, text, gist, answers=None):
+def result_row(rid, text, gist, answers=None, extra=()):
     fields = ["BCB", "v=1", "id=" + rid, "phase=RESULT", "class=NOTE", "from=" + TAG, "to=" + TO.replace(";", ",")]
     if answers:
         fields.append("answers=" + answers)
+    fields += list(extra)
     return board_cells(rid, "RESULT", "|".join(fields + ["text=" + text.strip().replace("|", "/")]), gist)
 
 
@@ -121,90 +121,71 @@ def ask_reads(reads, post=None, wait=None):
             continue
         status, text = answers.get(sent[name][0], (None, ""))
         out[name] = _body(text, key) if status == "OK" else None
+        out["_rid_" + name] = sent[name][0]
     return out
 
 
-def open_record(body, ask):
-    """The bridge's own record of this ask, or None. Values are the reconciler's previews of JSON strings."""
-    if not isinstance(body, dict) or ask not in body:
-        return None
+def bridge_state(value):
+    """The bridge's per-ask state (6b) from a governed get's value (a JSON string), or None."""
     try:
-        rec = json.loads(body[ask])
-    except (TypeError, ValueError):
+        state = json.loads(value) if isinstance(value, str) else None
+    except ValueError:
         return None
-    return rec if isinstance(rec, dict) and rec.get("agent") == TAG and rec.get("claimed_at") else None
+    return state if isinstance(state, dict) and state.get("state") in ("open", "done", "cancelled") else None
 
 
-def inbox_entry(body, ask):
-    for e in body or []:
-        if isinstance(e, dict) and e.get("by") == call_bridge.BY and e.get("task_id") == ask and e.get("ask") == ask:
-            return e
-    return None
-
-
-def norm(text):
-    return re.sub(r"\s+", " ", str(text).replace("|", "/")).strip()
-
-
-def provenance(events, room, ask, words):
-    """('MATCH', entry id) when the chair's protected event for this ask carries these words (prefix up to the
-    reconciler's 200-character quote), else ('NO-MATCH'|'NOT-FOUND', id or '')."""
-    for e in events or []:
-        if not isinstance(e, dict) or not cs.STREAM_ID.match(str(e.get("id", ""))):
-            continue
-        if call_bridge.ask_id(room, e["id"], TAG) != ask:
-            continue
-        said = norm(e.get("utterance", ""))
-        cut = said.endswith("...")
-        said = said[:-3].rstrip() if cut else said
-        mine = norm(words)
-        ok = mine.startswith(said) if cut else mine == said[:call_bridge.ASK_CHARS]
-        return ("MATCH" if ok and said else "NO-MATCH"), e["id"]
-    return "NOT-FOUND", ""
+def whole_ask(ask, st, digest, first, reads):
+    """('OK', words) when the protected parts rebuild words whose sha256 is the protected digest; else
+    ('UNKNOWN' | 'MISMATCH', ''). A governed read quotes the inbox text at 200 characters, so the whole ask comes
+    only from the bridge's own parts (6a), never from the inbox."""
+    n = st.get("parts")
+    if not isinstance(n, int) or not 1 <= n <= MAX_PARTS:
+        return "MISMATCH", ""
+    raw = [first] + [None] * (n - 1)
+    if n > 1:
+        got = reads([("p%d" % i, "get", call_bridge.SAID_PART_KEY % (ask, i), {}) for i in range(1, n)])
+        for i in range(1, n):
+            raw[i] = got.get("p%d" % i)
+    try:
+        parts = [json.loads(v) for v in raw]
+    except (TypeError, ValueError):
+        return "UNKNOWN", ""
+    if not all(isinstance(p, str) for p in parts):
+        return "UNKNOWN", ""
+    words = "".join(parts)
+    return ("OK" if hashlib.sha256(words.encode("utf-8")).hexdigest() == digest else "MISMATCH"), words
 
 
 # ------------------------------------------------------------------ accept
 def accept(ask, expect, brief, reads=ask_reads, now=time.time):
-    state = cs.load()
+    state = cs.load()                                        # no state: exit 5, run migrate first
     task = state["tasks"].get(ask)
-    if task and task["state"] not in ("PENDING",):
+    if task and task["state"] != "PENDING":
         print("NOTHING TO DO: %s is %s" % (ask, task["state"]))
         return 0 if task["state"] != "LEGACY_OPEN" else 2
-    after = cs.cursor(state)
-    got = reads([("inbox", "xrange", INBOX, {"after": after, "count": 20}),
-                 ("open", "hgetall", OPEN_KEY, {})])
-    rec, entry = open_record(got.get("open"), ask), inbox_entry(got.get("inbox"), ask)
-    if got.get("open") is None or got.get("inbox") is None:
-        print("UNKNOWN_AUTH: a private read had no usable answer; nothing posted (rerun: fresh ids)")
+    got = reads([("state", "get", call_bridge.STATE_KEY % ask, {}), ("said", "get", call_bridge.SAID_KEY % ask, {}),
+                 ("p0", "get", call_bridge.SAID_PART_KEY % (ask, 0), {})])
+    st, digest = bridge_state(got.get("state")), got.get("said")
+    if st is None or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        print("UNKNOWN_AUTH: no usable protected state/digest answer for %s; nothing posted (rerun: fresh ids)" % ask)
         return 2
-    if not rec or not entry:
-        print("NOT VALIDATED: %s (open record %s, inbox entry %s); nothing posted"
-              % (ask, "yes" if rec else "no", "yes" if entry else "no"))
+    if st["state"] != "open" or st.get("agent") != TAG:
+        print("NOT VALIDATED: the bridge's state for %s is %s for %s; nothing posted" % (ask, st["state"],
+                                                                                      st.get("agent")))
         return 2
-    room = str(entry.get("conference_room", ""))
-    claimed = dt.datetime.strptime(rec["claimed_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
-    origin = claimed.timestamp()
+    origin = dt.datetime.strptime(st["claimed_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc).timestamp()
     if now() - origin > MAX_AGE:
         with cs.locked() as txn:
-            txn.state["tasks"].setdefault(ask, {"rev": 0, "ops": {}})
-            cs.touch(txn.state["tasks"][ask], state="EXPIRED", origin=origin)
-        print("EXPIRED: claimed at %s" % rec["claimed_at"])
+            t = txn.state["tasks"].setdefault(ask, {"rev": 0, "ops": {}, "state": "PENDING"})
+            cs.touch(t, state="EXPIRED", origin=origin)
+        print("EXPIRED: claimed at %s" % st["claimed_at"])
         return 2
-    m = WORDS.search(str(entry.get("text", "")))
-    # The bridge claims within a few ticks of his turn: read the chair's stream from 60 s before the claim, up to
-    # EVENT_PAGES pages of 20, stopping at the matching entry or once past the claim time.
-    after, verdict, event_id = cs.pred("%d-0" % int((origin - 60) * 1000)), "NOT-FOUND", ""
-    for _ in range(EVENT_PAGES):
-        ev = reads([("events", "xrange", "v1:conf:%s:events" % room, {"after": after, "count": 20})]).get("events")
-        verdict, event_id = provenance(ev, room, ask, m.group(1) if m else "")
-        ids = [e.get("id") for e in ev or [] if isinstance(e, dict) and cs.STREAM_ID.match(str(e.get("id", "")))]
-        if verdict != "NOT-FOUND" or len(ids) < 20 or cs.sid(ids[-1])[0] > origin * 1000:
-            break
-        after = ids[-1]
-    if verdict != "MATCH":
-        print("NOT VALIDATED: content provenance %s for %s; nothing posted" % (verdict, ask))
+    verdict, words = whole_ask(ask, st, digest, got.get("p0"), reads)
+    if verdict != "OK":
+        print("NOT VALIDATED: the protected parts of %s are %s (they must rebuild words with the bridge's digest)"
+              % (ask, verdict))
         return 2
-    receipt = "cli:" + hashlib.sha256(("%s|%s|%s" % (ask, entry["id"], event_id)).encode()).hexdigest()[:24]
+    receipt = "cli:" + hashlib.sha256(("%s|%s" % (ask, digest)).encode()).hexdigest()[:24]
     rid, row = ack_row(ask, receipt)
     with cs.locked() as txn:
         tasks = txn.state["tasks"]
@@ -212,18 +193,20 @@ def accept(ask, expect, brief, reads=ask_reads, now=time.time):
             print("RE-PLAN: %s changed while reading" % ask)
             return 6
         task = tasks.setdefault(ask, {"rev": 0, "ops": {}, "state": "PENDING"})
-        cs.touch(task, origin=origin, entry=entry["id"], conference_room=room, event=event_id, expect=expect,
-                 brief=brief[:200], receipt=receipt, provenance="prefix-200" if len(m.group(1)) > 200 else "full",
+        cs.touch(task, origin=origin, conference_room=st.get("conference_room", ""), said_len=len(words),
+                 expect=expect, brief=brief[:200], receipt=receipt, said_sha256=digest, provenance="full",
                  stages={"origin": origin, "validated": now()})
         status = lp.send(txn, ask, rid, row)
         if status == "CONFIRMED":
             cs.touch(task, state="ACCEPTED")
             task["stages"]["accepted"] = now()
+        elif status == "CONFLICT":
+            cs.touch(task, state="CONFLICT")
     print("%s %s" % (status, rid))
     if status != "CONFIRMED":
-        print("STOPPED: the ACK is UNKNOWN (never retried blind); state kept")
+        print("STOPPED: the ACK is %s (never retried blind); state kept" % status)
         return 2
-    print("ASK (private, this terminal only): %s" % (m.group(1) if m else ""))
+    print("ASK (private, this terminal only): %s" % words)
     return 0
 
 
@@ -234,12 +217,10 @@ def public_file():
         return json.load(r)
 
 
-def still_open(ask, reads):
-    """True (open), False (closed by the bridge) or None (no usable answer). A fresh read id every call."""
-    body = reads([("status", "hgetall", OPEN_KEY, {})]).get("status")
-    if body is None:
-        return None
-    return open_record(body, ask) is not None
+def status_now(ask, reads):
+    """(state dict or None, the read's request id). A fresh read id every call."""
+    got = reads([("status", "get", call_bridge.STATE_KEY % ask, {})])
+    return bridge_state(got.get("status")), got.get("_rid_status", "")
 
 
 def card_for(ask, spec):
@@ -249,43 +230,87 @@ def card_for(ask, spec):
             "body": spec["body"], "ask": ask}
 
 
-def closed(ask, task, txn):
-    """The ask was closed elsewhere: stop, and withdraw a card that may be live (its request was SENT, CONFIRMED,
-    or UNKNOWN: any of them may have taken effect)."""
+def answer_index(rid, records):
+    """Row position of bus-reconciler's answer to `rid`, or None."""
+    for i, r in enumerate(records or []):
+        if str(r.get("Source_Tag", "")) == lp.RECONCILER and lp.bus_request.field(
+                str(r.get("Payload", "") or ""), "answers") == rid:
+            return i
+    return None
+
+
+def begin_cancel(ask, task, txn):
+    """The ask was closed elsewhere. No card request made: CANCELLED (terminal). Otherwise CANCELLING (open)."""
     if not task.get("ops", {}).get("CLAUDE-CARD-%s" % ask):
         cs.touch(task, state="CANCELLED")
         return "CANCELLED"
-    card = dict(task["card"], public=False, version=task["card"]["version"] + 1, ts=cs.utc_stamp())
-    rid, row = fa.request_row(TAG, "hset", PARTITION, val=json.dumps(card, ensure_ascii=False), field=task["field"],
-                              project="Conference", rid="CLAUDE-CARD-%s-WD" % ask)
-    lp.send(txn, ask, rid, row)
-    cs.touch(task, state="CANCELLED_AFTER_WRITE")
-    return "CANCELLED_AFTER_WRITE"
+    cs.touch(task, state="CANCELLING")
+    return "CANCELLING"
 
 
-def done(ask, card_path, reads=ask_reads, fetch=public_file, sleep=time.sleep, now=time.time):
+def withdraw(ask, task, txn, records, now):
+    """One step of CANCELLING. WITHDRAWN only when the CARD answer is known and a withdraw's answer row comes after
+    it. Unknown CARD past the deadline: FAILED_CARD_MAY_BE_LIVE. Returns the state after the step."""
+    crid = "CLAUDE-CARD-%s" % ask
+    card_op = task["ops"].get(crid, {})
+    if card_op.get("state") != "CONFIRMED":
+        lp.resolve(txn, ask, crid, records=records)
+        card_op = task["ops"].get(crid, {})
+    card_at = answer_index(crid, records) if card_op.get("state") == "CONFIRMED" else None
+    if card_at is None:
+        if now() - task["origin"] > MAX_AGE:
+            cs.touch(task, state="FAILED_CARD_MAY_BE_LIVE")
+        return task["state"]
+    for wd in ("CLAUDE-CARD-%s-WD" % ask, "CLAUDE-CARD-%s-WD2" % ask):
+        op = task["ops"].get(wd)
+        if op is None:
+            card = dict(task["card"], public=False, version=task["card"]["version"] + 1, ts=cs.utc_stamp())
+            wrid, wrow = fa.request_row(TAG, "hset", PARTITION, val=json.dumps(card, ensure_ascii=False),
+                                        field=task["field"], project="Conference", rid=wd)
+            lp.send(txn, ask, wrid, wrow)
+            return task["state"]                           # its answer is read on the next step
+        wd_at = answer_index(wd, records)
+        if wd_at is None:
+            if op.get("state") != "CONFIRMED" and now() - task["origin"] > MAX_AGE:
+                cs.touch(task, state="FAILED_CARD_MAY_BE_LIVE")
+            return task["state"]
+        if wd_at > card_at:
+            cs.touch(task, state="WITHDRAWN")
+            return "WITHDRAWN"
+    cs.touch(task, state="FAILED_CARD_MAY_BE_LIVE")         # both withdraws landed before the CARD answer
+    return task["state"]
+
+
+def done(ask, card_path, reads=ask_reads, fetch=public_file, sleep=time.sleep, now=time.time, records=None):
     task = cs.load()["tasks"].get(ask)
+    if task and task["state"] == "CANCELLING":
+        with cs.locked() as txn:
+            task = txn.state["tasks"][ask]
+            out = withdraw(ask, task, txn, lp.board_records() if records is None else records, now)
+        print(out)
+        return 0 if out == "WITHDRAWN" else 2
     if not task or task["state"] not in ("ACCEPTED", "WRITING", "STORED", "PUBLISHED"):
         print("REFUSED: %s is not an open accepted task (%s)" % (ask, task and task["state"]))
         return 2
     if now() - task["origin"] > MAX_AGE:
         with cs.locked() as txn:
-            cs.touch(txn.state["tasks"][ask], state="EXPIRED")
+            t = txn.state["tasks"][ask]
+            cs.touch(t, state="EXPIRED" if not t["ops"].get("CLAUDE-CARD-%s" % ask) else "CANCELLING")
         print("EXPIRED")
         return 2
     rev = task["rev"]
     if task["state"] in ("ACCEPTED", "WRITING"):
-        open_now = still_open(ask, reads)
+        st, _ = status_now(ask, reads)
         with cs.locked() as txn:
             task = txn.state["tasks"][ask]
             if task["rev"] != rev:
                 print("RE-PLAN")
                 return 6
-            if open_now is None:
+            if st is None:
                 print("UNKNOWN_AUTH: no status answer; nothing posted (rerun: fresh ids)")
                 return 2
-            if not open_now:
-                print(closed(ask, task, txn))
+            if st["state"] != "open":
+                print(begin_cancel(ask, task, txn))
                 return 2
             if task["state"] == "ACCEPTED":
                 with open(card_path, encoding="utf-8") as f:
@@ -303,7 +328,7 @@ def done(ask, card_path, reads=ask_reads, fetch=public_file, sleep=time.sleep, n
             status = lp.send(txn, ask, crid, crow)
             rev = task["rev"]
         if status != "CONFIRMED":
-            print("STOPPED: the card request is UNKNOWN; state kept")
+            print("STOPPED: the card request is %s; state kept" % status)
             return 2
         answer, text = lp.wait_answers([crid], timeout=ANSWER_WAIT)[crid]
         if answer != "OK":
@@ -338,29 +363,44 @@ def done(ask, card_path, reads=ask_reads, fetch=public_file, sleep=time.sleep, n
             cs.touch(task, state="PUBLISHED", published=seen)
             task["stages"]["published"] = now()
             rev = task["rev"]
-    open_now = still_open(ask, reads)
+    drid = "CLAUDE-DONE-%s" % ask
+    if task["ops"].get(drid, {}).get("state") != "CONFIRMED":
+        st, srid = status_now(ask, reads)
+        with cs.locked() as txn:
+            task = txn.state["tasks"][ask]
+            if task["rev"] != rev:
+                print("RE-PLAN")
+                return 6
+            if st is None:
+                print("UNKNOWN_AUTH before DONE; nothing posted")
+                return 2
+            if st["state"] != "open":
+                print(begin_cancel(ask, task, txn))
+                return 2
+            secs = task["stages"]["published"] - task["origin"]
+            body = ("Done: call ask %s. Card claude-code-cli/%s (%s), canonical sha256 %s under sanitizer blob %s, "
+                    "public file generated %s; claim-to-public %.0f s (claimed_at to the file, NOT owner-ask to "
+                    "browser). %s") % (ask, task["field"], task["card"]["type"], task["hash"][:16],
+                                       task["sanitizer"][:12], task["published"], secs, task.get("summary", ""))
+            status = lp.send(txn, ask, drid, result_row(drid, body[:1150], "Done: %s" % ask, answers=ask,
+                                                        extra=["status_op=" + srid]))
+            rev = task["rev"]
+        if status != "CONFIRMED":
+            print(status, drid)
+            return 2
+    # After DONE: was the ask cancelled before it? (Aya 8659 item 4.) Then the card comes down like any cancel.
+    st, _ = status_now(ask, reads)
     with cs.locked() as txn:
         task = txn.state["tasks"][ask]
-        if task["rev"] != rev:
-            print("RE-PLAN")
-            return 6
-        if open_now is None:
-            print("UNKNOWN_AUTH before DONE; nothing posted")
+        done_ts = task["ops"][drid]["row"][1]
+        if st is not None and st["state"] == "cancelled" and str(st.get("at", "")) <= done_ts[:19] + "Z":
+            task["done_superseded"] = True
+            cs.touch(task, state="CANCELLING")
+            print("DONE_SUPERSEDED: cancelled at %s, before DONE %s; withdrawing" % (st.get("at"), done_ts))
             return 2
-        if not open_now:
-            print(closed(ask, task, txn))
-            return 2
-        secs = task["stages"]["published"] - task["origin"]
-        drid = "CLAUDE-DONE-%s" % ask
-        body = ("Done: call ask %s. Card claude-code-cli/%s (%s), canonical sha256 %s under sanitizer blob %s, "
-                "public file generated %s; claim-to-public %.0f s (claimed_at to the file, NOT owner-ask to browser). "
-                "%s") % (ask, task["field"], task["card"]["type"], task["hash"][:16], task["sanitizer"][:12],
-                         task["published"], secs, task.get("summary", ""))
-        status = lp.send(txn, ask, drid, result_row(drid, body[:1250], "Done: %s" % ask, answers=ask))
-        if status == "CONFIRMED":
-            cs.touch(task, state="DONE")
-    print(status, drid)
-    return 0 if status == "CONFIRMED" else 2
+        cs.touch(task, state="DONE", post_done_check=(st or {}).get("state", "UNKNOWN"))
+    print("CONFIRMED", drid)
+    return 0
 
 
 def legacy(ask, how):
@@ -373,21 +413,81 @@ def legacy(ask, how):
     return 0
 
 
-if __name__ == "__main__":
+# ------------------------------------------------------------------ migrate
+def ask_of(text):
+    m = ASK_IN_TEXT.search(text or "")
+    return m.group(1) if m else None
+
+
+def migrate(legacy_path, reads=ask_reads, records=None, now=time.time):
+    """Bounded trusted replay into a NEW v2 state; refuses when one exists (Aya 8659 item 1)."""
+    if os.path.exists(cs.STATE):
+        print("REFUSED: %s exists; migrate only builds a new state" % cs.STATE)
+        return 2
+    try:
+        with open(legacy_path, encoding="utf-8") as f:
+            old = json.load(f)
+    except (OSError, ValueError):
+        old = {}
+    start = cm.window_start(str(old.get("cursor") or ""), int(now() * 1000))
+    entries, after = [], cs.pred(start) if start != "0-0" else "0-0"
+    for _ in range(MIGRATE_PAGES):
+        page = reads([("migrate", "xrange", INBOX, {"after": after, "count": 20})]).get("migrate")
+        if page is None:
+            print("FAILED: an inbox page had no usable answer; nothing written (rerun: fresh ids)")
+            return 2
+        for e in page:
+            if isinstance(e, dict) and cs.STREAM_ID.match(str(e.get("id", ""))):
+                entries.append((e["id"], str(e.get("by", "")), str(e.get("text", ""))))
+        if len(page) < 20:
+            break
+        after = entries[-1][0]
+    else:
+        print("FAILED: over %d pages in the replay window; escalate" % MIGRATE_PAGES)
+        return 2
+    records = lp.board_records() if records is None else records
+    if records is None:
+        print("FAILED: the board could not be read; nothing written")
+        return 2
+    state, notes = cm.replay(entries, records, old, int(now() * 1000), ask_of)
+    with cs.locked(missing_ok=True) as txn:
+        if txn.state["tasks"] or txn.state.get("seen"):
+            print("REFUSED: a state appeared meanwhile")
+            return 2
+        txn.state.update(state)
+    for note in notes:
+        print(note)
+    print("MIGRATED: %d tasks, seen %s" % (len(state["tasks"]), state.get("seen") or "-"))
+    return 0
+
+
+def main(argv):
     ap = argparse.ArgumentParser(add_help=False)
-    ap.add_argument("verb")
-    ap.add_argument("ask")
+    ap.add_argument("verb", choices=("accept", "done", "legacy", "migrate"))
+    ap.add_argument("ask", nargs="?")
     ap.add_argument("arg", nargs="?")
     ap.add_argument("--expect", default="mermaid")
     ap.add_argument("--brief", default="")
-    a = ap.parse_args()
-    if not ASK.match(a.ask):
-        sys.exit(1)
+    ap.add_argument("--legacy", default=os.path.join(os.path.dirname(cs.STATE_DIR), "cli_call_state.json"))
+    try:
+        a = ap.parse_args(argv)
+    except SystemExit:
+        print(__doc__)
+        return 1
+    if a.verb == "migrate":
+        return migrate(a.legacy)
+    if not a.ask or not ASK.match(a.ask):
+        print(__doc__)
+        return 1
     if a.verb == "accept":
-        sys.exit(accept(a.ask, a.expect, a.brief))
+        return accept(a.ask, a.expect, a.brief)
     if a.verb == "done" and a.arg:
-        sys.exit(done(a.ask, a.arg))
+        return done(a.ask, a.arg)
     if a.verb == "legacy" and a.arg in ("close", "abandon"):
-        sys.exit(legacy(a.ask, a.arg))
+        return legacy(a.ask, a.arg)
     print(__doc__)
-    sys.exit(1)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

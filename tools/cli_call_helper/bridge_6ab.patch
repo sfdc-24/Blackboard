@@ -1,0 +1,261 @@
+diff --git a/scripts/call_bridge.py b/scripts/call_bridge.py
+index accbc0c..5ad6b05 100644
+--- a/scripts/call_bridge.py
++++ b/scripts/call_bridge.py
+@@ -359,7 +359,42 @@ def completes(payload: str) -> bool:
+     return phase in COMPLETE_PHASES and not NOT_DONE.search(payload or "")
+ 
+ 
+-BRIDGE_ACTIVITIES = ("claimed in the room", "answered on the board", NO_WAKE, "wake delivery unconfirmed")
++BRIDGE_ACTIVITIES = ("claimed in the room", "answered on the board", NO_WAKE, "wake delivery unconfirmed",
++                     "cancelled in the room")
++
++# Owner's direct approval 2026-10-30 21:56Z ("approve the two bridge changes, source only"; PR 441 plan items 6a, 6b).
++# 6a: the exact words the inbox carries, their sha256, and the words themselves in parts, all in keys no agent can
++#     write. A governed read quotes any value at 200 characters (redis_gov.PREVIEW_CHARS), so the inbox text is
++#     always cut for a governed reader; the parts (each a JSON string under 200 characters) let a consumer read the
++#     WHOLE ask from protected keys and check it against the digest. 6b: each ask's state, open | done | cancelled,
++#     in a small per-ask key a governed `get` reads whole; an owner "cancel" now also cancels his latest open ask.
++SAID_KEY = "gov:callbridge:said:%s"
++SAID_PART_KEY = "gov:callbridge:said:%s:%d"
++SAID_PART_CHARS = 90           # a JSON-quoted part stays under the 200-character quote, escapes included
++STATE_KEY = "gov:callbridge:state:%s"
++
++
++def said_text(said: str) -> str:
++    """The words exactly as inbox_text puts them in the inbox."""
++    return (said or "")[:ASK_CHARS].replace("|", "/")
++
++
++def said_digest(said: str) -> str:
++    return hashlib.sha256(said_text(said).encode("utf-8")).hexdigest()
++
++
++def said_parts(said: str) -> list:
++    text = said_text(said)
++    return [text[i:i + SAID_PART_CHARS] for i in range(0, len(text), SAID_PART_CHARS)] or [""]
++
++
++def cancelled_card(agent: str, claimed_at, now, version: int) -> dict:
++    """Public: who and when only, never a word of the owner's."""
++    name = NAME_OF[agent]
++    return {"v": 1, "type": "note", "status": "done", "public": True, "version": version, "ts": stamp(now),
++            "activity": "cancelled in the room",
++            "title": "Cancelled: %s's work from the room" % name,
++            "body": "Claimed in the room at %s, cancelled in the room at %s." % (eastern(claimed_at), eastern(now))}
+ 
+ 
+ def answered_asks(payload: str) -> list:
+@@ -728,6 +763,7 @@ class Bridge:
+                 # tombstone is compatible with Redis and expires like the original.
+                 self.conn.set(PENDING_KEY % room, "null", ex=PENDING_SECONDS)
+                 self.conn.set(ASKED_KEY % room, "null", ex=ASKED_SECONDS)
++                self.cancel_latest(room, named_in(said), entry_id, now)       # 6b: accepted work too
+                 self.conn.set(CURSOR_KEY % room, entry_id, ex=TTL_SECONDS)
+                 continue
+             if go_ahead(fields):
+@@ -883,9 +919,18 @@ class Bridge:
+             pipe.multi()
+             pipe.hset(canvas_publish.PARTITION % (self.canvas_room, agent), ask,
+                       json.dumps(claimed_card(agent, now), sort_keys=True))
++            digest = said_digest(said)
+             pipe.xadd(INBOX_KEY % agent, {"by": BY, "text": inbox_text(ask, agent, self.canvas_room, said, now),
+                                           "at": stamp(now), "task_id": ask, "ask": ask,
+-                                          "conference_room": room, "canvas_room": self.canvas_room})
++                                          "conference_room": room, "canvas_room": self.canvas_room,
++                                          "said_sha256": digest, "said_len": str(len(said_text(said)))})
++            pipe.set(SAID_KEY % ask, digest, ex=TTL_SECONDS)
++            parts = said_parts(said)
++            for index, part in enumerate(parts):
++                pipe.set(SAID_PART_KEY % (ask, index), json.dumps(part, ensure_ascii=False), ex=TTL_SECONDS)
++            pipe.set(STATE_KEY % ask, json.dumps({"state": "open", "agent": agent, "conference_room": room,
++                                                  "claimed_at": stamp(now), "parts": len(parts)}, sort_keys=True),
++                     ex=TTL_SECONDS)
+             asked = event_time(asked_entry or entry_id)
+             pipe.hset(OPEN_KEY, ask, json.dumps({"agent": agent, "claimed_at": stamp(now), "room": self.canvas_room,
+                                                  "asked_at": asked.strftime("%Y-%m-%dT%H:%M:%S.%fZ") if asked else ""},
+@@ -952,11 +997,58 @@ class Bridge:
+                 version = max(2, (mine or {}).get("version", 1) + 1)
+                 pipe.hset(partition, ask, json.dumps(done_card(agent, claimed_at, now, version), sort_keys=True))
+             pipe.hdel(OPEN_KEY, ask)
++            pipe.set(STATE_KEY % ask, json.dumps({"state": "done", "agent": agent, "at": stamp(now)}, sort_keys=True),
++                     ex=TTL_SECONDS)
+             pipe.execute()
+         finally:
+             pipe.reset()
+         self.log.info("call bridge: %s done for %s", ask, agent)
+ 
++    def cancel_latest(self, room, named, entry_id, now):
++        """His bounded "cancel" (cancellation()) in conference room `room`: his latest open ask there, claimed at most
++        PENDING_SECONDS before, for the agents he named if he named any, becomes cancelled. Removed from the open
++        record (settle can then never flip it to done), its state key says cancelled, and the bridge's own placeholder
++        card says so; an agent's own card is never overwritten (the agent withdraws it). Returns the ask or None."""
++        latest = None
++        for raw_ask in (self.conn.hgetall(OPEN_KEY) or {}):
++            ask = _text(raw_ask)
++            try:
++                state = json.loads(_text(self.conn.get(STATE_KEY % ask)) or "")
++                claimed_at = _parse(state["claimed_at"])
++            except (TypeError, ValueError, KeyError, AttributeError):
++                continue                                   # no state key (claimed before 6b): not cancellable here
++            if state.get("state") != "open" or state.get("conference_room") != room:
++                continue
++            if named and state.get("agent") not in named:
++                continue
++            if (now - claimed_at).total_seconds() > PENDING_SECONDS or claimed_at > now:
++                continue
++            if latest is None or claimed_at > latest[1]:
++                latest = (ask, claimed_at, state["agent"])
++        if latest is None:
++            return None
++        ask, claimed_at, agent = latest
++        partition = canvas_publish.PARTITION % (self.canvas_room, agent)
++        current = _text(self.conn.hget(partition, ask))
++        try:
++            mine = json.loads(current) if current else None
++        except ValueError:
++            mine = None
++        pipe = self.conn.pipeline(transaction=True)
++        try:
++            pipe.multi()
++            if isinstance(mine, dict) and mine.get("activity") in BRIDGE_ACTIVITIES and mine.get("status") == "claimed":
++                version = (mine.get("version") or 1) + 1
++                pipe.hset(partition, ask, json.dumps(cancelled_card(agent, claimed_at, now, version), sort_keys=True))
++            pipe.hdel(OPEN_KEY, ask)
++            pipe.set(STATE_KEY % ask, json.dumps({"state": "cancelled", "agent": agent, "at": stamp(now),
++                                                  "entry": entry_id}, sort_keys=True), ex=TTL_SECONDS)
++            pipe.execute()
++        finally:
++            pipe.reset()
++        self.log.info("call bridge: %s cancelled in the room for %s", ask, agent)
++        return ask
++
+     def run(self, interval=TICK_SECONDS):
+         while not self.stop.is_set():
+             try:
+diff --git a/tests/test_bridge_6ab.py b/tests/test_bridge_6ab.py
+new file mode 100644
+index 0000000..84a1db2
+--- /dev/null
++++ b/tests/test_bridge_6ab.py
+@@ -0,0 +1,120 @@
++"""PR 441 plan items 6a and 6b (owner's direct approval 2026-10-30 21:56Z, source only): the said digest a consumer
++can check whole, and an owner "cancel" that reaches accepted work. Reuses test_call_bridge's fakes."""
++import datetime
++import hashlib
++import json
++import sys
++import unittest
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parent))
++import test_call_bridge as t                                             # noqa: E402
++from test_call_bridge import bridge, card, cb, open_window, row, turn
++
++CODEX = "chatgpt-codex-desktop"
++
++
++def state(conn, ask):
++    raw = conn.get(cb.STATE_KEY % ask)
++    return json.loads(raw) if raw else None
++
++
++class SaidDigest(unittest.TestCase):
++    def setUp(self):
++        self.conn = t.FakeRedis()
++        open_window(self.conn)
++
++    def test_the_digest_covers_exactly_the_words_the_inbox_carries(self):
++        said = "Codex, draft the lead | quote flow " + "with every stage " * 80      # over ASK_CHARS, with a pipe
++        turn(self.conn, said)
++        [ask] = bridge(self.conn).tick()
++        [(_, entry)] = self.conn.streams["fleet:inbox:%s" % CODEX]
++        words = said[:cb.ASK_CHARS].replace("|", "/")
++        self.assertIn(words, entry["text"])
++        digest = hashlib.sha256(words.encode("utf-8")).hexdigest()
++        self.assertEqual(digest, self.conn.get(cb.SAID_KEY % ask))
++        self.assertEqual((digest, str(len(words))), (entry["said_sha256"], entry["said_len"]))
++        n = state(self.conn, ask)["parts"]
++        parts = [json.loads(self.conn.get(cb.SAID_PART_KEY % (ask, i))) for i in range(n)]
++        self.assertEqual(words, "".join(parts), "the parts rebuild the whole ask")
++        self.assertEqual(digest, hashlib.sha256("".join(parts).encode("utf-8")).hexdigest())
++
++    def test_every_part_fits_the_200_character_governed_quote_even_with_escapes(self):
++        said = 'Codex, draft "the" plan \\ with quotes ' + '"' * 300
++        turn(self.conn, said)
++        [ask] = bridge(self.conn).tick()
++        for i in range(state(self.conn, ask)["parts"]):
++            self.assertLessEqual(len(self.conn.get(cb.SAID_PART_KEY % (ask, i))), 200)
++
++    def test_state_is_open_after_the_claim_and_done_after_the_answer(self):
++        turn(self.conn, "Codex, draft the queue flow.")
++        [ask] = bridge(self.conn).tick()
++        self.assertEqual(("open", CODEX, t.ROOM), (state(self.conn, ask)["state"], state(self.conn, ask)["agent"],
++                                                   state(self.conn, ask)["conference_room"]))
++        later = t.NOW + datetime.timedelta(minutes=3)
++        payload = "BCB|v=1|phase=RESULT|from=%s|answers=%s|text=ok" % (CODEX, ask)
++        self.assertEqual([ask], bridge(self.conn, clock=lambda: later).settle([row(CODEX, payload)]))
++        self.assertEqual("done", state(self.conn, ask)["state"])
++
++    def test_the_state_key_fits_a_governed_get_whole(self):
++        turn(self.conn, "Codex, draft the queue flow.")
++        [ask] = bridge(self.conn).tick()
++        self.assertLess(len(self.conn.get(cb.STATE_KEY % ask)), 200, "the reconciler quotes 200 characters")
++
++
++class CancelAcceptedWork(unittest.TestCase):
++    def setUp(self):
++        self.conn = t.FakeRedis()
++        open_window(self.conn)
++        turn(self.conn, "Codex, draft the queue flow.", seconds_ago=60)
++        [self.ask] = bridge(self.conn).tick()
++
++    def cancel(self, words, seconds_ago=5):
++        turn(self.conn, words, seconds_ago=seconds_ago)
++        return bridge(self.conn).tick()
++
++    def test_cancel_after_the_claim_cancels_that_ask_and_settle_can_no_longer_flip_it(self):
++        self.cancel("cancel that")
++        self.assertEqual("cancelled", state(self.conn, self.ask)["state"])
++        self.assertNotIn(self.ask, self.conn.hgetall(cb.OPEN_KEY))
++        got = card(self.conn, CODEX, self.ask)
++        self.assertEqual(("done", "cancelled in the room"), (got["status"], got["activity"]))
++        later = t.NOW + datetime.timedelta(minutes=3)
++        payload = "BCB|v=1|phase=RESULT|from=%s|answers=%s|text=ok" % (CODEX, self.ask)
++        self.assertEqual([], bridge(self.conn, clock=lambda: later).settle([row(CODEX, payload)]))
++        self.assertEqual("cancelled", state(self.conn, self.ask)["state"])
++
++    def test_the_agents_own_card_is_never_overwritten_by_the_cancel(self):
++        own = {"v": 1, "type": "note", "status": "working", "public": True, "version": 1, "ts": "x",
++               "title": "mine", "body": "b", "ask": self.ask}
++        self.conn.hset(t.cp.PARTITION % ("workshop", CODEX), self.ask, json.dumps(own))
++        self.cancel("cancel that")
++        self.assertEqual("mine", card(self.conn, CODEX, self.ask)["title"])
++        self.assertEqual("cancelled", state(self.conn, self.ask)["state"])
++
++    def test_a_cancel_in_another_conference_room_does_not_cancel_this_one(self):
++        fields = {"kind": "turn.started", "actor_id": "owner-1", "reason": "vocative", "room_id": "other-room",
++                  "control_sequence": "3", "utterance": "cancel that"}
++        self.conn.xadd("v1:conf:other-room:events", fields, entry_id=t.at(5))
++        bridge(self.conn).tick()
++        self.assertEqual("open", state(self.conn, self.ask)["state"])
++        self.cancel("cancel that")
++        self.assertEqual("cancelled", state(self.conn, self.ask)["state"], "the same words in its own room do")
++
++    def test_naming_another_agent_does_not_cancel_this_one(self):
++        self.cancel("Grok, cancel that")
++        self.assertEqual("open", state(self.conn, self.ask)["state"])
++
++    def test_an_ask_older_than_the_pending_window_is_not_cancelled(self):
++        old = t.NOW + datetime.timedelta(seconds=cb.PENDING_SECONDS + 120)
++        turn(self.conn, "cancel that", seconds_ago=-(cb.PENDING_SECONDS + 110))
++        bridge(self.conn, clock=lambda: old).tick()
++        self.assertEqual("open", state(self.conn, self.ask)["state"])
++
++    def test_a_task_containing_the_word_stop_is_not_a_cancel(self):
++        self.cancel("Codex, build a stop button")
++        self.assertEqual("open", state(self.conn, self.ask)["state"])
++
++
++if __name__ == "__main__":
++    unittest.main()

@@ -25,11 +25,13 @@ STATE = os.path.join(STATE_DIR, "cli_call_state.json")
 LOCKFILE = STATE + ".lock"
 STREAM_ID = re.compile(r"^\d{10,20}-\d+$")
 ASK_ID = re.compile(r"^call-[0-9a-f]{12}$")
-OPEN = ("PENDING", "LEGACY_OPEN", "ACCEPTED", "WRITING", "STORED", "PUBLISHED")
-TERMINAL = ("DONE", "CANCELLED", "CANCELLED_AFTER_WRITE", "EXPIRED", "FAILED", "HISTORICAL_CLOSED")
-OP_STATES = ("INTENT", "SENT", "CONFIRMED", "UNKNOWN")
+# CANCELLING is open on purpose (Aya 8570/8659 item 3): a withdrawal is not final while a delayed CARD could still land.
+OPEN = ("PENDING", "LEGACY_OPEN", "ACCEPTED", "WRITING", "STORED", "PUBLISHED", "CANCELLING")
+TERMINAL = ("DONE", "CANCELLED", "WITHDRAWN", "EXPIRED", "FAILED", "HISTORICAL_CLOSED", "FAILED_CARD_MAY_BE_LIVE",
+            "DONE_SUPERSEDED", "CONFLICT")
+OP_STATES = ("INTENT", "SENT", "CONFIRMED", "UNKNOWN", "CONFLICT")
 LOCK_WAIT = 30.0
-EXIT_LOCKED = 4
+EXIT_LOCKED, EXIT_NO_STATE = 4, 5
 
 if os.name == "nt":
     import msvcrt
@@ -94,13 +96,23 @@ def valid(state):
     return True
 
 
-def load():
-    """The state. Missing: empty (run `call_ask.py migrate` before the first live use). Broken: stop."""
+class NoState(SystemExit):
+    def __init__(self):
+        super().__init__(EXIT_NO_STATE)
+
+
+def load(missing_ok=False):
+    """The state. Missing: STOP, exit 5, unless `missing_ok` (only `call_ask.py migrate` passes it): a helper that
+    started from nothing would have no watermark and could pass over an earlier claimed ask (Aya 8659 item 2).
+    Broken: stop."""
     try:
         with open(STATE, encoding="utf-8") as f:
             state = json.load(f)
     except FileNotFoundError:
-        return empty()
+        if missing_ok:
+            return empty()
+        print("STOP: no %s; run `python call_ask.py migrate` first (exit 5)" % STATE, file=sys.stderr)
+        raise NoState()
     except ValueError:
         raise SystemExit("STOP: %s is not JSON; nothing done" % STATE)
     if not valid(state):
@@ -132,9 +144,10 @@ class Txn:
 
 
 @contextlib.contextmanager
-def locked(wait=LOCK_WAIT, clock=time.monotonic, sleep=time.sleep):
+def locked(wait=LOCK_WAIT, clock=time.monotonic, sleep=time.sleep, missing_ok=False):
     """Hold the OS lock and yield a Txn; whatever the caller left in it is written at the end.
-    An exception inside writes nothing more (what was saved stays saved)."""
+    An exception inside writes nothing more (what was saved stays saved). With no state file it stops (exit 5),
+    unless `missing_ok` (migrate only)."""
     fd = os.open(LOCKFILE, os.O_RDWR | os.O_CREAT)
     try:
         end = clock() + wait
@@ -148,7 +161,7 @@ def locked(wait=LOCK_WAIT, clock=time.monotonic, sleep=time.sleep):
                     raise Busy()
                 sleep(0.2)
         try:
-            txn = Txn(load())
+            txn = Txn(load(missing_ok=missing_ok))
             yield txn
             txn.save()
         finally:
@@ -164,15 +177,16 @@ def touch(task, **fields):
     return task
 
 
-def cursor(state=None, now=time.time):
-    """The lowest unfinished point (contract 3): the inbox is read after this. It never passes an open task's
-    entry, however many later asks were accepted."""
+def cursor(state=None):
+    """The lowest unfinished point (contract 3): never past an open task's entry, however many later asks were
+    accepted. It never defaults to now (Aya 8659 item 2): with nothing recorded it is "0-0". accept() does not read
+    from it at all; it reads from the protected claim time (call_ask.accept)."""
     state = state or load()
     opened = [t["entry"] for t in state["tasks"].values() if t["state"] in OPEN and t.get("entry")]
     points = [pred(min(opened, key=sid))] if opened else []
     if state.get("seen"):
         points.append(state["seen"])
-    return min(points, key=sid) if points else "%d-0" % int(now() * 1000)
+    return min(points, key=sid) if points else "0-0"
 
 
 def ring(ask, source, entry="", wait=200.0):

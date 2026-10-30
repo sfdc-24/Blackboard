@@ -1,7 +1,7 @@
-# claude-code-cli call-ask helper v5: contract v3, kept with the code
+# claude-code-cli call-ask helper v5.1: contract v3.1, kept with the code
 
-Builder: claude-code-cli. Independent verifier: Aya (one remaining helper cycle). Written 2026-10-30.
-Answers AYA-FINISH-RESUME-20261030T133945Z-CLI (row 8448) and the action list AYA-CLI-IMPLEMENT-ACTIONLIST-20261030T1347Z. It supersedes contracts v1 and v2 where they differ.
+Builder: claude-code-cli (main CLI session 88774585). Independent verifier: Aya (one remaining helper cycle, unrun). Written 2026-10-30.
+v3.1 answers Aya's PR 441 intake HOLD (8570, 8659). The plan is PR 441 comment 6533487332. It supersedes v3 where they differ.
 
 ## Pins (the frozen candidate)
 
@@ -9,41 +9,39 @@ Answers AYA-FINISH-RESUME-20261030T133945Z-CLI (row 8448) and the action list AY
 |---|---|
 | Deployed main | `0b752b4a325da596348496e55b72feda1e237c71` (PR 437; canvas_publish blob `1710f0eb`) |
 | O3 bridge chain | `origin/grok/doorbell-wake-ack` `d832f9c784a801b828d742cf0e0fb6c0e1d1a724`, merged cleanly onto main |
-| O3 repair | Aya's repair.patch, sha256 `91656b12...526d4`, applied unchanged (3 EOF warnings) |
-| Integration `scripts/` tree | `875a5f920a433d83c12679852ca3adb00d40b0a9`. laptop_post refuses any other tree, or a dirty one |
-| Helper files | tools/cli_call_helper/ at the frozen head; the sha256 values are in MANIFEST |
+| O3 repair | Aya's repair.patch, sha256 `91656b12...526d4`, applied unchanged |
+| Bridge 6a/6b | `bridge_6ab.patch` in this folder, on top of the repair. The owner's direct approval came at 21:56:39Z, source only (CLAUDE-CLI-OWNER-BRIDGE-GO-20261030T215653Z) |
+| Integration `scripts/` tree | `7a89d16d7ca8b439d8eaaa8deafe01d3b3c7b8ea`. laptop_post refuses any other tree, or a dirty one |
+| Helper files | This folder; the sha256 values are in MANIFEST.json |
 
-The O3 chain and the repair are not on main and not deployed. The helper speaks the O3 interfaces, so the bridge and the helper release together, or not at all.
+Nothing beyond main is deployed. The helper speaks the O3 + 6a/6b interfaces, so the bridge and the helper release together, or not at all.
 
-## Aya's items and where they are met
+## Aya's intake findings and where they are met
 
-| # | Item | In code | Tests |
+| # | Finding | In code | Tests |
 |---|---|---|---|
-| 1 | Timing is owner ask to the matched public **and** browser result. The diagram is semantic, not just matching words | The helper stores stages (origin = bridge claimed_at, validated, accepted, stored, published), the brief, the card, its canonical hash and the sanitizer blob. The DONE row reports claim-to-public seconds and says it is NOT owner-ask-to-browser. Browser render and the semantic judgement are the verifier's | whole path; wrong type refused |
-| 2 | Idempotency | Stable op ids. INTENT is saved before the append. An uncertain append is UNKNOWN and resolves only by a positive read. `DEDUP_ENFORCED = False` until the root task's live APPEND_DEDUP readback, so no uncertain append is retried. A later board timestamp proves nothing | landed-lost, absent-lost, not-verified rc, unreadable board, crash after INTENT, one retry only when enforced |
-| 3 | Content provenance | Accept needs three things: the inbox entry `by=call-bridge` with `task_id=ask=<ask>`; the protected `gov:callbridge:open` record naming this agent; and the chair's protected `v1:conf:<conference_room>:events` entry whose `ask_id(room, id, agent)` is the ask and whose utterance matches the inbox words. It pages up to 3 times 20 from 60 s before the claim. O3's strict sender rule closes the `from=` forgery in settle | forged inbox, other agent's record, different words, later page, 200-char prefix |
-| 4 | Cancellation and its boundaries | A fresh private status read happens before CARD and before DONE. The ask in the open record means go on. The ask gone means CANCELLED; after the card request it is CANCELLED_AFTER_WRITE plus one withdraw (`public:false`, so the publisher drops the card) and no DONE. No answer means UNKNOWN_AUTH: nothing is posted and nothing is cancelled. Once DONE is SENT, the ask is complete | cancel before card, after card, resumed WRITING, UNKNOWN_AUTH |
-| 5 | Fresh status identities | Every read id is `CLAUDE-ST-<name>-<utc>+<random>`, new on every call, retry and resume | fresh ids |
-| 6 | Lock and fence | An OS byte lock (msvcrt) on an open handle, so there is no steal, no pid and no age. A busy lock exits 4. A task `rev` makes a step that waited re-plan (exit 6) | live holder of any age, killed holder, two accepts at once, rev re-plan |
-| 7 | Migration | `call_migrate.replay` rebuilds from evidence: a DONE row gives HISTORICAL_CLOSED (never acceptance); ACCEPTED or ACK only gives LEGACY_OPEN, or EXPIRED over 2 h. The old pending is kept as PENDING. The old cursor is a cross-check (CURSOR_ADVANCED). It is bounded at 500 entries | replay, bound |
+| 1 | The advertised migrate command had no dispatch | `call_ask.py migrate [--legacy]`: a bounded replay of up to 25 governed inbox pages of 20, from the legacy cursor minus 24 h, plus one full board read. It writes a NEW state only, and refuses one that exists, even an empty one | command builds and refuses; CLI dispatch; unanswered page writes nothing; replay; bound |
+| 2 | A cold cursor at "now" could skip earlier claimed asks | `load()` with no state file stops (exit 5). The cursor never defaults to now. `accept` reads no cursor at all: everything comes from per-ask protected keys | no state means exit 5; cursor "0-0"; an earlier unindexed ask accepted behind a later one |
+| 3 | A withdrawal was terminal while a delayed CARD could land | `CANCELLING` stays open. WITHDRAWN needs both answers: the CARD answer seen, then a withdraw whose reconciler answer row comes after it. If the order is reversed, a second withdraw (`-WD2`) goes. An unknown CARD past the deadline means FAILED_CARD_MAY_BE_LIVE, which is never called withdrawn | not final until the order is proven; reversed order sends WD2; deadline |
+| 4 | Race between the final status read and DONE | DONE carries `status_op=<read id>`. One more state read happens after DONE. If the state is cancelled at a time before DONE, the task is marked `done_superseded` and goes to CANCELLING, so the card comes down and it never counts as acceptance | status_op in DONE; cancel between read and DONE |
+| 5 | Readback checked id and tag, not the payload | INTENT stores the exact row and the sha256 of its payload. A resume uses that row, never a rebuilt one. CONFIRMED needs a fresh read of the id, tag **and** payload (`append_and_verify` checks the id only). Same id with another payload is CONFLICT, escalated with no retry. Status-read rows get the same check | ok-but-absent is UNKNOWN; payload conflict; one retry under dedup with the first row |
+| 6a | Full-input provenance | The bridge writes `gov:callbridge:said:<ask>` (sha256 of the exact inbox words) and `gov:callbridge:said:<ask>:<n>` parts. Each part is a JSON string under the 200-character governed quote. `accept` rebuilds the WHOLE ask from these protected keys and requires the sha256 to match. The inbox is no longer a source, because a governed read cuts it at 200 | bridge: digest = inbox words, parts rebuild them, every part under 200 even with escapes. Helper: long ask whole, tampered part refused, malformed digest refused |
+| 6b | Cancelling accepted work | The bridge writes `gov:callbridge:state:<ask>`, which is open, done or cancelled. The owner's bounded "cancel" (O3 `cancellation()`) also cancels his latest open ask **in that conference room**: only the named agents' if he named any, and only within PENDING_SECONDS. That ask is removed from the open record, so settle cannot flip it; the bridge's placeholder card says so, and an agent's own card is never overwritten. The helper reads this state before CARD, before DONE and after DONE | bridge: cancel flips state, settle refused, own card kept, other agent, other room, too old, "stop" in a task. Helper: cancel before and after the card |
 
-The v4 HOLD's 7 failures, each covered by a v5 test. These were not run against the v4 code; the mutants in mutants_v5.py show that these tests catch the same defects reintroduced into v5:
-1. Legacy done without evidence: replay.
-2. Pending lost: replay.
-3. Wrong artifact on an id+ts match: same id and ts, another body.
-4. Cursor moved past an open ask: the cursor test.
-5. Concurrent duplicate appends: two accepts at once.
-6. Age-only steal: a live holder of any age.
-7. Resumed WRITING bypassing cancellation: the resumed WRITING test.
+The earlier items are unchanged from v3 (lock, fresh ids, stages and card hash, idempotency without dedup). Mutants (`mutants_v5.py`, on copies):
+- 31 helper mutants and 10 bridge mutants: 41 of 41 killed.
+- Builder results only.
 
-## Gaps not closed by the helper (owners named)
+## Gaps and dependencies (named owners)
 
-- **Owner cancel of accepted work:** O3 cancels only a pending go-ahead. A cancel that removes an accepted ask from `gov:callbridge:open` is a bridge change. The O3 builder cycles are exhausted, so it is escalated to the owner and Aya.
-- **Full content hash:** the reconciler quotes 200 characters per field, so provenance is a prefix match beyond that, and the task records `prefix-200`. A content sha256 in the bridge's open record would close it, which is a bridge change.
-- **Dedup readback:** owned by the root desktop task. Until it lands, no retry happens.
-- **Timing:** the measured earlier run took 188 s, made up of 55 s ring and 110 s compose. Each private read is about 11 s median and 20 s p90 (78 pairs, builder-measured). Accept needs 2 to 4 read rounds and done needs 2. The 180 s target is not shown.
-- **Laptop window watcher:** retired in v5. PR 437 and O3 open the canvas window in the cloud.
-- **Local full `unittest discover`** shows order-dependent failures (redis in sys.modules, a 10 s join under load, and the claude-api-worker Dockerfile import that also fails on main). CI runs those suites in separate steps.
+- **Dedup readback:** owned by the root desktop task. Until it lands, `DEDUP_ENFORCED` stays False and nothing uncertain is retried.
+- **Timing, not shown:**
+  - accept needs 1 read round, or 2 when the ask has more than 90 characters; done needs 3 state reads;
+  - each read takes about 11 s median and 20 s p90 (builder-measured);
+  - the earlier measured run was 188 s.
+- **Real readback shape:** the payload-sha check assumes the board stores the payload cell exactly as sent. That is still to be confirmed on a real row. If it is wrong, the helper fails closed (CONFLICT).
+- **State-key size:** the per-ask state includes the conference room id. A very long room id could push it past the 200-character quote. The helper then treats it as UNKNOWN_AUTH (fail closed).
+- **Not judged by the helper:** the semantic diagram check and the browser render. Those are the verifier's.
 
 ## Exit codes
 
@@ -52,4 +50,5 @@ The v4 HOLD's 7 failures, each covered by a v5 test. These were not run against 
 | 0 | Done |
 | 2 | Stopped, state kept, safe to rerun |
 | 4 | Lock busy |
+| 5 | No state; run migrate |
 | 6 | Re-plan |
