@@ -216,7 +216,20 @@ def store_spill(store=None):
                 raise exc
         return plan(key, full)
 
+    def verify(key: str, full: str) -> None:
+        """Read the object back and hold it to this row's own text. Raises when it is absent or
+        different. A save that returned is not proof the bytes are there (2026-10-12: two Gemini
+        replies went out with full= pointers to objects that did not exist, and nothing said so)."""
+        name = object_name(key, full)
+        record, _ = store.load(name)
+        text = (record or {}).get("text")
+        if text is None:
+            raise OSError("spill object %s is absent after the write" % name)
+        if len(text) != len(full) or sha256(text) != sha256(full):
+            raise OSError("spill object %s does not hold this row's text" % name)
+
     spill.plan = plan
+    spill.verify = verify
     return spill
 
 
@@ -226,12 +239,24 @@ def commit(info: dict, spill) -> str | None:
     Same bytes are the same object, so a retry is a no-op rather than a second copy. A failure
     here does not un-post the row: the caller says SPILL_UNCONFIRMED, and resolve() refuses a
     pointer whose bytes are not the sha256 on the row.
+
+    Returning means CONFIRMED, not "the write call came back": the object is read back and held to
+    the row's own length and sha256 before this returns. A store that cannot be read back cannot be
+    confirmed, and that is a raise too, so a caller never reports stored text it has not seen.
+
+    A raise means UNCONFIRMED, not "not stored": the write may have landed and the read-back been
+    refused, timed out or returned other bytes. The caller must say unconfirmed and claim neither.
     """
     if not info.get("deferred"):
         return info.get("pointer")
     if spill is None:
         raise OSError("no spill store configured")
-    return spill(info["key"], info["full"])
+    pointer = spill(info["key"], info["full"])
+    verify = getattr(spill, "verify", None)
+    if verify is None:
+        raise TypeError("spill cannot be confirmed: no verify()")
+    verify(info["key"], info["full"])
+    return pointer
 
 
 def resolve(payload: str, store=None) -> str:
