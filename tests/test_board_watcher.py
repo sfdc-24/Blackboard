@@ -348,10 +348,6 @@ class PendingUntilTheJobFinishes(unittest.TestCase):
         self.assertEqual(answered, ["ASK-1", "ASK-2", "ASK-3", "ASK-4"])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class ExecutionRunning(unittest.TestCase):
     """A dead execution must never read as a running one: that skips the route forever."""
 
@@ -371,14 +367,207 @@ class ExecutionRunning(unittest.TestCase):
     def test_started_and_unfinished_is_running(self):
         self.assertTrue(w.execution_running({"name": "x", "createTime": "2026-10-30T14:00:00Z"}))
 
-    def test_no_execution_is_not_running(self):
-        self.assertFalse(w.execution_running({}))
+    def test_empty_execution_is_unknown_and_blocks(self):
+        self.assertTrue(w.execution_running({}))
 
-    def test_live_statuses_are_running(self):
-        # The same field reports a live execution; reading it as finished would start a second copy.
-        for status in ("EXECUTION_RUNNING", "EXECUTION_PENDING"):
+
+class ExecutionStateSafety(unittest.TestCase):
+    BLOCKED = ("EXECUTION_RUNNING", "EXECUTION_PENDING", "COMPLETION_STATUS_UNSPECIFIED",
+               "EXECUTION_TIMED_OUT", "FUTURE_UNKNOWN", "", None, 0, [], {})
+
+    def test_only_documented_terminal_statuses_allow_start(self):
+        for status in ("EXECUTION_SUCCEEDED", "EXECUTION_FAILED", "EXECUTION_CANCELLED"):
             with self.subTest(status=status):
-                self.assertTrue(w.execution_running({"name": "x", "completionStatus": status}))
+                self.assertFalse(w.execution_running({"name": "x", "completionStatus": status}))
 
-    def test_unspecified_status_without_a_time_is_running(self):
-        self.assertTrue(w.execution_running({"name": "x", "completionStatus": "COMPLETION_STATUS_UNSPECIFIED"}))
+    def test_active_unknown_and_malformed_statuses_block_even_with_time(self):
+        for status in self.BLOCKED:
+            for extra in ({}, {"completionTime": "2026-10-27T16:36:46Z"}):
+                with self.subTest(status=status, extra=extra):
+                    self.assertTrue(w.execution_running(dict(name="x", completionStatus=status, **extra)))
+
+    def test_legacy_completion_time_requires_valid_zoned_timestamp(self):
+        self.assertFalse(w.execution_running({"name": "x", "completionTime": "2026-10-27T16:36:46Z"}))
+        for value in (None, "", "garbage", True, {}, "2026-10-27", "2026-10-27T16:36:46"):
+            with self.subTest(value=value):
+                self.assertTrue(w.execution_running({"name": "x", "completionTime": value}))
+
+    def test_malformed_execution_reference_blocks(self):
+        for latest in (None, {}, [], "", False, 0, {"completionStatus": "EXECUTION_FAILED"},
+                       {"name": "", "completionStatus": "EXECUTION_FAILED"}):
+            with self.subTest(latest=latest):
+                self.assertTrue(w.execution_running(latest))
+
+    def job_response(self, **fields):
+        name = (w.RUN_API % (w.PROJECT, w.REGION, "gemini-waker")).split("/v2/", 1)[1]
+        # Schema-backed GetJob fixture, not a live response. Job uid/createTime
+        # are server outputs; template is required. ProtoJSON can omit count=0.
+        response = dict(name=name, uid="12345678-1234-4234-8234-123456789abc",
+                        createTime="2026-09-24T03:00:00Z", generation="1",
+                        template={"template": {"containers": [{"image": "example.invalid/image:fixture"}]}})
+        response.update(fields)
+        return response
+
+    def test_known_no_prior_execution_is_distinct_from_missing_state(self):
+        from unittest.mock import patch
+        with patch.object(w, "_call", return_value=self.job_response(executionCount=0)):
+            self.assertFalse(w.job_running("gemini-waker", "fake"))
+        with patch.object(w, "_call", return_value=self.job_response()):
+            self.assertFalse(w.job_running("gemini-waker", "fake"))
+        responses = [None, {}, [], "", {"name": "wrong", "executionCount": 0},
+                     {"name": self.job_response()["name"]}]
+        responses += [self.job_response(executionCount=n) for n in (None, "0", False, -1, 1)]
+        responses += [self.job_response(executionCount=0, latestCreatedExecution=x)
+                      for x in (None, {}, [], "", False)]
+        for response in responses:
+            with self.subTest(response=response), patch.object(w, "_call", return_value=response):
+                self.assertTrue(w.job_running("gemini-waker", "fake"))
+
+    def run_tick_with_response(self, response):
+        from unittest.mock import patch
+        store = NamedStore({"board_watcher": {"watermark": "2026-09-24T03:40:00Z", "seen": []}})
+        started = []
+        with patch.object(w, "_call", return_value=response):
+            out = w.tick(store, read_since=lambda since: [row("R1", "2026-09-24T03:50:00Z")],
+                         routes=w._routes(), running=lambda job: w.job_running(job, "fake"),
+                         start=lambda job: started.append(job) or "fake-exec", now=NOW)
+        return out, started, store.slots["board_watcher"][0]
+
+    def test_integrated_active_unknown_states_never_duplicate_start(self):
+        for status in self.BLOCKED:
+            for extra in ({}, {"completionTime": "2026-10-27T16:36:46Z"}):
+                with self.subTest(status=status, extra=extra):
+                    response = self.job_response(latestCreatedExecution=dict(name="x", completionStatus=status, **extra))
+                    out, started, state = self.run_tick_with_response(response)
+                    self.assertEqual(started, [])
+                    self.assertIn("gemini-waker", out["skipped_running"])
+                    self.assertEqual(state["pending"]["gemini-waker"], [{"row_id": "R1", "work_id": "X"}])
+                    self.assertNotIn("R1", state["seen"])
+                    self.assertLess(state["watermark"], "2026-09-24T03:50:00Z")
+
+    def test_integrated_malformed_response_blocks_and_preserves_pending(self):
+        for response in (None, {}, {"name": self.job_response()["name"]}, self.job_response(latestCreatedExecution=None)):
+            with self.subTest(response=response):
+                out, started, state = self.run_tick_with_response(response)
+                self.assertEqual(started, [])
+                self.assertIn("gemini-waker", state["pending"])
+                self.assertNotIn("R1", state["seen"])
+
+    def test_integrated_terminal_and_known_no_prior_execution_can_start(self):
+        responses = [self.job_response(executionCount=0), self.job_response()]
+        responses += [self.job_response(latestCreatedExecution={"name": "x", "completionStatus": status})
+                      for status in ("EXECUTION_FAILED", "EXECUTION_SUCCEEDED", "EXECUTION_CANCELLED")]
+        for response in responses:
+            with self.subTest(response=response):
+                out, started, state = self.run_tick_with_response(response)
+                self.assertEqual(started, ["gemini-waker"])
+                self.assertIn("gemini-waker", state["pending"])
+
+    def test_first_use_partial_and_malformed_jobs_block_for_both_zero_encodings(self):
+        from unittest.mock import patch
+        for count in ({}, {"executionCount": 0}):
+            valid = self.job_response(**count)
+            responses = []
+            for field in ("name", "uid", "createTime", "template"):
+                partial = dict(valid)
+                del partial[field]
+                responses.append(partial)
+            for field, values in {
+                "uid": (None, "", [], "not-a-uuid"),
+                "createTime": (None, "", [], "not-a-time", "2026-09-24"),
+                "template": (None, {}, [], {"template": {}}, {"template": {"containers": []}},
+                             {"template": {"containers": [None]}},
+                             {"template": {"containers": [{"image": ""}]}}),
+            }.items():
+                responses.extend(dict(valid, **{field: value}) for value in values)
+            for response in responses:
+                with self.subTest(count=count, response=response), patch.object(w, "_call", return_value=response):
+                    self.assertTrue(w.job_running("gemini-waker", "fake"))
+                    out, started, state = self.run_tick_with_response(response)
+                    self.assertEqual(started, [])
+                    self.assertIn("gemini-waker", state["pending"])
+
+    def test_first_use_contradictory_counts_and_references_block(self):
+        from unittest.mock import patch
+        for count in (None, "0", False, -1, 1, 2):
+            response = self.job_response(executionCount=count)
+            with self.subTest(count=count), patch.object(w, "_call", return_value=response):
+                self.assertTrue(w.job_running("gemini-waker", "fake"))
+        for count in ({}, {"executionCount": 0}):
+            for latest in (None, {}, [], "", {"name": "x", "completionStatus": "EXECUTION_RUNNING"},
+                           {"name": "x", "completionStatus": "FUTURE_UNKNOWN"}):
+                response = self.job_response(latestCreatedExecution=latest, **count)
+                with self.subTest(count=count, latest=latest), patch.object(w, "_call", return_value=response):
+                    self.assertTrue(w.job_running("gemini-waker", "fake"))
+
+    def test_get_job_is_full_authenticated_get_and_failure_is_not_zero(self):
+        from unittest.mock import patch, MagicMock
+        import urllib.error
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = json.dumps(self.job_response()).encode()
+        with patch.object(w.urllib.request, "urlopen", return_value=response) as opened:
+            self.assertFalse(w.job_running("gemini-waker", "inert-test-token"))
+        request = opened.call_args.args[0]
+        self.assertEqual(request.get_method(), "GET")
+        self.assertEqual(request.full_url, w.RUN_API % (w.PROJECT, w.REGION, "gemini-waker"))
+        self.assertEqual(request.get_header("Authorization"), "Bearer inert-test-token")
+        self.assertIsNone(request.data)
+        with patch.object(w, "_call", side_effect=urllib.error.URLError("offline failure")):
+            with self.assertRaises(urllib.error.URLError):
+                w.job_running("gemini-waker", "fake")
+
+
+class ProjectAliasSafety(ExecutionStateSafety):
+    # Inherit the entire state suite so the alias response exercises every guard.
+    def job_response(self, **fields):
+        response = super().job_response(**fields)
+        if "name" not in fields:
+            response["name"] = "projects/123456789012/locations/%s/jobs/gemini-waker" % w.REGION
+        return response
+
+    def test_id_request_number_response_terminal_and_first_use(self):
+        from unittest.mock import patch
+        with patch.object(w, "PROJECT", "example-project"):
+            for fields in ({}, {"executionCount": 0},
+                           {"latestCreatedExecution": {"name": "x", "completionStatus": "EXECUTION_FAILED"}}):
+                response = self.job_response(**fields)
+                out, started, state = self.run_tick_with_response(response)
+                self.assertEqual(started, ["gemini-waker"])
+                self.assertIn("gemini-waker", state["pending"])
+
+    def test_malformed_or_wrong_location_job_names_block(self):
+        prefix = "projects/123456789012/locations/%s/jobs/" % w.REGION
+        for name in (None, "", [], "projects", prefix + "different-job", prefix + "gemini-waker/extra",
+                     "projects//locations/%s/jobs/gemini-waker" % w.REGION,
+                     "projects/123 456/locations/%s/jobs/gemini-waker" % w.REGION,
+                     "projects/123?fields=x/locations/%s/jobs/gemini-waker" % w.REGION,
+                     "projects/123456789012/locations/wrong-region/jobs/gemini-waker"):
+            for fields in ({}, {"latestCreatedExecution": {"name": "x", "completionStatus": "EXECUTION_FAILED"}}):
+                with self.subTest(name=name, fields=fields):
+                    out, started, state = self.run_tick_with_response(self.job_response(name=name, **fields))
+                    self.assertEqual(started, [])
+                    self.assertIn("gemini-waker", state["pending"])
+
+    def test_alias_http_and_malformed_body_failures_do_not_start(self):
+        from unittest.mock import patch, MagicMock
+        import urllib.error
+        for body in (b"", b"{}", b"null", b"[]", b"not-json", b"\xff"):
+            response = MagicMock()
+            response.__enter__.return_value.read.return_value = body
+            store = NamedStore({"board_watcher": {"watermark": "2026-09-24T03:40:00Z", "seen": []}})
+            started = []
+            with self.subTest(body=body), patch.object(w.urllib.request, "urlopen", return_value=response):
+                out = w.tick(store, read_since=lambda since: [row("R1", "2026-09-24T03:50:00Z")],
+                             routes=w._routes(), running=lambda job: w.job_running(job, "fake"),
+                             start=lambda job: started.append(job), now=NOW)
+            self.assertEqual(started, [])
+            self.assertIn("gemini-waker", store.slots["board_watcher"][0]["pending"])
+        for error in (urllib.error.HTTPError("https://run.googleapis.com", 403, "fixture", {}, None),
+                      urllib.error.URLError("fixture timeout")):
+            with self.subTest(error=error), patch.object(w.urllib.request, "urlopen", side_effect=error):
+                with self.assertRaises(urllib.error.URLError):
+                    w.job_running("gemini-waker", "fake")
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -191,31 +191,66 @@ def _call(method, url, token, body=None):
         return json.loads(r.read().decode("utf-8") or "{}")
 
 
-TERMINAL_STATUSES = ("EXECUTION_SUCCEEDED", "EXECUTION_FAILED", "EXECUTION_CANCELLED")
-
-
 def execution_running(latest) -> bool:
-    """Whether the job's newest execution is still running.
+    """Block starts unless this execution is positively known to be finished.
 
-    An execution that failed before it started reports a completionStatus and NO
-    completionTime. Measured 2026-10-30 on gemini-waker-rcz5p, killed on Oct 27
-    by a container image import timeout:
-        {"name": "gemini-waker-rcz5p", "createTime": "...", "completionStatus": "EXECUTION_FAILED"}
-    Reading completionTime alone counted that as running forever, so every tick
-    skipped gemini-waker and held its rows: 158 asks to Gemini over three days,
-    nothing logged. A completionTime, or a TERMINAL completionStatus, means it
-    is over. The same field also reads EXECUTION_RUNNING and EXECUTION_PENDING
-    for a live execution, so any other status, or none, still counts as
-    running: a live job read as idle would be started twice (Cursor NO-GO on
-    6659056f)."""
-    if not latest or latest.get("completionTime"):
-        return False
-    return latest.get("completionStatus") not in TERMINAL_STATUSES
+    Failed-before-start executions may lack completionTime. Only the three
+    documented terminal statuses prove completion; active, unspecified and
+    future statuses must not be overridden by a contradictory timestamp.
+    A legacy reference with no status may still prove completion by time.
+    Empty/malformed references are unknown, not proof of no prior execution.
+    """
+    if not isinstance(latest, dict) or not isinstance(latest.get("name"), str) or not latest["name"].strip():
+        return True
+    if "completionStatus" in latest:
+        return latest["completionStatus"] not in (
+            "EXECUTION_SUCCEEDED", "EXECUTION_FAILED", "EXECUTION_CANCELLED")
+    completed = latest.get("completionTime")
+    if not isinstance(completed, str):
+        return True
+    try:
+        stamp = datetime.fromisoformat(completed.replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    return stamp.tzinfo is None
 
 
 def job_running(job, token) -> bool:
-    got = _call("GET", RUN_API % (PROJECT, REGION, job), token)
-    return execution_running(got.get("latestCreatedExecution") or {})
+    url = RUN_API % (PROJECT, REGION, job)
+    got = _call("GET", url, token)
+    if not isinstance(got, dict) or not isinstance(got.get("name"), str):
+        return True
+    # GetJob binds the response to the requested resource. Its project segment
+    # may use the project number even when RUN_PROJECT uses the project ID.
+    # Check resource shape and unchanged location/job, not alias spelling.
+    parts = got["name"].split("/")
+    if (len(parts) != 6 or parts[0] != "projects" or not parts[1]
+            or not all(c.isascii() and (c.isalnum() or c == "-") for c in parts[1])
+            or parts[2:] != ["locations", REGION, "jobs", job]):
+        return True
+    if "latestCreatedExecution" not in got:
+        # GetJob requests the full authenticated resource (no field mask).
+        # execution_count is proto3 int32: JSON may omit its default zero.
+        # Do not apply that default to an empty/partial/malformed Job response.
+        uid, created, template = got.get("uid"), got.get("createTime"), got.get("template")
+        if not isinstance(uid, str) or not isinstance(created, str) or not isinstance(template, dict):
+            return True
+        try:
+            if uuid.UUID(uid).version != 4 or datetime.fromisoformat(created.replace("Z", "+00:00")).tzinfo is None:
+                return True
+        except ValueError:
+            return True
+        task = template.get("template")
+        containers = task.get("containers") if isinstance(task, dict) else None
+        if not isinstance(containers, list) or not containers or any(
+                not isinstance(c, dict) or not isinstance(c.get("image"), str) or not c["image"].strip()
+                for c in containers):
+            return True
+        # Both default encodings mean zero only on a recognizable full Job;
+        # explicit null/empty references or nonzero counts remain unknown.
+        count = got.get("executionCount", 0)
+        return not (type(count) is int and count == 0)
+    return execution_running(got["latestCreatedExecution"])
 
 
 def start_job(job, token) -> str:
