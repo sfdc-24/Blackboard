@@ -1,0 +1,45 @@
+{
+ "CONTRACT.md": {
+  "bytes": 5800,
+  "sha256": "36bc089acd06bb9682650debf606d92c1a6d4fcef62f9fa545ce48eee5f480bc"
+ },
+ "_pins": {
+  "bridge_6ab_commit": "ea8fe6bc3fe7043b4f873983f0e98398a445138a",
+  "main": "0b752b4a325da596348496e55b72feda1e237c71",
+  "o3_chain": "d832f9c784a801b828d742cf0e0fb6c0e1d1a724",
+  "o3_repair_patch_sha256": "91656b128b9f81547d1f4a210fafe42a2f936b1e0d9afab316bb9214615526d4",
+  "scripts_tree": "7a89d16d7ca8b439d8eaaa8deafe01d3b3c7b8ea"
+ },
+ "bridge_6ab.patch": {
+  "bytes": 14201,
+  "sha256": "7ba4a37b1d17c4d9118b3c7d535cd649883a7c3e225041a28d86bcfb327eb0d8"
+ },
+ "call_ask.py": {
+  "bytes": 23431,
+  "sha256": "7c92280c6b63a4a6a547d4d3bd8cb4f5e5d82a8ee7eed326fcdfd331aa7ceedf"
+ },
+ "call_migrate.py": {
+  "bytes": 3557,
+  "sha256": "5ea33b1b800f8eac92ebba693ef8924bcfcc565000e241473c60e834fcfd52e3"
+ },
+ "call_state.py": {
+  "bytes": 7702,
+  "sha256": "0436f619255e08b00dc337e3e855194b5f5c8a5a6e10fad0fdb98a15eca32d7f"
+ },
+ "cli_call_consumer.py": {
+  "bytes": 2860,
+  "sha256": "f3b3039cab192d9d3c50986e1f0db56d3d95004bc8ecd0118a5c789fbe4469e7"
+ },
+ "laptop_post.py": {
+  "bytes": 9418,
+  "sha256": "ac7add07411673cba1e15c451184b3a4e9efa62e0a3a85754fd7a79f97032eb5"
+ },
+ "mutants_v5.py": {
+  "bytes": 7779,
+  "sha256": "6f7612d71f04e3ef95d1d8ae9cfc94535a2ccc6443e340ee8aa66e90c6e457ac"
+ },
+ "test_v5.py": {
+  "bytes": 23008,
+  "sha256": "bf01a5623c9b36f660cb732975a27def9ac61bf3d394ea95085458d5c4a0105b"
+ }
+}
