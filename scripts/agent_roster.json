@@ -259,6 +259,20 @@
           "wake": "python scripts/agent_waker.py --agent gemini, or the cloud waker job. Answers rows addressed to=gemini and marks them wakerreply=1."
         },
         {
+          "id": "gemini-vscode",
+          "surface": "Roo Code extension in VS Code",
+          "runtime": "laptop VANLAS",
+          "gcp_identity": "none - Gemini API key held by the Roo extension",
+          "rows": 0,
+          "last_seen": "n/a",
+          "state": "active from 2026-10-30, tag ratified by the owner",
+          "in_vpc": false,
+          "redis_read": false,
+          "redis_write": false,
+          "why": "The laptop is not in the VPC. Unlike the gemini waker, this instance HAS a shell and reads the repo, so it can ground its designs in code. Design only: no commits, deploys or merges. A separate tag from gemini because the fleet is one writer per tag (sheet L-82).",
+          "wake": "NONE automatic. The owner starts a Roo Code task in VS Code. Its rules live in C:/Users/salam/.roo/rules. It answers only what the owner hands it or rows addressed to=gemini-vscode; rows to=gemini stay with the cloud waker."
+        },
+        {
           "id": "gemini-rw-probe",
           "surface": "Cloud Run job",
           "runtime": "us-central1",
