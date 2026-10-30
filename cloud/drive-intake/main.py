@@ -104,26 +104,32 @@ no credential of its own - every outside call is an injected adapter.
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
+import importlib.util
 import json
 import os
 import re
+import secrets
 import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
-def _load_task_filter():
-    """cloud/drive-intake/task_filter.py, beside this file (in the image: /app/task_filter.py)."""
-    import importlib.util  # noqa: PLC0415
-    here = os.path.dirname(os.path.abspath(__file__))
-    spec = importlib.util.spec_from_file_location("drive_intake_task_filter", os.path.join(here, "task_filter.py"))
+def _load_module(name, path):
+    """A module beside this file (in the image: /app/<file>)."""
+    spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-tf = _load_task_filter()
+# Each sibling file is named as a literal in the join below: the claude-api worker image loads this file
+# as its contract, and that image's test reads these names to check the image copies every one.
+here = os.path.dirname(os.path.abspath(__file__))
+trail_module = _load_module("drive_intake_trail", os.path.join(here, "trail.py"))   # the receipt-shape parser
+tf = _load_module("drive_intake_task_filter", os.path.join(here, "task_filter.py"))
 
 MAX_BODY = 65536
 MAX_DOC = 400000          # a doc larger than this is refused, not truncated (PR 354's rule)
@@ -138,6 +144,18 @@ DELIVER_LEASE = 60        # seconds a delivering pass owns the put before anothe
 
 ID_OK = re.compile(r"[A-Za-z0-9_.:-]{1,128}\Z")
 FILE_ID_OK = re.compile(r"[A-Za-z0-9_-]{10,128}\Z")
+
+# THE BINDING (step 4): which live studio session may read which doc's trail. Off unless
+# DRIVE_INTAKE_STUDIO_URL is set. When a request is dispatched, this service writes one more line into
+# the doc: a studio link that carries a pairing code in its fragment. The code is random, stored here
+# only as a hash with the doc it opens, and good for PAIR_TTL. The studio controller redeems it
+# (POST /pair, the poll token first) and learns the doc from this service. So the doc id never comes
+# from a browser, and only someone who can read the doc holds a code: the same people who can already
+# read every receipt in it. 16 base32 characters are 80 bits.
+PAIR_CODE_OK = re.compile(r"[A-Z2-7]{16}\Z")
+PAIR_TTL = 43200            # twelve hours
+PAIR_TTL_RANGE = (300, 86400)
+STUDIO_LINK = "STUDIO LINK"
 
 # The heading that separates the owner's REQUEST from the trail of receipts.
 # Everything from the first match onwards is receipts and is excluded from the
@@ -261,6 +279,11 @@ def correlate(file_id: str, text: str, drive_revision: str, recipient: str) -> d
     derived from exactly those three. The recipient rides along for the hops
     but is not identity - a request routed to a different worker on a later
     pass is the same request, not a second one.
+
+    That task is this service's task. It is not a studio session. The doc
+    text is the owner's request; a session id written into it would be the
+    author's claim, and this function does not read one. Nothing here calls
+    the studio controller.
     """
     revision = request_revision(text)
     found = REQUEST_LINE.search(strip_receipts(text) or "")
@@ -428,7 +451,12 @@ def write_receipt(deps, tuple_: dict, doc_text: str, state: str, at: str, detail
     # The id goes INTO the line: a read-back against a real doc looks for "id <receipt_id>",
     # and a line that does not carry it can never be found (cloud/claude-api-worker/gdocs.py).
     line = receipt_line(state, tuple_, at, detail) + " - id " + receipt_id
-    block = receipt_block(doc_text, line)
+    return _append_read_back(deps, tuple_, receipt_id, receipt_block(doc_text, line))
+
+
+def _append_read_back(deps, tuple_: dict, receipt_id: str, block: str) -> str:
+    """Append one block that carries "id <receipt_id>", then read it back (write_receipt's guard)."""
+    doc_id = tuple_["source_doc_id"]
     for attempt in (1, 2):
         try:
             new_revision = deps.receipts.append(doc_id, tuple_.get("drive_revision") or "",
@@ -451,6 +479,52 @@ def write_receipt(deps, tuple_: dict, doc_text: str, state: str, at: str, detail
         return "written" if deps.receipts.has(doc_id, receipt_id) else "not_read_back"
     except Exception as exc:  # noqa: BLE001
         return "unknown:" + type(exc).__name__
+
+
+def pair_hash(code: str) -> str:
+    """The key a pairing code is stored under. Redis holds this, never the code itself."""
+    return hashlib.sha256(("studio-pair\x1f" + code).encode("utf-8")).hexdigest()
+
+
+def write_studio_link(deps, tuple_: dict, doc_text: str) -> str:
+    """The binding's one doc write: a studio link whose fragment holds a fresh pairing code.
+
+    Off ("off") unless DRIVE_INTAKE_STUDIO_URL is set. One per task: an earlier pass's line is found
+    by its receipt id and nothing new is minted. The code is stored (as its hash, with the doc and a
+    TTL) BEFORE the line is written, so a link in the doc always opens; a code whose line never landed
+    is never shown to anyone and simply expires. The fragment is not sent to any web server, so the
+    code is not in the page host's logs. Not a receipt shape: the trail parser does not return it.
+    """
+    if not deps.studio_url:
+        return "off"
+    if deps.receipts is None:
+        return "no_receipt_writer"
+    if deps.claims is None:
+        return "no_store"
+    doc_id = tuple_["source_doc_id"]
+    receipt_id = receipt_id_for(tuple_, STUDIO_LINK)
+    try:
+        if deps.receipts.has(doc_id, receipt_id):
+            return "written"
+    except Exception as exc:  # noqa: BLE001
+        return "unknown:" + type(exc).__name__
+    code = base64.b32encode(secrets.token_bytes(10)).decode("ascii")
+    try:
+        deps.claims.pair_put(pair_hash(code), doc_id, deps.pair_ttl)
+    except Exception as exc:  # noqa: BLE001 - a code that is not stored is never written
+        return "unknown:" + type(exc).__name__
+    until = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_now(deps) + deps.pair_ttl))
+    line = "%s - task %s on a live studio call: %s?live=1#pair=%s - until %s - id %s" % (
+        STUDIO_LINK, tuple_["task_id"], deps.studio_url, code, until, receipt_id)
+    return _append_read_back(deps, tuple_, receipt_id, receipt_block(doc_text, line))
+
+
+def studio_url_from_env(environ) -> str:
+    """https only, and no query or fragment of its own: anything else leaves the link off."""
+    url = (environ.get("DRIVE_INTAKE_STUDIO_URL") or "").strip()
+    if not url.startswith("https://") or "?" in url or "#" in url or any(c.isspace() for c in url):
+        return ""
+    return url
 
 
 def _on_any_inbox(deps, task_id: str):
@@ -756,6 +830,7 @@ def decide(hint: dict, deps) -> dict:
             # writes whichever line is still owed.
             out["status"] = "dispatched_receipt_owed"
             return out
+        out["studio_link"] = write_studio_link(deps, tuple_, text)
         _advance(deps, key, current, DONE)
         out["status"] = DISPATCHED.lower()
         out["state"] = DISPATCHED
@@ -1012,7 +1087,8 @@ def push_pass(deps) -> list:
 
 
 def handle(method: str, path: str, headers: dict, body: bytes, deps) -> tuple:
-    path = path.split("?", 1)[0]
+    path, _sep, raw_query = path.partition("?")
+    query = urllib.parse.parse_qs(raw_query, keep_blank_values=False)
     headers = {str(k).lower(): v for k, v in (headers or {}).items()}
     if method == "GET" and path == "/healthz":
         now = _now(deps)
@@ -1075,7 +1151,115 @@ def handle(method: str, path: str, headers: dict, body: bytes, deps) -> tuple:
         if not deps.enabled:
             return 200, {"enabled": False, "intake": []}
         return 200, {"enabled": True, "intake": poll(deps)}
+    if method == "POST" and path == "/pair":
+        # The studio controller redeems a pairing code for the doc it opens (the binding, step 4).
+        # The poll token first; then the flag and the link's own switch; then the code's shape.
+        # Unknown and expired are the same 404.
+        if not poll_token_ok(deps.poll_token, headers):
+            return 401, {"error": "bad poll token"}
+        if not deps.enabled or not deps.studio_url:
+            return 200, {"enabled": False, "doc": None}
+        try:
+            code = json.loads((body or b"{}").decode("utf-8")).get("code")
+        except (ValueError, AttributeError, UnicodeDecodeError):
+            return 400, {"error": "body must be a JSON object with a code"}
+        if not isinstance(code, str) or not PAIR_CODE_OK.fullmatch(code):
+            return 400, {"error": "code must be 16 base32 characters"}
+        if deps.claims is None:
+            return 503, {"error": "no store"}
+        try:
+            doc = deps.claims.pair_get(pair_hash(code))
+        except Exception as exc:  # noqa: BLE001 - unreadable is not unknown
+            return 503, {"error": "the store could not be read: " + type(exc).__name__}
+        if not isinstance(doc, str) or not FILE_ID_OK.fullmatch(doc):
+            return 404, {"error": "no such pairing code"}
+        return 200, {"enabled": True, "doc": doc}
+    if method == "GET" and path == "/trail":
+        # The page's read (step 4): the same token as the poll, before anything else.
+        if not poll_token_ok(deps.poll_token, headers):
+            return 401, {"error": "bad poll token"}
+        if not deps.enabled:
+            return 200, {"enabled": False, "trail": None}
+        file_id = (query.get("doc") or [""])[0]
+        if not FILE_ID_OK.fullmatch(file_id):
+            return 400, {"error": "doc must be a Drive file id"}
+        return 200, trail_for_doc(deps, file_id)
     return 404, {"error": "not found"}
+
+
+API_HEARTBEAT = 900   # the worker beats once per tick (5 min); three ticks silent reads offline
+
+
+def liveness(store, agent: str, now: float, window: int) -> str:
+    """'online' inside the window, 'offline' when absent or stale, 'unknown' when the key cannot be read."""
+    try:
+        at = store.heartbeat(agent)
+    except Exception:  # noqa: BLE001
+        return "unknown"
+    if at is None:
+        return "offline"
+    try:
+        age = float(now) - float(at)
+    except (TypeError, ValueError):
+        return "unknown"
+    return "online" if 0 <= age <= window else "offline"
+
+
+def trail_for_doc(deps, file_id: str) -> dict:
+    """The doc's receipt trail and the live state behind it. Never the request's own words.
+
+    The doc is read every time (it is the record); what Redis adds is the claim's phase, whether
+    the doc is still pending a pass, the two heartbeats, the worker's claim and the doorbell
+    marker. Anything Redis cannot answer reads "unknown", never a guess.
+    """
+    out = {"enabled": True, "doc": file_id, "at": deps.at}
+    if deps.docs is None:
+        out["status"] = "no_store"
+        return out
+    try:
+        doc = deps.docs.read(file_id)
+    except Exception as exc:  # noqa: BLE001
+        out.update(status="read_error", error=type(exc).__name__)
+        return out
+    if not isinstance(doc, dict):
+        out.update(status="read_error", error="shape")
+        return out
+    if deps.folder_id and doc.get("folder_id") != deps.folder_id:
+        out["status"] = "out_of_scope"
+        return out
+    text = doc.get("text") or ""
+    if len(text) > MAX_DOC:
+        out.update(status="too_large", chars=len(text))
+        return out
+    entries = trail_module.parse(text)
+    revision = str(doc.get("revision_id") or "")
+    recipient = next((e["recipient"] for e in entries if e["state"] == REQUESTED and canonical(e["recipient"])),
+                     "claude-code-cli")
+    tuple_ = correlate(file_id, text, revision, recipient) if strip_receipts(text).strip() else None
+    out.update(status="ok", revision=revision, entries=entries, tasks=trail_module.tasks_of(entries),
+               task=tuple_["task_id"] if tuple_ else None, request=tuple_["request_id"] if tuple_ else None)
+    now = _now(deps)
+    live = {"laptop": "unknown", "api_worker": "unknown", "intake": "unknown", "pending": "unknown",
+            "worker_claim": "unknown", "doorbell": "unknown"}
+    if deps.claims is not None:
+        # A heartbeat the store cannot READ is unknown, not offline (Cursor on e080da3): the router's
+        # heartbeat_age treats unreadable as absent on purpose, so this reads the key itself first.
+        live["laptop"] = liveness(deps.claims, "claude-code-cli", now, deps.heartbeat_window)
+        live["api_worker"] = liveness(deps.claims, "claude-api", now, API_HEARTBEAT)
+        if tuple_:
+            for name, read in (("intake", lambda: deps.claims.state(idempotency_key(tuple_))),
+                               ("pending", lambda: file_id in (deps.claims.pending() or ())),
+                               ("worker_claim", lambda: deps.claims.worker_state(tuple_["task_id"])),
+                               ("doorbell", lambda: deps.claims.doorbell_state(tuple_["task_id"]))):
+                try:
+                    value = read()
+                except Exception:  # noqa: BLE001 - unreadable is unknown
+                    continue
+                live[name] = value if value is not None else "none"
+            if isinstance(live["intake"], str) and ":" in live["intake"]:
+                live["intake"] = live["intake"].split(":", 1)[0] + ":" + live["intake"].split(":")[1]
+    out["live"] = live
+    return out
 
 
 def no_ring(_tuple):
@@ -1195,6 +1379,19 @@ class MemoryClaims:
     def pending_remove(self, file_id):
         self.beats.setdefault("pending", set()).discard(file_id)
 
+    # Read only, for the trail: what the worker and the lane wrote under their own keys.
+    def worker_state(self, task_id):
+        return self.beats.get("fleet:worker:claim:" + task_id)
+
+    def pair_put(self, code_hash, file_id, ttl):
+        self.beats["fleet:intake:pair:" + code_hash] = (file_id, int(ttl))
+
+    def pair_get(self, code_hash):
+        held = self.beats.get("fleet:intake:pair:" + code_hash)
+        return held[0] if held else None
+
+    def doorbell_state(self, task_id):
+        return self.beats.get("fleet:worker:woke:" + task_id)
     def processed_has(self, file_id):
         return file_id in self.beats.setdefault("processed", set())
 
@@ -1357,6 +1554,23 @@ class RedisClaims:
     def pending_remove(self, file_id):
         self.client.srem("fleet:intake:pending", file_id)
 
+    # fleet:intake:pair:<hash> - a studio pairing code's doc, for its TTL (the binding, step 4). Keyed by
+    # the hash, so a reader of Redis does not learn a code that opens a trail.
+    def pair_put(self, code_hash, file_id, ttl):
+        self.client.set("fleet:intake:pair:" + code_hash, file_id, ex=int(ttl))
+
+    def pair_get(self, code_hash):
+        raw = self.client.get("fleet:intake:pair:" + code_hash)
+        return raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
+
+    # Read only, for the trail: the worker's claim and the lane's doorbell marker.
+    def worker_state(self, task_id):
+        raw = self.client.get("fleet:worker:claim:" + task_id)
+        return raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
+
+    def doorbell_state(self, task_id):
+        raw = self.client.get("fleet:worker:woke:" + task_id)
+        return raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
     # fleet:intake:processed - G4: every doc ever dispatched under the task filter. Never admitted again.
     def processed_has(self, file_id):
         return bool(self.client.sismember("fleet:intake:processed", file_id))
@@ -1444,8 +1658,12 @@ class Deps:
                  api_worker="", now=None, at="", channel_expires_at=None,
                  heartbeat_window=DEFAULT_HEARTBEAT, renew_warn=DEFAULT_RENEW_WARN,
                  at_provider=None, poll_tick=DEFAULT_POLL_TICK, recipients=None, baseline=False,
-                 filter_tasks=False, confirm_token="", renamer=None, watch=None, push_url=""):
+                 filter_tasks=False, confirm_token="", renamer=None, watch=None, push_url="",
+                 studio_url="", pair_ttl=PAIR_TTL):
         self.enabled = enabled
+        # The studio link (the binding): "" writes none and /pair answers enabled=false.
+        self.studio_url = studio_url
+        self.pair_ttl = pair_ttl
         # The push channel (drive_watch.DriveWatch) and the public address Drive pings. None keeps the
         # poll-only behaviour, exactly as before the watch existed.
         self.watch = watch
@@ -1563,6 +1781,8 @@ def deps_from_env(environ=None, client=None, docs=None, feed=None, post=None, re
         # DRIVE_INTAKE_WATCH=on registers the watch; anything else is the poll alone.
         watch=watch if (environ.get("DRIVE_INTAKE_WATCH") or "") == "on" else None,
         push_url=environ.get("DRIVE_INTAKE_PUSH_URL") or "",
+        studio_url=studio_url_from_env(environ),
+        pair_ttl=min(max(_int_env(environ, "DRIVE_INTAKE_PAIR_TTL", PAIR_TTL), PAIR_TTL_RANGE[0]), PAIR_TTL_RANGE[1]),
     )
 
 

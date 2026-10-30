@@ -20,6 +20,15 @@ WHAT ONE POLL ASKS, AND WHAT IT NEVER WRITES
   would never move (Cursor on 0bee083). No watermark on record means a
   bounded look back, not "everything ever".
 
+  A TIMESTAMP IS A CURSOR ONLY TO THE SECOND (Copilot on ff15a56). The
+  watermark is kept in whole seconds, so a resume asks for that second AND
+  after (>=): docs that share the last doc's second are listed again, which
+  decide() makes harmless, rather than skipped, which nothing would repair.
+  And the cap may not stop inside the second the listing started in, or the
+  next poll would ask for the same second, get the same pages, and never
+  reach the docs behind them: such a listing reads on until the second moves
+  or the listing ends, and past STUCK_FACTOR times the cap it raises.
+
   This module writes NOTHING to the store. Cursor on 0bee083: the feed used to
   record the poll as soon as the listing returned, before a single hint was
   decided, so a doc queued for the laptop fell out of the window and was
@@ -42,6 +51,7 @@ DEFAULT_LOOKBACK = 86400     # with no watermark on record, one day back
 DEFAULT_MARGIN = 600         # ten minutes behind the watermark, so an edit mid-poll is not missed
 PAGE = 100
 MAX_PAGES = 10               # a thousand changed docs in one poll is a poll; past that, the next continues
+STUCK_FACTOR = 10            # a cap that fell inside one second reads on this many caps, then says so
 
 
 class Unconfigured(Exception):
@@ -66,12 +76,13 @@ def epoch_of(rfc3339) -> float | None:
     return parsed.timestamp()
 
 
-def query_for(folder_id: str, since_epoch: float) -> str:
-    """The Drive query: this folder, Docs only, not trashed, modified after `since`."""
+def query_for(folder_id: str, since_epoch: float, inclusive: bool = False) -> str:
+    """The Drive query: this folder, Docs only, not trashed, modified after `since`; a resume is
+    `inclusive`, the second itself and after, because the cursor is only good to the second."""
     if not folder_id:
         raise Unconfigured("no folder to poll (DRIVE_INTAKE_FOLDER_ID)")
-    return ("'%s' in parents and mimeType = '%s' and trashed = false and modifiedTime > '%s'"
-            % (folder_id, DOC, iso(since_epoch)))
+    return ("'%s' in parents and mimeType = '%s' and trashed = false and modifiedTime %s '%s'"
+            % (folder_id, DOC, ">=" if inclusive else ">", iso(since_epoch)))
 
 
 def since_for(watermark, now: float, lookback=DEFAULT_LOOKBACK, margin=DEFAULT_MARGIN) -> float:
@@ -170,30 +181,44 @@ class DriveFolder:
         # finished: an edit that landed while that poll ran is still inside the next window.
         resume = getattr(self.store, "resume", None)
         mark = self.store.watermark()
+        resumed = False
         if callable(resume) and resume() and mark is not None:
             try:
                 since = max(0.0, min(float(mark), now))
+                resumed = True
             except (TypeError, ValueError):
                 since = since_for(mark, now, self.lookback, self.margin)
         else:
             since = since_for(mark, now, self.lookback, self.margin)
         # The baseline (main.poll's first poll): nothing modified before it is listed, whatever the
-        # watermark or the look back says.
+        # watermark or the look back says. A floor above the resume point is the baseline, not a
+        # resume, so that listing is strictly after it.
         floor = getattr(self.store, "floor", None)
         low = floor() if callable(floor) else None
-        if low is not None:
-            since = max(since, min(float(low), now))
-        query = query_for(folder_id, since)
+        if low is not None and min(float(low), now) > since:
+            since = min(float(low), now)
+            resumed = False
+        query = query_for(folder_id, since, inclusive=resumed)
         self.last_query = query
-        files, page_token, complete = [], "", True
-        for _page in range(self.max_pages):
+        files, page_token, pages = [], "", 0
+        while True:
             answer = self._list(query, page_token)
+            pages += 1
             files.extend(answer.get("files") or [])
             page_token = answer.get("nextPageToken") or ""
-            if not page_token:
+            if not page_token or pages < self.max_pages:
+                if not page_token:
+                    break
+                continue
+            # At the cap with pages left. Stopping is safe only once the last doc is in a LATER
+            # second than the one this listing started in; otherwise the next poll asks again
+            # for this second and gets these pages again.
+            last = epoch_of((files[-1] or {}).get("modifiedTime")) if files else None
+            if last is not None and int(last) > int(since):
                 break
-        else:
-            complete = not page_token
+            if pages >= self.max_pages * STUCK_FACTOR:
+                raise RuntimeError("more docs share one second than a poll may list (%d pages)" % pages)
+        complete = not page_token
         # Complete: the watermark is now. Incomplete: the last doc returned (oldest first), so the
         # next poll continues from there and the docs past the cap are not past the cursor.
         watermark = now

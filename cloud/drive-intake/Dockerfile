@@ -17,6 +17,7 @@ COPY cloud/claude-api-worker/gdocs.py /app/gdocs.py
 COPY cloud/drive-intake/drive_feed.py /app/drive_feed.py
 COPY cloud/drive-intake/drive_watch.py /app/drive_watch.py
 COPY cloud/drive-intake/task_filter.py /app/task_filter.py
+COPY cloud/drive-intake/trail.py /app/trail.py
 COPY cloud/drive-intake/main.py /app/main.py
 
 ENV PYTHONUNBUFFERED=1

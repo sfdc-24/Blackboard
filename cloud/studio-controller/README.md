@@ -252,6 +252,42 @@ The Apps Script sender mails a sign-in code only to an address in its own
 `STUDIO_SUMMARY_ANY_RECIPIENT=true`), so the invited addresses and the notify
 address must be there as well.
 
+The telephone trail (step 4 of the broken-telephone fix; off unless
+`STUDIO_TELEPHONE_URL` is set): `GET /v1/session/{id}/telephone?doc=<Drive
+file id>` reads the private drive-intake service's `/trail` and returns its
+receipts and answer lines, never the request. The query names a doc. The read
+happens only for a live session whose server-side record already stores that
+same id (`telephone_doc`). A stopped, expired, deleted, or unknown session is
+refused before any read. A doc the session is not bound to is refused with
+nothing about that doc's contents, size, or existence. The five-second cache
+is per session and doc, so one session is not handed another's trail, and
+callers that miss it together share one upstream read. The answer is checked
+against the shape drive-intake writes (the doc that was asked for, a known
+status, typed entries) and rebuilt from its named keys; anything else is a 502,
+never a trail. It needs
+`STUDIO_TELEPHONE_URL` (the service URL), `STUDIO_TELEPHONE_TOKEN` (the same
+value as `DRIVE_INTAKE_POLL_TOKEN`, from Secret Manager), and `roles/run.invoker`
+on drive-intake for this service's account, since the call carries this
+service's own OIDC identity. The binding is written only by
+`bind_telephone_doc`, not by the query, and that writer is off with the flag.
+`POST /v1/session` binds nothing: its body is the client's.
+
+The binding is a pairing code. When drive-intake dispatches a request and
+`DRIVE_INTAKE_STUDIO_URL` is set, it writes one more line into that doc:
+`STUDIO LINK - task <id> on a live studio call: <studio>?live=1#pair=<code> -
+until <time> - id <receipt id>`. The code is random (80 bits), stored in Redis
+only as a hash with the doc it opens, and good for `DRIVE_INTAKE_PAIR_TTL`
+(12 hours by default). It sits in the URL fragment, so no web server logs it.
+`POST /v1/session/{id}/telephone/pair` with `{"code": ...}` (this session's
+token, an operator's live session; a visitor or pilot session is 403) asks
+drive-intake's `POST /pair`, as this service's identity with the poll token,
+which doc the code opens. drive-intake names the doc; the browser never does.
+Unknown and expired codes are one 403; five tries per session. A session is
+bound once: the same doc again is a no-op and another doc is 409. So whoever
+can read the doc can show its trail on their own operator session: the same
+people who can already read every receipt in it. Nothing else binds: not a
+session id in the doc, not an operator-to-doc map, not a client doc field.
+
 Keep `STUDIO_MAX_SESSION_SECONDS=600`, `STUDIO_DAILY_SESSION_CAP=20`, and
 the operator allowlist for the approved initial envelope. Voice is one call per
 Studio session. The controller reserves one `STUDIO_VOICE_MINT_CAP` slot
