@@ -275,7 +275,7 @@ def live(conn, env, execution, me, until, interval, lock_ttl, settle=None) -> in
 
 
 def live_with_canvas(conn, env, execution, me, until, interval, lock_ttl, start=None, start_bridge=None,
-                     environ=None) -> int:
+                     environ=None, start_relay=None) -> int:
     """live(), with the canvas publisher (scripts/canvas_publish.py) beside it while CANVAS_BUCKET is set.
 
     BESIDE THE LOOP, ON ITS OWN THREAD: one pass starts with a board read that can take minutes, and the
@@ -302,11 +302,19 @@ def live_with_canvas(conn, env, execution, me, until, interval, lock_ttl, start=
         bridge = (start_bridge or call_bridge.start)(conn, log, holds)
         if bridge is not None:
             log.info("call bridge: on, room asks become claimed cards in conf:canvas:%s", bridge.canvas_room)
+    relay = None
+    if bridge is not None and environ.get("CALL_RELAY", "").strip().lower() == "on":
+        # docs/CALL-DELIVERY-LOOP.md: every claimed ask gets a board pointer its agent reads, an overdue row at
+        # 180 s, and expiry when the call ends. Same lease as the bridge; off is the rollback.
+        import call_relay                                                # noqa: PLC0415
+        relay = (start_relay or call_relay.start)(conn, log, holds, appender(env), call_relay.board_lookup(env))
+        if relay is not None:
+            log.info("call relay: on, pointers for open asks, overdue at %ds", call_relay.OVERDUE_SECONDS)
     try:
         return live(conn, env, execution, me, until, interval, lock_ttl,
                     bridge.settle if bridge is not None else None)
     finally:
-        for worker in (bridge, publisher):
+        for worker in (relay, bridge, publisher):
             if worker is not None:
                 worker.stop.set()
                 worker.thread.join(timeout=15)
