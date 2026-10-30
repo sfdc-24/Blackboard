@@ -49,7 +49,7 @@ stateDiagram-v2
 | `pointed` | **call relay (new, beside the bridge)** | one board row `phase=DISPATCH`, `to=<agent>`, `id=<call id>`, `inbox=fleet:inbox:<agent>`, **no words** | Every agent's existing reader now sees that an ask waits. |
 | `working` | the agent's own writer | card v2, `status=working`, `activity` names what it is doing | Real work started. The page shows it. |
 | `done` | the agent's own writer | card v3 with the deliverable (`mermaid` for a diagram ask, `note` otherwise), then a board row `answers=<call id>` | The bridge closes the open entry. It never overwrites a card above v1 (`call_bridge._flip`). |
-| `routed` | the agent's own writer | card v2, `status=review`, body says which lane will build it and that it is **not done**; board row `routes=<call id>`, **never `answers=`** | Honest: a model cannot deploy, fix or wire. `answers=` would flip the card to done, so a routed reply must not use it. |
+| `routed` | the agent's own writer | card v2, `type=note`, `status=review`, body says which lane will build it and that it is **not done**; board row `routes=<call id>`, **never `answers=`** | Honest: a model cannot deploy, fix or wire. `answers=` would flip the card to done, so a routed reply must not use it. |
 | `overdue` | call relay | board row to the agent and cc the owner's channel, once | Silence becomes visible within 180 s instead of at the end of the call. |
 
 Card versions only go up. A card is never moved back to a lower version.
@@ -60,7 +60,7 @@ Card versions only go up. A card is never moved back to a lower version.
 |---|---|---|
 | diagram, draw, map, sketch, design, flow, wireframe | Mermaid text that passes `canvas_publish.mermaid_ok` | `mermaid` |
 | draft, write, list, plan, outline, summarize, compare, estimate, research, prepare | Plain text, at most `BODY_MAX` characters | `note` |
-| build, fix, deploy, wire, test, verify, set up, open | Not a model deliverable | `routed` (see section 3) |
+| build, fix, deploy, wire, test, verify, set up, open | Not a model deliverable: the routed state (section 3) | `note` with `status=review`. There is no `routed` card type: `canvas_publish.clean_item` drops any type outside `TYPES`, so the card would never publish. |
 
 A deliverable is the **requested thing**. A note saying "I will do this" is not a deliverable and must not use
 `answers=`. Aya's acceptance bar stands: a placeholder never passes.
