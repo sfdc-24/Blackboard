@@ -25,6 +25,8 @@ carries a status banner is shifted down by two lines.
 
 | Document | Status | Notes |
 |---|---|---|
+| docs/okf/HOW-WE-WORK.md | CANON | Execution model (`EXECUTION-MODEL-20260928`): OKF is the delivery surface, the bus is doorbells and milestones, Ops shows the living hub, roles, and release NOW. Living fleet roles refine here. EXPRESS §2 matches this page. |
+| docs/okf/ (pack) | CANON for alignment | One shared Blackboard project OKF. Cooking is live PR state from `bake.py`, not doctrine. |
 | ADR-20260925-…-CONTROL-PLANE.md | CANON | The architecture and gates G1–G9. Its snapshot tables are dated (R5/R5b); read live state instead. |
 | AGENCY-DOCTRINE.md | CANON | Decision rights (clause 4 lists six carve-outs) and evidence. Stale: the "Today:" notes that name the laptop `board_waker.py` (lines 61–63, 188–190) and the `inference_report.py` step (line 232), both laptop tasks. |
 | PRODUCT.md | CANON | The four beats (sheet L-90). |

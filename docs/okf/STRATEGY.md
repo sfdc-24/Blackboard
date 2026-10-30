@@ -4,7 +4,7 @@ id: FULL-STRATEGY-BUILD-20260927
 owner: grok (PM)
 authority: Codex PDF SFDC24-Blackboard-Architecture-Current-Future-2026-09-26
 status: living
-updated_at: 2026-09-27T04:21:00Z
+updated_at: 2026-09-28T13:20:00Z
 public_site_rule: never put the word OKF on www.sfdc24.com public pages
 ---
 
@@ -14,7 +14,7 @@ public_site_rule: never put the word OKF on www.sfdc24.com public pages
 **Local:** `/workspace/briefs/SFDC24-Blackboard-Architecture-Current-Future-2026-09-26-CODEX.pdf`
 **Companion stitch (CONF-LINE overlay only):** `/workspace/briefs/conf-line-architecture-stitched.md` — LiveKit media plane *on top of* this motherboard; never a replacement.
 
-This pack is HOW-WE-WORK–adjacent. Board moves work; this pack + Cooking show the field; EXPRESS is how we behave.
+This pack is HOW-WE-WORK–adjacent. The execution model is [HOW-WE-WORK](./HOW-WE-WORK.md). This pack and Cooking show the field. The bus carries doorbells and milestones. EXPRESS is how we behave.
 
 ## 1) Vision (from Codex FUTURE page)
 
@@ -46,18 +46,21 @@ Held/dark (do not auto-promote): Zoom RTMS+Ubuntu presenter; Salesforce writes (
 
 **Converspan launch (non-waivable):** ADR **G9** in full (includes G2 + own enrollment). Soak criteria set by Codex/owner.
 
-## 4) Lanes (fleet) — Test lead = Codex
+## 4) Lanes (fleet) — living roles on HOW-WE-WORK
 
-| Lane | Owner | Notes |
+Delivery assignment refines on [HOW-WE-WORK](./HOW-WE-WORK.md) (`EXECUTION-MODEL-20260928`). This table matches that page. Codex remains quality and test lead. Promotion order in §3 is unchanged.
+
+| Role | Owner | Notes |
 |---|---|---|
-| Strategy / track / stitch | **grok** (PM) | This pack; overnight GO triage; board NOTE ALL |
-| CHAIR / Spike A–B / conference packages | **claude-code-cli** | chair/, gateway/, console/, personas/ |
-| Contract + broker + **Test lead** | **chatgpt-codex-desktop (Codex)** | broker/, docs/; exact-head GO/NO-GO; fleet test suite lead |
-| Adversarial / multimodal limits | **gemini** | Reasoning only unless given hands |
-| Living docs ops (Cooking/HOW-WE-WORK/session packs) | **copilot** | Doorbell → refresh living docs; no motherboard redesign |
+| Delivery and strategy lead | **Grok Bot** | This pack; overnight GO triage; alignment on the project OKF |
+| Quality and test lead | **Codex** (`chatgpt-codex-desktop`) | Exact-head GO/NO-GO; fleet tests; broker/ and docs/ quality |
+| Data and security engineer | **Claude** (`claude-code-cli`) | Data handling and security engineering, with evidence |
+| Heavy PM and Build and PR execution | **Cursor** | The build and the PR, including conference packages when that is the change |
+| Admin and analyst | **Gemini** | Admin surfaces and analysis written back to the OKF |
+| GitHub DevOps and repo reviewer | **Copilot Agents** | CI, repo review, Cooking / HOW-WE-WORK / session pack refresh via PR |
 | Human decision / commercial / irreversible | **Mr. Salam** | His six; CX pricing; paid plans; live keys |
 
-Conference folder ownership stays in `conference/docs/okf/lanes.md`. Blackboard lane map stays in `./lanes.md`. This table is the **cross-repo** strategy view.
+Conference folder ownership stays in `conference/docs/okf/lanes.md`. Blackboard lane map stays in `./lanes.md`. Role edits land on HOW-WE-WORK.
 
 ## 5) HITL — bake gates into the plan (not after)
 
@@ -88,15 +91,15 @@ Track in Cooking + Ops snapshot (public Ops shows numbers, never internal jargon
 | PR cycle | open → green checks → exact-head GO → merge | density+test green = squash-merge eligible |
 | Evidence hygiene | every RESULT names evidence level | 100% |
 | Gate debt | open NO-GO / pending verdict heads | triage; no silent re-ask |
-| Doorbell→docs lag | board NOTE that changes field → Cooking/HOW-WE-WORK refresh | <15m (Copilot lane) |
+| Doorbell→docs lag | DISPATCH or RESULT that changes the field → Cooking/HOW-WE-WORK refresh | <15m (Copilot Agents) |
 | Test lead coverage | Codex-led suite plan posted for conference | FLEET-TEST-SUITE-CODEX-20260927 |
 
 ## 7) Doorbell → living docs
 
-1. Board row wakes the idle agent (doorbell).
-2. Agent updates **Cooking / session pack / gates** in-repo (living docs).
-3. Copilot Agents keep HOW-WE-WORK / Cooking / session packs current across Blackboard · conference · site knowledge packs.
-4. Public **Ops** (`https://www.sfdc24.com/ops/`) is the client-safe living **project board** — snapshot, not motherboard dump. **Never print "OKF" on the public site.**
+1. Bus DISPATCH wakes the idle agent and carries the `okf=` URL.
+2. The agent updates **Cooking / session pack / gates** on that OKF page.
+3. Copilot Agents keep HOW-WE-WORK / Cooking / session packs current across Blackboard · conference · site knowledge packs, via the PR.
+4. Public **Ops** (`https://www.sfdc24.com/ops/`) shows the living hub, the fleet roles, and release NOW. Snapshot, not a motherboard dump. Public pages do not print the word OKF.
 
 ## 8) Spike A → sfdc24.com `/conference` page
 
@@ -104,13 +107,15 @@ Track in Cooking + Ops snapshot (public Ops shows numbers, never internal jargon
 - Public surface is **`/conference/`** on sfdc24-site: owner-facing status of the conference line POC — media plane, rooms, next demo — **without** the word OKF, without secrets, without motherboard internals.
 - Internal durable wiki remains `docs/okf/` in private/working repos.
 
-## 9) OPS living project board
+## 9) OPS — living hub, roles, release NOW
 
-- URL: `/ops/` (already densified toward sprint lanes: Next release · In sprint · Backlog).
+- URL: https://www.sfdc24.com/ops/
+- Shows three things: the living hub (this OKF, in plain words), the fleet roles, and **release NOW** (Cooking now / next release). Sprint lanes on the page: Next release · In sprint · Backlog.
+- Public copy does not print the word OKF.
 - Overnight GO: squash-merge **green density + test** PRs on conference / site / Blackboard that are docs-or-test-safe and exact-head GO'd.
 - Hold: anything touching live keys, traffic %, Salesforce writes, paid plans, or a Codex NO-GO head.
 
-## 10) Overnight GO policy (PM-Grok)
+## 10) Overnight GO policy (Grok Bot, delivery lead)
 
 **GO = squash-merge** when all true:
 
@@ -119,12 +124,13 @@ Track in Cooking + Ops snapshot (public Ops shows numbers, never internal jargon
 3. Exact-head GO from required reviewers (Codex Test lead where named).
 4. Scope is density/docs/test/living-pack — not irreversible prod traffic.
 
-**HOLD** otherwise; board the reason; keep fleet busy on the next green item.
+**HOLD** otherwise; post the reason on the bus; keep the fleet on the next green item.
 
 ## 11) Pack index (inline links for board NOTE)
 
 - This file: `docs/okf/STRATEGY.md`
-- HOW-WE-WORK: `docs/okf/HOW-WE-WORK.md`
+- Execution model: `okf=https://github.com/sfdc-24/Blackboard/blob/main/docs/okf/HOW-WE-WORK.md`
+- Project OKF: `okf=https://github.com/sfdc-24/Blackboard/blob/main/docs/okf/index.md`
 - Lanes: `docs/okf/lanes.md`
 - Cooking: `docs/okf/cooking.md`
 - Utilization: `docs/okf/utilization.md`

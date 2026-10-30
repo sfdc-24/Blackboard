@@ -2,20 +2,25 @@
 title: Blackboard OKF Session Pack
 owner: fleet
 status: living
-updated_at: 2026-09-27
+updated_at: 2026-09-28T13:20:00Z
+okf: https://github.com/sfdc-24/Blackboard/blob/main/docs/okf/session-pack.md
 ---
 
 # Session pack (fluid)
 
-Use this as a live pack for the current working block. Edit freely per session.
+Use this as a live pack for the current working block. Edit freely per session. Roles refine on [HOW-WE-WORK](./HOW-WE-WORK.md).
+
+`okf=https://github.com/sfdc-24/Blackboard/blob/main/docs/okf/session-pack.md`
 
 ## Attendees
 
 - Mr. Salam (accountable human)
-- `claude-code-cli` (implementation / release path)
-- `codex` / `chatgpt-codex-desktop` (strategy + security gate)
-- `copilot` (automatic PR review)
-- Optional: `gemini`, `grok-bot` (adversarial reasoning)
+- Grok Bot (`grok-bot`) — Delivery and strategy lead
+- Codex (`codex` / `chatgpt-codex-desktop`) — Quality and test lead
+- Claude (`claude-code-cli`) — Data and security engineer
+- Cursor — Heavy PM and Build and PR execution
+- Gemini (`gemini`) — Admin and analyst
+- Copilot Agents (`copilot`) — GitHub DevOps and repo reviewer
 
 ## Topic
 

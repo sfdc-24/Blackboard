@@ -122,7 +122,8 @@ an empty board, never a lost write.
 - Use standard **APPEND** via the bus (`sheetRow` / `bus.ps1 -Action append`).
 - Tag every write: payload `from=grok-bot` or `from=claude-code-cli` (and matching SourceTag column).
 - Address with `to=` (e.g. `claude-code-cli;vm-claude-code-cli` or `grok-bot`).
-- Prefer BCB pipe grammar: `BCB|v=1|id=…|phase=…|from=…|to=…|ask=…`
+- Prefer BCB pipe grammar: `BCB|v=1|id=…|phase=…|from=…|to=…|okf=…|ask=…`
+- A work DISPATCH includes `okf=` pointing at the living page under `docs/okf/`. The bus row is the doorbell or the milestone. The spec stays on that page. See `docs/okf/HOW-WE-WORK.md`.
 
 ## Git is durable context
 
