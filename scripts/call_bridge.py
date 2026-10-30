@@ -37,6 +37,12 @@ import threading
 
 import canvas_publish
 
+try:                                                   # redis-py raises WatchError when a watched key changed
+    from redis.exceptions import WatchError as _WatchError
+    WATCH_ERRORS = (_WatchError,)
+except ImportError:                                    # no client installed (offline tests use a fake)
+    WATCH_ERRORS = ()
+
 STREAM_MATCH = "v1:conf:*:events"
 CONF_ROOM = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 CURSOR_KEY = "gov:callbridge:cursor:%s"
@@ -48,6 +54,7 @@ CANVAS_ROOM = "workshop"
 TTL_SECONDS = 2 * 24 * 60 * 60
 LOOKBACK_SECONDS = 300
 TICK_SECONDS = 5
+FLIP_TRIES = 3
 PAGE = 200
 ASK_CHARS = 1000
 
@@ -188,13 +195,15 @@ class Bridge:
             for agent in asks_in(_fields(raw)):
                 if not self.holds():
                     return claimed
-                ask = self._claim(room, entry_id, agent, _fields(raw).get("utterance") or "", now)
+                fields = _fields(raw)
+                ask = self._claim(room, entry_id, agent, fields.get("utterance") or "", now,
+                                  epoch=fields.get("session_epoch") or "")
                 if ask:
                     claimed.append(ask)
             self.conn.set(CURSOR_KEY % room, entry_id, ex=TTL_SECONDS)
         return claimed
 
-    def _claim(self, room, entry_id, agent, said, now):
+    def _claim(self, room, entry_id, agent, said, now, epoch=""):
         ask = ask_id(room, entry_id, agent)
         if not self.conn.set(ASK_KEY % ask, stamp(now), nx=True, ex=TTL_SECONDS):
             return None                                      # claimed before: never twice
@@ -205,8 +214,11 @@ class Bridge:
                       json.dumps(claimed_card(agent, now), sort_keys=True))
             pipe.xadd(INBOX_KEY % agent, {"by": BY, "text": inbox_text(ask, agent, self.canvas_room, said, now),
                                           "at": stamp(now)})
-            pipe.hset(OPEN_KEY, ask, json.dumps({"agent": agent, "claimed_at": stamp(now), "room": self.canvas_room},
-                                                sort_keys=True))
+            # conf_room and session_epoch name the CALL the ask came from (the canvas room is shared), so the
+            # call relay can close it on that call's own end (docs/CALL-DELIVERY-LOOP.md). Additive: settle
+            # reads agent, claimed_at and room only.
+            pipe.hset(OPEN_KEY, ask, json.dumps({"agent": agent, "claimed_at": stamp(now), "room": self.canvas_room,
+                                                 "conf_room": room, "session_epoch": epoch}, sort_keys=True))
             pipe.expire(OPEN_KEY, TTL_SECONDS)
             pipe.execute()
         finally:
@@ -245,22 +257,35 @@ class Bridge:
         return done
 
     def _flip(self, ask, agent, room, claimed_at, now) -> None:
+        """Close the ask; write the generic done card only over the bridge's own claim, decided under WATCH.
+
+        Cursor on 11b0c0fa: a decision from a read outside the transaction could write the done card over a
+        terminal card another writer (the call relay's expiry) committed in between. The card is re-read under
+        WATCH, and EXEC fails if it changed; a few retries keep a busy key from dropping the flip."""
         partition = canvas_publish.PARTITION % (room, agent)
-        current = _text(self.conn.hget(partition, ask))
-        try:
-            mine = json.loads(current) if current else None
-        except ValueError:
-            mine = None
-        pipe = self.conn.pipeline(transaction=True)
-        try:
-            pipe.multi()
-            # The agent's own card under the same id, posted after the claim, is never overwritten.
-            if mine is None or (mine.get("status") == "claimed" and mine.get("version") == 1):
-                pipe.hset(partition, ask, json.dumps(done_card(agent, claimed_at, now), sort_keys=True))
-            pipe.hdel(OPEN_KEY, ask)
-            pipe.execute()
-        finally:
-            pipe.reset()
+        for _attempt in range(FLIP_TRIES):
+            pipe = self.conn.pipeline(transaction=True)
+            try:
+                pipe.watch(partition)
+                current = _text(pipe.hget(partition, ask))
+                try:
+                    mine = json.loads(current) if current else None
+                except ValueError:
+                    mine = None
+                pipe.multi()
+                # The agent's own card under the same id, posted after the claim, is never overwritten.
+                if mine is None or (mine.get("status") == "claimed" and mine.get("version") == 1):
+                    pipe.hset(partition, ask, json.dumps(done_card(agent, claimed_at, now), sort_keys=True))
+                pipe.hdel(OPEN_KEY, ask)
+                pipe.execute()
+                break
+            except WATCH_ERRORS:
+                continue                                     # the card moved: decide again on the new value
+            finally:
+                pipe.reset()
+        else:
+            self.log.warning("call bridge: %s not flipped, card kept changing", ask)
+            return
         self.log.info("call bridge: %s done for %s", ask, agent)
 
     def run(self, interval=TICK_SECONDS):

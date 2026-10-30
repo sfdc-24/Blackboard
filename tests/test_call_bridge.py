@@ -34,7 +34,7 @@ class FakeRedis:
     """Strings, hashes and streams, with a MULTI that queues and runs in order (no rollback, like Redis)."""
 
     def __init__(self):
-        self.store, self.hashes, self.streams, self.ttls, self.seq = {}, {}, {}, {}, 0
+        self.store, self.hashes, self.streams, self.ttls, self.seq, self.edits = {}, {}, {}, {}, 0, {}
 
     def set(self, key, value, nx=False, ex=None):
         if nx and key in self.store:
@@ -48,6 +48,7 @@ class FakeRedis:
 
     def hset(self, key, field, value):
         self.hashes.setdefault(key, {})[field] = value
+        self.edits[key] = self.edits.get(key, 0) + 1
         return 1
 
     def hget(self, key, field):
@@ -57,6 +58,7 @@ class FakeRedis:
         return dict(self.hashes.get(key, {}))
 
     def hdel(self, key, field):
+        self.edits[key] = self.edits.get(key, 0) + 1
         return 1 if self.hashes.get(key, {}).pop(field, None) is not None else 0
 
     def expire(self, key, seconds):
@@ -86,24 +88,35 @@ class FakeRedis:
 
 
 class FakePipe:
+    """redis-py's shape: after watch() commands run immediately; after multi() they queue; execute() runs the
+    queue, or raises WatchError when a watched key changed since watch() (writes are versioned in `edits`)."""
+
     def __init__(self, conn):
-        self.conn, self.queued = conn, []
+        self.conn, self.queued, self.watched, self.in_multi = conn, [], None, False
+
+    def watch(self, *keys):
+        self.watched = {k: self.conn.edits.get(k, 0) for k in keys}
 
     def multi(self):
-        pass
+        self.in_multi = True
 
     def reset(self):
-        self.queued = []
+        self.queued, self.watched, self.in_multi = [], None, False
 
     def execute(self):
+        if self.watched and any(self.conn.edits.get(k, 0) != v for k, v in self.watched.items()):
+            self.queued = []
+            raise cb.WATCH_ERRORS[0]("watched key changed") if cb.WATCH_ERRORS else RuntimeError("watch")
         out = [getattr(self.conn, name)(*a, **kw) for name, a, kw in self.queued]
         self.queued = []
         return out
 
     def __getattr__(self, name):
-        def queue(*a, **kw):
+        def call(*a, **kw):
+            if self.watched is not None and not self.in_multi:
+                return getattr(self.conn, name)(*a, **kw)
             self.queued.append((name, a, kw))
-        return queue
+        return call
 
 
 def at(seconds_ago=0):
@@ -290,6 +303,39 @@ class Done(unittest.TestCase):
         self.settle([row("aya", "BCB|v=1|id=X|from=aya|answers=%s|text=done" % self.ask)])
         self.assertEqual(own, card(self.conn, "chatgpt-codex-desktop", self.ask))
         self.assertNotIn(self.ask, self.conn.hgetall(cb.OPEN_KEY))
+
+    def test_a_terminal_card_written_during_the_flip_is_never_overwritten(self):
+        """Cursor on 11b0c0fa: the call relay's expiry can commit between _flip's read and its write. The card is
+        re-read under WATCH, so the done card never lands over it; the ask still leaves the open set."""
+        expired = {"v": 1, "type": "note", "status": "review", "public": True, "version": 2, "ts": "x",
+                   "title": "Not started: the call ended", "body": "closed"}
+        partition = cp.PARTITION % ("workshop", "chatgpt-codex-desktop")
+        real = self.conn.pipeline
+        raced = []
+
+        def racing(transaction=True):
+            pipe = real(transaction)
+            original = pipe.multi
+
+            def multi():
+                if not raced:                    # the relay commits once, between the read and EXEC
+                    raced.append(1)
+                    self.conn.hset(partition, self.ask, json.dumps(expired))
+                original()
+            pipe.multi = multi
+            return pipe
+        self.conn.pipeline = racing
+        self.settle([row("aya", "BCB|v=1|id=X|from=aya|answers=%s|text=done" % self.ask)])
+        self.assertEqual(expired, card(self.conn, "chatgpt-codex-desktop", self.ask))
+        self.assertNotIn(self.ask, self.conn.hgetall(cb.OPEN_KEY))
+
+    def test_the_open_record_names_the_call_it_came_from(self):
+        conn = FakeRedis()
+        open_window(conn)
+        turn(conn, "Gemini, draw the quote flow.", session_epoch="7")
+        [ask] = bridge(conn).tick()
+        info = json.loads(conn.hgetall(cb.OPEN_KEY)[ask])
+        self.assertEqual((ROOM, "7", "workshop"), (info["conf_room"], info["session_epoch"], info["room"]))
 
     def test_no_flip_without_the_lease(self):
         payload = "BCB|v=1|id=X|from=aya|answers=%s|text=done" % self.ask
