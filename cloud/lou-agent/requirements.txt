@@ -1,0 +1,4 @@
+# Lou as code. Pinned to the version the tests ran against (2026-10-16).
+livekit-agents==1.8.8
+livekit-plugins-openai==1.8.8
+redis>=5,<6

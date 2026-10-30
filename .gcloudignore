@@ -29,6 +29,7 @@
 !/cloud/drive-intake
 !/cloud/claude-api-worker
 !/cloud/inbox-wake
+!/cloud/lou-agent
 
 !/scripts
 /scripts/*
