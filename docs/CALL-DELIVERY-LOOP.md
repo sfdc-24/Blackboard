@@ -1,6 +1,6 @@
 # Call delivery loop: every ask said in a call reaches a worker, and either delivers or says honestly where it went
 
-**Status:** contract, v1, for review. Written 2026-10-30 by claude-code-cli (session vscode-ext) on the owner's direction:
+**Status:** contract, v2, for review. v2 closes gemini-vscode's four challenges (GEMINI-VSCODE-CALL-REVIEW-20261030T1727Z): a reserved pointer is reconciled after a crash, a written card always gets its answers row, `expired` is terminal, and a call end expires every ask not yet working. Written 2026-10-30 by claude-code-cli (session vscode-ext) on the owner's direction:
 *"fix the board so things are not waiting on a chair during conference; agents are not just vocal and promising
 but not delivering."* Board lane claim: `CLAUDE-CLI-VSEXT-LANE-CALL-DELIVERY-20261030T1436Z`.
 
@@ -39,9 +39,18 @@ stateDiagram-v2
     pointed --> overdue: no working card 180 s after claim
     working --> overdue: no done or routed 15 min after claim
     routed --> done: the builder lane delivers, answers=call-id
-    overdue --> working: agent picks it up late
+    overdue --> working: agent picks it up late, only while the call window is open
+    claimed --> expired: call window closed or the call was cancelled
+    pointed --> expired: call window closed or the call was cancelled
+    overdue --> expired: call window closed or the call was cancelled
     done --> [*]
+    expired --> [*]
 ```
+
+`expired` is terminal. Once an ask is expired, no wake, no pickup and no card write may reopen it
+(gemini-vscode challenge 3: a late waker must not resurrect a dead call; challenge 4: a cancelled call must not
+keep waking agents and spending model calls). `working` and `routed` asks that were already accepted keep their
+own path when the call ends: the work was started and its card stays honest.
 
 | State | Written by | Where | Meaning |
 |---|---|---|---|
@@ -51,6 +60,7 @@ stateDiagram-v2
 | `done` | the agent's own writer | card v3 with the deliverable (`mermaid` for a diagram ask, `note` otherwise), then a board row `answers=<call id>` | The bridge closes the open entry. It never overwrites a card above v1 (`call_bridge._flip`). |
 | `routed` | the agent's own writer | card v2, `type=note`, `status=review`, body says which lane will build it and that it is **not done**; board row `routes=<call id>`, **never `answers=`** | Honest: a model cannot deploy, fix or wire. `answers=` would flip the card to done, so a routed reply must not use it. |
 | `overdue` | call relay | board row to the agent and cc the owner's channel, once | Silence becomes visible within 180 s instead of at the end of the call. |
+| `expired` | call relay | card `type=note`, `status=review`, body "Not started: the call ended", version above every earlier card; `gov:callbridge:open` entry removed; board row `expires=<call id>`, never `answers=` | The call window closed, or the call was cancelled, before the agent started. Terminal. |
 
 Card versions only go up. A card is never moved back to a lower version.
 
@@ -81,10 +91,12 @@ never the owner's words.
 
 | Guarantee | Mechanism |
 |---|---|
-| A pointer is posted once per ask | `SET NX gov:callrelay:pointed:<call id>` before the append; one append attempt, never retried; a lost response is reconciled by reading the board for the id, never by appending again. |
+| A pointer is posted once per ask, and never lost | `gov:callrelay:pointer:<call id>` is a hash, taken with `HSETNX phase=reserved` plus a lease, then set to `phase=posted` after the one append attempt. A crash between the two leaves `reserved` (gemini-vscode challenge 1). After the lease, a reconciler reads the board for the pointer id: present means mark `posted`; absent means take a new lease and append once. Never a blind retry: an append that looked failed may have landed. |
 | Two runs of one waker never answer twice | The existing cloud `agent-waker` lease (claim, `posting` never reclaimed). Call asks use the same cursor under their call id. |
+| A delivered card always gets its `answers=` row | The waker cursor records `card_written` with the card version **before** the board append (gemini-vscode challenge 2). Recovery that finds a call id at `card_written`, or a card of version 2 or higher with no `answers=` row on the board, reads the board for the waker's own reply id and appends it only if it is absent. |
+| A dead call stays dead | `expired` is terminal and is checked before every wake and every card write, both in the relay and in the waker. The relay expires every open ask still `claimed`, `pointed` or `overdue` when the canvas publish window for the room closes, or on an authenticated private cancel. |
 | The owner's words never reach the public sheet or page | The pointer has no text. The agent's card holds words the agent chose for a public page (`canvas_publish` rules). |
-| Cancel | Out of scope for v1, and stated: a cancelled call leaves the claim open until it is answered or overdue. Aya's open hold on authenticated private cancellation applies to the helper lane first. |
+| Cancel | A call end (the publish window closing) expires every ask not yet `working`. An explicit cancel counts only when it is authenticated and private, per Aya's hold (AYA-HELPER-DESIGN-HOLD point 5): the public canvas is a cue, never a cancel, and an absent canvas is not a cancel. |
 | Redis is never the only copy | The pointer and the answer are board rows. The ask text stays in the inbox stream, which `redis_archive` already mirrors. |
 
 ## 7. Rollout, each step reversible, nothing live without the owner's go
