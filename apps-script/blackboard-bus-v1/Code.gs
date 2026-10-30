@@ -36,6 +36,12 @@
  * GET/POST {action:'time', secret}        -> current server timestamp
  * POST      {action:'append', secret, title, text, ...}
  * GET/POST {action:'read', secret, title} -> current file content
+ *              sheets only, all optional and combinable:
+ *              limit  N     the last N rows (a range read, not the whole sheet)
+ *              match  text  only rows containing this text, case-insensitive
+ *              since  ISO   only rows whose timestamp is at or after this
+ *              -> adds total and filtered to the response so a narrow answer
+ *                 can never be mistaken for an empty board
  *
  * See each handler below for full parameter docs.
  */
@@ -166,8 +172,32 @@ function handleAppend_(body, cfg) {
 // ---- READ -----------------------------------------------------------
 //
 // params: secret, title (or fileId)
-// Returns the Doc's full text, or every row of the first (or named)
-// Sheet tab. For instances with no Drive connector of their own.
+//         optional, sheets only: limit, match, since, sheetName
+//
+// Returns the Doc's full text, or rows of the first (or named) Sheet tab.
+// For instances with no Drive connector of their own.
+//
+// WHY THE FILTERS EXIST, ADDED 2026-09-18
+//   Every read of the operational board returned the whole sheet: measured the
+//   same day at 2,831 rows and 4,297,598 bytes. Agents coordinate by posting a
+//   row and reading it back, so one sentence between two agents cost a POST
+//   plus four megabytes plus a second four megabytes to verify the row landed.
+//   Mr Salam's words: "the board is taking multiple round trips and wasting
+//   tokens".
+//
+//   `limit` also reads a RANGE rather than the whole sheet, so the script stops
+//   paying for the rows it is about to throw away - that matters more as the
+//   board grows, because getDataRange() on a sheet this size is the part that
+//   will eventually meet the six-minute execution limit.
+//
+// BACKWARDS COMPATIBLE ON PURPOSE
+//   No parameters means exactly the old behaviour, byte for byte. Five clients
+//   on three machines call this endpoint and none of them may break today.
+//
+// WHAT A FILTERED RESPONSE SAYS ABOUT ITSELF
+//   It carries `total` (rows in the sheet) and `filtered` (rows returned), so a
+//   caller can never read a narrow answer as an empty board. That distinction
+//   has already cost this project a false data-loss escalation.
 
 function handleRead_(params, cfg) {
   if (!params.title && !params.fileId) return jsonOut_({ ok: false, error: 'title or fileId is required.' }, 400);
@@ -182,8 +212,50 @@ function handleRead_(params, cfg) {
     const ss = SpreadsheetApp.openById(file.getId());
     const sheet = params.sheetName ? ss.getSheetByName(params.sheetName) : ss.getSheets()[0];
     if (!sheet) return jsonOut_({ ok: false, error: 'Sheet tab not found: ' + params.sheetName }, 400);
-    const rows = sheet.getDataRange().getValues();
-    return jsonOut_({ ok: true, fileId: file.getId(), title: file.getName(), rows: rows });
+
+    const total = sheet.getLastRow();
+    const cols = sheet.getLastColumn();
+    const limit = parseInt(params.limit, 10);
+    const match = String(params.match || '').toLowerCase();
+    const since = String(params.since || '');
+    const filtered = (limit > 0) || !!match || !!since;
+
+    if (!filtered) {
+      // The old path, untouched.
+      return jsonOut_({ ok: true, fileId: file.getId(), title: file.getName(),
+                        rows: sheet.getDataRange().getValues() });
+    }
+
+    // A tail read when a limit is given, so the rows nobody asked for are never
+    // loaded. With match or since and no limit, the whole sheet is still read -
+    // there is no way to find a substring without looking at it - but only the
+    // matching rows travel, which is where the four megabytes went.
+    let rows;
+    if (limit > 0 && !match && !since) {
+      const n = Math.min(limit, total);
+      rows = total > 0 ? sheet.getRange(Math.max(1, total - n + 1), 1, n, cols).getValues() : [];
+    } else {
+      rows = sheet.getDataRange().getValues();
+      if (since) {
+        rows = rows.filter(function (r) {
+          for (let i = 0; i < r.length; i++) {
+            const cell = r[i];
+            if (cell instanceof Date) return cell.toISOString() >= since;
+            if (typeof cell === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(cell)) return cell >= since;
+          }
+          return false;   // a row with no timestamp cannot satisfy a since
+        });
+      }
+      if (match) {
+        rows = rows.filter(function (r) {
+          return r.join(' ').toLowerCase().indexOf(match) !== -1;
+        });
+      }
+      if (limit > 0 && rows.length > limit) rows = rows.slice(rows.length - limit);
+    }
+
+    return jsonOut_({ ok: true, fileId: file.getId(), title: file.getName(),
+                      rows: rows, total: total, filtered: rows.length });
   }
   return jsonOut_({ ok: false, error: 'Unsupported file type for read: ' + mime }, 400);
 }
