@@ -106,7 +106,7 @@ class FakePipe:
     def execute(self):
         if self.watched and any(self.conn.edits.get(k, 0) != v for k, v in self.watched.items()):
             self.queued = []
-            raise cb.WATCH_ERRORS[0]("watched key changed") if cb.WATCH_ERRORS else RuntimeError("watch")
+            raise cb.WATCH_ERRORS[0]("watched key changed")
         out = [getattr(self.conn, name)(*a, **kw) for name, a, kw in self.queued]
         self.queued = []
         return out

@@ -40,8 +40,10 @@ import canvas_publish
 try:                                                   # redis-py raises WatchError when a watched key changed
     from redis.exceptions import WatchError as _WatchError
     WATCH_ERRORS = (_WatchError,)
-except ImportError:                                    # no client installed (offline tests use a fake)
-    WATCH_ERRORS = ()
+except ImportError:                                    # no client installed: offline tests use a fake that
+    class WatchError(Exception):                       # raises this, so _flip's retry path runs the same way
+        """Stand-in for redis.exceptions.WatchError when redis-py is not installed."""
+    WATCH_ERRORS = (WatchError,)
 
 STREAM_MATCH = "v1:conf:*:events"
 CONF_ROOM = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
