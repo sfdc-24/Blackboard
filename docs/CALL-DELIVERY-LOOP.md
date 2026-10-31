@@ -85,13 +85,23 @@ The exact words exist in Redis only: the chair's event `v1:conf:<room>:events` a
 | Route | Why it is not allowed today |
 |---|---|
 | Governed `redis-op` read through the reconciler | Its RESULT row goes on the shared board with a text preview (Aya's privacy hold f650). |
-| Direct Redis read from the runner | gemini-waker has no Redis credential, and a new credential or IAM grant is an owner decision. |
+| Direct Redis read from the runner | gemini-waker has no Redis credential, and Memorystore has no per-user ACLs to make a read-only one. |
 
-**Proposal for the owner's decision (D1):** one Redis ACL user for the Gemini runner that can only read
-(`+get +xrange`) the keys `gov:callbridge:task:*` and `v1:conf:*:events`, and write nothing. It is stored as a Secret
-Manager secret mounted only on `gemini-waker`. Until D1 is decided, the runner's input source is "unavailable" and
-every Gemini ask is **held**: the runner ships, behaves honestly, and delivers nothing. That is the stated cost of
-not deciding.
+**D1, as approved and as built.** The owner approved (relayed by Grok, `GROK-OWNER-GO-D1-CALLRUNNER-20261031T0015Z`)
+read-only, least-privilege access for `gemini-waker` alone, with no writes. The first proposal was a Redis ACL user.
+Measured: Redis is Memorystore `redis-central` (Standard HA, Redis 7.0, AUTH), and Google's documentation lists the
+ACL user commands as blocked there, so that user most likely cannot be created. The approved intent is met instead on
+the live, IAM-gated `redis-tool-bridge`, which already holds the only Redis credential, and **no new secret is made**:
+
+| Gate | What it admits |
+|---|---|
+| Cloud Run `run.invoker` on the bridge, and `BRIDGE_CALLERS` | `waker-gemini@`, by its own Google identity token |
+| `callers.json` line `{"principal": "gemini", "for": "call-input"}` | one op, `call-input`, and no `redis_gov` op at all; no other caller may make `call-input` |
+| `scripts/call_input.read` | the exact words of an ask that is `OPEN`, unexpired (its own clock and the server-expiring active key), assigned to `gemini`, from the recorded source event only, and only when the bytes hash to the lifecycle's `input_sha256` with exactly `input_bytes`; the read is audited first, without the words |
+
+The words go back in the bridge's TLS response to the runner only, never to the board or a log. Until the live steps
+run (section 6), the runner's input is "unavailable" and every Gemini ask is **held**: the runner ships, behaves
+honestly, and delivers nothing.
 
 ## 5. Guarantees and their mechanism
 
@@ -107,7 +117,10 @@ not deciding.
 
 1. The canonical candidate lands on main (root lane).
 2. This contract reviewed; PR: `scripts/call_runner.py` and its tests, offline, default off.
-3. Owner decision D1. Without it, step 4 delivers nothing.
-4. Config, owner-run: PR 440's watcher release (root-sequenced), `CALL_RUNNER=on` on gemini-waker, D1's secret mounted.
+3. PR: `call-input` on the bridge (`scripts/call_input.py`, `op.py`, `callers.json`) and its tests. D1 is approved;
+   Aya is the checker of record for both PRs.
+4. Live, after merge, owner- or root-run: PR 440's watcher release; `waker-gemini@` added to the bridge's
+   `run.invoker` and `BRIDGE_CALLERS`; the bridge and agent-waker redeployed from merged code; `CALL_RUNNER=on` and
+   `CALL_RUNNER_BRIDGE_URL` set on gemini-waker. No new secret.
 5. Acceptance, owner's go: one TEST-room call, three diagram asks to Gemini, each a published `mermaid` card within
    180 s of the ask, with verified `complete` receipts. The existing 3+1 bar applies.
