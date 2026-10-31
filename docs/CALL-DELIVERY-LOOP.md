@@ -1,14 +1,14 @@
 # Call delivery loop v3: an API agent's runner takes its call ask and delivers it through the lifecycle
 
-**Status:** contract v3, for review. Nothing in this file is deployed or enabled. Written 2026-10-30 by
+**Status:** contract v3.2, for review. Nothing in this file is deployed or enabled. Written 2026-10-30 by
 claude-code-cli (session vscode-ext) on the owner's direction: *"fix the board so things are not waiting on a chair
 during conference; agents are not just vocal and promising but not delivering."*
 
-**Depends on** Aya's root canonical candidate `06f64cf0a3ac2aff408135ce4cbb91f021ce13df` (tree
-`a5a37522485d52aa987ca11368d9a50f411e4eab`, mechanically reconstructed and hash-matched by this session on
-2026-10-30, board `CLAUDE-CLI-VSEXT-CANON-06F64-READBACK-20261030T2354Z`). Until that candidate is on main, this
-contract describes a consumer of interfaces that are not on main yet. It does not edit any of the canonical's 25
-files: `scripts/call_bridge.py` and `scripts/call_lifecycle.py` have one builder, Aya's root session (board
+**Depends on** Aya's root canonical candidate `9f8f12ba67831974da4dc0f469149665e0e562bf` (parent main `2bb9546`,
+tree `2251b333deb883bc88ea66e1f60c529b8cc4846d`, mechanically reconstructed and hash-matched by this session on
+2026-10-31, board `CLAUDE-CLI-VSEXT-9F8F-READBACK-20261031T0045Z`; it supersedes `06f64cf0`). Until that candidate
+is on main, this contract describes a consumer of interfaces that are not on main yet. It does not edit any of the
+canonical's 32 files: `scripts/call_bridge.py` and `scripts/call_lifecycle.py` have one builder, Aya's root session (board
 `AYA-O3-FIRST-RELAY-HANDOFF-20261030T2110Z`).
 
 **Reviewers:** Aya (independent verifier), gemini-vscode (shape), Cursor (exact head), Grok (request fit).
@@ -51,8 +51,8 @@ stateDiagram-v2
     [*] --> seen: ring row CALLBRIDGE-WAKE-ask to my tag
     seen --> held: status not OPEN, expired, or input unavailable or mismatched
     seen --> taken: ACK row appended once
-    taken --> made: model output passes the card checks
-    taken --> held: model failed or output refused
+    taken --> made: authorized again, then model output passes the card checks
+    taken --> held: not authorized at the model call, model failed, or output refused
     made --> carded: verified card receipt
     carded --> done: verified complete receipt
     seen --> unknown: an append or receipt outcome is not known
@@ -71,6 +71,7 @@ stateDiagram-v2
 | **authority** | A `call-task op=status` request; only a receipt with the verified reconciler stamp, the exact request correlation and `agent` equal to my tag counts. `state` must be `OPEN` and `expires_at` in the future. Otherwise **held**, and nothing is posted. |
 | **input** | The exact words come only from the source in section 4, and must hash to the receipt's `input_sha256` with exactly `input_bytes`. The inbox preview is never used: it is truncated and has pipes replaced. Missing or mismatched input means **held**, and no ACK is posted, so the ring's own timer marks "agent did not wake" honestly rather than the runner taking work it cannot do. |
 | **taken** | One ACK row (`wake_ack.ack_spec`) through `append.py`, never retried. |
+| **authorized** | Immediately before the one model call: a second `call-input` read, which the bridge answers only for the state it commits its audit on (section 4), bound to the status receipt's `source_revision` and the same digest and bytes; and the runner's own clock before `expires_at`. A cancel, expiry or revision change at any point after the status receipt means **held** with no model call. `making` is saved before the ACK, so a run that dies after it never repeats the model call. |
 | **made** | One model call. Deliverable type by the owner's verb (diagram words give `mermaid`, writing words give `note`; build, fix, deploy and similar are not model deliverables, so **held**). The card must pass `canvas_publish.clean_item`, and `mermaid_ok` for a diagram. **No owner words on the public card:** a card that repeats any run of 6 or more consecutive words from the input is refused (**held**), because the canvas is world-readable (owner order O2). |
 | **carded, done** | One `card` request, then one `complete` request with the digest of the stored item. Each request id and its exact row are saved before sending. |
 | **unknown** | Never re-sent with a new id or payload. On the next run, a `status` request decides: my `card_op` or `completion_op` recorded means the step happened. Otherwise the task stays unknown and is reported, not guessed. |
@@ -97,7 +98,7 @@ the live, IAM-gated `redis-tool-bridge`, which already holds the only Redis cred
 |---|---|
 | Cloud Run `run.invoker` on the bridge, and `BRIDGE_CALLERS` | `waker-gemini@`, by its own Google identity token |
 | `callers.json` line `{"principal": "gemini", "for": "call-input"}` | one op, `call-input`, and no `redis_gov` op at all; no other caller may make `call-input` |
-| `scripts/call_input.read` | the exact words of an ask that is `OPEN`, unexpired (its own clock and the server-expiring active key), assigned to `gemini`, from the recorded source event only, and only when the bytes hash to the lifecycle's `input_sha256` with exactly `input_bytes`; the read is audited first, without the words |
+| `scripts/call_input.read` | the exact words of an ask that is `OPEN`, unexpired (its own clock and the server-expiring active key), assigned to `gemini`, from the recorded source event only, and only when the bytes hash to the lifecycle's `input_sha256` with exactly `input_bytes`. The task and active keys are WATCHed before the first read and the audit entry (no words) is written in MULTI/EXEC on that WATCH: a cancel, revision change, rewrite or expiry before EXEC aborts it, and no words are returned (Redis aborts EXEC on an expired watched key since 6.0.9; redis-central runs 7.0) |
 
 The words go back in the bridge's TLS response to the runner only, never to the board or a log. Until the live steps
 run (section 6), the runner's input is "unavailable" and every Gemini ask is **held**: the runner ships, behaves
@@ -109,7 +110,8 @@ honestly, and delivers nothing.
 |---|---|
 | A runner never completes work it did not do | Completion is only `operate(complete)` with the stored card's digest; the card is the model's output; the receipt must carry the verified reconciler stamp. |
 | A dead call stays dead | The lifecycle refuses `card` and `complete` on a terminal or expired task; the runner checks `status` first and holds. |
-| The owner's words never reach the board or the page | The runner posts identifiers and digests only; input is read privately; the 6-word repeat guard runs on every card. |
+| The owner's words never reach the board or the page | The runner posts identifiers and digests only; input is read privately; the 6-word repeat guard runs on every card. That guard is a floor, not redaction: publication stays behind the existing gate. A card is public only while the room's time-boxed publish window is open (`gov:canvas:publish:<room>`, which no agent may write, optionally scoped to named items), and `call_lifecycle.visible` fences each card by state, room, source revision and exact card hash. |
+| No paid call for a dead ask | The `authorized` stage: a fresh, bound `call-input` read immediately before the model call. |
 | Nothing is sent twice | Request id and exact row saved before sending; unknown outcomes reconcile through `status`, never by resending. |
 | Default off | `CALL_RUNNER` unset or anything but `on` leaves `agent_waker.py` behaviour exactly as today. |
 
