@@ -1,112 +1,113 @@
-# Call delivery loop: every ask said in a call reaches a worker, and either delivers or says honestly where it went
+# Call delivery loop v3: an API agent's runner takes its call ask and delivers it through the lifecycle
 
-**Status:** contract, v2, for review. v2 closes gemini-vscode's four challenges (GEMINI-VSCODE-CALL-REVIEW-20261030T1727Z): a reserved pointer is reconciled after a crash, a written card always gets its answers row, `expired` is terminal, and a call end expires every ask not yet working. Written 2026-10-30 by claude-code-cli (session vscode-ext) on the owner's direction:
-*"fix the board so things are not waiting on a chair during conference; agents are not just vocal and promising
-but not delivering."* Board lane claim: `CLAUDE-CLI-VSEXT-LANE-CALL-DELIVERY-20261030T1436Z`.
+**Status:** contract v3, for review. Nothing in this file is deployed or enabled. Written 2026-10-30 by
+claude-code-cli (session vscode-ext) on the owner's direction: *"fix the board so things are not waiting on a chair
+during conference; agents are not just vocal and promising but not delivering."*
 
-**Reviewers:** gemini-vscode (shape: states and transitions), Aya (independent verifier), Grok (request fit).
-Nothing in this file is deployed. Code follows only after this contract survives review.
+**Depends on** Aya's root canonical candidate `06f64cf0a3ac2aff408135ce4cbb91f021ce13df` (tree
+`a5a37522485d52aa987ca11368d9a50f411e4eab`, mechanically reconstructed and hash-matched by this session on
+2026-10-30, board `CLAUDE-CLI-VSEXT-CANON-06F64-READBACK-20261030T2354Z`). Until that candidate is on main, this
+contract describes a consumer of interfaces that are not on main yet. It does not edit any of the canonical's 25
+files: `scripts/call_bridge.py` and `scripts/call_lifecycle.py` have one builder, Aya's root session (board
+`AYA-O3-FIRST-RELAY-HANDOFF-20261030T2110Z`).
 
-## 1. What is broken, measured on 2026-10-30
+**Reviewers:** Aya (independent verifier), gemini-vscode (shape), Cursor (exact head), Grok (request fit).
 
-| Link | Measured state |
-|---|---|
-| Owner names an agent with a task verb → bridge claims → `fleet:inbox:<agent>` | **Works.** `call-81d2f2b0b0b6` claimed 2026-10-29T22:28:56Z (CLAUDE-CLI-FINISH-PATH). |
-| Inbox → something wakes the agent | **Broken.** `inbox-wake` is on but `INBOX_WAKE_AGENTS=claude-api` only, and nothing schedules its `/sweep`. All six laptop wakers are Disabled. `gemini-waker` last started Oct 27 and its last execution failed at container import. `claude-api-worker` last ran Oct 17. |
-| Woken agent → reads the ask | **Missing.** `agent_waker.py` reads the board only. The call ask is written to Redis only, by design, because the owner's words can name a client and the board is a public sheet. A woken waker finds nothing. |
-| Agents outside the VPC (Grok, Aya) | Can't read Redis directly. They do read the board, and they already fetch Redis keys through `bus-reconciler` requests (`redis-op`). Nothing tells them an ask is waiting. |
-| Ask done → a real card | Only once, and only on the attended Claude laptop path, which missed 180 s and was a note rather than the requested diagram. Codex, Grok and Gemini claims stay `claimed` forever (step 4b). |
+## 1. What changed since v2, and why
 
-So a call voice says "I'll do it", a claimed card appears, and no process ever starts the work. That is the
-"vocal and promising, not delivering" the owner saw, and it is a wiring gap, not a model gap.
+| v2 said | v3 says | Why |
+|---|---|---|
+| A new call relay posts a pointer row and an overdue row, and expires asks when the call ends (PR 442) | **Retired.** The O3 ring already posts one wake row per ask (`CALLBRIDGE-WAKE-<ask>`, SET NX, never retried), re-rings once after 90 s and marks "agent did not wake". The lifecycle owns every terminal state. | Two writers of the same signal is the duplication the one-builder rule exists to stop. PR 442 stays as a draft for its history and is closed once the canonical lands. |
+| An agent completes with a board row `answers=<call id>` | An agent completes only with the governed `call-task` operations `card` then `complete`, and only a verified reconciler receipt counts. | Board `Source_Tag` is a claim, not authentication. `call_lifecycle.operate` fences source revision, task revision, expiry and cancellation in one WATCH/MULTI. |
+| gemini-waker "already holds the Redis secret" | **Wrong.** It is on the VPC but holds only `BUS_URL`, `BUS_SECRET`, `GEMINI_API_KEY` and a GitHub token (measured 2026-10-30). | See section 4: this is the one access decision the loop needs. |
+| gemini-waker's start is broken | **It is not.** Four runs on 2026-10-27 succeeded; the one failure was a Google-side image import timeout (`ContainerImageImportFailed`, `DEADLINE_EXCEEDED`). It has not run since because board-watcher, which starts it, has the Gemini bug fixed in PR 440 and not yet released. | The fix is Aya's root-sequenced PR 440 release, not new code. |
 
-## 2. The rule that shapes the fix: one writer per tag
+## 2. What already exists in the canonical candidate (not built here)
 
-A card flips to done only on a board row from that agent's own tag (`call_bridge.ANSWERS_FROM`), and every tag
-has exactly one writer (sheet L-82). So delivery happens **inside each agent's existing writer**, never in a new
-central worker posting under the agents' names. The chair stays what CR-20261029-005 says it is: a voice and a
-router. It claims and it speaks. It never does the work and it never gates it.
+| Step | Owner | Mechanism |
+|---|---|---|
+| Claim | bridge + lifecycle (root) | `call_lifecycle.claim`: PREPARED then OPEN, task record `gov:callbridge:task:<ask>` binding room, epoch, event, owner, `input_sha256`, `input_bytes`. |
+| Ring | bridge (O3) | One board row `CALLBRIDGE-WAKE-<ask>` to the agent's tag, re-ring `-R2` after 90 s, then "agent did not wake" on the card. |
+| Take | the agent's runner | One ACK row from the agent's own tag (`wake_ack.ack_spec`), answering the ring. |
+| Work card, done | the agent's runner, through the reconciler | `do=call-task op=card` with the card bound to `ask` and `source_revision`; then `op=complete` with the stored card's digest. Same request id and payload is idempotent; a different payload under one id is refused. |
+| Cancel, expiry | lifecycle (root) | Typed owner cancel from the chair; `MAX_AGE` 2 h and the `active` key. Terminal states never reopen. |
+| Claude's runner | main CLI session (PR 441 helper v6) | `call_ask.py accept` with a complete private `--input-file`, attended. |
 
-## 3. States and who moves each
+The open live gates the root contract names that a runner closes: **private input provisioning** and
+**unattended wake/liveness**. This contract claims to close no other gate.
+
+Compatibility input for the root builder, not an edit: the canonical `wake_row` text still tells the agent to
+"reply with a RESULT row `answers=<ask>`", while `inbox_text` and the lifecycle say a free RESULT never completes a
+task. The ring text should point at `call-task card` and `complete`.
+
+## 3. The runner for an API agent (Gemini first)
+
+A runner is the agent's own writer: it posts only under the agent's tag (one writer per tag, sheet L-82). It lives in
+`scripts/call_runner.py`, called by `agent_waker.py` when a ring row addresses its agent, behind `CALL_RUNNER=on`,
+default off. It never edits a canonical file.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> claimed: bridge (owner named agent + task verb)
-    claimed --> pointed: relay posts board pointer row
-    pointed --> working: agent's writer, working card v2
-    working --> done: agent's real card v3 + board answers=call-id
-    working --> routed: agent cannot do it, card says where it went
-    pointed --> overdue: card still the v1 claim 180 s after the claim
-    routed --> done: the builder lane delivers, answers=call-id
-    overdue --> working: agent picks it up late, only while the call has not ended
-    claimed --> expired: the chair closed the call, or the room moved to a newer session
-    pointed --> expired: the chair closed the call, or the room moved to a newer session
-    overdue --> expired: the chair closed the call, or the room moved to a newer session
+    [*] --> seen: ring row CALLBRIDGE-WAKE-ask to my tag
+    seen --> held: status not OPEN, expired, or input unavailable or mismatched
+    seen --> taken: ACK row appended once
+    taken --> made: model output passes the card checks
+    taken --> held: model failed or output refused
+    made --> carded: verified card receipt
+    carded --> done: verified complete receipt
+    seen --> unknown: an append or receipt outcome is not known
+    taken --> unknown
+    made --> unknown
+    carded --> unknown
+    unknown --> carded: status shows my card_op
+    unknown --> done: status shows my completion_op
+    held --> [*]
     done --> [*]
-    expired --> [*]
 ```
 
-`expired` is terminal. Once an ask is expired, no wake, no pickup and no card write may reopen it
-(gemini-vscode challenge 3: a late waker must not resurrect a dead call; challenge 4: an ended call must not
-keep waking agents and spending model calls). `working` and `routed` asks that were already accepted keep their
-own path when the call ends: the work was started and its card stays honest.
+| Stage | Rule |
+|---|---|
+| **seen** | The ring row's `ask` matches `call-<12 hex>` and its `to` is my tag. The runner's state file (GCS, generation-checked like the waker's) records the ask once. A ring seen again is ignored. |
+| **authority** | A `call-task op=status` request; only a receipt with the verified reconciler stamp, the exact request correlation and `agent` equal to my tag counts. `state` must be `OPEN` and `expires_at` in the future. Otherwise **held**, and nothing is posted. |
+| **input** | The exact words come only from the source in section 4, and must hash to the receipt's `input_sha256` with exactly `input_bytes`. The inbox preview is never used: it is truncated and has pipes replaced. Missing or mismatched input means **held**, and no ACK is posted, so the ring's own timer marks "agent did not wake" honestly rather than the runner taking work it cannot do. |
+| **taken** | One ACK row (`wake_ack.ack_spec`) through `append.py`, never retried. |
+| **made** | One model call. Deliverable type by the owner's verb (diagram words give `mermaid`, writing words give `note`; build, fix, deploy and similar are not model deliverables, so **held**). The card must pass `canvas_publish.clean_item`, and `mermaid_ok` for a diagram. **No owner words on the public card:** a card that repeats any run of 6 or more consecutive words from the input is refused (**held**), because the canvas is world-readable (owner order O2). |
+| **carded, done** | One `card` request, then one `complete` request with the digest of the stored item. Each request id and its exact row are saved before sending. |
+| **unknown** | Never re-sent with a new id or payload. On the next run, a `status` request decides: my `card_op` or `completion_op` recorded means the step happened. Otherwise the task stays unknown and is reported, not guessed. |
 
-| State | Written by | Where | Meaning |
-|---|---|---|---|
-| `claimed` | call bridge (exists) | card v1 in `conf:canvas:<room>:<agent>` field `call-<12hex>`; ask text on `fleet:inbox:<agent>`; entry in `gov:callbridge:open` | The owner asked this agent. |
-| `pointed` | **call relay (new, beside the bridge)** | one board row `phase=DISPATCH`, `to=<agent>`, `id=<call id>`, `inbox=fleet:inbox:<agent>`, **no words** | Every agent's existing reader now sees that an ask waits. |
-| `working` | the agent's own writer | card v2, `status=working`, `activity` names what it is doing | Real work started. The page shows it. |
-| `done` | the agent's own writer | card v3 with the deliverable (`mermaid` for a diagram ask, `note` otherwise), then a board row `answers=<call id>` | The bridge closes the open entry. It never overwrites a card above v1 (`call_bridge._flip`). |
-| `routed` | the agent's own writer | card v2, `type=note`, `status=review`, body says which lane will build it and that it is **not done**; board row `routes=<call id>`, **never `answers=`** | Honest: a model cannot deploy, fix or wire. `answers=` would flip the card to done, so a routed reply must not use it. |
-| `overdue` | call relay | board row to the agent, `cc=aya` (the outcome owner), once, best effort, only while the card is still the untouched v1 claim (or absent) 180 s after the claim; it is also the second ring for an agent whose pointer was lost | Silence becomes visible within 180 s instead of at the end of the call. A `working` card is not flagged in v1: a stall flag for `working` is deferred (section 6). |
-| `expired` | call relay, only on the chair's own record that the ask's call ended: `v1:conf:<room>:state` has `closed=1` and `closed_epoch` equal to the ask's `session_epoch`, or a `session_epoch` different from the ask's; a closed publish window is not evidence, and an ask with no recorded room or epoch never expires | card `type=note`, `status=review`, title "Not started: the call ended", body "Asked in the room at <time>. The call ended before <name> started this, so it is closed and not done.", version above every earlier card; `gov:callbridge:open` entry removed; board row `expires=<call id>`, never `answers=` | The chair ended the ask's call session, or started a newer one, before the agent started. Terminal. There is no cancel path in v1. |
+Cost: at most one model call per ask, inside the waker's existing per-run cap. No always-on worker.
 
-Card versions only go up. A card is never moved back to a lower version.
+## 4. The one decision the loop needs: how a cloud runner reads the exact words privately
 
-## 4. What counts as a deliverable
+The exact words exist in Redis only: the chair's event `v1:conf:<room>:events` at the task's `source.event`
+(field `utterance`, under 1000 characters). A cloud runner can reach them two ways today, and neither is allowed:
 
-| The owner said | Deliverable | Card type |
-|---|---|---|
-| diagram, draw, map, sketch, design, flow, wireframe | Mermaid text that passes `canvas_publish.mermaid_ok` | `mermaid` |
-| draft, write, list, plan, outline, summarize, compare, estimate, research, prepare | Plain text, at most `BODY_MAX` characters | `note` |
-| build, fix, deploy, wire, test, verify, set up, open | Not a model deliverable: the routed state (section 3) | `note` with `status=review`. There is no `routed` card type: `canvas_publish.clean_item` drops any type outside `TYPES`, so the card would never publish. |
+| Route | Why it is not allowed today |
+|---|---|
+| Governed `redis-op` read through the reconciler | Its RESULT row goes on the shared board with a text preview (Aya's privacy hold f650). |
+| Direct Redis read from the runner | gemini-waker has no Redis credential, and a new credential or IAM grant is an owner decision. |
 
-A deliverable is the **requested thing**. A note saying "I will do this" is not a deliverable and must not use
-`answers=`. Aya's acceptance bar stands: a placeholder never passes.
+**Proposal for the owner's decision (D1):** one Redis ACL user for the Gemini runner that can only read
+(`+get +xrange`) the keys `gov:callbridge:task:*` and `v1:conf:*:events`, and write nothing. It is stored as a Secret
+Manager secret mounted only on `gemini-waker`. Until D1 is decided, the runner's input source is "unavailable" and
+every Gemini ask is **held**: the runner ships, behaves honestly, and delivers nothing. That is the stated cost of
+not deciding.
 
-## 5. Per-agent wiring
-
-| Agent | Who reads its asks | How it gets the words | How it is woken | Change needed |
-|---|---|---|---|---|
-| Gemini | `gemini-waker` (Cloud Run job, in the VPC, already holds the Redis secret) | Reads `fleet:inbox:gemini` directly | `inbox-wake` starts the job | **Code:** `agent_waker` handles a `pointed` row by reading its inbox entry. **Config:** add `gemini` to `INBOX_WAKE_AGENTS`; fix the failed job start. |
-| Grok | Grok's own runtime (posts as `grok`) | `redis-op` request to `bus-reconciler`, the route Grok already uses | The pointer row on the board | **None in this repo.** Grok answers the pointer row. |
-| Codex / Aya | Aya (ChatGPT DM agent, reads the board) | Same `redis-op` route | The pointer row; `codex queue` when the desktop session is live | **None in this repo.** |
-| Claude | Other session's helper (PR437 lane, v4 HOLD) | Reads its inbox | Its own path | **Out of scope here.** This contract must stay compatible with it. |
-
-The pointer row is the one new message. It carries the call id, the agent, the inbox key and the deadline, and
-never the owner's words.
-
-## 6. Guarantees and their mechanism
+## 5. Guarantees and their mechanism
 
 | Guarantee | Mechanism |
 |---|---|
-| A pointer is never sent twice, and its loss is covered | `gov:callrelay:pointer:<call id>` is reserved (`SET NX`, `phase=reserved`, a lease) before its **single** append attempt and set to `posted` after it. A crash between the two leaves `reserved` (gemini-vscode challenge 1). After the lease, an exact Row_ID board read decides: present means `posted`; absent means `lost`, recorded and **never retried**, because a delayed original can still land and the board has no dedupe (Codex on 11b0c0fa); unreadable leaves it `reserved`. A lost pointer is covered by the overdue row, which has its own id. |
-| Relay failures never stop the relay | `append.py` and `bus.read_rows` signal failure with `SystemExit`; every relay boundary catches it (Cursor on 11b0c0fa). |
-| Two runs of one waker never answer twice | The existing cloud `agent-waker` lease (claim, `posting` never reclaimed). Call asks use the same cursor under their call id. |
-| A delivered card always gets its `answers=` row | The waker cursor records `card_written` with the card version **before** the board append (gemini-vscode challenge 2). Recovery acts only on a **deliverable**: a call id the cursor recorded as `card_written` with `status=done`, whose published card at that id is also `status=done`. It reads the board for the waker's own reply id and appends it only if it is absent. A working, routed or expired card is never recovered into `answers=`: `settle` closes any ask an `answers=` row names, whatever the card says (Cursor NO-GO on 47fb0787). |
-| A dead call stays dead | `expired` is terminal and is checked before every wake and every card write, both in the relay and in the waker. The relay expires an ask still `claimed`, `pointed` or `overdue` only when the chair's record says its call ended. It WATCHes the card, the open set, `gov:worker:lock` and the call's state key, and re-checks the lock and the end under WATCH, so a lost lock or a reopened call aborts the write. The bridge's `_flip` re-reads the card under WATCH too, so its done card never lands over an expired one. A chair that died never closes its record: its asks stay open and go overdue, never expired. |
-| The owner's words never reach the public sheet or page | The pointer has no text. The agent's card holds words the agent chose for a public page (`canvas_publish` rules). |
-| Stall while `working` | **Deferred in v1, stated:** the relay flags only an untouched claim. A `working` card with no `done` or `routed` is visible on the page but gets no overdue row yet. |
-| Cancel | **Deferred in v1, stated:** no authenticated private cancel source exists yet, so the chair's end of call is the only expiry trigger. When one exists it must be authenticated and private, per Aya's hold (AYA-HELPER-DESIGN-HOLD point 5): the public canvas is a cue, never a cancel. |
-| Redis is never the only copy | The pointer and the answer are board rows. The ask text stays in the inbox stream, which `redis_archive` already mirrors. |
+| A runner never completes work it did not do | Completion is only `operate(complete)` with the stored card's digest; the card is the model's output; the receipt must carry the verified reconciler stamp. |
+| A dead call stays dead | The lifecycle refuses `card` and `complete` on a terminal or expired task; the runner checks `status` first and holds. |
+| The owner's words never reach the board or the page | The runner posts identifiers and digests only; input is read privately; the 6-word repeat guard runs on every card. |
+| Nothing is sent twice | Request id and exact row saved before sending; unknown outcomes reconcile through `status`, never by resending. |
+| Default off | `CALL_RUNNER` unset or anything but `on` leaves `agent_waker.py` behaviour exactly as today. |
 
-## 7. Rollout, each step reversible, nothing live without the owner's go
+## 6. Rollout, each step reversible, nothing live without the owner's go
 
-1. This contract reviewed: gemini-vscode challenge, Aya verdict.
-2. PR: `call_relay.py` (pointer and overdue rows), beside the bridge, behind `CALL_RELAY=on`, default off. Tests offline.
-3. PR: `agent_waker` handles a `pointed` row for its own agent (Gemini first), behind a flag, default off. Tests offline.
-4. Config, owner-run: `INBOX_WAKE_AGENTS=claude-api,gemini`, a one-minute `/sweep` schedule, and the gemini-waker start fixed.
-5. Acceptance, owner's go: one TEST-room call, three diagram asks to Gemini, each delivered as a matching published `mermaid` card within 180 s. The existing 3+1 bar applies.
-
-Cost: one Gemini API call per ask, bounded by the waker's existing per-run cap. No new service, no new database,
-no always-on worker.
+1. The canonical candidate lands on main (root lane).
+2. This contract reviewed; PR: `scripts/call_runner.py` and its tests, offline, default off.
+3. Owner decision D1. Without it, step 4 delivers nothing.
+4. Config, owner-run: PR 440's watcher release (root-sequenced), `CALL_RUNNER=on` on gemini-waker, D1's secret mounted.
+5. Acceptance, owner's go: one TEST-room call, three diagram asks to Gemini, each a published `mermaid` card within
+   180 s of the ask, with verified `complete` receipts. The existing 3+1 bar applies.
