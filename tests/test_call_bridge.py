@@ -162,6 +162,29 @@ class WhatIsAnAsk(unittest.TestCase):
         self.assertEqual([], cb.asks_in(dict(f, utterance="Draft the flow, please.")))
         self.assertEqual([], cb.asks_in(dict(f, utterance="Open Codex's PR and check it.")))
 
+    def test_the_widened_task_words(self):
+        """Synthetic sentences, one per added word (2026-11-01 widening)."""
+        f = {"kind": "turn.started", "actor_id": "owner-1", "reason": "vocative"}
+        for said in ("Claude, push the release notes.", "Claude, get on the backlog item.",
+                     "Claude, give the team a status table.", "Claude, assign the review to yourself.",
+                     "Claude, do it after lunch.", "Claude, clean up the sample folder.",
+                     "Claude, troubleshoot the sample job.", "Claude, show the sample flow."):
+            self.assertEqual(["claude-code-cli"], cb.asks_in(dict(f, utterance=said)), said)
+        for said in ("Claude, what do you think?", "Claude, how is it going?", "Claude, do you remember?"):
+            self.assertEqual([], cb.asks_in(dict(f, utterance=said)), said)
+
+    def test_cloud_code_is_claude_even_when_the_chair_did_not_hear_a_name(self):
+        """A transcriber can write Claude Code as "cloud code"; the chair then routes on continuity, host or room."""
+        f = {"kind": "turn.started", "actor_id": "owner-1", "reason": "continuity"}
+        self.assertEqual(["claude-code-cli"], cb.asks_in(dict(f, utterance="Cloud code, draft the sample flow.")))
+        self.assertEqual(["claude-code-cli"], cb.asks_in(dict(f, reason="room",
+                                                               utterance="Send the sample table to cloud code.")))
+        self.assertEqual(["claude-code-cli"], cb.asks_in(dict(f, reason="vocative",
+                                                               utterance="Cloud code, make the sample card.")))
+        self.assertEqual([], cb.asks_in(dict(f, utterance="Is cloud code online?")))         # no task word
+        self.assertEqual([], cb.asks_in(dict(f, reason="", utterance="Cloud code, draft the sample flow.")))
+        self.assertEqual([], cb.asks_in(dict(f, utterance="Google Cloud, build it.")))      # not the phrase
+
     def test_only_an_owner_turn_with_his_words(self):
         f = {"kind": "turn.started", "actor_id": "owner-1", "reason": "vocative", "utterance": "Codex, draft it."}
         self.assertEqual([], cb.asks_in(dict(f, kind="floor.granted")))
