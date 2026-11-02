@@ -253,6 +253,28 @@ class Snapshot(unittest.TestCase):
         ids = [i["id"] for i in cp.snapshot(conn, "demo", NOW)["items"]]
         self.assertEqual(sorted(ids), ["claude-code-cli/1", "grok/1"])
 
+    def test_the_newest_card_comes_first(self):
+        """The page draws cards in file order, so the newest must be first."""
+        conn = FakeRedis()
+        put(conn, "chatgpt-codex-desktop", "old", item(ts="2026-10-19T10:00:00Z"))
+        put(conn, "claude-code-cli", "new", item(ts="2026-10-20T21:59:00Z"))
+        put(conn, "grok", "mid", item(ts="2026-10-20T08:00:00Z"))
+        put(conn, "grok", "same", item(ts="2026-10-20T08:00:00Z"))
+        put(conn, "gemini", "future", item(ts="2027-01-01T00:00:00Z"))       # cannot pin itself first
+        put(conn, "gemini", "odd", item(ts="9999"))
+        ids = [i["id"] for i in cp.snapshot(conn, "demo", NOW)["items"]]
+        self.assertEqual(ids[:4], ["claude-code-cli/new", "grok/mid", "grok/same", "chatgpt-codex-desktop/old"])
+        self.assertEqual(sorted(ids[4:]), ["gemini/future", "gemini/odd"])
+
+    def test_the_cap_keeps_the_newest(self):
+        conn = FakeRedis()
+        for n in range(cp.MAX_ITEMS):
+            put(conn, "grok", "i%03d" % n, item(ts="2026-10-19T10:00:00Z"))
+        put(conn, "grok", "zzz-new", item(ts="2026-10-20T21:00:00Z"))
+        ids = [i["id"] for i in cp.snapshot(conn, "demo", NOW)["items"]]
+        self.assertEqual(ids[0], "grok/zzz-new")
+        self.assertEqual(len(ids), cp.MAX_ITEMS)
+
     def test_the_item_count_is_capped(self):
         conn = FakeRedis()
         for n in range(cp.MAX_ITEMS + 5):

@@ -213,8 +213,24 @@ def image_ok(url: str) -> bool:
             and (parts.hostname or "") in IMAGE_HOSTS and parts.port in (None, 443))
 
 
+_SORT_TS = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ")
+
+
+def _newest_first(item, now: str) -> str:
+    """The sort key: the item's ts when it is a real UTC stamp no later than now (an agent cannot pin its card
+    first with a future or made-up ts), else "" so it goes last."""
+    ts = item.get("ts") or ""
+    if not _SORT_TS.fullmatch(ts):
+        return ""
+    return ts if ts <= now else ""
+
+
 def snapshot(conn, room: str, generated, until=None) -> dict:
-    """The room file: every public item of every allowlisted agent, in a stable order."""
+    """The room file: every public item of every allowlisted agent, newest first.
+
+    The page draws cards in file order, so the newest card is the first one seen, on the left (the owner's
+    order, 2026-11-01). Ties keep the stable
+    agent-then-id order, and the cap keeps the newest."""
     items = []
     for agent in AGENTS:
         stored = conn.hgetall(PARTITION % (room, agent)) or {}
@@ -225,6 +241,8 @@ def snapshot(conn, room: str, generated, until=None) -> dict:
             published = clean_item(agent, item_id, raw)
             if published:
                 items.append(published)
+    now = stamp(generated)
+    items.sort(key=lambda i: _newest_first(i, now), reverse=True)      # Python's sort is stable with reverse=True too
     doc = {"format": FORMAT, "v": 1, "room": room, "generated": stamp(generated), "items": items[:MAX_ITEMS]}
     if until is not None:
         doc["until"] = stamp(until)

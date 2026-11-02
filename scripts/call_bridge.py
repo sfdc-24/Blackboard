@@ -64,15 +64,19 @@ ANSWERS_FROM = {
 }
 # Each voice's name and the spellings the chair's addressing accepts for it (conference addressing.HEARD_AS).
 NAMES = {persona: re.compile(r"(?i)\b(?:%s)\b(?!['’]s\b)" % "|".join(spellings)) for persona, spellings in {
-    "grok": ("grok", "grock", "groq"), "claude": ("claude", "claud"), "codex": ("codex", "kodex"),
+    "grok": ("grok", "grock", "groq"), "claude": ("claude", "claud", r"cloud\s+code"), "codex": ("codex", "kodex"),
     "gemini": ("gemini", "jemini", "gemeni")}.items()}
 # The chair names an agent with one of these (addressing.py). "everyone", "room", "host" and "continuity" name nobody.
 NAMED = ("vocative", "mention", "view_request")
-# A task, not a question: one of these words anywhere in what he said.
+# A name the transcriber gives that the chair's addressing does not hear as a name, so the chair's reason for the
+# turn is continuity, host or room. Said in so many words it still names that agent.
+HEARD_ONLY_HERE = re.compile(r"(?i)\bcloud\s+code\b")
+# A task, not a question: one of these words anywhere in what he said. Widened 2026-11-01 on the owner's order.
 TASK = re.compile(
     r"(?i)\b(?:build|draft|make|create|write|design|mock(?:\s+up)?|prototype|add|fix|check|review|draw|diagram|"
-    r"sketch|list|find|research|compare|summari[sz]e|update|set\s+up|put|post|show\s+me|work\s+on|look\s+into|"
-    r"prepare|plan|test|verify|deploy|open|wire|map|outline|estimate)\b")
+    r"sketch|list|find|research|compare|summari[sz]e|update|set\s+up|put|post|show|work\s+on|look\s+into|"
+    r"prepare|plan|test|verify|deploy|open|wire|map|outline|estimate|push|give|assign|send|take\s+over|handle|"
+    r"investigate|troubleshoot|clean\s+up|get\s+on|ship|publish|release|do\s+(?:that|this|it))\b")
 
 
 def _text(value):
@@ -104,11 +108,13 @@ def asks_in(fields: dict) -> list:
     """The agents an event asks for work, or []: an owner turn naming them, with a task verb in his words."""
     if fields.get("kind") != "turn.started" or fields.get("actor_id") in ("", None, "chair"):
         return []
-    if fields.get("reason") not in NAMED:
-        return []
     said = fields.get("utterance") or ""
     if not said.strip() or not TASK.search(said):
         return []
+    if fields.get("reason") not in NAMED:
+        # Only the name the chair cannot hear, and only for its own agent: any other name in the same words was
+        # not taken by the chair as addressing (a remark about Grok is not an ask of Grok).
+        return [AGENT_OF["claude"]] if fields.get("reason") and HEARD_ONLY_HERE.search(said) else []
     # The projection keeps no persona list (redis_state.METADATA_FIELDS), so the names are read from his words, as the
     # chair's addressing spells them (HEARD_AS), never a possessive ("Codex's PR" names nobody).
     found = sorted((match.start(), AGENT_OF[persona]) for persona, pattern in NAMES.items()
