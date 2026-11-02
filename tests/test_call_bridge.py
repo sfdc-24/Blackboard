@@ -1683,7 +1683,7 @@ class ReadBack(unittest.TestCase):
         field = cb.proposal_id(ROOM, second, self.CODEX)
         before = self.cards(self.CODEX)[field]
         self.conn.store.pop(cb.CURSOR_KEY % ROOM)                       # a lost cursor replays both turns
-        self.b().tick()
+        self.b(now=NOW + datetime.timedelta(seconds=30)).tick()         # a later tick must not rewrite it
         self.assertEqual(before, self.cards(self.CODEX)[field])
 
     def test_a6_a_go_ahead_naming_a_voice_outside_the_proposal_claims_nothing(self):
