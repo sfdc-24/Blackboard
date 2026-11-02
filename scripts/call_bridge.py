@@ -153,14 +153,20 @@ READBACK_OFF = os.environ.get("CALL_BRIDGE_READBACK", "on").strip().lower() == "
 READ_BACK_OFF = "Not started, the read-back is off"
 READBACK_SECONDS = 2 * 60
 PROPOSAL_KEY = "gov:callbridge:proposal:%s"   # the room's one open proposal: {entry, agents, asks, at}
-# THE SPOKEN READ-BACK (the owner's order 2026-11-02, "go ahead with the chair read-back"; Codex's row 9443 G1): the
-# card is public, so it can never hold his words. The task itself is read back on the call: the bridge writes the
-# room's open proposal to READBACK_KEY (exact task, who it is for, the read-back id), the chair speaks that text
-# verbatim into the same call and projects READBACK_SPOKEN with the id. A go-ahead counts only after that event, and
+# THE SPOKEN READ-BACK (the owner's orders 2026-11-02; his B3 decision, GROK-OWNER-GO-CALLFIX-20261102T2324Z): the
+# card is public, so it can never hold his words. The ask is read back on the call as a SHORT PARAPHRASE: the
+# bridge writes the room's open proposal's id, ask entry, recipient set and word bound to READBACK_KEY (never his
+# words: the named voice heard him live and restates in its own words), the chair has that voice say it and
+# projects READBACK_SPOKEN with the id. A go-ahead counts only after that event, and
 # within READBACK_SECONDS of it. No chair, no read-back, no claim: it fails closed. The key is the room's own, never
 # public; it lives only while the proposal can still be read back (until READBACK_SECONDS after his ask, F4) and
 # goes when the proposal closes or is heard.
 READBACK_KEY = "v1:conf:%s:readback"
+READBACK_MAX_WORDS = 60      # the paraphrase bound the chair passes its voice (contract v2)
+ASK_MAX_WORDS = 40           # B1: a longer turn never becomes a read-back; he is asked to restate
+ASK_MAX_CHARS = 1000         # B1: the pinned chair truncates there, so a longer ask is already cut
+TOO_LONG = "Not started, too long to read back: please restate it briefly"
+WAITING_BEHIND = "Not started, an earlier ask is still waiting for its read-back"
 READBACK_SPOKEN = "readback.spoken"
 PROPOSED = "proposed in the room"
 NOT_STARTED = "not started"
@@ -352,14 +358,6 @@ def readback_id(room: str, entry_id: str, agents) -> str:
     return "rb-" + hashlib.sha256(("%s|%s|%s" % (room, entry_id, ",".join(agents))).encode("utf-8")).hexdigest()[:12]
 
 
-def readback_text(agents, said: str) -> str:
-    """What the chair says, verbatim: who the work is for, his exact words, and the phrase that starts it."""
-    names = [NAME_OF[a] for a in agents]
-    who = names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
-    words = " ".join(said.split())
-    if words and words[-1] not in ".!?":
-        words += "."
-    return "Read-back for %s: %s To start it, say: %s, go ahead." % (who, words, names[0])
 
 
 def proposal_card(agent: str, asked_at, now) -> dict:
@@ -879,7 +877,9 @@ class Bridge:
                                   "an ambiguous voice" if confirms else "no pending task ask")
             else:
                 agents = asks_in(fields)
-                if not agents and follow_up(fields):
+                if not agents and follow_up(fields) and not self.readback:
+                    # A2 (the owner, 2026-11-02): an unnamed turn is NEVER assigned to whoever is speaking in
+                    # read-back mode; his 36-char aside to the floor holder became tonight's claimed card.
                     # The voice he was talking to: same turn, or a grant at most FLOOR_FRESH_SECONDS before (never a
                     # stale floor, Aya's binding hold on d2d1618).
                     holder = self._floor_at(room, entry_id, fields.get("turn_id"), entries[index + 1:])
@@ -889,8 +889,9 @@ class Bridge:
                     self._asked(room, entry_id, said, now, fields.get("actor_id"), fields.get("session_epoch"))
                     if task_ask(fields):
                         named = named_in(said)
-                        assigned = named or [a for a in [self._floor_at(room, entry_id, fields.get("turn_id"),
-                                                                         entries[index + 1:])] if a]
+                        assigned = named if self.readback else (
+                            named or [a for a in [self._floor_at(room, entry_id, fields.get("turn_id"),
+                                                                 entries[index + 1:])] if a])
                         if not self.readback:
                             # Claiming at once only. The read-back keeps his words in the proposal alone (F2).
                             self.conn.set(PENDING_KEY % room, json.dumps(
@@ -901,8 +902,13 @@ class Bridge:
                 if self.readback:
                     # READ-BACK: an ask PROPOSES; nothing is claimed until his go-ahead.
                     if agents and self.holds():
-                        self._propose(room, entry_id, agents, said, now, fields.get("actor_id"),
-                                      fields.get("session_epoch"))
+                        if len(said) >= ASK_MAX_CHARS or len(said.split()) > ASK_MAX_WORDS:
+                            # B1 (the owner, 2026-11-02): a 1058-char capture was recited for 63 s on his call.
+                            # A turn this long is never read back: the card asks him to restate it briefly.
+                            self._refuse(room, entry_id, agents, TOO_LONG, now)
+                        else:
+                            self._propose(room, entry_id, agents, said, now, fields.get("actor_id"),
+                                          fields.get("session_epoch"))
                     agents = []
             for agent in agents:
                 if not self.holds():
@@ -973,9 +979,9 @@ class Bridge:
             READBACK_SECONDS - (self.clock() - asked).total_seconds())
         if left <= 0:
             return
-        self.conn.hset(READBACK_KEY % room, mapping={"id": rid, "text": readback_text(proposal["agents"],
-                                                                                        proposal["said"]),
-                                                     "entry": proposal["entry"]})
+        self.conn.hset(READBACK_KEY % room, mapping={"id": rid, "entry": proposal["entry"],
+                                                     "agents": ",".join(proposal["agents"]),
+                                                     "max_words": str(READBACK_MAX_WORDS)})
         self.conn.expire(READBACK_KEY % room, int(left))
 
     def _drop(self, room) -> None:
@@ -991,8 +997,9 @@ class Bridge:
         """One proposal card per voice, field readback-<the hex its claim would have> (a call-* field is the
         lifecycle's and is published only for an open claim). The proposal keeps who asked and the chair session,
         so only that caller's go-ahead confirms it. Read again (a replay, a lost cursor), a turn already proposed or
-        claimed proposes nothing: a closed or claimed ask is never reopened. A newer ask closes the older open
-        proposal as replaced; a voice added to the SAME turn (its own "I can't") joins it."""
+        claimed proposes nothing: a closed or claimed ask is never reopened. A pending ask is NEVER replaced (A2,
+        the owner, 2026-11-02: three replacements on his call meant no read-back ever finished): a newer ask gets
+        its own closed card and waits its turn; a voice added to the SAME turn (its own "I can't") joins it."""
         partition = canvas_publish.PARTITION
         if self.paused:
             self.log.info("call bridge: the read-back is off; nothing proposed in %s", room)
@@ -1009,7 +1016,9 @@ class Bridge:
         elif older:
             if not _after(entry_id, older["entry"]):
                 return                                    # an older turn read late never replaces a newer one
-            self._close(room, older, older["agents"], "Replaced by a newer ask", now)
+            # A2: the open proposal stands. The newer ask is refused visibly and claims nothing.
+            self._refuse(room, entry_id, agents, WAITING_BEHIND, now)
+            return
         asked = event_time(entry_id) or now
         self._keep(room, {"entry": entry_id, "said": said, "agents": joined, "actor": actor, "epoch": epoch})
         for agent in agents:
@@ -1018,6 +1027,21 @@ class Bridge:
             if self.bucket:
                 self.open_if_shut(now, "%s/%s" % (agent, field))
             self.log.info("call bridge: %s proposed for %s, waiting for a go-ahead", field, agent)
+
+    def _refuse(self, room, entry_id, agents, why, now) -> None:
+        """A visible card for an ask that never becomes a proposal (too long, or one is already waiting).
+        Who, when and why only; writing it again (a replay) is the same write."""
+        partition = canvas_publish.PARTITION
+        asked = event_time(entry_id) or now
+        for agent in agents:
+            field = proposal_id(room, entry_id, agent)
+            if self.conn.hget(partition % (self.canvas_room, agent), field) is not None:
+                continue
+            self.conn.hset(partition % (self.canvas_room, agent), field,
+                           json.dumps(unstarted_card(agent, asked, why, now)))
+            if self.bucket:
+                self.open_if_shut(now, "%s/%s" % (agent, field))
+            self.log.info("call bridge: %s refused for %s (%s)", field, agent, why)
 
     def _close(self, room, proposal, agents, why, now) -> None:
         """Close the given voices' proposal cards and drop the proposal once none is left. A voice whose ask was
