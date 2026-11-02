@@ -47,6 +47,36 @@ class Routing(unittest.TestCase):
         wanted, _, _, _ = w.plan([row("R1", "2026-09-24T03:50:00Z")], set(), self.routes)
         self.assertEqual(list(wanted), ["gemini-waker"])
 
+    def test_gemini_route_excludes_rows_its_wake_filter_will_not_consume(self):
+        import agent_waker as aw
+        examples = [
+            row("INFO-1", "2026-09-24T03:50:00Z",
+                payload="BCB|v=1|id=INFO-1|phase=RESULT|to=gemini"),
+            row("INFO-2", "2026-09-24T03:50:00Z",
+                payload="BCB|v=1|id=INFO-2|phase=DONE|to=gemini"),
+            row("INFO-3", "2026-09-24T03:50:00Z", target="claude-code-cli",
+                payload="BCB|v=1|id=INFO-3|phase=REQUEST|to=claude-code-cli|cc=gemini"),
+        ]
+        result_action = row("INFO-4", "2026-09-24T03:50:00Z",
+                            payload="BCB|v=1|id=INFO-4|phase=REQUEST|to=gemini")
+        result_action[4] = "RESULT"
+        examples.append(result_action)
+        for item in examples:
+            with self.subTest(row_id=item[0]):
+                self.assertEqual(aw.select([item], set(), "gemini"), [])
+                self.assertEqual(w.plan([item], set(), self.routes)[0], {})
+
+    def test_disabling_gemini_wake_filter_keeps_the_existing_route(self):
+        import agent_waker as aw
+        item = row("INFO-5", "2026-09-24T03:50:00Z",
+                   payload="BCB|v=1|id=INFO-5|phase=RESULT|to=gemini")
+        original = aw.AGENTS["gemini"].get("wake_filter")
+        try:
+            aw.AGENTS["gemini"]["wake_filter"] = False
+            self.assertIn("gemini-waker", w.plan([item], set(), self.routes)[0])
+        finally:
+            aw.AGENTS["gemini"]["wake_filter"] = original
+
     def test_his_whatsapp_prefix_starts_gemini(self):
         r = row("R2", "2026-09-24T03:50:00Z", source="whatsapp", target="Blackboard Alpha DB",
                 payload="Gemini - review the watcher")
@@ -441,7 +471,8 @@ class ExecutionStateSafety(unittest.TestCase):
                     out, started, state = self.run_tick_with_response(response)
                     self.assertEqual(started, [])
                     self.assertIn("gemini-waker", out["skipped_running"])
-                    self.assertEqual(state["pending"]["gemini-waker"], [{"row_id": "R1", "work_id": "X"}])
+                    self.assertEqual(state["pending"]["gemini-waker"],
+                                     [{"row_id": "R1", "work_id": "X", "ts": "2026-09-24T03:50:00Z"}])
                     self.assertNotIn("R1", state["seen"])
                     self.assertLess(state["watermark"], "2026-09-24T03:50:00Z")
 
@@ -571,3 +602,113 @@ class ProjectAliasSafety(ExecutionStateSafety):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExpiresWhatItsPassCanNeverReach(unittest.TestCase):
+    """An agent pass reads only rows newer than its cursor's watermark. A pending row
+    older than that cannot be answered, so it stops restarting the job (2026-11-02:
+    146 such Gemini rows restarted gemini-waker every tick)."""
+
+    WM = "2026-09-24T03:45:00Z"   # the gemini cursor's watermark; the floor is 03:44:00Z
+
+    def tick(self, pending, rows=(), cursor=None, watcher_wm="2026-09-24T03:40:00Z"):
+        store = NamedStore({
+            "board_watcher": {"watermark": watcher_wm, "seen": [], "pending": pending},
+            "gemini_waker": cursor if cursor is not None else {"watermark": self.WM, "answered_ids": []},
+            "wa_outbox": {"watermark": self.WM, "delivered_row_ids": []},
+        })
+        started = []
+
+        def start(job):
+            started.append(job)
+            return "exec-1"
+        out = w.tick(store, read_since=lambda since: list(rows), routes=w._routes(),
+                     running=lambda job: False, start=start, now=NOW)
+        return out, started, store.slots["board_watcher"][0]
+
+    @staticmethod
+    def item(rid, ts=None):
+        got = {"row_id": rid, "work_id": rid}
+        if ts:
+            got["ts"] = ts
+        return got
+
+    def test_a_row_older_than_the_route_watermark_expires_and_is_not_restarted(self):
+        out, started, state = self.tick({"gemini-waker": [self.item("OLD", "2026-09-24T03:00:00Z")]})
+        self.assertEqual(started, [])
+        self.assertNotIn("gemini-waker", state["pending"])
+        self.assertIn("OLD", state["seen"])
+        self.assertIn("expired 1", out["expired"]["gemini-waker"])
+
+    def test_a_row_inside_the_margin_is_kept_and_rings(self):
+        out, started, state = self.tick({"gemini-waker": [self.item("EDGE", "2026-09-24T03:44:30Z")]})
+        self.assertEqual(started, ["gemini-waker"])
+        self.assertEqual([i["row_id"] for i in state["pending"]["gemini-waker"]], ["EDGE"])
+        self.assertNotIn("EDGE", state["seen"])
+
+    def test_a_row_past_the_watermark_is_kept_even_when_the_read_is_empty(self):
+        out, started, state = self.tick({"gemini-waker": [self.item("NEW", "2026-09-24T03:50:00Z")]})
+        self.assertEqual(started, ["gemini-waker"])
+        self.assertEqual(state["pending"]["gemini-waker"],
+                         [{"row_id": "NEW", "work_id": "NEW", "ts": "2026-09-24T03:50:00Z"}])
+
+    def test_an_answered_row_is_done_not_expired(self):
+        cursor = {"watermark": self.WM, "answered_ids": ["OLD"]}
+        out, started, state = self.tick({"gemini-waker": [self.item("OLD", "2026-09-24T03:00:00Z")]},
+                                        cursor=cursor)
+        self.assertEqual(started, [])
+        self.assertIn("OLD", state["seen"])
+        self.assertEqual(out["expired"], {})
+
+    def test_a_legacy_item_missing_from_a_read_that_starts_before_the_floor_expires(self):
+        other = row("UNRELATED", "2026-09-24T03:35:00Z", target="nobody",
+                    payload="BCB|v=1|id=UNRELATED|phase=NOTE|to=nobody")
+        out, started, state = self.tick({"gemini-waker": [self.item("LEGACY")]}, rows=[other])
+        self.assertEqual(started, [])
+        self.assertIn("LEGACY", state["seen"])
+
+    def test_a_legacy_item_is_kept_when_the_read_is_empty(self):
+        out, started, state = self.tick({"gemini-waker": [self.item("LEGACY")]}, rows=[])
+        self.assertEqual(started, ["gemini-waker"])
+        self.assertEqual(state["pending"]["gemini-waker"], [self.item("LEGACY")])
+
+    def test_a_legacy_item_found_in_the_read_takes_that_rows_time(self):
+        found = row("LEGACY", "2026-09-24T03:46:00Z", payload="BCB|v=1|id=LEGACY|phase=DISPATCH|to=gemini")
+        out, started, state = self.tick({"gemini-waker": [self.item("LEGACY")]}, rows=[found])
+        self.assertEqual(started, ["gemini-waker"])
+        self.assertIn("LEGACY", [i["row_id"] for i in state["pending"]["gemini-waker"]])
+
+    def test_a_legacy_item_is_kept_when_the_read_starts_after_the_floor(self):
+        # The cursor is far behind the watcher's read: absence proves nothing.
+        cursor = {"watermark": "2026-09-24T03:00:00Z", "answered_ids": []}
+        other = row("UNRELATED", "2026-09-24T03:35:00Z", target="nobody",
+                    payload="BCB|v=1|id=UNRELATED|phase=NOTE|to=nobody")
+        out, started, state = self.tick({"gemini-waker": [self.item("LEGACY")]}, rows=[other], cursor=cursor)
+        self.assertEqual(started, ["gemini-waker"])
+        self.assertEqual(state["pending"]["gemini-waker"], [self.item("LEGACY")])
+
+    def test_no_usable_cursor_watermark_keeps_everything(self):
+        for cursor in ({"answered_ids": []}, {"watermark": "Friday", "answered_ids": []}):
+            with self.subTest(cursor=cursor):
+                out, started, state = self.tick(
+                    {"gemini-waker": [self.item("OLD", "2026-09-24T03:00:00Z")]}, cursor=cursor)
+                self.assertEqual(started, ["gemini-waker"])
+                self.assertEqual([i["row_id"] for i in state["pending"]["gemini-waker"]], ["OLD"])
+
+    def test_outbox_items_never_expire_here(self):
+        out, started, state = self.tick({"wa-outbox": [self.item("WA-OLD", "2026-09-24T03:00:00Z")]})
+        self.assertEqual(started, ["wa-outbox"])
+        self.assertEqual([i["row_id"] for i in state["pending"]["wa-outbox"]], ["WA-OLD"])
+
+    def test_a_newly_routed_row_is_pending_with_its_time(self):
+        ask = row("ASK", "2026-09-24T03:50:00Z", payload="BCB|v=1|id=ASK-W|phase=DISPATCH|to=gemini")
+        out, started, state = self.tick({}, rows=[ask])
+        self.assertEqual(started, ["gemini-waker"])
+        self.assertEqual(state["pending"]["gemini-waker"],
+                         [{"row_id": "ASK", "work_id": "ASK-W", "ts": "2026-09-24T03:50:00Z"}])
+
+    def test_reconcile_alone_never_expires(self):
+        store = NamedStore({"gemini_waker": {"watermark": self.WM, "answered_ids": []}})
+        still, done = w.reconcile({"gemini-waker": [self.item("OLD", "2026-09-24T03:00:00Z")]}, store)
+        self.assertEqual(done, [])
+        self.assertEqual(still["gemini-waker"], [self.item("OLD", "2026-09-24T03:00:00Z")])
