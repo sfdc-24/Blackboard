@@ -47,6 +47,36 @@ class Routing(unittest.TestCase):
         wanted, _, _, _ = w.plan([row("R1", "2026-09-24T03:50:00Z")], set(), self.routes)
         self.assertEqual(list(wanted), ["gemini-waker"])
 
+    def test_gemini_route_excludes_rows_its_wake_filter_will_not_consume(self):
+        import agent_waker as aw
+        examples = [
+            row("INFO-1", "2026-09-24T03:50:00Z",
+                payload="BCB|v=1|id=INFO-1|phase=RESULT|to=gemini"),
+            row("INFO-2", "2026-09-24T03:50:00Z",
+                payload="BCB|v=1|id=INFO-2|phase=DONE|to=gemini"),
+            row("INFO-3", "2026-09-24T03:50:00Z", target="claude-code-cli",
+                payload="BCB|v=1|id=INFO-3|phase=REQUEST|to=claude-code-cli|cc=gemini"),
+        ]
+        result_action = row("INFO-4", "2026-09-24T03:50:00Z",
+                            payload="BCB|v=1|id=INFO-4|phase=REQUEST|to=gemini")
+        result_action[4] = "RESULT"
+        examples.append(result_action)
+        for item in examples:
+            with self.subTest(row_id=item[0]):
+                self.assertEqual(aw.select([item], set(), "gemini"), [])
+                self.assertEqual(w.plan([item], set(), self.routes)[0], {})
+
+    def test_disabling_gemini_wake_filter_keeps_the_existing_route(self):
+        import agent_waker as aw
+        item = row("INFO-5", "2026-09-24T03:50:00Z",
+                   payload="BCB|v=1|id=INFO-5|phase=RESULT|to=gemini")
+        original = aw.AGENTS["gemini"].get("wake_filter")
+        try:
+            aw.AGENTS["gemini"]["wake_filter"] = False
+            self.assertIn("gemini-waker", w.plan([item], set(), self.routes)[0])
+        finally:
+            aw.AGENTS["gemini"]["wake_filter"] = original
+
     def test_his_whatsapp_prefix_starts_gemini(self):
         r = row("R2", "2026-09-24T03:50:00Z", source="whatsapp", target="Blackboard Alpha DB",
                 payload="Gemini - review the watcher")

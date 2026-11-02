@@ -128,7 +128,9 @@ def _routes():
     def for_agent(tag):
         def pred(row):
             return (len(row) > aw.C_PAYLOAD and not aw.is_from(row, tag)
-                    and not aw.is_waker_reply(row) and aw.addressed_to(row, tag))
+                    and not aw.is_waker_reply(row) and aw.addressed_to(row, tag)
+                    and (not (aw.AGENTS.get(tag) or {}).get("wake_filter")
+                         or aw.wakes_for(row, tag)))
         return pred
 
     # foundry was DROPPED the same day: "it never added real value and right
