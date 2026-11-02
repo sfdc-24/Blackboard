@@ -85,6 +85,8 @@ from __future__ import annotations
 import datetime
 import hashlib
 import json
+import math
+import os
 import re
 import threading
 
@@ -138,6 +140,30 @@ FLOOR_FRESH_SECONDS = 3 * 60  # an unnamed task ask goes to the floor holder onl
 # evidence=STATED) or a refusal is not taking it. No ack: rung once more (row id + RERING_SUFFIX), and no ack
 # ACK_SECONDS after that: the record says the agent did not wake and so does the card. The bridge rings; it
 # launches nothing. Launching is each agent's own runner (see the module docstring).
+# READ-BACK (the owner's order 2026-11-02, "go ahead and build the on-call read-back"; contract v1, sha256 d494097d):
+# a turn that asks a voice for work no longer claims. It PROPOSES: a public card in status review, who and when only,
+# titled with the phrase that starts it. His go-ahead within READBACK_SECONDS of the ask (both stream ids, the same
+# Redis clock) CONFIRMS it through the existing claim path, under the same ask id. A cancellation, the window running
+# out, or a newer ask closes it visibly and claims nothing. A voice's own "I can't" still claims at once.
+# CALL_BRIDGE_READBACK=off is the rollback switch, and it FAILS CLOSED (Codex's review of row 9443, F1): nothing
+# said on a call starts anything, and an open proposal closes as "Not started, the read-back is off". The
+# environment never brings back claiming at once: READBACK is the code's own setting, pinned False only by tests.
+READBACK = True
+READBACK_OFF = os.environ.get("CALL_BRIDGE_READBACK", "on").strip().lower() == "off"
+READ_BACK_OFF = "Not started, the read-back is off"
+READBACK_SECONDS = 2 * 60
+PROPOSAL_KEY = "gov:callbridge:proposal:%s"   # the room's one open proposal: {entry, agents, asks, at}
+# THE SPOKEN READ-BACK (the owner's order 2026-11-02, "go ahead with the chair read-back"; Codex's row 9443 G1): the
+# card is public, so it can never hold his words. The task itself is read back on the call: the bridge writes the
+# room's open proposal to READBACK_KEY (exact task, who it is for, the read-back id), the chair speaks that text
+# verbatim into the same call and projects READBACK_SPOKEN with the id. A go-ahead counts only after that event, and
+# within READBACK_SECONDS of it. No chair, no read-back, no claim: it fails closed. The key is the room's own, never
+# public; it lives only while the proposal can still be read back (until READBACK_SECONDS after his ask, F4) and
+# goes when the proposal closes or is heard.
+READBACK_KEY = "v1:conf:%s:readback"
+READBACK_SPOKEN = "readback.spoken"
+PROPOSED = "proposed in the room"
+NOT_STARTED = "not started"
 WAKE_KEY = "gov:callbridge:wake:%s"
 ACK_SECONDS = 90
 RERING_SUFFIX = "-R2"
@@ -316,6 +342,46 @@ def claimed_card(agent: str, now) -> dict:
                 eastern(now), name)}
 
 
+def proposal_id(room: str, entry_id: str, agent: str) -> str:
+    """readback-<12 hex>: the proposal card's field, the same hex as the ask id its claim would have."""
+    return "readback-" + ask_id(room, entry_id, agent)[len("call-"):]
+
+
+def readback_id(room: str, entry_id: str, agents) -> str:
+    """rb-<12 hex>: one proposal with one recipient set. A changed set is a different read-back."""
+    return "rb-" + hashlib.sha256(("%s|%s|%s" % (room, entry_id, ",".join(agents))).encode("utf-8")).hexdigest()[:12]
+
+
+def readback_text(agents, said: str) -> str:
+    """What the chair says, verbatim: who the work is for, his exact words, and the phrase that starts it."""
+    names = [NAME_OF[a] for a in agents]
+    who = names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+    words = " ".join(said.split())
+    if words and words[-1] not in ".!?":
+        words += "."
+    return "Read-back for %s: %s To start it, say: %s, go ahead." % (who, words, names[0])
+
+
+def proposal_card(agent: str, asked_at, now) -> dict:
+    """Public, READ-BACK (the owner's order 2026-11-02, contract v1): the ask was heard and waits for his go-ahead.
+    Who and when only, never a word of his. The title is the phrase that starts it."""
+    name = NAME_OF[agent]
+    return {"v": 1, "type": "note", "status": "review", "public": True, "version": 1, "ts": stamp(now),
+            "activity": PROPOSED,
+            "title": "Say: %s, go ahead (asked %s)" % (name, eastern(asked_at)),
+            "body": "Heard in the room at %s. It is read back on the call; nothing starts until the owner then says this name and go ahead within %d minutes. "
+                    "Cancel or a newer ask drops it." % (eastern(asked_at), READBACK_SECONDS // 60)}
+
+
+def unstarted_card(agent: str, asked_at, why: str, now) -> dict:
+    """Public: a proposal that closed without a go-ahead. Who, when and why only."""
+    name = NAME_OF[agent]
+    return {"v": 1, "type": "note", "status": "done", "public": True, "version": 2, "ts": stamp(now),
+            "activity": NOT_STARTED,
+            "title": "%s, %s" % (why, eastern(now)),
+            "body": "Heard in the room at %s for %s. Not started: %s." % (eastern(asked_at), name, why.lower())}
+
+
 def no_wake_card(agent: str, claimed_at, rung_at, rerung_at, version: int) -> dict:
     """Public: the agent was rung twice and never took the claim. Who and when only, never a word of the owner's."""
     name = NAME_OF[agent]
@@ -423,8 +489,11 @@ def inbox_text(ask: str, agent: str, room: str, said: str, now) -> str:
 
 
 class Bridge:
-    def __init__(self, conn, log, holds, clock=None, canvas_room=CANVAS_ROOM, ring=None, bucket=None):
+    def __init__(self, conn, log, holds, clock=None, canvas_room=CANVAS_ROOM, ring=None, bucket=None, readback=None):
         self.conn, self.log, self.holds = conn, log, holds
+        self.readback = READBACK if readback is None else bool(readback)
+        # Switched off: still the read-back path (never claiming at once), but nothing is proposed or confirmed.
+        self.paused = self.readback and READBACK_OFF
         self.ring = ring
         # The publisher's bucket: given, the bridge reads every call and opens the canvas window for its first claim.
         self.bucket = bucket
@@ -736,14 +805,64 @@ class Bridge:
                     self.log.warning("call bridge: cancellation refused (%s)", refused)
                 self.conn.set(CURSOR_KEY % room, entry_id, ex=TTL_SECONDS)
                 continue
+            if self.readback and fields.get("kind") == READBACK_SPOKEN and fields.get("actor_id") == "chair":
+                # The chair read the open proposal back into the call, verbatim, under this read-back id. Only the
+                # current id counts: a read-back of an older or changed proposal is not one of this.
+                proposal = self._proposal(room)
+                # Only the asker's own chair session reads it back (Codex's review of row 9443, F3): a receipt with
+                # another session_epoch, or none, is not this read-back.
+                if (proposal and not proposal["spoken"] and fields.get("readback_id") == proposal["rid"]
+                        and fields.get("session_epoch") == proposal["epoch"]
+                        and _after(entry_id, proposal["entry"])):
+                    self._keep(room, dict(proposal, spoken=entry_id))
+                    self.conn.delete(READBACK_KEY % room)        # spoken once; the chair does not repeat it
+                    self.log.info("call bridge: read-back %s heard in %s", proposal["rid"], room)
+                self.conn.set(CURSOR_KEY % room, entry_id, ex=TTL_SECONDS)
+                continue
             if cancellation(fields):
                 # Clear both pending confirmation and refusal fallback. An empty
                 # tombstone is compatible with Redis and expires like the original.
                 self.conn.set(PENDING_KEY % room, "null", ex=PENDING_SECONDS)
                 self.conn.set(ASKED_KEY % room, "null", ex=ASKED_SECONDS)
+                if self.readback:
+                    proposal = self._proposal(room)
+                    if proposal and _after(entry_id, proposal["entry"]):
+                        self._close(room, proposal, proposal["agents"], "Cancelled", now)
                 self.conn.set(CURSOR_KEY % room, entry_id, ex=TTL_SECONDS)
                 continue
-            if go_ahead(fields):
+            if go_ahead(fields) and self.readback:
+                # READ-BACK: a go-ahead confirms only the room's open proposal, said at most READBACK_SECONDS before
+                # it, and only for the proposed voices it NAMES, as the card says ("Codex, go ahead"). An unnamed
+                # "go ahead" or "yes please" may answer anything said on the call, so it confirms nothing.
+                agents = []
+                proposal = None if self.paused else self._proposal(room)
+                go_names = named_in(said)
+                if not proposal or not _after(entry_id, proposal["entry"]):
+                    self.log.info("call bridge: a go-ahead in %s with no open proposal; nothing claimed", room)
+                elif not proposal["spoken"] or not _after(entry_id, proposal["spoken"]):
+                    # The chair has not yet read the task back to him: he has not heard what he would confirm.
+                    self.log.info("call bridge: a go-ahead in %s before the read-back; nothing claimed", room)
+                elif not _within(proposal["spoken"], entry_id, READBACK_SECONDS):
+                    self._close(room, proposal, proposal["agents"], "Not started, no go-ahead in time", now)
+                elif not go_names:
+                    self.log.info("call bridge: a go-ahead in %s names no voice; nothing claimed", room)
+                elif (fields.get("actor_id"), fields.get("session_epoch")) != (proposal["actor"], proposal["epoch"]):
+                    # Only the caller who asked, in the same chair session, confirms his own ask.
+                    self.log.info("call bridge: a go-ahead in %s from another caller or session; nothing claimed",
+                                  room)
+                else:
+                    agents = self._go_agents({"named": True, "agents": proposal["agents"]}, go_names)
+                    if agents:
+                        confirms, asked_entry = proposal, entry_id
+                        said = "%s -- then, to go ahead: %s" % (proposal["said"], said)
+                        self._asked(room, proposal["entry"], said, now)
+                        self._drop(room)
+                        self._close(room, proposal, [a for a in proposal["agents"] if a not in agents],
+                                    "Not started, not in the go-ahead", now)
+                    else:
+                        self.log.info("call bridge: a go-ahead in %s names a voice outside the proposal; "
+                                      "nothing claimed", room)
+            elif go_ahead(fields):
                 # "Do it" (Aya's binding hold on d2d1618): it confirms his last TASK ask in this room (PENDING_SECONDS),
                 # for the voice that ask was assigned when he made it; never the floor holder of the go-ahead's own
                 # moment. No pending task: nothing is claimed. A go-ahead naming a voice other than the one his ask
@@ -767,14 +886,24 @@ class Bridge:
                     agents = [holder] if holder else []
                 if fields.get("kind") == "turn.started" and fields.get("actor_id") not in ("", None, "chair") \
                         and said.strip():
-                    self._asked(room, entry_id, said, now)
+                    self._asked(room, entry_id, said, now, fields.get("actor_id"), fields.get("session_epoch"))
                     if task_ask(fields):
                         named = named_in(said)
                         assigned = named or [a for a in [self._floor_at(room, entry_id, fields.get("turn_id"),
                                                                          entries[index + 1:])] if a]
-                        self.conn.set(PENDING_KEY % room, json.dumps(
-                            {"entry": entry_id, "said": said, "agents": assigned, "named": bool(named)},
-                            sort_keys=True), ex=PENDING_SECONDS)
+                        if not self.readback:
+                            # Claiming at once only. The read-back keeps his words in the proposal alone (F2).
+                            self.conn.set(PENDING_KEY % room, json.dumps(
+                                {"entry": entry_id, "said": said, "agents": assigned, "named": bool(named)},
+                                sort_keys=True), ex=PENDING_SECONDS)
+                        if self.readback and TASK.search(said):
+                            agents = list(dict.fromkeys(agents + assigned))
+                if self.readback:
+                    # READ-BACK: an ask PROPOSES; nothing is claimed until his go-ahead.
+                    if agents and self.holds():
+                        self._propose(room, entry_id, agents, said, now, fields.get("actor_id"),
+                                      fields.get("session_epoch"))
+                    agents = []
             for agent in agents:
                 if not self.holds():
                     return claimed
@@ -782,10 +911,143 @@ class Bridge:
                                   asked_entry=asked_entry)
                 if ask:
                     claimed.append(ask)
+                if self.readback and confirms:
+                    # Claimed: the proposal card is retired. Held: it says so, and nothing was claimed.
+                    self._close(room, confirms, [agent], "Not started, the claim was held", now)
             self.conn.set(CURSOR_KEY % room, entry_id, ex=TTL_SECONDS)
+        if self.paused and self.holds():
+            proposal = self._proposal(room)
+            if proposal:
+                self._close(room, proposal, proposal["agents"], READ_BACK_OFF, now)
+        if self.readback and self.holds() and len(entries) < PAGE:
+            # Every event so far is read: a proposal older than READBACK_SECONDS has had its chance.
+            proposal = self._proposal(room)
+            since = event_time(proposal["spoken"] or proposal["entry"]) if proposal else None
+            if since is not None and (now - since).total_seconds() > READBACK_SECONDS:
+                self._close(room, proposal, proposal["agents"], "Not started, no go-ahead in time"
+                            if proposal["spoken"] else "Not started, the read-back was not heard", now)
         if self.holds():
             claimed.extend(self._refusals(room, now))
+        if self.readback and self.holds():
+            # A proposed ask that is claimed by other means (an earlier claim): its proposal card goes.
+            proposal = self._proposal(room)
+            done = [a for a in proposal["agents"] if self._claimed(room, proposal["entry"], a)] if proposal else []
+            if done:
+                self._close(room, proposal, done, "Claimed", now)
         return claimed
+
+    def _proposal(self, room):
+        """The room's open proposal {entry, said, agents}, or None."""
+        try:
+            held = json.loads(_text(self.conn.get(PROPOSAL_KEY % room)) or "null")
+        except (TypeError, ValueError):
+            return None
+        if not (isinstance(held, dict) and held.get("entry") and isinstance(held.get("said"), str)):
+            return None
+        agents = held.get("agents")
+        if not isinstance(agents, list) or not agents or any(a not in NAME_OF for a in agents):
+            return None
+        if not (isinstance(held.get("actor"), str) and held["actor"] and isinstance(held.get("epoch"), str)
+                and held["epoch"]):
+            return None                                      # no caller binding: confirms nothing
+        spoken = held.get("spoken")
+        return {"entry": str(held["entry"]), "said": held["said"], "agents": agents, "actor": held["actor"],
+                "epoch": held["epoch"], "rid": readback_id(room, str(held["entry"]), agents),
+                "spoken": spoken if isinstance(spoken, str) and spoken else None}
+
+    def _keep(self, room, proposal) -> None:
+        """Write the room's open proposal and, for the chair, its read-back: v1:conf:<room>:readback, the exact
+        task and who it is for, under the proposal's read-back id. A changed recipient set is a new id, so the
+        chair reads it back again and an earlier readback.spoken no longer counts."""
+        rid = readback_id(room, proposal["entry"], proposal["agents"])
+        record = {k: proposal[k] for k in ("entry", "said", "agents", "actor", "epoch")}
+        if proposal.get("spoken") and proposal.get("rid") == rid:
+            record["spoken"] = proposal["spoken"]
+        self.conn.set(PROPOSAL_KEY % room, json.dumps(record, sort_keys=True), ex=TTL_SECONDS)
+        if record.get("spoken"):
+            return
+        self.conn.delete(READBACK_KEY % room)
+        # An unheard proposal closes READBACK_SECONDS after his ask; the chair gets exactly that long (F4).
+        asked = event_time(proposal["entry"])
+        left = READBACK_SECONDS if asked is None else math.ceil(
+            READBACK_SECONDS - (self.clock() - asked).total_seconds())
+        if left <= 0:
+            return
+        self.conn.hset(READBACK_KEY % room, mapping={"id": rid, "text": readback_text(proposal["agents"],
+                                                                                        proposal["said"]),
+                                                     "entry": proposal["entry"]})
+        self.conn.expire(READBACK_KEY % room, int(left))
+
+    def _drop(self, room) -> None:
+        self.conn.delete(PROPOSAL_KEY % room)
+        self.conn.delete(READBACK_KEY % room)
+
+    def _claimed(self, room, entry_id, agent) -> bool:
+        """A claim exists for this voice and turn (by go-ahead, by a voice's "I can't", or from before)."""
+        ask = ask_id(room, entry_id, agent)
+        return self.conn.get(call_lifecycle.TASK_KEY % ask) is not None or self.conn.get(ASK_KEY % ask) is not None
+
+    def _propose(self, room, entry_id, agents, said, now, actor, epoch) -> None:
+        """One proposal card per voice, field readback-<the hex its claim would have> (a call-* field is the
+        lifecycle's and is published only for an open claim). The proposal keeps who asked and the chair session,
+        so only that caller's go-ahead confirms it. Read again (a replay, a lost cursor), a turn already proposed or
+        claimed proposes nothing: a closed or claimed ask is never reopened. A newer ask closes the older open
+        proposal as replaced; a voice added to the SAME turn (its own "I can't") joins it."""
+        partition = canvas_publish.PARTITION
+        if self.paused:
+            self.log.info("call bridge: the read-back is off; nothing proposed in %s", room)
+            return
+        if not actor or actor == "chair" or not epoch:
+            return
+        if any(self.conn.hget(partition % (self.canvas_room, agent), proposal_id(room, entry_id, agent)) is not None
+               or self._claimed(room, entry_id, agent) for agent in agents):
+            return
+        older = self._proposal(room)
+        joined = list(agents)
+        if older and older["entry"] == entry_id:
+            joined = list(dict.fromkeys(older["agents"] + agents))
+        elif older:
+            if not _after(entry_id, older["entry"]):
+                return                                    # an older turn read late never replaces a newer one
+            self._close(room, older, older["agents"], "Replaced by a newer ask", now)
+        asked = event_time(entry_id) or now
+        self._keep(room, {"entry": entry_id, "said": said, "agents": joined, "actor": actor, "epoch": epoch})
+        for agent in agents:
+            field = proposal_id(room, entry_id, agent)
+            self.conn.hset(partition % (self.canvas_room, agent), field, json.dumps(proposal_card(agent, asked, now)))
+            if self.bucket:
+                self.open_if_shut(now, "%s/%s" % (agent, field))
+            self.log.info("call bridge: %s proposed for %s, waiting for a go-ahead", field, agent)
+
+    def _close(self, room, proposal, agents, why, now) -> None:
+        """Close the given voices' proposal cards and drop the proposal once none is left. A voice whose ask was
+        claimed after all (a go-ahead, its own "I can't") loses the proposal card: its claimed card says the rest.
+        Otherwise a card that is still a proposal flips to done with the reason; nothing else is touched."""
+        partition = canvas_publish.PARTITION
+        asked = event_time(proposal["entry"]) or now
+        for agent in agents:
+            field = proposal_id(room, proposal["entry"], agent)
+            raw = self.conn.hget(partition % (self.canvas_room, agent), field)
+            try:
+                item = json.loads(_text(raw)) if raw is not None else None
+            except (TypeError, ValueError):
+                item = None
+            if not (isinstance(item, dict) and item.get("activity") == PROPOSED):
+                continue
+            if self._claimed(room, proposal["entry"], agent):
+                self.conn.hdel(partition % (self.canvas_room, agent), field)
+                self.log.info("call bridge: %s claimed; its proposal card is retired", field)
+            else:
+                self.conn.hset(partition % (self.canvas_room, agent), field,
+                               json.dumps(unstarted_card(agent, asked, why, now)))
+                self.log.info("call bridge: %s %s", field, why.lower())
+        held = self._proposal(room)
+        if held and held["entry"] == proposal["entry"]:
+            left = [a for a in held["agents"] if a not in agents]
+            if left:
+                self._keep(room, dict(held, agents=left))
+            else:
+                self._drop(room)
 
     def _refusals(self, room: str, now) -> list:
         """A voice's "I can't" to the owner's last turn (ASKED_SECONDS) claims that turn for the voice's agent.
@@ -814,15 +1076,35 @@ class Bridge:
                 if isinstance(asked, dict) and asked.get("entry") and _after(entry_id, str(asked["entry"])):
                     if not self.holds():
                         return claimed
+                    if self.readback:
+                        # READ-BACK: a voice's "I can't" is a NON-EXECUTING disposition. It proposes that
+                        # voice for his turn, and only his named go-ahead claims it.
+                        said = self._said(room, str(asked["entry"]))
+                        if said.strip():
+                            self._propose(room, str(asked["entry"]), [agent], said, now,
+                                          asked.get("actor"), asked.get("epoch"))
+                        self.conn.set(cursor_key, entry_id, ex=TTL_SECONDS)
+                        continue
                     ask = self._claim(room, str(asked["entry"]), agent, str(asked.get("said") or ""), now)
                     if ask:
                         claimed.append(ask)
             self.conn.set(cursor_key, entry_id, ex=TTL_SECONDS)
         return claimed
 
-    def _asked(self, room, entry_id, said, now) -> None:
-        self.conn.set(ASKED_KEY % room, json.dumps({"entry": entry_id, "said": said, "at": stamp(now)}, sort_keys=True),
-                      ex=ASKED_SECONDS)
+    def _asked(self, room, entry_id, said, now, actor=None, epoch=None) -> None:
+        record = {"entry": entry_id, "at": stamp(now)}
+        if not self.readback:
+            record["said"] = said      # read-back: his words stay in the room's stream and the proposal (F2)
+        if actor and epoch:
+            record.update(actor=actor, epoch=epoch)        # who asked, so a read-back proposal binds the caller
+        self.conn.set(ASKED_KEY % room, json.dumps(record, sort_keys=True), ex=ASKED_SECONDS)
+
+    def _said(self, room, entry_id) -> str:
+        """His words at entry_id, read again from the room's own stream (the read-back keeps no copy), or ""."""
+        for got, raw in self.conn.xrange("v1:conf:%s:events" % room, min=entry_id, max=entry_id, count=1) or ():
+            if _text(got) == entry_id:
+                return _fields(raw).get("utterance") or ""
+        return ""
 
     def _pending(self, room):
         """{entry, said}: his last ask in this room that was not a go-ahead, kept PENDING_SECONDS, or None."""
@@ -952,6 +1234,12 @@ def _after(entry_id: str, other: str) -> bool:
     return a > b
 
 
+def _within(first: str, then: str, seconds: int) -> bool:
+    """Stream id `then` comes after `first` by at most `seconds` (the same Redis clock). Unreadable ids never are."""
+    a, b = event_time(first), event_time(then)
+    return a is not None and b is not None and _after(then, first) and (b - a).total_seconds() <= seconds
+
+
 def _row(row):
     """(payload, sender tag) of a board row: bus_request's columns."""
     import bus_request                                                   # noqa: PLC0415
@@ -965,12 +1253,12 @@ def _field(payload, name):
     return bus_request.field(payload, name)
 
 
-def start(conn, log, holds, ring=None, bucket=None):
+def start(conn, log, holds, ring=None, bucket=None, readback=None):
     """The bridge on its own thread, or None without a way to ask for the lease. `ring`: the doorbell's board append
     (one row spec), or None for no doorbell. `bucket`: the publisher's, so a claim can open the canvas window."""
     if holds is None:
         return None
-    bridge = Bridge(conn, log, holds, ring=ring, bucket=bucket)
+    bridge = Bridge(conn, log, holds, ring=ring, bucket=bucket, readback=readback)
     thread = threading.Thread(target=bridge.run, name="call-bridge", daemon=True)
     thread.start()
     bridge.thread = thread
