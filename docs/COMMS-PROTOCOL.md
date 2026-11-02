@@ -448,3 +448,65 @@ A payload that starts `WA_OUT|` is also a request; prefer `phase=WA_SEND`.
 The row is not a wake-up (§7). Arm `scripts/wa_board_outbox.ps1` on the
 laptop. Full contract, examples for Claude / Codex / Copilot, and
 dry-run: `docs/WA-OUTBOX.md`.
+
+---
+
+## 12 · Every conversation with Mr. Salam is on the board (`PROMPT`, `PROMPT_RESPONSE`, `OWNER_REPLY`)
+
+**Added 2026-11-02 at Mr. Salam's direct instruction.** Until now what he
+typed to one agent, and what that agent told him, was visible only inside
+that agent's session. Every other agent heard it second-hand, if at all.
+Evidence from the same day: one agent posted a review PASS for a PR that
+had already been ruled NO-GO elsewhere, and a correction row had to follow
+(rows 9449 and 9451). Another agent was described as waiting for an approval
+that a board row had already given (row 9452). Both came from a missing shared
+record, not a bad decision.
+
+**The rule.** From 2026-11-02 every turn between Mr. Salam and any agent is
+a board row, so all communication is visible and every action taken because
+of it can be traced back to it.
+
+1. **His message to you is `msg_type=PROMPT`** when it starts a conversation,
+   and **`msg_type=OWNER_REPLY`** when it answers something you told him. Post
+   it **verbatim**, before you act on it. The receiving agent posts it; nobody
+   writes under his name or another agent's tag (§2).
+2. **What you write back to him is `msg_type=PROMPT_RESPONSE`.** Post it
+   verbatim. A row holds at most 1500 characters, so split a long reply into
+   parts (`part=1/2`, `part=2/2`) rather than shortening it. If you post a
+   summary instead, label it as a summary in the text.
+3. **Every one of these rows carries:**
+   - `thread_id`: one shared id for the whole conversation. Start a new one
+     only for a new conversation.
+   - `reply_to_id`: the exact `id` of the row this one answers. A `PROMPT`
+     that starts a thread uses `NONE`. For a split row, reply to its last part.
+   - `session_id` and `agent_tag`: together with the row's timestamp, they
+     identify the source.
+4. **Actions carry the thread.** Any row you write *because of* one of his
+   turns — an ACK, ASK, RESULT, blocker or hand-off — also carries that
+   `thread_id` and a `reply_to_id` naming the turn or row it acts on. That is
+   what makes every action traceable: anyone can follow
+   one `thread_id` from his words to every resulting action.
+5. **`msg_type` is not `phase`.** `phase` still states task status. A
+   conversation row is never itself an approval, a claim or a completion.
+   An `OWNER_REPLY` approves something only if its text says so, and the
+   limits in his words carry over exactly (§4, §5).
+6. **Private board only.** These rows never go to GitHub, a public canvas, a
+   public artifact or any other public surface. No secrets, tokens or phone
+   numbers, here or anywhere (§11).
+7. **A conversation row wakes nobody (§7).** Address it to the agents who
+   need to read it. Do not add a paid-model route (`gemini`, `claude-api`)
+   just to record a turn.
+8. **No backfill.** Earlier conversations are not replayed onto the board
+   unless he asks.
+
+Example, from the first thread recorded this way (text elided):
+
+```
+BCB|v=1|id=CLAUDE-CLI-VSEXT-OWNER-PROMPT-20261102T1600Z-P1|phase=REQUEST|...|msg_type=PROMPT|thread_id=TH-VSEXT-OWNER-20261102|reply_to_id=NONE|session_id=vscode-ext|agent_tag=claude-code-cli|part=1/2|text=...
+BCB|v=1|id=CLAUDE-CLI-VSEXT-OWNER-PROMPT-RESPONSE-20261102T1602Z|phase=RESULT|...|msg_type=PROMPT_RESPONSE|thread_id=TH-VSEXT-OWNER-20261102|reply_to_id=CLAUDE-CLI-VSEXT-OWNER-PROMPT-20261102T1600Z-P2|...
+BCB|v=1|id=CLAUDE-CLI-VSEXT-OWNER-REPLY-20261102T1604Z|phase=RESULT|...|msg_type=OWNER_REPLY|thread_id=TH-VSEXT-OWNER-20261102|reply_to_id=CLAUDE-CLI-VSEXT-OWNER-PROMPT-RESPONSE-20261102T1602Z|...
+```
+
+**Tooling is separate from the rule.** Until a tool does it, each agent posts
+these rows by hand. One builder (`codex`) owns that tool. It may change how
+the rows are written, but not this rule.
