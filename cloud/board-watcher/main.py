@@ -30,6 +30,13 @@ WHAT IT WILL NOT DO
     quarantined. While anything is still pending, the next tick starts the
     route again, once, and not while the job is already running. How many
     rows one run actually answers stays the job's own per-pass cap.
+  - A row an agent pass can never reach stops being pending. An agent_waker
+    pass reads only rows newer than its own cursor's watermark, so a row more
+    than EXPIRY_MARGIN older than that watermark, and still not answered, will
+    never be answered by it. Holding it restarted the job every tick for
+    nothing: 146 such Gemini rows did exactly that on 2026-11-02. It is
+    dropped as expired, not done, and remembered as seen so it is not routed
+    again. The outbox keeps its own rule.
   - It reads the lease back immediately before a start. A slow read can
     outlive the 120s lease; if another tick owns it by then, this one does
     not start the job and does not write the cursor.
@@ -92,13 +99,65 @@ def finished_ids(state, job: str) -> set:
     return {str(item) for item in found if item}
 
 
+# Routes whose job is an agent_waker pass. That pass reads only rows newer than
+# its cursor's watermark (agent_waker.main: since = state["watermark"]), so its
+# watermark is also the edge of what it can still answer. wa-outbox is not one.
+AGENT_ROUTES = ("gemini-waker", "claude-api-waker")
+# Rows this close behind the watermark are kept, for clock and boundary slack.
+EXPIRY_MARGIN = timedelta(seconds=int(os.environ.get("EXPIRY_MARGIN_SECONDS") or 60))
+
+
 def reconcile(pending, store) -> tuple:
     """Drop pending work the route has finished. Returns (still, done row ids)."""
-    still, done = {}, []
+    still, done, _expired, _notes = settle(pending, store)
+    return still, done
+
+
+def settle(pending, store, rows=None, since=None) -> tuple:
+    """Drop pending work the route has finished, and agent-route work it can never reach.
+
+    Returns (still, done row ids, expired row ids, notes by job). Each route's
+    cursor is loaded ONCE, so "answered" and "watermark" come from the same
+    save: a row the pass answered is done, never expired.
+
+    An unfinished agent-route row expires when its timestamp is more than
+    EXPIRY_MARGIN older than that route cursor's watermark. The timestamp is
+    the one recorded when the row became pending ("ts"). An item from before
+    that field existed takes it from this tick's read when the row is in it.
+    When it is not, and the read is non-empty and starts no later than the
+    floor, the row is older than the read and so older than the floor. Unknown
+    is never unreachable: no `rows` (reconcile), no usable watermark, or a
+    legacy item the read cannot place keeps the item.
+
+    Why a running pass cannot be raced: one copy of a job runs at a time, and
+    it reads from the watermark it loaded. Anything older than that, it will
+    not read. Anything between that and the watermark it later saves it read,
+    and it either answered it (saved in the same object) or never will.
+    """
+    import agent_waker as aw
+    still, done, expired, notes = {}, [], [], {}
+    since_ts = aw.parse_ts(since) if since else None
+    read_ts = {}
+    for r in rows or []:
+        if r and len(r) > aw.C_TS:
+            ts = aw.parse_ts(r[aw.C_TS])
+            if ts is not None:
+                read_ts[str(r[aw.C_ROW_ID]).strip()] = ts
     for job, items in (pending or {}).items():
         cursor, _token = store.load(ROUTE_CURSORS.get(job) or job)
         finished = finished_ids(cursor, job)
-        keep = []
+        floor = None
+        if rows is not None and job in AGENT_ROUTES and isinstance(cursor, dict):
+            wm = aw.parse_ts(str(cursor.get("watermark") or ""))
+            if wm is None:
+                notes[job] = "no usable cursor watermark: nothing expired"
+            else:
+                floor = wm - EXPIRY_MARGIN
+        # A row missing from a non-empty read that starts at or before the
+        # floor is older than the read, so older than the floor.
+        absent_is_old = (floor is not None and bool(read_ts) and since_ts is not None
+                         and since_ts <= floor)
+        keep, gone = [], 0
         for item in items or []:
             if isinstance(item, str):
                 item = {"row_id": item, "work_id": item}
@@ -112,10 +171,25 @@ def reconcile(pending, store) -> tuple:
                 if rid:
                     done.append(rid)
                 continue
-            keep.append({"row_id": rid, "work_id": wid or rid})
+            ts = aw.parse_ts(str(item.get("ts") or "")) if item.get("ts") else None
+            if ts is None:
+                ts = read_ts.get(rid)
+            if floor is not None and ((ts is not None and ts < floor)
+                                      or (ts is None and absent_is_old)):
+                gone += 1
+                if rid:
+                    expired.append(rid)
+                continue
+            kept = {"row_id": rid, "work_id": wid or rid}
+            if item.get("ts"):
+                kept["ts"] = str(item["ts"])
+            keep.append(kept)
+        if gone:
+            notes[job] = "expired %d unanswered row(s) older than cursor watermark %s" % (
+                gone, cursor.get("watermark"))
         if keep:
             still[job] = keep[-SEEN_CAP:]
-    return still, done
+    return still, done, expired, notes
 
 
 # ------------------------------------------------------------------ routing
@@ -295,9 +369,11 @@ def tick(store, read_since, routes, running, start, now=None) -> dict:
     # an earlier tick managed to start the job. A capped pass that answered
     # three of four leaves the fourth pending, and the next tick starts
     # that route again.
-    pending, done_rows = reconcile(state.get("pending") or {}, store)
+    pending, done_rows, expired_rows, expiry_notes = settle(
+        state.get("pending") or {}, store, rows=rows, since=since)
     seen_ids = [str(r) for r in (state.get("seen") or []) if r]
-    for rid in done_rows:
+    # Expired rows join seen too: the overlap must not route them back.
+    for rid in done_rows + expired_rows:
         if rid not in seen_ids:
             seen_ids.append(rid)
     wanted, fresh, newest, errors = plan(rows, set(seen_ids), routes)
@@ -305,10 +381,12 @@ def tick(store, read_since, routes, running, start, now=None) -> dict:
     def add_pending(job, hits):
         items = list(pending.get(job) or [])
         have = {item["row_id"] for item in items}
-        for _ts, rid, wid in hits:
+        for ts, rid, wid in hits:
             if rid in have:
                 continue
-            items.append({"row_id": rid, "work_id": wid or rid})
+            # ts lets a later tick tell when the route can no longer reach it.
+            items.append({"row_id": rid, "work_id": wid or rid,
+                          "ts": ts.strftime("%Y-%m-%dT%H:%M:%SZ")})
             have.add(rid)
         if items:
             pending[job] = items[-SEEN_CAP:]
@@ -403,6 +481,7 @@ def tick(store, read_since, routes, running, start, now=None) -> dict:
             "started": started, "skipped_running": skipped, "failed": failed,
             "routed": {job: [rid for _ts, rid, _wid in hits] for job, hits in wanted.items()},
             "route_errors": {rid: msgs for rid, (_, msgs) in errors.items()},
+            "expired": expiry_notes,
             "watermark": new_state["watermark"]}
 
 
