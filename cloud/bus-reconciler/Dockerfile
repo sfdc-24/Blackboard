@@ -49,6 +49,8 @@ COPY scripts/redis_acl.json /app/redis_acl.json
 COPY scripts/canvas_publish.py /app/canvas_publish.py
 # The call bridge beside the publisher (CALL_BRIDGE=on): the owner's spoken asks become claimed cards.
 COPY scripts/call_bridge.py /app/call_bridge.py
+# Shared authoritative task CAS and publisher fence; source bytes are copied unchanged.
+COPY scripts/call_lifecycle.py /app/call_lifecycle.py
 # The git channel: Redis requests from GitHub bot accounts the access list binds by numeric id (Cursor).
 COPY scripts/git_requests.py /app/git_requests.py
 # The scheduled rewrite of the live milestone chart from its durable repo copy (milestones-sync job).

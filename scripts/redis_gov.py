@@ -1447,6 +1447,19 @@ def _finish_audit(conn, acl, who, raw_tag, via, key, entries, generation, correl
     return result
 
 
+def managed_canvas(field, raw=None):
+    """Pure managed-card classifier shared by admission and publication.
+    Keep this in governance: redis-tool-bridge also imports this module, and must
+    not gain a dependency on the lifecycle/publisher merely to deny a write."""
+    if str(_text(field) or "").startswith("call-"):
+        return True
+    try:
+        card = json.loads(_text(raw))
+    except (TypeError, ValueError, UnicodeError):
+        return False
+    return isinstance(card, dict) and ("ask" in card or "source_revision" in card)
+
+
 def _write(conn, acl, who, raw_tag, via, op, key, field, value, now, stated=None) -> dict:
     """WATCH, check the type, read the old value, then MULTI the write AND its audit entry together.
 
@@ -1461,6 +1474,19 @@ def _write(conn, acl, who, raw_tag, via, op, key, field, value, now, stated=None
         allowed = WRITABLE_TYPES.get(op)
         if allowed and kind not in allowed:
             raise Refused("the key holds a %s; %s writes a %s" % (kind, op, allowed[1]))
+        # Managed task cards have a separate authoritative CAS writer. Check
+        # under this same partition WATCH so concurrent claim creation cannot
+        # slip between inspecting the old hash and replacing/deleting it.
+        if key.startswith("conf:canvas:"):
+            proposed = ({field: value} if op == "hset" else value if op == "hput" else {})
+            if any(managed_canvas(k, v) for k, v in proposed.items()):
+                raise Refused("managed call cards require the authoritative task path")
+            if op == "hset" and kind == "hash" and managed_canvas(field, pipe.hget(key, field)):
+                raise Refused("replacement would affect a managed call card")
+            if op in ("hput", "del", "set") and kind == "hash":
+                existing = pipe.hgetall(key) or {}
+                if any(managed_canvas(k, v) for k, v in existing.items()):
+                    raise Refused("replacement would affect managed call cards")
         # The OLD value, read under the WATCH, so the audit says exactly what this replaced.
         if op in ("set", "del"):
             old = pipe.get(key) if kind in ("none", "string") else "(%s)" % kind

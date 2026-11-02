@@ -1092,11 +1092,34 @@ class EndToEndThroughTheBoardWorker(unittest.TestCase):
             self.assertEqual(set(), missing, "refusal %s lacks %s" % (item.get("req_id"), missing))
 
     def test_redis_op_is_listed_TOGETHER_with_its_branch(self):
-        """Listed without the branch, a redis-op would fall into the probe path and say OK for
-        nothing done. Both halves, or neither."""
-        import inspect
+        """Governed operations must dispatch to their controller, never the synthetic probe."""
+        from unittest import mock
         self.assertIn("redis-op", self.br.ACTIONS)
-        self.assertIn('if req["action"] == "redis-op":', inspect.getsource(self.br.handle))
+        self.assertIn("call-task", self.br.ACTIONS)
+        self.assertIn("call-task", self.br.ACL_ACTIONS)
+        class LifecyclePipeline(FakePipeline):
+            def watch(self, *keys):
+                for key in keys:
+                    super().watch(key)
+        class LifecycleRedis(FakeRedis):
+            def pipeline(self, transaction=True):
+                return LifecyclePipeline(self)
+        with mock.patch.object(self.br, "synthetic_probe", side_effect=AssertionError("wrong action branch")):
+            result, rows, conn = self.run_rows([
+                self.row("grok", "do=redis-op|op=set|key=fleet:branch|val=governed", req="REQ-BRANCH01"),
+                self.row("claude-code-cli", "do=call-task|op=status|key=call-000000000000", req="REQ-BRANCH02"),
+            ], LifecycleRedis())
+        self.assertEqual("governed", conn.data["fleet:branch"])
+        self.assertEqual(["OK", "REFUSED"], [item["status"] for item in result["answered"]])
+        self.assertEqual(["AYA_RESULT", "AYA_RESULT"], [item["action_type"] for item in rows])
+        self.assertIn("call-task authority, binding or operation unavailable", rows[1]["payload"])
+        self.assertIn(self.br.run_marker(self.br.parse_request(self.row(
+            "claude-code-cli", "do=call-task|op=status|key=call-000000000000", req="REQ-BRANCH02"))), conn.data)
+        # Listing an action cannot bypass the access list: an unknown board tag gets no controller execution.
+        with mock.patch.object(self.br, "_call_task", side_effect=AssertionError("ungoverned lifecycle request")):
+            refused, _, _ = self.run_rows([self.row("a-stranger", "do=call-task|op=status|key=call-000000000000")])
+        self.assertEqual([], refused["answered"])
+        self.assertTrue(refused["refused"])
 
 
 class NothingLeaks(unittest.TestCase):

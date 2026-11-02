@@ -4,8 +4,10 @@
 import contextlib
 import io
 import json
+import os
 import pathlib
 import sys
+import tempfile
 import unittest
 import urllib.error
 from unittest import mock
@@ -99,7 +101,12 @@ class AppendClientTests(unittest.TestCase):
         )
         result = None
         raised = None
-        with patches[0], patches[1], patches[2], patches[3] as send, patches[4] as read, contextlib.redirect_stdout(output):
+        # Keep the real spill-store constructor, but confine its directory to this
+        # disposable fixture. The default repository-local board-full is not test state.
+        with tempfile.TemporaryDirectory(prefix="append-client-spill-") as spill_dir, \
+                mock.patch.dict(os.environ, {"BOARD_SPILL_URI": spill_dir}), \
+                patches[0], patches[1], patches[2], patches[3] as send, patches[4] as read, \
+                contextlib.redirect_stdout(output):
             if isinstance(write_result, BaseException):
                 send.side_effect = write_result
             else:
@@ -112,9 +119,11 @@ class AppendClientTests(unittest.TestCase):
 
     def test_ambiguous_write_is_not_replayed_and_resolves_by_full_count(self):
         spec = {"row_id": "WRK-one", "source_tag": "claude-code-cli", "payload": "BCB|v=1|id=ONE|from=claude-code-cli|phase=RESULT"}
+        intended = [spec["row_id"], "2026-09-08T00:00:00.000000Z", spec["source_tag"], "ALL", "APPEND",
+                    spec["payload"], "OPEN", "", "", ""]
         reads = [
             {"rows": [row("older")], "total": 9, "filtered": 1},
-            {"rows": [row("WRK-one", spec["payload"])], "total": 9, "filtered": 1},
+            {"rows": [intended], "total": 9, "filtered": 1},
         ]
         _, raised, output, send, read = self.run_client(spec, reads, write_result=OSError("response lost"))
         self.assertIsNone(raised)
@@ -122,6 +131,23 @@ class AppendClientTests(unittest.TestCase):
         self.assertEqual(send.call_args.kwargs["tries"], 1)
         self.assertEqual(read.call_count, 2)
         self.assertIn("READ-BACK OK", output)
+
+    def test_same_id_with_conflicting_content_is_not_confirmation_or_permission_to_repost(self):
+        spec = {"row_id": "WRK-conflict", "source_tag": "claude-code-cli",
+                "payload": "BCB|v=1|id=CONFLICT|from=claude-code-cli|phase=RESULT"}
+        intended = [spec["row_id"], "2026-09-08T00:00:00.000000Z", spec["source_tag"], "ALL", "APPEND",
+                    spec["payload"], "OPEN", "", "", ""]
+        for column in (2, 3, 4, 5, 6, 7, 8, 9):
+            with self.subTest(column=column):
+                conflicting = list(intended)
+                conflicting[column] += "-different"
+                _, raised, output, send, read = self.run_client(
+                    spec, [{"rows": [conflicting]}], write_result=OSError("response lost"))
+                self.assertIsInstance(raised, SystemExit)
+                self.assertIn("READ-BACK CONFLICT", str(raised))
+                self.assertNotIn("READ-BACK OK", output)
+                self.assertEqual(1, send.call_count, "unknown transport plus conflicting readback never retries")
+                self.assertEqual(1, read.call_count)
 
     def test_nonadjacent_full_sheet_duplicates_exit_two_without_repost(self):
         spec = {"row_id": "WRK-dupe", "source_tag": "claude-code-cli", "payload": "BCB|v=1|id=DUPE|from=claude-code-cli|phase=RESULT"}
@@ -238,7 +264,10 @@ class MatchIsNotIdentityTests(unittest.TestCase):
         spec = {"row_id": "WRK-cited", "source_tag": "claude-code-cli", "payload": "BCB|v=1|id=CITED|from=claude-code-cli|phase=RESULT"}
         quoting = row("WRK-later", "BCB|v=1|id=LATER|phase=RESULT|note=supersedes WRK-cited")
         also = row("WRK-later2", "BCB|v=1|id=LATER2|phase=RESULT|note=see WRK-cited above")
-        served = {"rows": [row("WRK-cited", spec["payload"]), quoting, also], "total": 2953, "filtered": 3}
+        intended = row("WRK-cited", spec["payload"])
+        intended[2] = spec["source_tag"]
+        intended[6] = "OPEN"
+        served = {"rows": [intended, quoting, also], "total": 2953, "filtered": 3}
         _, raised, output, send, read = AppendClientTests().run_client(spec, [served])
         self.assertIsNone(raised, "three match hits for one real row must not exit non-zero")
         self.assertIn("present exactly once", output)

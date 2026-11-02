@@ -1,0 +1,57 @@
+{
+  "schema": 2,
+  "scripts_tree": "8a97cd5c420c66bafb307d8c65a17d1900ab8e24",
+  "source_composition": "2fed1e57f5a72eed32e90ace1c1fad2217a86add",
+  "conference_base": "41daf85bb75d53755d41db2dd45f941044b4e7c3",
+  "files": {
+    "CONTRACT.md": {
+      "bytes": 9482,
+      "sha256": "dd9dfb1a83c70e74199e6025517f4fa15b68849dd597a76d6b23a4d922add542",
+      "role": "runtime-or-contract"
+    },
+    "call_ask.py": {
+      "bytes": 17745,
+      "sha256": "1a6d149d8494cd579ba55d51d1f927a83da1d6aa1c04999b88ddfb829e04f0df",
+      "role": "runtime-or-contract"
+    },
+    "call_migrate.py": {
+      "bytes": 12345,
+      "sha256": "a246e4177b231cea69c8316566f8532517316b689d4d34f32a12ffe5f7331c51",
+      "role": "runtime-or-contract"
+    },
+    "call_state.py": {
+      "bytes": 9638,
+      "sha256": "6a52f386761d12e75a11686161c02740193642ff7c7ab92eea7a911885152fb2",
+      "role": "runtime-or-contract"
+    },
+    "cli_call_consumer.py": {
+      "bytes": 2895,
+      "sha256": "1a2149f72e006716a069f1fa66a327d1e2b3e061ad986b68efa55bb070bd7cfc",
+      "role": "runtime-or-contract"
+    },
+    "laptop_post.py": {
+      "bytes": 12581,
+      "sha256": "1fd74df14854778504deffd44c9a7cc22487dfdb8e35df6828325df1f83e245b",
+      "role": "runtime-or-contract"
+    },
+    "mutants_v5.py": {
+      "bytes": 4192,
+      "sha256": "3108b1d091ca3495440939e554c4ebd76f91145907d29e898355abc4a8d49a39",
+      "role": "historical-v5-builder-evidence-not-current-contract"
+    },
+    "test_v5.py": {
+      "bytes": 19260,
+      "sha256": "f1aa12f079e57afdb4611ca21406c9799394d2ce553e079bcae2001b3bb2ea70",
+      "role": "historical-v5-builder-evidence-not-current-contract"
+    }
+  },
+  "containment_parent": "9ed134221ef6cbd7a21d1e8ec4d2e6b123bd8f9b",
+  "integration_main": "2bb9546210a3b6f8f0b64874d231efa78ffe0a9f",
+  "reviewed_source_commit": "06f64cf0a3ac2aff408135ce4cbb91f021ce13df",
+  "reviewed_manifest_sha256": "f6a9a6e152f1b721b0a5e306eaf40c5f986597b43e544f266cecbf5f56fa0721",
+  "integration_only_changes": [
+    "laptop_post.py executable scripts pin",
+    "CONTRACT.md stale scripts pin",
+    "MANIFEST.json integration identity/hashes"
+  ]
+}

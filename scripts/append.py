@@ -13,7 +13,7 @@ import sys
 
 import board_row
 import signature
-from bus import fetch, load_env, read_rows
+from bus import fetch, load_env, read_rows, with_sender_token
 
 TITLE = "Blackboard - Alpha DB"
 
@@ -36,7 +36,7 @@ def _conflicting_keys(payload):
     return bad
 
 
-def main():
+def main(require_sender_identity=False):
     if len(sys.argv) < 2:
         raise SystemExit(
             "usage: python scripts/append.py <row.json>\n"
@@ -128,20 +128,22 @@ def main():
     # landed. On 2026-09-08 the old transport default replayed
     # WRK-vmccc-xray-blocker-20260908T1630Z onto the live board. Never let an
     # append retry itself; the read-back below is what closes the loop.
+    # A reconciler receipt must carry the workload's own existing metadata
+    # identity. This opt-in is an in-process argument, NOT a field supplied in the
+    # row file. Missing identity stops before append; never persist/log its token.
+    outbound = {"action": "append", "secret": env["BUS_SECRET"], "title": TITLE, "sheetRow": row}
+    if require_sender_identity:
+        outbound = with_sender_token(outbound, require_metadata=True)
     try:
-        body = fetch(
-            env["BUS_URL"],
-            {
-                "action": "append",
-                "secret": env["BUS_SECRET"],
-                "title": TITLE,
-                "sheetRow": row,
-            },
-            tries=1,
-        )
-        print("APPEND response:", body[:300])
+        body = fetch(env["BUS_URL"], outbound, tries=1)
+        if require_sender_identity:
+            print("APPEND response received (authenticated request; body not logged)")
+        else:
+            print("APPEND response:", body[:300])
     except Exception as exc:  # noqa: BLE001 - the transport failure is not the answer
-        print("APPEND raised %s: %s" % (type(exc).__name__, exc))
+        # An authenticated transport error/response may echo the credential sent.
+        print("APPEND raised %s" % type(exc).__name__ if require_sender_identity
+              else "APPEND raised %s: %s" % (type(exc).__name__, exc))
         print("This does NOT mean the row is absent. Reading back to find out.")
 
     if fitted.get("deferred"):
@@ -181,6 +183,11 @@ def main():
         hits = [r for r in obj["rows"] if r and r[0] == spec["row_id"]]
         if len(hits) == 1:
             r = hits[0]
+            if len(r) < 10 or any(str(r[i] or "") != str(row[i] or "") for i in range(10) if i != 1):
+                raise SystemExit("READ-BACK CONFLICT: row id exists with different content; do not retry")
+            if require_sender_identity and (len(r) <= 11 or r[11] !=
+                    "sender=verified;who=bus-reconciler@sfdc24.iam.gserviceaccount.com"):
+                raise SystemExit("READ-BACK UNAUTHENTICATED: reconciler receipt has no verified server stamp")
             print("READ-BACK OK: row present exactly once, %d cells" % len(r))
             print("  ts=%s from=%s cat=%s tag=%s" % (r[1], r[2], r[6], r[7]))
             print("  payload starts: %s" % str(r[5])[:80])

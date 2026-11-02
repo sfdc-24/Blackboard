@@ -34,7 +34,7 @@ DOCKERFILE = ROOT / "cloud" / "bus-reconciler" / "Dockerfile"
 # Everything the image is expected to be able to import, entrypoints first.
 MODULES = ("serve_requests", "main", "probe", "keyspace_view", "roster_seed",
            "bus_request", "bus_reconcile", "append", "signature", "redis_dual", "bus",
-           "git_requests", "milestones_sync", "canvas_publish", "call_bridge")
+           "git_requests", "milestones_sync", "canvas_publish", "call_bridge", "call_lifecycle")
 
 
 def copied_paths():
@@ -101,6 +101,12 @@ class TheBuildContext(unittest.TestCase):
                 self.assertTrue(in_build_context(rel, rules),
                                 "%s is COPYed by the Dockerfile but excluded by .gcloudignore, so "
                                 "the build will fail with 'file not found in build context'" % rel)
+
+    def test_lifecycle_is_a_real_copy_and_context_input_not_a_checkout_only_import(self):
+        self.assertIn("scripts/call_lifecycle.py", copied_paths())
+        rules = gcloudignore_rules((ROOT / ".gcloudignore").read_text(encoding="utf-8"))
+        self.assertTrue(in_build_context("scripts/call_lifecycle.py", rules))
+        self.assertIn("call_lifecycle", MODULES)
 
     def test_the_allowlist_still_refuses_the_env_file(self):
         """The positive control for the matcher. If this ever passes a .env, the test above is
