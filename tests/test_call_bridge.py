@@ -1055,9 +1055,9 @@ class OneAppendAtATime(unittest.TestCase):
         wrote = []
         guard = threading.Lock()
 
-        def main(*, require_sender_identity=False):
-            self.assertIs(require_sender_identity, True,
-                          "every reconciler append must request workload sender identity")
+        def main(*, require_sender_identity=None):
+            self.assertIs(require_sender_identity, False,
+                          "the stamp is asked for only when the operator turns %s on" % sr.IDENTITY_FLAG)
             with guard:
                 state["inside"] += 1
                 state["most"] = max(state["most"], state["inside"])
@@ -1080,6 +1080,19 @@ class OneAppendAtATime(unittest.TestCase):
         self.assertEqual(sorted(ids), sorted(r for _, r in wrote))
         self.assertTrue(all(same for same, _ in wrote))
         self.assertNotIn("append.py", sys.argv[0])
+
+    def test_the_sender_stamp_is_asked_for_only_when_the_switch_says_the_gateway_has_it(self):
+        """2026-11-02: the live gateway stamps nothing, so a required stamp failed every worker append.
+        Off by default; an explicit yes turns it back on without a code change once the gateway stamps."""
+        import serve_requests as sr
+        for value, wanted in (({}, False), ({sr.IDENTITY_FLAG: ""}, False), ({sr.IDENTITY_FLAG: "0"}, False),
+                              ({sr.IDENTITY_FLAG: "maybe"}, False), ({sr.IDENTITY_FLAG: "1"}, True),
+                              ({sr.IDENTITY_FLAG: " on "}, True), ({sr.IDENTITY_FLAG: "TRUE"}, True)):
+            self.assertIs(wanted, sr.identity_required(value), value)
+        source = (ROOT / "cloud" / "bus-reconciler" / "serve_requests.py").read_text(encoding="utf-8")
+        self.assertEqual(1, source.count("require_sender_identity="),
+                         "one call site, and it must take the switch")
+        self.assertIn("append.main(require_sender_identity=identity_required())", source)
 
 
 

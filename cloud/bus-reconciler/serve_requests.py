@@ -148,6 +148,18 @@ def guarded(append, renew):
 # a concurrent append never reads the other's row file.
 APPEND_LOCK = threading.Lock()
 
+# The gateway's sender stamp on the worker's own rows. The live gateway writes 11 columns and no stamp
+# (2026-11-02, first deploy of the stamped read-back: every worker append landed, then raised READ-BACK
+# UNAUTHENTICATED and ended its pass). Until the deployed gateway stamps rows, requiring the stamp turns
+# every answer into a failure, so it is asked for only when the operator says the gateway has it.
+IDENTITY_FLAG = "APPEND_REQUIRE_SENDER_IDENTITY"
+
+
+def identity_required(environ=None) -> bool:
+    """True only for an explicit yes, as redis_state.flag reads a switch: absent or anything else is off."""
+    value = (environ if environ is not None else os.environ).get(IDENTITY_FLAG, "")
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
 
 def appender(env):
     """Append one row spec through append.py, so the write and its read-back are the fleet's one path."""
@@ -166,7 +178,7 @@ def appender(env):
             argv = sys.argv
             sys.argv = ["append.py", path]
             try:
-                append.main(require_sender_identity=True)
+                append.main(require_sender_identity=identity_required())
                 log.info("appended %s (%s)", spec["row_id"], spec["action_type"])
             except SystemExit as stop:
                 # append.py exits non-zero when the read-back does not find the row exactly once.
