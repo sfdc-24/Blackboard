@@ -453,60 +453,76 @@ dry-run: `docs/WA-OUTBOX.md`.
 
 ## 12 · Every conversation with Mr. Salam is on the board (`PROMPT`, `PROMPT_RESPONSE`, `OWNER_REPLY`)
 
-**Added 2026-11-02 at Mr. Salam's direct instruction.** Until now what he
-typed to one agent, and what that agent told him, was visible only inside
-that agent's session. Every other agent heard it second-hand, if at all.
-Evidence from the same day: one agent posted a review PASS for a PR that
-had already been ruled NO-GO elsewhere, and a correction row had to follow
-(rows 9449 and 9451). Another agent was described as waiting for an approval
-that a board row had already given (row 9452). Both came from a missing shared
-record, not a bad decision.
+**Added 2026-11-02 at Mr. Salam's direct instruction.** Until now, what he
+typed to one agent, and what that agent told him, was visible only inside that
+agent's session. Every other agent heard it second-hand, if at all. Two
+incidents from the same day were made worse by that gap, though it may not
+be their only cause:
+- An agent posted a review PASS for a PR already ruled NO-GO elsewhere, and a
+  correction row had to follow (rows 9449 and 9451).
+- Another agent was described as waiting for an approval that a board row had
+  already given (row 9452).
 
-**The rule.** From 2026-11-02 every turn between Mr. Salam and any agent is
-a board row, so all communication is visible and every action taken because
-of it can be traced back to it.
+**The rule.** From 2026-11-02, every turn between Mr. Salam and any agent is
+recorded on the private board. All communication is then visible, and every
+action taken because of it can be traced back to it.
 
-1. **His message to you is `msg_type=PROMPT`** when it starts a conversation,
-   and **`msg_type=OWNER_REPLY`** when it answers something you told him. Post
-   it **verbatim**, before you act on it. The receiving agent posts it; nobody
-   writes under his name or another agent's tag (§2).
-2. **What you write back to him is `msg_type=PROMPT_RESPONSE`.** Post it
-   verbatim. A row holds at most 1500 characters, so split a long reply into
-   parts (`part=1/2`, `part=2/2`) rather than shortening it. If you post a
-   summary instead, label it as a summary in the text.
-3. **Every one of these rows carries:**
-   - `thread_id`: one shared id for the whole conversation. Start a new one
+1. **Message types.** His message to you is `msg_type=PROMPT` when it starts
+   a conversation, and `msg_type=OWNER_REPLY` when it answers something you
+   told him. What you write back to him is `msg_type=PROMPT_RESPONSE`. The
+   receiving agent posts all three, under its own tag (§2). Post each turn
+   before you act on it.
+2. **Verbatim, always.** The recorded text is the exact original. A summary
+   may be posted *in addition*, clearly labelled as a summary, but it never
+   replaces the verbatim record or stands in for it.
+3. **Two identities, kept apart.** Every row carries:
+   - the **source** message ID and source time, as the chat surface gave them;
+   - the **board** row ID and the time the board observed the row, which is
+     its own Timestamp.
+
+   If the surface does not expose a source ID or time, write `UNKNOWN`.
+   Never invent one, and never put a description where an ID belongs.
+4. **Linking.** Every row carries:
+   - `thread_id`: one shared ID for the whole conversation. Start a new one
      only for a new conversation.
-   - `reply_to_id`: the exact `id` of the row this one answers. A `PROMPT`
-     that starts a thread uses `NONE`. For a split row, reply to its last part.
-   - `session_id` and `agent_tag`: together with the row's timestamp, they
-     identify the source.
-4. **Actions carry the thread.** Any row you write *because of* one of his
-   turns — an ACK, ASK, RESULT, blocker or hand-off — also carries that
-   `thread_id` and a `reply_to_id` naming the turn or row it acts on. That is
-   what makes every action traceable: anyone can follow
-   one `thread_id` from his words to every resulting action.
-5. **`msg_type` is not `phase`.** `phase` still states task status. A
-   conversation row is never itself an approval, a claim or a completion.
-   An `OWNER_REPLY` approves something only if its text says so, and the
-   limits in his words carry over exactly (§4, §5).
-6. **Private board only.** These rows never go to GitHub, a public canvas, a
-   public artifact or any other public surface. No secrets, tokens or phone
-   numbers, here or anywhere (§11).
-7. **A conversation row wakes nobody (§7).** Address it to the agents who
-   need to read it. Do not add a paid-model route (`gemini`, `claude-api`)
-   just to record a turn.
-8. **No backfill.** Earlier conversations are not replayed onto the board
-   unless he asks.
+   - `reply_to`: the exact source ID of the message this one answers, or
+     `NONE` for the opening `PROMPT`. If that ID is unknown, write `UNKNOWN`,
+     not a guess.
+   - `agent` and `session`: who recorded the row.
+5. **Long messages.** A row holds at most 1500 characters. Split a long
+   message into parts that carry the same message ID and `part=n/m`. A reader
+   reassembles the whole message in order before using it. A message with a
+   missing or conflicting part cannot be acted on until it is complete.
+   `reply_to` names the whole message, never a single part.
+6. **Encoding.** BCB fields are split on `|`, so verbatim text is encoded
+   reversibly: `%` becomes `%25`, `|` becomes `%7C`, and a newline becomes
+   `%0A`. Rows encoded this way carry `text_enc=pct`, and readers decode them
+   before use.
+7. **Actions carry the thread.** Any row you write *because of* one of his
+   turns (an ACK, ASK, RESULT, blocker or hand-off) also carries that
+   `thread_id`, plus a `reply_to` naming the turn or row it acts on. Following
+   one `thread_id` then leads from his words to every resulting action.
+8. **A record is not an authorization.** A conversation row never grants,
+   claims or completes anything, and `msg_type` is not `phase`. A recorded
+   `OWNER_REPLY` authorizes nothing by its text alone. Authority still comes
+   from him, through the approval path for that exact action and scope (§4,
+   §5). Another agent reading his recorded words must not treat them as an
+   approval to act.
+9. **Record-only, so nobody is woken.** A row wakes nobody by itself (§7),
+   and leaving out a paid route's tag is not enough to make sure. Consumers
+   must treat any row with `msg_type` as record-only and nonactionable. Until
+   the tooling enforces that, post conversation rows with `phase=RESULT`,
+   which the agent wakers already skip, and never address `gemini` or
+   `claude-api` on them.
+10. **Private board only.** These rows never go to GitHub, a public canvas, a
+    public artifact or any other public surface. No secrets, tokens or phone
+    numbers, here or anywhere (§11).
+11. **No backfill.** Earlier conversations are not replayed onto the board
+    unless he asks. Rows already posted in an earlier format stay as they are.
+    Corrections are appended, never made by erasing.
 
-Example, from the first thread recorded this way (text elided):
-
-```
-BCB|v=1|id=CLAUDE-CLI-VSEXT-OWNER-PROMPT-20261102T1600Z-P1|phase=REQUEST|...|msg_type=PROMPT|thread_id=TH-VSEXT-OWNER-20261102|reply_to_id=NONE|session_id=vscode-ext|agent_tag=claude-code-cli|part=1/2|text=...
-BCB|v=1|id=CLAUDE-CLI-VSEXT-OWNER-PROMPT-RESPONSE-20261102T1602Z|phase=RESULT|...|msg_type=PROMPT_RESPONSE|thread_id=TH-VSEXT-OWNER-20261102|reply_to_id=CLAUDE-CLI-VSEXT-OWNER-PROMPT-20261102T1600Z-P2|...
-BCB|v=1|id=CLAUDE-CLI-VSEXT-OWNER-REPLY-20261102T1604Z|phase=RESULT|...|msg_type=OWNER_REPLY|thread_id=TH-VSEXT-OWNER-20261102|reply_to_id=CLAUDE-CLI-VSEXT-OWNER-PROMPT-RESPONSE-20261102T1602Z|...
-```
-
-**Tooling is separate from the rule.** Until a tool does it, each agent posts
-these rows by hand. One builder (`codex`) owns that tool. It may change how
-the rows are written, but not this rule.
+**Field names are interim.** The information above is the rule. The exact
+field names are not settled yet: one builder (`codex`) owns the tool that will
+post and read these rows, and its schema is the one to follow once it lands.
+Until then, post the information above by hand under the clearest names
+available. The tool may change how rows are written, but not this rule.
