@@ -1843,6 +1843,10 @@ class ReadBack(unittest.TestCase):
         self.assertEqual([], self.b().tick())
         self.assertTrue(self.cards(self.CODEX)[cb.proposal_id(ROOM, chars, self.CODEX)]["title"]
                         .startswith(cb.TOO_LONG))
+        before = self.cards(self.CODEX)
+        self.conn.store.pop(cb.CURSOR_KEY % ROOM)                       # a lost cursor replays both turns
+        self.b(now=NOW + datetime.timedelta(seconds=30)).tick()         # a later tick must not rewrite them
+        self.assertEqual(before, self.cards(self.CODEX))
 
     def test_b1_a_turn_at_the_word_bound_still_proposes(self):
         words = "Codex, draft " + " ".join(["sample"] * (cb.ASK_MAX_WORDS - 2)) + "."
