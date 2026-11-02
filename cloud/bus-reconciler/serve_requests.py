@@ -27,6 +27,7 @@ import logging
 import os
 import sys
 import tempfile
+import threading
 import time
 
 sys.path.insert(0, "/app")
@@ -142,11 +143,21 @@ def guarded(append, renew):
     return write
 
 
+# append.py reads its row file from the process-global sys.argv. The request loop and the call bridge's doorbell
+# (its own thread) both append, so the swap and the append are one critical section (Aya's hold on 5d41cb5, item 2):
+# a concurrent append never reads the other's row file.
+APPEND_LOCK = threading.Lock()
+
+
 def appender(env):
     """Append one row spec through append.py, so the write and its read-back are the fleet's one path."""
     import append                                                        # noqa: PLC0415
 
     def write(spec):
+        with APPEND_LOCK:
+            _write(spec)
+
+    def _write(spec):
         handle, path = tempfile.mkstemp(suffix=".json", prefix="row-")
         os.close(handle)
         try:
@@ -155,7 +166,7 @@ def appender(env):
             argv = sys.argv
             sys.argv = ["append.py", path]
             try:
-                append.main()
+                append.main(require_sender_identity=True)
                 log.info("appended %s (%s)", spec["row_id"], spec["action_type"])
             except SystemExit as stop:
                 # append.py exits non-zero when the read-back does not find the row exactly once.
@@ -285,7 +296,8 @@ def live_with_canvas(conn, env, execution, me, until, interval, lock_ttl, start=
 
     THE CALL BRIDGE (scripts/call_bridge.py) runs beside it, on its own thread, only with CALL_BRIDGE=on and a
     publisher running: its cards reach the page only through the publisher. Its done flips read the board rows
-    each pass already read (one_pass `settle`). Off, or without the flag, nothing starts: the rollback is the flag."""
+    each pass already read (one_pass `settle`). Off, or without the flag, nothing starts: the rollback is the flag.
+    CALL_BRIDGE_RING=on adds the doorbell: each claim rings its agent with one board row (call_bridge.wake_row)."""
     import canvas_publish                                                # noqa: PLC0415
     environ = os.environ if environ is None else environ
     bucket = environ.get("CANVAS_BUCKET", "")
@@ -299,7 +311,20 @@ def live_with_canvas(conn, env, execution, me, until, interval, lock_ttl, start=
     bridge = None
     if publisher is not None and environ.get("CALL_BRIDGE", "").strip().lower() == "on":
         import call_bridge                                               # noqa: PLC0415
-        bridge = (start_bridge or call_bridge.start)(conn, log, holds)
+        # THE DOORBELL (O3 gap 1): with CALL_BRIDGE_RING=on as well, each claim rings its agent with one board
+        # row through this worker's own append path, asked under the lease. Off (the default): no ring, no change.
+        ring = None
+        if environ.get("CALL_BRIDGE_RING", "").strip().lower() == "on":
+            write = appender(env)
+
+            def ring(spec):
+                if not holds():
+                    raise LockLost("gov:worker:lock is not ours; %s not written" % spec.get("row_id"))
+                return write(spec)
+        # The publisher's bucket goes too: the bridge's first claim in a call opens the canvas window itself
+        # (the owner's 11:17 ET test call on 2026-10-29 had no window, so nothing read his "do it").
+        bridge = (start_bridge or call_bridge.start)(conn, log, holds, bucket=bucket,
+                                                      **({"ring": ring} if ring else {}))
         if bridge is not None:
             log.info("call bridge: on, room asks become claimed cards in conf:canvas:%s", bridge.canvas_room)
     try:

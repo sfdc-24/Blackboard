@@ -259,7 +259,8 @@ function bcbId_(payload) {
 // FLAG, NOT REJECT, by default, so nothing breaks mid-day. Script Property SENDER_CHECK:
 //   absent or 'flag'  stamp every row (default)
 //   'enforce'         ALSO refuse mismatch and bad-token with 403 SENDER_REFUSED (unverified passes)
-//   'off'             the old behaviour, byte for byte: nothing stamped, nothing checked
+//   'off'             no token check, but overwrite column L with sender=disabled.
+//                    Never pass through a caller's purported verified stamp.
 //
 // The token rides in the body as `id_token` (Apps Script cannot read request headers). It is checked
 // with Google's own tokeninfo endpoint over the script.external_request scope this project already
@@ -282,7 +283,7 @@ const GOOGLE_ISSUERS = ['accounts.google.com', 'https://accounts.google.com'];
 function senderCheck_(body) {
   const props = PropertiesService.getScriptProperties();
   const mode = String(props.getProperty('SENDER_CHECK') || 'flag').trim().toLowerCase();
-  if (mode === 'off') return null;
+  if (mode === 'off') return { stamp: 'sender=disabled', refuse: false };
   const enforce = mode === 'enforce';
   const claimed = cleanTag_(body.sheetRow[2]);
   const from = cleanTag_(bcbField_(body.sheetRow[5], 'from'));

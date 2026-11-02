@@ -76,9 +76,9 @@ SENDERS = ("aya", "chatgpt-codex-desktop", "claude-code-cli", "owner", "whatsapp
 # redis-op request would fall into the synthetic-probe path and be answered "OK" for nothing done.
 # canvas-publish opens or closes a room's time-boxed publishing window (scripts/canvas_publish.py). It names a
 # room and a number of minutes and nothing else: the keys it reads, the filter and the bucket are the server's.
-ACTIONS = ("redis-synthetic-probe", "redis-op", "canvas-publish")
+ACTIONS = ("redis-synthetic-probe", "redis-op", "canvas-publish", "call-task")
 # The actions whose senders are the ACCESS LIST's principals, not SENDERS.
-ACL_ACTIONS = ("redis-op", "canvas-publish")
+ACL_ACTIONS = ("redis-op", "canvas-publish", "call-task")
 
 # A request id is the only thing taken from the row, so its grammar is closed and narrow.
 _REQ_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{3,63}$")
@@ -323,6 +323,45 @@ def refusals(req, now, already, acl=None) -> list:
         out.append("ambiguous: the field(s) %s appear more than once"
                    % ", ".join(safe(k)[:20] for k in req["repeated"][:5]))
     return out
+
+
+def _call_task(conn, acl, req, now):
+    """Narrow lifecycle controller, using existing governed principal claims.
+    Authenticity of its response comes from the reconciler's sender token, not
+    a caller-declared from/actor. No owner input is returned on this shared bus."""
+    import base64
+    import call_lifecycle as life
+    try:
+        who = redis_gov.principal(acl, req["claimed_sender"])
+        ask, op = req.get("key") or "", req.get("op") or ""
+        redis_gov.check(acl, who, "get", life.TASK_KEY % ask)
+        supplied = {}
+        if req.get("val"):
+            if req.get("enc") != "b64" or len(req["val"]) > 2800:
+                raise life.Refused("invalid lifecycle payload encoding")
+            raw = base64.b64decode(req["val"], validate=True)
+            if len(raw) > 2048:
+                raise life.Refused("lifecycle payload too large")
+            supplied = json.loads(raw.decode("utf-8"))
+            if not isinstance(supplied, dict):
+                raise life.Refused("lifecycle payload must be an object")
+        value = life.operate(conn, who, ask, op, supplied, req["req_id"], now)
+        value["request_hash"] = life.digest({"op": op, "input": supplied})
+        return {"ok": True, "op": op, "value": value}
+    except (ValueError, TypeError, KeyError, UnicodeError, redis_gov.Refused):
+        return {"ok": False, "refused": "call-task authority, binding or operation unavailable"}
+    except Exception:
+        return {"ok": False, "refused": "call-task outcome unknown; reconcile with fresh status"}
+
+
+def _call_summary(result, req):
+    if not result.get("ok"):
+        return "REFUSED: " + result["refused"]
+    import call_lifecycle as life
+    body = life.dump(result["value"])
+    if len(body) > 1250:
+        return "REFUSED: lifecycle metadata exceeds bounded receipt"
+    return "OK call-task %s: %s" % (safe(req.get("key")), body)
 
 
 def synthetic_probe(conn, req_id) -> dict:
@@ -589,7 +628,7 @@ def handle(rows, conn, now=None, append=None, max_per_run=MAX_PER_RUN, clock=tim
                                     "op": req.get("op"), "key": "",
                                     "latency_ms": 0})
             continue
-        if req["action"] == "redis-op":
+        if req["action"] in ("redis-op", "call-task"):
             # ONE ROW, NOT TWO. The probe writes a RECEIPT then a RESULT because it takes a moment;
             # a governed op is one round trip, and every row addressed to an agent can wake it (a row
             # is money he pays). The op is in gov:audit whether or not this row lands.
@@ -619,19 +658,23 @@ def handle(rows, conn, now=None, append=None, max_per_run=MAX_PER_RUN, clock=tim
                 state, age = marker_state(conn, marker, clock)
                 budget = _claimed(req, state, age, conn, append, already, out, budget, acl, clock)
                 continue
-            result = redis_gov.execute(conn, acl, req["claimed_sender"],
-                                       "%s/%s" % (req["req_id"], req["row_id"]),
-                                       req.get("op"), req.get("key"), field=req.get("field") or "",
-                                       raw_value=req.get("val") or "", enc=req.get("enc") or "",
-                                       count=count, now=now, generation=req.get("gen") or "",
-                                       after=req.get("after") or "",
-                                       correlation=req.get("cid") or "", head=req.get("head") or "")
+            if req["action"] == "call-task":
+                result = _call_task(conn, acl, req, now)
+            else:
+                result = redis_gov.execute(conn, acl, req["claimed_sender"],
+                                           "%s/%s" % (req["req_id"], req["row_id"]),
+                                           req.get("op"), req.get("key"), field=req.get("field") or "",
+                                           raw_value=req.get("val") or "", enc=req.get("enc") or "",
+                                           count=count, now=now, generation=req.get("gen") or "",
+                                           after=req.get("after") or "",
+                                           correlation=req.get("cid") or "", head=req.get("head") or "")
             if append:
                 # ANSWERING BEFORE THE APPEND, or no append. If it cannot be recorded, the marker stays a bare
                 # claim and a later pass gives the one UNKNOWN notice; appending without it is what let a
                 # stale pass add a second row under this Row_ID.
                 if _mark_answering(conn, req):
-                    append(row_for(RESULT_ACTION, req, redis_gov.summarise(result),
+                    append(row_for(RESULT_ACTION, req, (_call_summary(result, req) if req["action"] == "call-task"
+                                                       else redis_gov.summarise(result)),
                                    ("%s %s %s" % ("OK" if result.get("ok") else "NOT DONE",
                                                   req.get("op") or "?", req.get("key") or "?"))[:100]))
                     _mark_answered(conn, req)

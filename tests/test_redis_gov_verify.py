@@ -1367,9 +1367,10 @@ class ScopeAndManifest(unittest.TestCase):
         data = json.loads((ROOT / "scripts" / "redis_acl.json").read_text(encoding="utf-8"))
         self.assertEqual(["Blackboard", "conference"], data["git"]["repos"])
         self.assertNotIn("sfdc24-site", data["git"]["repos"])
-        # canvas-publish was added on purpose (spec v0.2, owner-approved 2026-10-20, Blackboard PR 428). Any
-        # other new action still trips this line.
-        self.assertEqual(("redis-synthetic-probe", "redis-op", "canvas-publish"), br.ACTIONS)
+        # canvas-publish (PR 428) and the bounded call-task lifecycle (owner-approved O3/PR441
+        # repair) are intentional. No other action or ungoverned lifecycle route is authorized.
+        self.assertEqual(("redis-synthetic-probe", "redis-op", "canvas-publish", "call-task"), br.ACTIONS)
+        self.assertEqual(("redis-op", "canvas-publish", "call-task"), br.ACL_ACTIONS)
 
 
 class ThroughTheWorker(unittest.TestCase):

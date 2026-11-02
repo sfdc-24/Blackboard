@@ -236,9 +236,13 @@ _METADATA_IDENTITY = ("http://metadata.google.internal/computeMetadata/v1/instan
                       "service-accounts/default/identity?audience=%s&format=full")
 
 
-def sender_token(audience=None, opener=None):
-    """An ID token for this workload's own service account, or None. Never raises, never logs it."""
-    if os.environ.get("BUS_SENDER_TOKEN", "").strip().lower() != "metadata":
+def sender_token(audience=None, opener=None, require_metadata=False):
+    """This workload's metadata ID token, or None; never logs a credential.
+
+    require_metadata is an in-process opt-in for the reconciler's authenticated
+    receipts. It does not change environment, grant access or select another identity.
+    """
+    if not require_metadata and os.environ.get("BUS_SENDER_TOKEN", "").strip().lower() != "metadata":
         return None
     aud = audience or os.environ.get("BUS_SENDER_AUDIENCE") or SENDER_AUDIENCE
     req = urllib.request.Request(_METADATA_IDENTITY % urllib.parse.quote(aud, safe=""),
@@ -251,10 +255,16 @@ def sender_token(audience=None, opener=None):
     return tok if tok.count(".") == 2 else None
 
 
-def with_sender_token(payload, audience=None, opener=None):
-    """The append payload with id_token added when this workload can mint one; otherwise unchanged."""
-    tok = sender_token(audience, opener)
+def with_sender_token(payload, audience=None, opener=None, require_metadata=False):
+    """Attach this workload's token. Required receipts fail closed before posting.
+
+    The token exists only in the request sent directly to the gateway; callers must
+    not persist or print the returned payload.
+    """
+    tok = sender_token(audience, opener, require_metadata=require_metadata)
     if not tok:
+        if require_metadata:
+            raise RuntimeError("authenticated sender identity unavailable")
         return payload
     out = dict(payload)
     out["id_token"] = tok
