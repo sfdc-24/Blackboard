@@ -28,7 +28,7 @@ import call_bridge as cb                                                 # noqa:
 import canvas_publish as cp                                              # noqa: E402
 import call_lifecycle as life                                            # noqa: E402
 
-# These suites pin the claim path itself, so they run with the read-back off (CALL_BRIDGE_READBACK=off): an ask
+# These suites pin the claim path itself (cb.READBACK = False, a code setting no environment reaches): an ask
 # claims at once. The ReadBack class below runs the default, read-back on, and passes readback=True explicitly.
 cb.READBACK = False
 
@@ -1792,7 +1792,9 @@ class ReadBack(unittest.TestCase):
 
     def test_g2_a_refusal_to_a_turn_with_no_known_caller_proposes_nothing(self):
         turn(self.conn, None, reason="", actor="grok", kind="floor.granted", seconds_ago=40)   # the room is live
-        self.conn.set(cb.ASKED_KEY % ROOM, json.dumps({"entry": at(30), "said": "sample", "at": cb.stamp(NOW)}))
+        self.conn.xadd(STREAM, {"kind": "transcript.line", "actor_id": "own_fixture_owner", "room_id": ROOM,
+                                "utterance": "Could someone find a sample chair picture?"}, entry_id=at(30))
+        self.conn.set(cb.ASKED_KEY % ROOM, json.dumps({"entry": at(30), "at": cb.stamp(NOW)}))   # no caller
         self.conn.xadd(self.side, {"by": "chair", "voice": "claude", "room": ROOM, "text": "I can't pull an image.",
                                    "at": cb.stamp(NOW)}, entry_id=at(25))
         self.assertEqual([], self.b().tick())
@@ -1913,7 +1915,7 @@ class ReadBack(unittest.TestCase):
                           "text": "Read-back for Codex: Codex, draft the sample queue flow. "
                                   "To start it, say: Codex, go ahead."}, held)
         self.assertTrue((cb.READBACK_KEY % ROOM).startswith("v1:conf:%s:" % ROOM))   # the room's own key
-        self.assertEqual(cb.READBACK_SECONDS + 60, self.conn.ttls[cb.READBACK_KEY % ROOM])
+        self.assertEqual(cb.READBACK_SECONDS - 60, self.conn.ttls[cb.READBACK_KEY % ROOM])   # F4
         self.assertNotIn("sample queue", json.dumps(cp.snapshot(self.conn, "workshop", NOW)))
         turn(self.conn, "Codex, go ahead.", seconds_ago=50)              # before the read-back: not heard yet
         self.assertEqual([], self.b().tick())
@@ -1966,12 +1968,154 @@ class ReadBack(unittest.TestCase):
         self.assertEqual({}, self.conn.hgetall(cb.READBACK_KEY % ROOM))
         self.assertIsNone(self.conn.get(cb.PROPOSAL_KEY % ROOM))
 
-    def test_the_switch_reads_off_only(self):
+    def test_the_switch_reads_off_only_and_never_selects_claiming_at_once(self):
+        """Codex's review of row 9443, F1: the environment reads one switch, and it can only pause the read-back."""
         source = (ROOT / "scripts" / "call_bridge.py").read_text(encoding="utf-8")
-        line = [x for x in source.splitlines() if x.startswith("READBACK = ")]
-        self.assertEqual(['READBACK = os.environ.get("CALL_BRIDGE_READBACK", "on").strip().lower() != "off"'], line)
-        for value, on in (("on", True), ("", True), ("OFF", False), ("off ", False), ("no", True)):
-            self.assertEqual(on, value.strip().lower() != "off", value)
+        lines = [x for x in source.splitlines() if x.startswith(("READBACK = ", "READBACK_OFF = "))]
+        self.assertEqual(['READBACK = True',
+                          'READBACK_OFF = os.environ.get("CALL_BRIDGE_READBACK", "on").strip().lower() == "off"'], lines)
+        self.assertEqual(1, source.count('os.environ.get("CALL_BRIDGE_READBACK"'))
+        for value, off in (("on", False), ("", False), ("OFF", True), ("off ", True), ("no", False)):
+            self.assertEqual(off, value.strip().lower() == "off", value)
+
+    def load(self, value):
+        """call_bridge as a fresh module, imported with CALL_BRIDGE_READBACK=value (this file pins cb.READBACK)."""
+        import importlib.util                                            # noqa: PLC0415
+        spec = importlib.util.spec_from_file_location("call_bridge_env", ROOT / "scripts" / "call_bridge.py")
+        fresh = importlib.util.module_from_spec(spec)
+        with mock.patch.dict("os.environ", {"CALL_BRIDGE_READBACK": value}):
+            spec.loader.exec_module(fresh)
+        return fresh
+
+    def test_f1_switched_off_the_bridge_is_paused_never_claiming_at_once(self):
+        for value, paused in (("off", True), ("OFF ", True), ("on", False), ("", False)):
+            fresh = self.load(value)
+            bridge = fresh.Bridge(FakeRedis(), LOG, lambda: True, clock=lambda: NOW)
+            self.assertEqual((True, paused), (bridge.readback, bridge.paused), value)
+
+    def test_f1_switched_off_nothing_said_on_the_call_starts_anything(self):
+        """Codex's review of row 9443, F1: off, a named ask, a voice's "I can't", a heard read-back and his named
+        go-ahead all start nothing; an open proposal closes visibly."""
+        entry = turn(self.conn, "Codex, draft the sample queue flow.", seconds_ago=60)
+        self.b().tick()                                                  # proposed while the read-back was on
+        self.assertEqual("review", self.cards(self.CODEX)[cb.proposal_id(ROOM, entry, self.CODEX)]["status"])
+        fresh = self.load("off")
+
+        def off():
+            return fresh.Bridge(self.conn, LOG, lambda: True, clock=lambda: NOW)
+        self.heard(entry, [self.CODEX], 50)
+        turn(self.conn, "Codex, go ahead.", seconds_ago=40)
+        self.assertEqual([], off().tick())
+        got = self.cards(self.CODEX)[cb.proposal_id(ROOM, entry, self.CODEX)]
+        self.assertEqual(("done", cb.NOT_STARTED), (got["status"], got["activity"]))
+        self.assertTrue(got["title"].startswith(cb.READ_BACK_OFF))
+        self.assertIsNone(self.conn.get(cb.PROPOSAL_KEY % ROOM))
+        later = turn(self.conn, "Grok, list the sample risks.", seconds_ago=30)
+        self.conn.xadd(self.side, {"by": "chair", "voice": "gemini", "room": ROOM, "text": "I can't open files.",
+                                   "at": cb.stamp(NOW)}, entry_id=at(25))
+        self.assertEqual([], off().tick())
+        self.heard(later, ["grok"], 20)
+        turn(self.conn, "Grok, go ahead.", seconds_ago=10)
+        self.assertEqual([], off().tick())
+        self.assertEqual({}, self.cards("grok"))
+        self.assertEqual({}, self.cards("gemini"))
+        self.assertEqual([], self.inbox(self.CODEX) + self.inbox("grok") + self.inbox("gemini"))
+        self.assertEqual({}, self.conn.hgetall(cb.OPEN_KEY))
+        for agent, said in ((self.CODEX, entry), ("grok", later), ("gemini", later)):
+            self.assertIsNone(self.conn.get(life.TASK_KEY % cb.ask_id(ROOM, said, agent)))
+
+    def holders(self, words):
+        """Every Redis key whose value holds these words."""
+        found = []
+        for store in (self.conn.store, self.conn.hashes, self.conn.streams):
+            found += [k for k, v in store.items() if words in json.dumps(v, default=str)]
+        return sorted(found)
+
+    def test_f2_his_words_live_only_in_the_stream_the_proposal_the_read_back_and_the_inbox(self):
+        """Codex's review of row 9443, F2 (C9): no pending or asked copy in read-back mode, at any step."""
+        words = "find a sample chair picture"
+        events, proposal, readback = STREAM, cb.PROPOSAL_KEY % ROOM, cb.READBACK_KEY % ROOM
+        entry = turn(self.conn, "Could someone find a sample chair picture?", reason="everyone", seconds_ago=30)
+        self.conn.xadd(self.side, {"by": "chair", "voice": "claude", "room": ROOM, "text": "I can't pull an image.",
+                                   "at": cb.stamp(NOW)}, entry_id=at(25))
+        self.assertEqual([], self.b().tick())
+        self.assertEqual(sorted([events, proposal, readback]), self.holders(words))
+        self.assertNotIn("said", json.loads(self.conn.get(cb.ASKED_KEY % ROOM)))
+        self.assertIsNone(self.conn.get(cb.PENDING_KEY % ROOM))
+        self.heard(entry, ["claude-code-cli"], 15)
+        self.b().tick()
+        self.assertEqual(sorted([events, proposal]), self.holders(words))
+        turn(self.conn, "Claude, go ahead.", seconds_ago=10)
+        self.assertEqual([cb.ask_id(ROOM, entry, "claude-code-cli")], self.b().tick())
+        self.assertEqual(sorted([events, "fleet:inbox:claude-code-cli"]), self.holders(words))
+
+    def test_f2_a_task_ask_writes_no_pending_copy_in_read_back_mode(self):
+        turn(self.conn, "Codex, draft the sample queue flow.", seconds_ago=60)
+        self.b().tick()
+        self.assertIsNone(self.conn.get(cb.PENDING_KEY % ROOM))
+        self.assertEqual(sorted([STREAM, cb.PROPOSAL_KEY % ROOM, cb.READBACK_KEY % ROOM]),
+                         self.holders("draft the sample queue flow"))
+
+    def test_f2_a_voice_that_cannot_reads_his_words_from_the_stream_or_proposes_nothing(self):
+        """No copy: a turn gone from the room's stream (trimmed) proposes nothing, rather than an empty task."""
+        self.conn.set(cb.ASKED_KEY % ROOM, json.dumps({"entry": at(30), "at": cb.stamp(NOW),
+                                                       "actor": "own_fixture_owner", "epoch": "fixture-epoch"}))
+        turn(self.conn, None, reason="", actor="grok", kind="floor.granted", seconds_ago=40)   # the room is live
+        self.conn.xadd(STREAM, {"kind": "transcript.line", "actor_id": "grok", "room_id": ROOM,
+                                "utterance": "Something else entirely."}, entry_id=at(28))  # a later line
+        self.conn.xadd(self.side, {"by": "chair", "voice": "claude", "room": ROOM, "text": "I can't pull an image.",
+                                   "at": cb.stamp(NOW)}, entry_id=at(25))
+        self.assertEqual([], self.b().tick())
+        self.assertIsNone(self.conn.get(cb.PROPOSAL_KEY % ROOM))
+        self.assertEqual({}, self.cards("claude-code-cli"))
+
+    def test_f3_a_read_back_receipt_from_another_chair_session_is_not_heard(self):
+        """Codex's review of row 9443, F3: the receipt binds the asker's chair session, as his go-ahead does."""
+        entry = turn(self.conn, "Codex, draft the sample queue flow.", seconds_ago=60)
+        self.b().tick()
+        rid = cb.readback_id(ROOM, entry, [self.CODEX])
+        for ago, epoch in ((55, "other-epoch"), (50, None), (45, "")):
+            fields = {"kind": cb.READBACK_SPOKEN, "actor_id": "chair", "room_id": ROOM, "readback_id": rid}
+            if epoch is not None:
+                fields["session_epoch"] = epoch
+            self.conn.xadd(STREAM, fields, entry_id=at(ago))
+        turn(self.conn, "Codex, go ahead.", seconds_ago=40)
+        self.assertEqual([], self.b().tick())
+        self.assertEqual([], self.inbox(self.CODEX))
+        self.assertIsNone(json.loads(self.conn.get(cb.PROPOSAL_KEY % ROOM)).get("spoken"))
+        self.assertEqual(rid, self.conn.hgetall(cb.READBACK_KEY % ROOM)["id"], "still waiting to be read back")
+        self.heard(entry, [self.CODEX], 30)                              # the asker's own session
+        turn(self.conn, "Codex, go ahead.", seconds_ago=20)
+        self.assertEqual([cb.ask_id(ROOM, entry, self.CODEX)], self.b().tick())
+
+    def test_f4_the_read_back_key_lives_exactly_as_long_as_the_proposal_can_be_heard(self):
+        """Codex's review of row 9443, F4: one number, READBACK_SECONDS from his ask, for the key and the close."""
+        self.assertEqual(120, cb.READBACK_SECONDS)
+        for ago, ttl in ((0, 120), (60, 60), (100, 20), (119, 1)):
+            self.setUp()
+            turn(self.conn, "Codex, draft the sample queue flow.", seconds_ago=ago)
+            self.b().tick()
+            self.assertEqual(ttl, self.conn.ttls[cb.READBACK_KEY % ROOM], ago)
+        self.setUp()
+        entry = turn(self.conn, "Codex, draft the sample queue flow.", seconds_ago=100)
+        self.b().tick()
+        self.b(now=NOW + datetime.timedelta(seconds=19)).tick()          # 119 s: still open, key still there
+        self.assertEqual("review", self.cards(self.CODEX)[cb.proposal_id(ROOM, entry, self.CODEX)]["status"])
+        self.assertNotEqual({}, self.conn.hgetall(cb.READBACK_KEY % ROOM))
+        self.b(now=NOW + datetime.timedelta(seconds=21)).tick()          # 121 s: closed, and the key with it
+        got = self.cards(self.CODEX)[cb.proposal_id(ROOM, entry, self.CODEX)]
+        self.assertTrue(got["title"].startswith("Not started, the read-back was not heard"))
+        self.assertEqual({}, self.conn.hgetall(cb.READBACK_KEY % ROOM))
+
+    def test_f4_a_recipient_change_rewrites_the_key_with_the_time_that_is_left(self):
+        entry = turn(self.conn, "Grok, list the sample risks.", seconds_ago=90)
+        self.b().tick()
+        self.conn.xadd(self.side, {"by": "chair", "voice": "gemini", "room": ROOM, "text": "I can't open files.",
+                                   "at": cb.stamp(NOW)}, entry_id=at(25))
+        self.b().tick()
+        self.assertEqual(cb.readback_id(ROOM, entry, ["grok", "gemini"]),
+                         self.conn.hgetall(cb.READBACK_KEY % ROOM)["id"])
+        self.assertEqual(30, self.conn.ttls[cb.READBACK_KEY % ROOM])
 
 
 if __name__ == "__main__":
