@@ -167,7 +167,9 @@ READBACK_MAX_WORDS = 60      # the paraphrase bound the chair passes its voice (
 ASK_MAX_WORDS = 40           # B1: a longer turn never becomes a read-back; he is asked to restate
 ASK_MAX_CHARS = 1000         # B1: the pinned chair truncates there, so a longer ask is already cut
 TOO_LONG = "Not started, too long to read back: please restate it briefly"
-WAITING_BEHIND = "Not started, an earlier ask is still waiting for its read-back"
+# Grok's N1 on PR 452: the earlier ask may already be read back and waiting for his go-ahead, so the card says
+# only what is true in both cases.
+WAITING_BEHIND = "Not started, an earlier ask is still waiting to start"
 READBACK_SPOKEN = "readback.spoken"
 PROPOSED = "proposed in the room"
 NOT_STARTED = "not started"

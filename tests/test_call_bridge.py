@@ -1690,6 +1690,11 @@ class ReadBack(unittest.TestCase):
         self.assertNotIn("price table", sent["text"])
         self.assertIsNone(self.conn.get(cb.PROPOSAL_KEY % ROOM), "confirmed and closed")
 
+    def test_a5_n1_the_waiting_card_is_true_whether_the_earlier_ask_was_read_back_or_not(self):
+        """Grok's N1 on PR 452: it said the earlier ask waits for its read-back, also when it was already heard."""
+        self.assertEqual("Not started, an earlier ask is still waiting to start", cb.WAITING_BEHIND)
+        self.assertNotIn("read-back", cb.WAITING_BEHIND)
+
     def test_a5_the_waiting_card_is_written_once_however_often_the_turn_is_read(self):
         turn(self.conn, "Codex, draft the sample queue flow.", seconds_ago=80)
         second = turn(self.conn, "Codex, draft the sample price table.", seconds_ago=60)
