@@ -57,6 +57,7 @@
 !/scripts/agent_waker.py
 !/scripts/gemini_agent.py
 !/scripts/claude_agent.py
+!/scripts/jev_agent.py
 !/scripts/repo_context.py
 !/scripts/cloud_context.py
 !/scripts/okf_land.py
