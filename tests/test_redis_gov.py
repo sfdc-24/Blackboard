@@ -1006,6 +1006,57 @@ class EndToEndThroughTheBoardWorker(unittest.TestCase):
             [self.row("cursor", "do=redis-op|op=get|key=fleet:status")], conn)
         self.assertIn("amber", rows[0]["payload"])
 
+    WORDS = "Codex, draft the sample queue flow for the vans."     # synthetic, as every test sentence here
+
+    def test_a_call_bridge_inbox_entry_never_shows_his_words_on_the_board(self):
+        """2026-11-02 23:06Z: a governed inbox read put a short call ask's exact words in a PUBLIC RESULT row."""
+        conn = FakeRedis()
+        conn.xadd("fleet:inbox:claude-code-cli", {"by": "call-bridge", "ask": "call-0123456789ab",
+                                                  "input_sha256": "ab" * 32, "text": "CALL ASK: " + self.WORDS})
+        conn.xadd("fleet:inbox:claude-code-cli", {"by": "grok", "text": "a peer note stays readable"})
+        for payload in ("do=redis-op|op=xrange|key=fleet:inbox:claude-code-cli|count=5",
+                        "do=redis-op|op=xrange|key=fleet:inbox:claude-code-cli|count=5|after=0-0"):
+            out, rows, _ = self.run_rows([self.row("claude-code-cli", payload, req="REQ-IN-%d" % len(payload))], conn)
+            body = rows[0]["payload"]
+            self.assertNotIn("sample queue flow", body)
+            self.assertIn(gov.WITHHELD, body)
+            self.assertIn("call-0123456789ab", body, "the ask id and the hash stay: the agent knows which ask")
+            self.assertIn("a peer note stays readable", body, "only the call bridge's text is withheld")
+        self.assertIn("1-0", body)
+        self.assertIn("last=2-0", body, "paging still moves the cursor")
+
+    def test_the_rooms_stream_and_the_bridges_records_are_withheld_whole(self):
+        conn = FakeRedis()
+        conn.xadd("v1:conf:conf-0123456789abcdef-89abcdef:events", {"kind": "turn.started", "utterance": self.WORDS})
+        conn.set("gov:callbridge:proposal:conf-0123456789abcdef-89abcdef", '{"said": "%s"}' % self.WORDS)
+        conn.set("gov:callbridge:asked:conf-0123456789abcdef-89abcdef", '{"said": "%s"}' % self.WORDS)
+        conn.set("gov:callbridge:pending:conf-0123456789abcdef-89abcdef", '{"said": "%s"}' % self.WORDS)
+        conn.hset("v1:conf:conf-0123456789abcdef-89abcdef:readback", mapping={"id": "rb-0123456789ab",
+                                                                             "text": self.WORDS})
+        reads = ["op=xrange|key=v1:conf:conf-0123456789abcdef-89abcdef:events|count=5",
+                 "op=get|key=gov:callbridge:proposal:conf-0123456789abcdef-89abcdef",
+                 "op=get|key=gov:callbridge:asked:conf-0123456789abcdef-89abcdef",
+                 "op=get|key=gov:callbridge:pending:conf-0123456789abcdef-89abcdef",
+                 "op=hgetall|key=v1:conf:conf-0123456789abcdef-89abcdef:readback"]
+        for n, read in enumerate(reads):
+            out, rows, _ = self.run_rows([self.row("claude-code-cli", "do=redis-op|" + read, req="REQ-W-%d" % n)], conn)
+            self.assertNotIn("sample queue flow", rows[0]["payload"], read)
+            self.assertIn(gov.WITHHELD, rows[0]["payload"], read)
+
+    def test_board_safe_leaves_everything_else_and_never_mutates_the_answer(self):
+        answer = {"ok": True, "op": "get", "key": "fleet:status", "value": "amber"}
+        self.assertIs(answer, gov.board_safe(answer))
+        inbox = {"ok": True, "op": "xrange", "key": "fleet:inbox:x",
+                 "value": [{"id": "1-0", "by": "call-bridge", "text": self.WORDS}]}
+        shown = gov.board_safe(inbox)
+        self.assertEqual(self.WORDS, inbox["value"][0]["text"], "the caller's dict is untouched")
+        self.assertEqual(gov.WITHHELD, shown["value"][0]["text"])
+        refused = {"ok": False, "op": "get", "key": "gov:callbridge:proposal:x", "refused": "no"}
+        self.assertIs(refused, gov.board_safe(refused))
+        for key in ("v1:conf:r:check", "v1:conf:r:events:x", "gov:callbridge:task:call-1", "conf:briefing"):
+            plain = {"ok": True, "op": "get", "key": key, "value": "v"}
+            self.assertIs(plain, gov.board_safe(plain), key)
+
     def test_a_protected_write_is_refused_on_the_board_and_in_the_audit(self):
         out, rows, conn = self.run_rows([self.row(
             "gemini", "do=redis-op|op=set|key=v1:bus:row:R-1|val=forged")])

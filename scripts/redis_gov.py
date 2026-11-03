@@ -1583,6 +1583,39 @@ def _summarise_verify(result: dict) -> str:
                 (" error=%s" % result["error"]) if result.get("error") else ""))
 
 
+# THE OWNER'S CALL WORDS NEVER REACH THE PUBLIC BOARD (2026-11-02 23:06Z: a governed read of fleet:inbox:claude-code-cli
+# put a short call ask's exact words in a public RESULT row, through the call bridge's inbox preview). The board route
+# answers in public rows, so before it summarises a read it withholds every value that can hold his words: the room's
+# event stream and read-back key, the bridge's proposal, asked and pending records, and the text of an inbox entry the
+# call bridge wrote. Ids, counts and paging stay, so a cursor still moves. The direct route answers only its caller
+# and is unchanged. The full words stay where they were: Redis, read privately.
+WITHHELD = "withheld on the public board: the owner's call words; read them by the private route"
+_PRIVATE_KEY = re.compile(r"^(?:v1:conf:[^:]+:(?:events|readback)"
+                          r"|gov:callbridge:(?:proposal|asked|pending):.+)$")
+CALL_BRIDGE_BY = "call-bridge"
+
+
+def board_safe(result: dict) -> dict:
+    """`result` as the PUBLIC board may show it (WITHHELD above). Never mutates the caller's dict."""
+    if not isinstance(result, dict) or not result.get("ok") or result.get("op") not in OPS_READ:
+        return result
+    key = str(result.get("key") or "")
+    value = result.get("value")
+    out = dict(result)
+    if _PRIVATE_KEY.match(key):
+        if result["op"] == "xrange" and isinstance(value, list):
+            out["value"] = [{"id": e.get("id"), "withheld": WITHHELD} if isinstance(e, dict) else WITHHELD
+                            for e in value]
+        else:
+            out["value"] = WITHHELD if value is not None else None
+        return out
+    if result["op"] == "xrange" and key.startswith("fleet:inbox:") and isinstance(value, list):
+        out["value"] = [dict(e, text=WITHHELD) if isinstance(e, dict) and e.get("by") == CALL_BRIDGE_BY else e
+                        for e in value]
+        return out
+    return result                                   # nothing of his here: the answer as it is
+
+
 def summarise(result: dict) -> str:
     """One line for a board RESULT row: pipe-free, newline-free, bounded."""
     if result.get("op") == VERIFY_OP:
