@@ -1042,6 +1042,14 @@ class EndToEndThroughTheBoardWorker(unittest.TestCase):
             out, rows, _ = self.run_rows([self.row("claude-code-cli", "do=redis-op|" + read, req="REQ-W-%d" % n)], conn)
             self.assertNotIn("sample queue flow", rows[0]["payload"], read)
             self.assertIn(gov.WITHHELD, rows[0]["payload"], read)
+        # A withheld stream page keeps its stream ids, so a reader's cursor still moves past it.
+        conn.xadd("v1:conf:conf-0123456789abcdef-89abcdef:events", {"kind": "turn.started", "utterance": "x"})
+        out, rows, _ = self.run_rows([self.row(
+            "claude-code-cli", "do=redis-op|op=xrange|key=v1:conf:conf-0123456789abcdef-89abcdef:events|count=5|after=0-0",
+            req="REQ-W-PAGE")], conn)
+        self.assertIn('"id": "1-0"', rows[0]["payload"])
+        self.assertIn('"id": "2-0"', rows[0]["payload"])
+        self.assertIn("last=2-0", rows[0]["payload"])
 
     def test_board_safe_leaves_everything_else_and_never_mutates_the_answer(self):
         answer = {"ok": True, "op": "get", "key": "fleet:status", "value": "amber"}
