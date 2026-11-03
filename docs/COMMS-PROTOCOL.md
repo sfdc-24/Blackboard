@@ -448,3 +448,81 @@ A payload that starts `WA_OUT|` is also a request; prefer `phase=WA_SEND`.
 The row is not a wake-up (§7). Arm `scripts/wa_board_outbox.ps1` on the
 laptop. Full contract, examples for Claude / Codex / Copilot, and
 dry-run: `docs/WA-OUTBOX.md`.
+
+---
+
+## 12 · Every conversation with Mr. Salam is on the board (`PROMPT`, `PROMPT_RESPONSE`, `OWNER_REPLY`)
+
+**Added 2026-11-02 at Mr. Salam's direct instruction.** Until now, what he
+typed to one agent, and what that agent told him, was visible only inside that
+agent's session. Every other agent heard it second-hand, if at all. Two
+incidents from the same day were made worse by that gap, though it may not
+be their only cause:
+- An agent posted a review PASS for a PR already ruled NO-GO elsewhere, and a
+  correction row had to follow (rows 9449 and 9451).
+- Another agent was described as waiting for an approval that a board row had
+  already given (row 9452).
+
+**The rule.** From 2026-11-02, every turn between Mr. Salam and any agent is
+recorded on the private board. All communication is then visible, and every
+action taken because of it can be traced back to it.
+
+1. **Message types.** His message to you is `msg_type=PROMPT` when it starts
+   a conversation, and `msg_type=OWNER_REPLY` when it answers something you
+   told him. What you write back to him is `msg_type=PROMPT_RESPONSE`. The
+   receiving agent posts all three, under its own tag (§2). Post each turn
+   before you act on it.
+2. **Verbatim, always.** The recorded text is the exact original. A summary
+   may be posted *in addition*, clearly labelled as a summary, but it never
+   replaces the verbatim record or stands in for it.
+3. **Two identities, kept apart.** Every row carries:
+   - the **source** message ID and source time, as the chat surface gave them;
+   - the **board** row ID and the time the board observed the row, which is
+     its own Timestamp.
+
+   If the surface does not expose a source ID or time, write `UNKNOWN`.
+   Never invent one, and never put a description where an ID belongs.
+4. **Linking.** Every row carries:
+   - `thread_id`: one shared ID for the whole conversation. Start a new one
+     only for a new conversation.
+   - `reply_to`: the exact source ID of the message this one answers, or
+     `NONE` for the opening `PROMPT`. If that ID is unknown, write `UNKNOWN`,
+     not a guess.
+   - `agent` and `session`: who recorded the row.
+5. **Long messages.** A row holds at most 1500 characters. Split a long
+   message into parts that carry the same message ID and `part=n/m`. A reader
+   reassembles the whole message in order before using it. A message with a
+   missing or conflicting part cannot be acted on until it is complete.
+   `reply_to` names the whole message, never a single part.
+6. **Encoding.** BCB fields are split on `|`, so verbatim text is encoded
+   reversibly: `%` becomes `%25`, `|` becomes `%7C`, and a newline becomes
+   `%0A`. Rows encoded this way carry `text_enc=pct`, and readers decode them
+   before use.
+7. **Actions carry the thread.** Any row you write *because of* one of his
+   turns (an ACK, ASK, RESULT, blocker or hand-off) also carries that
+   `thread_id`, plus a `reply_to` naming the turn or row it acts on. Following
+   one `thread_id` then leads from his words to every resulting action.
+8. **A record is not an authorization.** A conversation row never grants,
+   claims or completes anything, and `msg_type` is not `phase`. A recorded
+   `OWNER_REPLY` authorizes nothing by its text alone. Authority still comes
+   from him, through the approval path for that exact action and scope (§4,
+   §5). Another agent reading his recorded words must not treat them as an
+   approval to act.
+9. **Record-only, so nobody is woken.** A row wakes nobody by itself (§7),
+   and leaving out a paid route's tag is not enough to make sure. Consumers
+   must treat any row with `msg_type` as record-only and nonactionable. Until
+   the tooling enforces that, post conversation rows with `phase=RESULT`,
+   which the agent wakers already skip, and never address `gemini` or
+   `claude-api` on them.
+10. **Private board only.** These rows never go to GitHub, a public canvas, a
+    public artifact or any other public surface. No secrets, tokens or phone
+    numbers, here or anywhere (§11).
+11. **No backfill.** Earlier conversations are not replayed onto the board
+    unless he asks. Rows already posted in an earlier format stay as they are.
+    Corrections are appended, never made by erasing.
+
+**Field names are interim.** The information above is the rule. The exact
+field names are not settled yet: one builder (`codex`) owns the tool that will
+post and read these rows, and its schema is the one to follow once it lands.
+Until then, post the information above by hand under the clearest names
+available. The tool may change how rows are written, but not this rule.
