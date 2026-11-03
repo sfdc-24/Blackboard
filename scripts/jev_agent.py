@@ -40,6 +40,7 @@ USAGE
   python scripts/jev_agent.py say "jev:yesno: Is the sky blue?"
 """
 import json
+import math
 import os
 import re
 import sys
@@ -136,28 +137,74 @@ def wire_question(question):
     return {"type": "noul", "instructions": question["question"]}
 
 
+def _probability(value):
+    """A finite numeric probability, excluding bool (a subclass of int)."""
+    if type(value) not in (int, float):
+        return None
+    value = float(value)
+    return value if math.isfinite(value) and 0.0 <= value <= 1.0 else None
+
+
 def read_answer(question, answer):
-    """(decision text, probability) from one System One answer, or (None, None)."""
+    """(decision text, probability) from a validated System One answer."""
     if not isinstance(answer, dict):
         return None, None
     kind = question["type"]
-    if kind == "yesno" and isinstance(answer.get("noul"), (int, float)):
-        p_yes = float(answer["noul"])
+    expected = {"yesno": "noul", "choice": "choice", "score": "score"}.get(kind)
+    if answer.get("type") != expected:
+        return None, None
+
+    if kind == "yesno":
+        p_yes = _probability(answer.get("noul"))
+        if p_yes is None:
+            return None, None
         return ("yes" if p_yes >= 0.5 else "no"), (p_yes if p_yes >= 0.5 else 1 - p_yes)
-    if kind == "choice" and answer.get("choice") is not None:
-        conf = answer.get("confidence")
-        return str(answer["choice"]), (float(conf) if isinstance(conf, (int, float)) else None)
-    if kind == "score" and isinstance(answer.get("score"), (int, float)):
+
+    confidence = answer.get("confidence")
+    if confidence is not None:
+        confidence = _probability(confidence)
+        if confidence is None:
+            return None, None
+
+    probabilities = answer.get("probabilities")
+    if probabilities is not None and not isinstance(probabilities, dict):
+        return None, None
+
+    if kind == "choice":
+        chosen = answer.get("choice")
+        options = question["options"]
+        if not isinstance(chosen, str) or chosen not in options:
+            return None, None
+        if probabilities is not None:
+            if any(name not in options or _probability(p) is None
+                   for name, p in probabilities.items()):
+                return None, None
+        probability = confidence
+        if probability is None and probabilities is not None:
+            probability = _probability(probabilities.get(chosen))
+        return (chosen, probability) if probability is not None else (None, None)
+
+    if kind == "score":
         bands = _bands(question["min"], question["max"])
-        probs = answer.get("probabilities") if isinstance(answer.get("probabilities"), dict) else {}
+        score = answer.get("score")
+        if type(score) not in (int, float) or not math.isfinite(float(score)):
+            return None, None
+        if not 0 <= score <= len(bands) - 1:
+            return None, None
         best, best_p = None, None
-        for level, p in probs.items():
-            if str(level).isdigit() and int(level) < len(bands) and isinstance(p, (int, float)):
+        if probabilities is not None:
+            for level, p in probabilities.items():
+                if (not isinstance(level, str) or not level.isdecimal()
+                        or str(int(level)) != level or int(level) >= len(bands)):
+                    return None, None
+                p = _probability(p)
+                if p is None:
+                    return None, None
                 if best_p is None or p > best_p:
-                    best, best_p = int(level), float(p)
+                    best, best_p = int(level), p
         if best is None:
-            best = min(len(bands) - 1, max(0, int(round(float(answer["score"])))))
-        return _band_label(bands[best]), best_p
+            best, best_p = int(round(score)), confidence
+        return (_band_label(bands[best]), best_p) if best_p is not None else (None, None)
     return None, None
 
 
@@ -180,14 +227,10 @@ def ask(prompt, model=None):
         with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
             data = json.loads(response.read().decode("utf-8") or "{}")
     except urllib.error.HTTPError as error:
-        detail = ""
-        try:
-            detail = error.read().decode("utf-8", "replace")[:200]
-        except Exception:  # noqa: BLE001
-            pass
-        return None, "systemone HTTP %s: %s" % (error.code, detail or error.reason)
+        # Provider error bodies can echo the submitted row or credentials.
+        return None, "systemone HTTP %s" % error.code
     except Exception as error:  # noqa: BLE001 - the waker reports, never crashes
-        return None, "systemone %s: %s" % (type(error).__name__, str(error)[:160])
+        return None, "systemone %s" % type(error).__name__
     if not isinstance(data, dict):
         return None, "systemone answered a non-object"
     answers = data.get("answers") if isinstance(data.get("answers"), dict) else {}
