@@ -610,6 +610,44 @@ class NoIdleWaiting(unittest.TestCase):
         later, idle = w.idle_asks([row("R9", "2026-09-24T03:59:00Z", source="aya", payload="BCB|v=1|id=R9")], again, NOW)
         self.assertEqual({"codex": ["A1"]}, idle, "aya spoke on a later tick: cleared")
 
+    def test_a_reply_later_in_the_same_second_clears_the_ask(self):
+        # Codex HOLD on 52afe478: times cut to whole seconds kept this ask open, and later listed it as idle.
+        rows = [self.ask("A1", "2026-09-24T03:00:00.100Z", to="codex"),
+                row("R2", "2026-09-24T03:00:00.900Z", source="codex", payload="BCB|v=1|id=R2|phase=RESULT")]
+        opened, idle = w.idle_asks(rows, {}, NOW)
+        self.assertEqual({}, idle)
+        self.assertNotIn("codex", opened)
+
+    def test_a_row_at_the_same_instant_as_the_ask_does_not_clear_it(self):
+        # The tie rule: which came first cannot be known, so the ask stays listed.
+        rows = [self.ask("A1", "2026-09-24T03:00:00.500Z", to="codex"),
+                row("R2", "2026-09-24T03:00:00.500Z", source="codex", payload="BCB|v=1|id=R2|phase=RESULT")]
+        self.assertEqual({"codex": ["A1"]}, w.idle_asks(rows, {}, NOW)[1])
+
+    def test_a_reply_a_moment_before_the_ask_does_not_clear_it(self):
+        rows = [row("R0", "2026-09-24T03:00:00.400Z", source="codex", payload="BCB|v=1|id=R0|phase=RESULT"),
+                self.ask("A1", "2026-09-24T03:00:00.500Z", to="codex")]
+        self.assertEqual({"codex": ["A1"]}, w.idle_asks(rows, {}, NOW)[1])
+
+    def test_held_state_is_compared_as_instants_not_as_text(self):
+        # A held ask written at whole seconds, and a reply half a second later: as text "...00Z" sorts after
+        # "...00.5...Z" and the reply would never clear it.
+        held = {"codex": [{"id": "A1", "asked_at": "2026-09-24T03:00:00Z"}]}
+        reply = [row("R2", "2026-09-24T03:00:00.500Z", source="codex", payload="BCB|v=1|id=R2|phase=RESULT")]
+        opened, idle = w.idle_asks(reply, held, NOW)
+        self.assertEqual({}, idle)
+        self.assertEqual({}, opened)
+
+    def test_an_ask_whose_time_does_not_parse_stays_listed(self):
+        held = {"codex": [{"id": "A1", "asked_at": "garbled"}]}
+        reply = [row("R2", "2026-09-24T03:10:00Z", source="codex", payload="BCB|v=1|id=R2|phase=RESULT")]
+        self.assertEqual({"codex": ["A1"]}, w.idle_asks(reply, held, NOW)[1])
+
+    def test_the_report_bound_is_exact(self):
+        just = self.ask("A1", "2026-09-24T03:30:00.000001Z", to="codex")      # a microsecond inside the bound
+        over = self.ask("A2", "2026-09-24T03:29:59.999999Z", to="grok")       # a microsecond past it
+        self.assertEqual({"grok": ["A2"]}, w.idle_asks([just, over], {}, NOW)[1])
+
     def test_the_target_column_names_the_agents_when_the_payload_has_no_to(self):
         bare = row("A3", "2026-09-24T03:00:00Z", target="grok", payload="BCB|v=1|id=A3|phase=ASK|text=x")
         self.assertEqual({"grok": ["A3"]}, w.idle_asks([bare], {}, NOW)[1])

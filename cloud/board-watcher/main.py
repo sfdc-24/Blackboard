@@ -155,9 +155,15 @@ def idle_asks(rows, held, now) -> tuple:
     """(open, report). `open`: {agent: [{"id", "asked_at"}]}, every ASK addressed to an agent that has posted no row
     since it. `report`: {agent: [ids]} of those open longer than IDLE_MINUTES. Pure: no IO. Names are as rows write
     them (to=, else the target column): an agent that answers under another tag stays open, a stated limit of a
-    report that never acts. A row seen twice adds its ask once."""
+    report that never acts. A row seen twice adds its ask once.
+
+    Times are compared as parsed instants at full precision, never as truncated text: a reply 0.8 s after an ask
+    in the same second clears it. Tie rule: a row at exactly the ask's instant does not clear it, because which
+    came first cannot be known; the ask stays listed, the safe side for a report. An asked_at that does not parse
+    (a hand-edited state) keeps the ask open and listed, for the same reason."""
     import agent_waker as aw
-    stamp = lambda ts: ts.strftime("%Y-%m-%dT%H:%M:%SZ")             # noqa: E731
+    stamp = lambda ts: ts.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")   # noqa: E731
+    asked = lambda item: aw.parse_ts(item.get("asked_at", ""))                       # noqa: E731
     opened = {agent: [dict(i) for i in items] for agent, items in (held or {}).items()
               if isinstance(items, list)}
     timed = [(aw.parse_ts(r[aw.C_TS] if len(r) > aw.C_TS else ""), r) for r in rows if r]
@@ -165,7 +171,7 @@ def idle_asks(rows, held, now) -> tuple:
         at = stamp(ts)
         source = str(row[aw.C_SOURCE] if len(row) > aw.C_SOURCE else "").strip().lower()
         if source in opened:
-            opened[source] = [i for i in opened[source] if i.get("asked_at", "") >= at]   # it spoke: not idle
+            opened[source] = [i for i in opened[source] if asked(i) is None or asked(i) >= ts]   # it spoke: not idle
         payload = str(row[aw.C_PAYLOAD] if len(row) > aw.C_PAYLOAD else "")
         phase = re.search(r"(?:^|\|)phase=([A-Za-z_]+)", payload)
         if not phase or phase.group(1).upper() != "ASK":
@@ -181,8 +187,9 @@ def idle_asks(rows, held, now) -> tuple:
                 items.append({"id": ask, "asked_at": at})
             opened[name] = items[-IDLE_CAP:]
     opened = {agent: items for agent, items in opened.items() if items}
-    cutoff = stamp(now - timedelta(minutes=IDLE_MINUTES))
-    report = {agent: [i["id"] for i in items if i.get("asked_at", "") < cutoff] for agent, items in opened.items()}
+    cutoff = now - timedelta(minutes=IDLE_MINUTES)
+    report = {agent: [i["id"] for i in items if asked(i) is None or asked(i) < cutoff]
+              for agent, items in opened.items()}
     return opened, {agent: ids for agent, ids in report.items() if ids}
 
 
