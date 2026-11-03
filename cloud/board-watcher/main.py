@@ -82,6 +82,7 @@ RUN_API = "https://run.googleapis.com/v2/projects/%s/locations/%s/jobs/%s"
 # or quarantined. Defaults match the cloud jobs' CURSOR_NAME.
 ROUTE_CURSORS = {
     "gemini-waker": "gemini_waker",
+    "jev-waker": "jev_waker",
     "claude-api-waker": "claude_api_waker",
     "wa-outbox": "wa_outbox",
 }
@@ -152,6 +153,7 @@ def _routes():
     # to claude-code-cli - agent_waker.addressed_to carries that rule.
     return {
         "gemini-waker": for_agent("gemini"),
+        "jev-waker": for_agent("jev"),
         "claude-api-waker": for_agent("claude-api"),
         "wa-outbox": lambda row: ob.parse_wa_request(row) is not None,
     }

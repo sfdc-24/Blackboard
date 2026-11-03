@@ -449,6 +449,29 @@
           "wake": "NONE. An Apps Script page, not an agent."
         }
       ]
+    },
+    {
+      "family": "jev",
+      "name": "Jev",
+      "lead_role": "Decision layer (capability)",
+      "responsibility": "Typed decisions only: yes/no, score, choice, with calibrated probabilities (TypeSafe System One). No text generation, no reviews, no agency. Data boundary (owner 2026-11-03): board rows and PR metadata only. Budget: $25/mo working budget; the TypeSafe balance is the hard stop.",
+      "appointed": "2026-11-03",
+      "instances": [
+        {
+          "id": "jev",
+          "surface": "model endpoint via the waker (api.typesafe.ai/v1/systemone, model jev-latest)",
+          "runtime": "Cloud Run job jev-waker (to be created at first deploy)",
+          "gcp_identity": "waker-jev@sfdc24 (to be created; secretAccessor on JEV_API_KEY only)",
+          "rows": 0,
+          "last_seen": "n/a",
+          "state": "wired 2026-11-03 on the owner's order (CLAUDE-CLI-VSEXT-OWNER-REPLY-20261103T19..Z); first deploy pending",
+          "in_vpc": false,
+          "redis_read": false,
+          "redis_write": false,
+          "why": "JEV IS A CAPABILITY WITH A DOORBELL, NOT A REVIEWER: it cannot write text or explanations (TypeSafe's own statement), so it must never hold a review seat. Its waker answers rows addressed to=jev with one typed decision each.",
+          "wake": "python scripts/agent_waker.py --agent jev, or the cloud waker job. Answers rows addressed to=jev (jev:yesno / jev:score / jev:choice specs) and marks them wakerreply=1."
+        }
+      ]
     }
   ]
 }

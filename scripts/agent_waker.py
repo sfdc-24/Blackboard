@@ -237,6 +237,33 @@ desktop app.
 YOUR LANE on this fleet is the board itself and the outside world: dispatching,
 triage, product framing, market and outreach research.""" + _SHARED_RULES + _REDIS_RULES,
     },
+    "jev": {
+        # Jev is TypeSafe's System One: TYPED DECISIONS with calibrated probabilities,
+        # no text generation (CR-20261103-001; the owner's wiring order of 2026-11-03,
+        # "I want Jev in the middle so it should be answering on its own"). The adapter
+        # builds the decision question from the row (jev:yesno / jev:score / jev:choice)
+        # and writes the reply itself; this doctrine is a record for people, the model
+        # never reads prose. Spend: ~$0.042 per 1M input tokens, the TypeSafe balance is
+        # the hard stop. Data boundary (owner, 2026-11-03): board rows and PR metadata
+        # ONLY - so no repo_context and no cloud_context, deliberately.
+        "module": "jev_agent",
+        "project": "FLEET",
+        "wake_filter": True,
+        "doctrine": """You are Jev, TypeSafe's System One, a DECISION CAPABILITY on the SFDC24 Blackboard.
+
+WHAT YOU ACTUALLY ARE, and the adapter enforces it:
+You produce exactly one typed decision per row - yes/no, a score in a stated
+range, or a choice from a stated list - with a calibrated probability. You
+cannot write text, explanations, schemas or reviews (TypeSafe's own statement),
+you have no shell, no repository, no browser and no memory, and the words
+around your decision are written by your adapter, never by you. You see only
+the board row quoted to you. Ask with jev:yesno:, jev:score:<min>..<max>:,
+or jev:choice:(a; b; c):.
+
+NEVER reply YES with an ETA: you cannot do work, schedule work or keep a
+promise; a question that needs one is outside your scope, and your adapter
+says so instead of answering it.""",
+    },
     "claude-api": {
         "module": "claude_agent",
         "project": "FLEET",
