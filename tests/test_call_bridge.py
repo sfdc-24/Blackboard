@@ -281,7 +281,7 @@ class Claim(unittest.TestCase):
         self.assertRegex(ask, r"^call-[0-9a-f]{12}$")
         got = card(self.conn, "chatgpt-codex-desktop", ask)
         self.assertEqual(("claimed", 1, "2026-10-24T14:02:00Z"), (got["status"], got["version"], got["ts"]))
-        self.assertEqual("In the making: Codex's work from the room", got["title"])
+        self.assertEqual("Waiting for a worker: Codex's work from the room", got["title"], "no worker is wired for codex")
         self.assertIsNotNone(cp.clean_item("chatgpt-codex-desktop", ask, json.dumps(got)), "the publisher takes it")
         [(_, entry)] = self.conn.streams["fleet:inbox:chatgpt-codex-desktop"]
         self.assertEqual("call-bridge", entry["by"])
@@ -306,8 +306,8 @@ class Claim(unittest.TestCase):
         words = [w for w in re.findall(r"[A-Za-z][A-Za-z'-]+", said) if w.lower() not in ("codex", "the", "for", "first")]
         claimed = card(self.conn, "chatgpt-codex-desktop", ask)
         self.assertEqual("claimed in the room", claimed["activity"])
-        self.assertEqual("Claimed in the room at 10:02 ET. Codex's card for this work follows here when it is done.",
-                         claimed["body"])
+        self.assertEqual("Claimed in the room at 10:02 ET. No worker picks up Codex's call asks yet; the ask waits in "
+                         "Codex's inbox, and Codex's own card replaces this one when it is taken.", claimed["body"])
         later = NOW + datetime.timedelta(minutes=3)
         bridge(self.conn, clock=lambda: later).settle([row("chatgpt-codex-desktop",
                                                             "BCB|v=1|phase=RESULT|from=chatgpt-codex-desktop|answers=%s|text=ok" % ask)])
@@ -714,9 +714,23 @@ class InTheMakingAndLatency(unittest.TestCase):
         return json.loads(raw) if raw else None
 
     def test_the_title_says_in_the_making_and_who_never_his_words(self):
-        got = cb.claimed_card("gemini", NOW)
-        self.assertEqual("In the making: Gemini's work from the room", got["title"])
-        self.assertIsNotNone(cp.clean_item("gemini", "call-000000000000", json.dumps(got)))
+        got = cb.claimed_card("claude-code-cli", NOW)
+        self.assertEqual("In the making: Claude's work from the room", got["title"])
+        self.assertIsNotNone(cp.clean_item("claude-code-cli", "call-000000000000", json.dumps(got)))
+
+    def test_fix1_an_agent_with_no_wired_worker_gets_an_honest_title(self):
+        """FIX 1 (the owner's 8 PM call, 2026-11-02): two asks for grok sat "In the making" with nobody to take them."""
+        for agent, name in (("grok", "Grok"), ("gemini", "Gemini"), ("chatgpt-codex-desktop", "Codex")):
+            got = cb.claimed_card(agent, NOW, environ={})
+            self.assertEqual("Waiting for a worker: %s's work from the room" % name, got["title"])
+            self.assertEqual(("claimed", "claimed in the room"), (got["status"], got["activity"]),
+                             "the same activity: every later step reads it unchanged")
+            self.assertIsNotNone(cp.clean_item(agent, "call-000000000000", json.dumps(got)))
+        self.assertTrue(cb.claimed_card("gemini", NOW, environ={"CALL_BRIDGE_WIRED": "claude-code-cli, gemini"})
+                        ["title"].startswith("In the making"), "a worker wired by the switch")
+        self.assertEqual(frozenset({"claude-code-cli"}), cb.wired({}))
+        self.assertEqual(frozenset({"grok"}), cb.wired({"CALL_BRIDGE_WIRED": "grok,nobody,,"}), "unknown names ignored")
+        self.assertEqual(frozenset(), cb.wired({"CALL_BRIDGE_WIRED": ""}))
 
     def test_the_agent_card_within_three_minutes_is_measured_on_time(self):
         ask = self.claim()
@@ -1121,7 +1135,7 @@ class GoAheadAt1117(unittest.TestCase):
         self.assertEqual([], cp.active_windows(self.conn, NOW), "as on the call: no window open")
         [ask] = self.opened().tick()
         got = card(self.conn, "gemini", ask)
-        self.assertEqual(("claimed", "In the making: Gemini's work from the room"), (got["status"], got["title"]))
+        self.assertEqual(("claimed", "Waiting for a worker: Gemini's work from the room"), (got["status"], got["title"]))
         self.assertEqual(["workshop"], [room for room, _ in cp.active_windows(self.conn, NOW)], "the window opened")
         self.assertEqual("call-bridge", cp.read_window(self.conn, "workshop")["by"])
         self.assertIn("gemini/" + ask, [item["id"] for item in cp.snapshot(self.conn, "workshop", NOW)["items"]],
@@ -1676,6 +1690,11 @@ class ReadBack(unittest.TestCase):
         self.assertNotIn("price table", sent["text"])
         self.assertIsNone(self.conn.get(cb.PROPOSAL_KEY % ROOM), "confirmed and closed")
 
+    def test_a5_n1_the_waiting_card_is_true_whether_the_earlier_ask_was_read_back_or_not(self):
+        """Grok's N1 on PR 452: it said the earlier ask waits for its read-back, also when it was already heard."""
+        self.assertEqual("Not started, an earlier ask is still waiting to start", cb.WAITING_BEHIND)
+        self.assertNotIn("read-back", cb.WAITING_BEHIND)
+
     def test_a5_the_waiting_card_is_written_once_however_often_the_turn_is_read(self):
         turn(self.conn, "Codex, draft the sample queue flow.", seconds_ago=80)
         second = turn(self.conn, "Codex, draft the sample price table.", seconds_ago=60)
@@ -1867,6 +1886,27 @@ class ReadBack(unittest.TestCase):
         turn(self.conn, "Codex, go ahead.", seconds_ago=2)
         self.assertEqual([cb.ask_id(ROOM, second, self.CODEX)], self.b().tick())
 
+    def test_a5_a_waiting_card_under_the_old_wording_still_yields_to_the_replay(self):
+        """Codex's HOLD on adc6558e: a waiting card PR 452 wrote, under its own wording, must not block the
+        queued ask once the earlier one is gone."""
+        turn(self.conn, "Codex, draft the sample queue flow.", seconds_ago=170)
+        second = turn(self.conn, "Codex, draft the sample price table.", seconds_ago=60)
+        self.b(now=NOW - datetime.timedelta(seconds=55)).tick()
+        key, field = cp.PARTITION % ("workshop", self.CODEX), cb.proposal_id(ROOM, second, self.CODEX)
+        card = self.cards(self.CODEX)[field]
+        card["title"] = "Not started, an earlier ask is still waiting for its read-back" + card["title"][len(cb.WAITING_BEHIND):]
+        self.conn.hset(key, field, json.dumps(card))                    # as PR 452 would have written it
+        self.b().tick()                                                 # the first ask expires unheard
+        self.conn.store.pop(cb.CURSOR_KEY % ROOM)                       # a restart: the cursor is gone
+        self.b().tick()
+        got = self.cards(self.CODEX)[field]
+        self.assertEqual(("review", cb.PROPOSED), (got["status"], got["activity"]), "its turn now")
+        self.assertEqual(second, json.loads(self.conn.get(cb.PROPOSAL_KEY % ROOM))["entry"])
+
+    def test_a5_every_waiting_wording_ever_written_is_kept(self):
+        self.assertEqual(cb.WAITING_BEHIND, cb.WAITING_TITLES[0], "the current wording is the one written")
+        self.assertIn("Not started, an earlier ask is still waiting for its read-back", cb.WAITING_TITLES)
+
     def test_a5_h2_an_expired_unheard_proposal_yields_to_the_newer_ask_with_the_cursor_kept(self):
         """Grok on PR 452, H2: with the cursor kept there is no replay, so an ask that waited behind a proposal
         whose window had already closed would be lost for good. The expired one closes; the newer one proposes."""
@@ -1932,6 +1972,34 @@ class ReadBack(unittest.TestCase):
         self.assertIn("a newer ask waits behind it", card["body"])
         for stale in ("drops it. ", "newer ask drops", "Replaced"):
             self.assertNotIn(stale, card["title"] + " " + card["body"].replace("Cancel drops it;", ""), stale)
+
+    def test_fix5_a_proposal_closed_after_the_window_shut_is_still_published(self):
+        """FIX 5 (the owner's 8 PM call): rb-5d43 retired at 8:16 after the window shut, and the public page kept
+        it as a review card. The close reopens the window for that one item, so the publisher carries it."""
+        entry = turn(self.conn, "Codex, draft the sample queue flow.", seconds_ago=100)
+        self.b().tick()
+        field = cb.proposal_id(ROOM, entry, self.CODEX)
+        self.conn.store.pop(cp.WINDOW_PREFIX + "workshop")              # the call's window shut
+        self.assertEqual([], cp.active_windows(self.conn, NOW))
+        later = NOW + datetime.timedelta(seconds=30)                     # 130 s: the unheard proposal expires
+        published = cb.Bridge(self.conn, LOG, lambda: True, clock=lambda: later, readback=True, bucket="sfdc24-canvas")
+        published.tick()
+        got = self.cards(self.CODEX)[field]
+        self.assertTrue(got["title"].startswith("Not started, the read-back was not heard"))
+        self.assertEqual(["workshop"], [room for room, _ in cp.active_windows(self.conn, later)], "reopened")
+        window = self.conn.get(cp.WINDOW_PREFIX + "workshop")
+        self.assertIn("%s/%s" % (self.CODEX, field), cp.scope_of(self.conn, "workshop", window),
+                      "scoped to exactly the closed card")
+
+    def test_fix5_a_close_inside_an_open_window_adds_the_item_and_opens_nothing_new(self):
+        entry = turn(self.conn, "Codex, draft the sample queue flow.", seconds_ago=100)
+        self.b().tick()
+        before = self.conn.get(cp.WINDOW_PREFIX + "workshop")
+        later = NOW + datetime.timedelta(seconds=30)
+        cb.Bridge(self.conn, LOG, lambda: True, clock=lambda: later, readback=True, bucket="sfdc24-canvas").tick()
+        self.assertEqual(before, self.conn.get(cp.WINDOW_PREFIX + "workshop"), "the open window is left as it is")
+        self.assertTrue(self.cards(self.CODEX)[cb.proposal_id(ROOM, entry, self.CODEX)]["title"]
+                        .startswith("Not started"))
 
     def test_b1_a_turn_at_the_word_bound_still_proposes(self):
         words = "Codex, draft " + " ".join(["sample"] * (cb.ASK_MAX_WORDS - 2)) + "."

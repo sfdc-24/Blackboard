@@ -167,7 +167,13 @@ READBACK_MAX_WORDS = 60      # the paraphrase bound the chair passes its voice (
 ASK_MAX_WORDS = 40           # B1: a longer turn never becomes a read-back; he is asked to restate
 ASK_MAX_CHARS = 1000         # B1: the pinned chair truncates there, so a longer ask is already cut
 TOO_LONG = "Not started, too long to read back: please restate it briefly"
-WAITING_BEHIND = "Not started, an earlier ask is still waiting for its read-back"
+# Grok's N1 on PR 452: the earlier ask may already be read back and waiting for his go-ahead, so the card says
+# only what is true in both cases.
+WAITING_BEHIND = "Not started, an earlier ask is still waiting to start"
+# Codex's HOLD on adc6558e: a card written under PR 452's wording (if 452 runs a call before this ships) must still
+# read as a waiting card on replay, or it blocks the queued ask for good. Every wording a waiting card was ever
+# written under; a new wording is added here, never swapped in.
+WAITING_TITLES = (WAITING_BEHIND, "Not started, an earlier ask is still waiting for its read-back")
 READBACK_SPOKEN = "readback.spoken"
 PROPOSED = "proposed in the room"
 NOT_STARTED = "not started"
@@ -342,16 +348,30 @@ def refusal(fields: dict, room: str):
     return AGENT_OF[fields["voice"]] if REFUSAL.search(fields.get("text") or "") else None
 
 
-def claimed_card(agent: str, now) -> dict:
+def wired(environ=None) -> frozenset:
+    """The agents a worker picks call asks up for (CALL_BRIDGE_WIRED, comma-separated; default claude-code-cli,
+    whose doorbell runs). FIX 1 (the owner's 8 PM call, 2026-11-02): two asks routed to grok sat "In the making"
+    with no worker to take them. Unknown names are ignored."""
+    raw = (environ if environ is not None else os.environ).get("CALL_BRIDGE_WIRED", "claude-code-cli")
+    return frozenset(a.strip() for a in str(raw).split(",") if a.strip() in NAME_OF)
+
+
+def claimed_card(agent: str, now, environ=None) -> dict:
     """Public: who and when, in the bridge's words. Never a word of the owner's (module docstring; Aya's privacy
     hold on 922e8da). O3: the card goes up seconds after the ask and is titled "In the making"; WHAT is being made is
-    said by the agent's own card, in its own words, which replaces this one."""
+    said by the agent's own card, in its own words, which replaces this one. An agent with no wired worker (FIX 1)
+    gets an honest title instead: its ask waits in its inbox for a worker. The activity is the same either way, so
+    every later step (the wake check, the agent's own card, the done flip) reads it unchanged."""
     name = NAME_OF[agent]
+    if agent in wired(environ):
+        title = "In the making: %s's work from the room" % name
+        body = "Claimed in the room at %s. %s's card for this work follows here when it is done." % (eastern(now), name)
+    else:
+        title = "Waiting for a worker: %s's work from the room" % name
+        body = ("Claimed in the room at %s. No worker picks up %s's call asks yet; the ask waits in %s's inbox, "
+                "and %s's own card replaces this one when it is taken." % (eastern(now), name, name, name))
     return {"v": 1, "type": "note", "status": "claimed", "public": True, "version": 1, "ts": stamp(now),
-            "activity": "claimed in the room",
-            "title": "In the making: %s's work from the room" % name,
-            "body": "Claimed in the room at %s. %s's card for this work follows here when it is done." % (
-                eastern(now), name)}
+            "activity": "claimed in the room", "title": title, "body": body}
 
 
 def proposal_id(room: str, entry_id: str, agent: str) -> str:
@@ -1050,7 +1070,7 @@ class Bridge:
         if held is None:
             return False
         try:
-            return not str(json.loads(_text(held)).get("title", "")).startswith(WAITING_BEHIND)
+            return not str(json.loads(_text(held)).get("title", "")).startswith(WAITING_TITLES)
         except (TypeError, ValueError):
             return True                                   # an unreadable card blocks, as it always did
 
@@ -1091,6 +1111,10 @@ class Bridge:
                 self.conn.hset(partition % (self.canvas_room, agent), field,
                                json.dumps(unstarted_card(agent, asked, why, now)))
                 self.log.info("call bridge: %s %s", field, why.lower())
+            if self.bucket:
+                # FIX 5 (the owner's 8 PM call): a proposal retired after the call's window shut stayed a review
+                # card on the public page. The window is reopened for this one item, so the close is published.
+                self.open_if_shut(now, "%s/%s" % (agent, field))
         held = self._proposal(room)
         if held and held["entry"] == proposal["entry"]:
             left = [a for a in held["agents"] if a not in agents]
