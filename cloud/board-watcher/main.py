@@ -67,6 +67,12 @@ SEEN_CAP = 1000
 IDLE_MINUTES = int(os.environ.get("IDLE_MINUTES") or 30)
 IDLE_CAP = 100                      # open asks kept per agent
 NOT_AN_AGENT = frozenset({"all", "everyone", "owner", "abdus", ""})
+# Codex posts under several tags (chatgpt-codex-desktop, codex, CODEX-DESKTOP) and is asked as to=codex; without
+# this an answer under one tag never clears an ask to another, and Codex always reads idle (Grok N1 on 1c7c90da).
+# The same names cloud/inbox-wake ALIASES maps to Codex, except aya: Aya has no board tag of her own and a Codex row
+# is not her answer, so her asks stay hers.
+IDLE_ALIASES = {"codex": "chatgpt-codex-desktop", "codex-desktop": "chatgpt-codex-desktop",
+                "chatgpt-codex": "chatgpt-codex-desktop"}
 # Longer than the task timeout, so a tick killed mid-run cannot leave a lease
 # that expires while it is still starting jobs.
 LEASE = timedelta(seconds=int(os.environ.get("LEASE_SECONDS") or 120))
@@ -153,9 +159,13 @@ def _routes():
 
 def idle_asks(rows, held, now) -> tuple:
     """(open, report). `open`: {agent: [{"id", "asked_at"}]}, every ASK addressed to an agent that has posted no row
-    since it. `report`: {agent: [ids]} of those open longer than IDLE_MINUTES. Pure: no IO. Names are as rows write
-    them (to=, else the target column): an agent that answers under another tag stays open, a stated limit of a
-    report that never acts. A row seen twice adds its ask once.
+    since it. `report`: {agent: [ids]} of those open longer than IDLE_MINUTES. Pure: no IO. Names are folded to
+    lower case and through IDLE_ALIASES (to=, else the target column, and the source tag), so Codex answering under
+    any of its tags clears an ask to any of them. A row seen twice adds its ask once.
+
+    The held state is read defensively: it is the watcher's own file, but a hand edit must never stop the tick. A
+    held value that is not a {agent: [{"id", "asked_at"}]} shape is skipped piece by piece, and what is well formed
+    is kept.
 
     Times are compared as parsed instants at full precision, never as truncated text: a reply 0.8 s after an ask
     in the same second clears it. Tie rule: a row at exactly the ask's instant does not clear it, because which
@@ -164,12 +174,20 @@ def idle_asks(rows, held, now) -> tuple:
     import agent_waker as aw
     stamp = lambda ts: ts.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")   # noqa: E731
     asked = lambda item: aw.parse_ts(item.get("asked_at", ""))                       # noqa: E731
-    opened = {agent: [dict(i) for i in items] for agent, items in (held or {}).items()
-              if isinstance(items, list)}
+    name_of = lambda raw: (lambda n: IDLE_ALIASES.get(n, n))(str(raw).strip().lower())   # noqa: E731
+    opened = {}
+    for agent, held_items in (held.items() if isinstance(held, dict) else ()):
+        if not isinstance(held_items, list):
+            continue
+        items = opened.setdefault(name_of(agent), [])
+        for i in held_items:
+            if (isinstance(i, dict) and isinstance(i.get("id"), str) and i["id"]
+                    and not any(k["id"] == i["id"] for k in items)):
+                items.append({"id": i["id"], "asked_at": str(i.get("asked_at") or "")})
     timed = [(aw.parse_ts(r[aw.C_TS] if len(r) > aw.C_TS else ""), r) for r in rows if r]
     for ts, row in sorted(((t, r) for t, r in timed if t is not None), key=lambda pair: pair[0]):
         at = stamp(ts)
-        source = str(row[aw.C_SOURCE] if len(row) > aw.C_SOURCE else "").strip().lower()
+        source = name_of(row[aw.C_SOURCE] if len(row) > aw.C_SOURCE else "")
         if source in opened:
             opened[source] = [i for i in opened[source] if asked(i) is None or asked(i) >= ts]   # it spoke: not idle
         payload = str(row[aw.C_PAYLOAD] if len(row) > aw.C_PAYLOAD else "")
@@ -179,7 +197,7 @@ def idle_asks(rows, held, now) -> tuple:
         to = re.search(r"(?:^|\|)to=([^|]+)", payload)
         raw = to.group(1) if to else str(row[aw.C_TARGET] if len(row) > aw.C_TARGET else "")
         ask = aw.bcb_id(row)
-        for name in (n.strip().lower() for n in re.split(r"[;,]", raw)):
+        for name in (name_of(n) for n in re.split(r"[;,]", raw)):
             if name in NOT_AN_AGENT or name == source:
                 continue
             items = opened.setdefault(name, [])
@@ -338,7 +356,13 @@ def tick(store, read_since, routes, running, start, now=None) -> dict:
     wm = aw.parse_ts(state["watermark"])
     since = (wm - OVERLAP).strftime("%Y-%m-%dT%H:%M:%SZ")
     rows = read_since(since)
-    idle_open, idle = idle_asks(rows, state.get("idle_open"), now)    # reported, never acted on
+    # Reported, never acted on, so it must never stop the tick: if the report fails, the jobs still start, what was
+    # held is kept unchanged for the next tick, and the failure is named (its type only) in the state and the output.
+    try:
+        idle_open, idle = idle_asks(rows, state.get("idle_open"), now)
+        idle_error = ""
+    except Exception as e:  # noqa: BLE001
+        idle_open, idle, idle_error = state.get("idle_open") or {}, {}, type(e).__name__
     # Completion is read from each route's cursor, not from the fact that
     # an earlier tick managed to start the job. A capped pass that answered
     # three of four leaves the fourth pending, and the next tick starts
@@ -444,14 +468,14 @@ def tick(store, read_since, routes, running, start, now=None) -> dict:
     target = max(target, wm)  # never backwards
 
     new_state = {"watermark": target.strftime("%Y-%m-%dT%H:%M:%SZ"), "seen": new_seen,
-                 "pending": pending, "idle_open": idle_open, "idle": idle,
+                 "pending": pending, "idle_open": idle_open, "idle": idle, "idle_error": idle_error,
                  "last_tick": now.strftime("%Y-%m-%dT%H:%M:%SZ")}
     store.save(CURSOR, new_state, token)
     return {"ran": True, "since": since, "rows": len(rows), "new": len(fresh),
             "started": started, "skipped_running": skipped, "failed": failed,
             "routed": {job: [rid for _ts, rid, _wid in hits] for job, hits in wanted.items()},
             "route_errors": {rid: msgs for rid, (_, msgs) in errors.items()},
-            "idle": idle,
+            "idle": idle, "idle_error": idle_error,
             "watermark": new_state["watermark"]}
 
 

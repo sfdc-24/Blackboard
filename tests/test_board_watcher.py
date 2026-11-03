@@ -580,20 +580,20 @@ class NoIdleWaiting(unittest.TestCase):
     def test_an_ask_nobody_answered_for_longer_than_the_bound_is_reported(self):
         rows = [self.ask("A1", "2026-09-24T03:00:00Z")]
         opened, idle = w.idle_asks(rows, {}, NOW)                         # NOW is 04:00Z: an hour later
-        self.assertEqual({"codex": ["A1"], "aya": ["A1"]}, idle)
-        self.assertEqual({"codex", "aya"}, set(opened))
+        self.assertEqual({"chatgpt-codex-desktop": ["A1"], "aya": ["A1"]}, idle)
+        self.assertEqual({"chatgpt-codex-desktop", "aya"}, set(opened))
 
     def test_an_agent_that_posts_anything_after_the_ask_is_not_idle(self):
         rows = [self.ask("A1", "2026-09-24T03:00:00Z"), row("R2", "2026-09-24T03:10:00Z", source="codex",
                                                             target="claude-code-cli", payload="BCB|v=1|id=R2|phase=RESULT")]
         opened, idle = w.idle_asks(rows, {}, NOW)
         self.assertEqual({"aya": ["A1"]}, idle)
-        self.assertNotIn("codex", opened)
+        self.assertNotIn("chatgpt-codex-desktop", opened)
 
     def test_a_fresh_ask_is_open_but_not_yet_reported(self):
         opened, idle = w.idle_asks([self.ask("A1", "2026-09-24T03:45:00Z")], {}, NOW)
         self.assertEqual({}, idle)
-        self.assertEqual(["A1"], [i["id"] for i in opened["codex"]])
+        self.assertEqual(["A1"], [i["id"] for i in opened["chatgpt-codex-desktop"]])
 
     def test_only_asks_count_and_never_the_asker_the_owner_or_everyone(self):
         rows = [self.ask("D1", "2026-09-24T03:00:00Z", phase="RESULT"),
@@ -605,10 +605,10 @@ class NoIdleWaiting(unittest.TestCase):
     def test_what_was_open_carries_across_ticks_and_a_reread_row_adds_nothing(self):
         first, _ = w.idle_asks([self.ask("A1", "2026-09-24T03:00:00Z")], {}, NOW)
         again, idle = w.idle_asks([self.ask("A1", "2026-09-24T03:00:00Z")], first, NOW)
-        self.assertEqual(1, len(again["codex"]), "the overlap re-reads rows: the ask is added once")
-        self.assertEqual({"codex": ["A1"], "aya": ["A1"]}, idle)
+        self.assertEqual(1, len(again["chatgpt-codex-desktop"]), "the overlap re-reads rows: the ask is added once")
+        self.assertEqual({"chatgpt-codex-desktop": ["A1"], "aya": ["A1"]}, idle)
         later, idle = w.idle_asks([row("R9", "2026-09-24T03:59:00Z", source="aya", payload="BCB|v=1|id=R9")], again, NOW)
-        self.assertEqual({"codex": ["A1"]}, idle, "aya spoke on a later tick: cleared")
+        self.assertEqual({"chatgpt-codex-desktop": ["A1"]}, idle, "aya spoke on a later tick: cleared")
 
     def test_a_reply_later_in_the_same_second_clears_the_ask(self):
         # Codex HOLD on 52afe478: times cut to whole seconds kept this ask open, and later listed it as idle.
@@ -616,32 +616,32 @@ class NoIdleWaiting(unittest.TestCase):
                 row("R2", "2026-09-24T03:00:00.900Z", source="codex", payload="BCB|v=1|id=R2|phase=RESULT")]
         opened, idle = w.idle_asks(rows, {}, NOW)
         self.assertEqual({}, idle)
-        self.assertNotIn("codex", opened)
+        self.assertNotIn("chatgpt-codex-desktop", opened)
 
     def test_a_row_at_the_same_instant_as_the_ask_does_not_clear_it(self):
         # The tie rule: which came first cannot be known, so the ask stays listed.
         rows = [self.ask("A1", "2026-09-24T03:00:00.500Z", to="codex"),
                 row("R2", "2026-09-24T03:00:00.500Z", source="codex", payload="BCB|v=1|id=R2|phase=RESULT")]
-        self.assertEqual({"codex": ["A1"]}, w.idle_asks(rows, {}, NOW)[1])
+        self.assertEqual({"chatgpt-codex-desktop": ["A1"]}, w.idle_asks(rows, {}, NOW)[1])
 
     def test_a_reply_a_moment_before_the_ask_does_not_clear_it(self):
         rows = [row("R0", "2026-09-24T03:00:00.400Z", source="codex", payload="BCB|v=1|id=R0|phase=RESULT"),
                 self.ask("A1", "2026-09-24T03:00:00.500Z", to="codex")]
-        self.assertEqual({"codex": ["A1"]}, w.idle_asks(rows, {}, NOW)[1])
+        self.assertEqual({"chatgpt-codex-desktop": ["A1"]}, w.idle_asks(rows, {}, NOW)[1])
 
     def test_held_state_is_compared_as_instants_not_as_text(self):
         # A held ask written at whole seconds, and a reply half a second later: as text "...00Z" sorts after
         # "...00.5...Z" and the reply would never clear it.
-        held = {"codex": [{"id": "A1", "asked_at": "2026-09-24T03:00:00Z"}]}
+        held = {"chatgpt-codex-desktop": [{"id": "A1", "asked_at": "2026-09-24T03:00:00Z"}]}
         reply = [row("R2", "2026-09-24T03:00:00.500Z", source="codex", payload="BCB|v=1|id=R2|phase=RESULT")]
         opened, idle = w.idle_asks(reply, held, NOW)
         self.assertEqual({}, idle)
         self.assertEqual({}, opened)
 
     def test_an_ask_whose_time_does_not_parse_stays_listed(self):
-        held = {"codex": [{"id": "A1", "asked_at": "garbled"}]}
+        held = {"chatgpt-codex-desktop": [{"id": "A1", "asked_at": "garbled"}]}
         reply = [row("R2", "2026-09-24T03:10:00Z", source="codex", payload="BCB|v=1|id=R2|phase=RESULT")]
-        self.assertEqual({"codex": ["A1"]}, w.idle_asks(reply, held, NOW)[1])
+        self.assertEqual({"chatgpt-codex-desktop": ["A1"]}, w.idle_asks(reply, held, NOW)[1])
 
     def test_the_report_bound_is_exact(self):
         just = self.ask("A1", "2026-09-24T03:30:00.000001Z", to="codex")      # a microsecond inside the bound
@@ -671,6 +671,90 @@ class NoIdleWaiting(unittest.TestCase):
         for act in ("append", "post", "urlopen", "_call(", "start"):
             self.assertNotIn(act + "(", body.replace("items.append(", ""), "the report never acts: %s" % act)
 
+
+    # Grok HOLD H1 on 1c7c90da: a hand-edited idle_open made idle_asks raise inside tick, and no job started.
+    def test_a_malformed_held_state_is_skipped_piece_by_piece_and_never_raises(self):
+        good = {"id": "A9", "asked_at": "2026-09-24T03:00:00Z"}
+        for held in ("not a dict", ["A1"], 7, None,
+                     {"grok": ["A1"]}, {"grok": [None]}, {"grok": "A1"}, {"grok": None},
+                     {"grok": [{"id": 5}]}, {"grok": [{"asked_at": "2026-09-24T03:00:00Z"}]}, {"grok": [{"id": ""}]},
+                     {"grok": [{"id": "A1", "asked_at": 12345}]}):
+            with self.subTest(held=held):
+                opened, idle = w.idle_asks([], held, NOW)
+                bad_time = isinstance(held, dict) and held.get("grok") == [{"id": "A1", "asked_at": 12345}]
+                self.assertEqual({"grok": ["A1"]} if bad_time else {}, idle, "a time that is not text stays listed")
+        mixed = {"grok": [None, "A1", {"id": 5}, good, dict(good)], "codex": "junk"}
+        opened, idle = w.idle_asks([], mixed, NOW)
+        self.assertEqual({"grok": ["A9"]}, idle, "the well-formed ask is kept, once")
+        self.assertEqual([good], opened["grok"])
+
+    def test_a_malformed_held_state_never_stops_the_jobs(self):
+        for held in ({"grok": ["A1"]}, "not a dict", {"grok": [None]}):
+            with self.subTest(held=held):
+                store = MemStore({"watermark": "2026-09-24T03:40:00Z", "seen": [], "idle_open": held})
+                started = []
+                out = w.tick(store, read_since=lambda since: [row("R1", "2026-09-24T03:50:00Z")],
+                             routes=w._routes(), running=lambda job: False,
+                             start=lambda job: started.append(job) or "exec-1", now=NOW)
+                self.assertTrue(out["ran"])
+                self.assertEqual(["gemini-waker"], started)
+                self.assertEqual("", out["idle_error"])
+
+    def test_if_the_report_itself_fails_the_tick_goes_on_and_keeps_what_was_held(self):
+        from unittest.mock import patch
+        held = {"grok": [{"id": "A1", "asked_at": "2026-09-24T03:00:00Z"}]}
+        store = MemStore({"watermark": "2026-09-24T03:40:00Z", "seen": [], "idle_open": held})
+        started = []
+        with patch.object(w, "idle_asks", side_effect=RuntimeError("fixture")):
+            out = w.tick(store, read_since=lambda since: [row("R1", "2026-09-24T03:50:00Z")],
+                         routes=w._routes(), running=lambda job: False,
+                         start=lambda job: started.append(job) or "exec-1", now=NOW)
+        self.assertEqual(["gemini-waker"], started)
+        self.assertEqual({}, out["idle"])
+        self.assertEqual("RuntimeError", out["idle_error"])
+        self.assertEqual("RuntimeError", store.state["idle_error"])
+        self.assertEqual(held, store.state["idle_open"], "kept unchanged for the next tick")
+        self.assertEqual("2026-09-24T03:50:00Z", store.state["watermark"])
+
+    # Grok N1 on 1c7c90da: asked as to=codex, Codex answers as chatgpt-codex-desktop or CODEX-DESKTOP.
+    def test_codex_answering_under_any_of_its_tags_clears_an_ask_to_any_of_them(self):
+        for to in ("codex", "CODEX", "chatgpt-codex-desktop", "codex-desktop", "chatgpt-codex"):
+            for source in ("chatgpt-codex-desktop", "CODEX-DESKTOP", "codex", "Chatgpt-Codex"):
+                with self.subTest(to=to, source=source):
+                    rows = [self.ask("A1", "2026-09-24T03:00:00Z", to=to),
+                            row("R2", "2026-09-24T03:10:00Z", source=source, payload="BCB|v=1|id=R2|phase=RESULT")]
+                    opened, idle = w.idle_asks(rows, {}, NOW)
+                    self.assertEqual({}, idle)
+                    self.assertEqual({}, opened)
+
+    def test_an_ask_to_codex_still_open_is_reported_under_one_name(self):
+        rows = [self.ask("A1", "2026-09-24T03:00:00Z", to="codex;chatgpt-codex-desktop;CODEX-DESKTOP")]
+        opened, idle = w.idle_asks(rows, {"codex": [{"id": "A0", "asked_at": "2026-09-24T02:00:00Z"}]}, NOW)
+        self.assertEqual({"chatgpt-codex-desktop": ["A0", "A1"]}, idle, "held under an old name, merged, added once")
+
+    def test_a_codex_row_is_not_an_answer_from_aya(self):
+        rows = [self.ask("A1", "2026-09-24T03:00:00Z", to="aya"),
+                row("R2", "2026-09-24T03:10:00Z", source="chatgpt-codex-desktop", payload="BCB|v=1|id=R2|phase=RESULT")]
+        self.assertEqual({"aya": ["A1"]}, w.idle_asks(rows, {}, NOW)[1])
+
+    def test_case_is_folded_in_the_phase_the_names_and_the_source(self):
+        rows = [self.ask("A1", "2026-09-24T03:00:00Z", to="GROK;Gemini", phase="ask"),
+                self.ask("A2", "2026-09-24T03:00:00Z", to="grok", phase="Ask")]
+        self.assertEqual({"grok": ["A1", "A2"], "gemini": ["A1"]}, w.idle_asks(rows, {}, NOW)[1])
+        rows.append(row("R3", "2026-09-24T03:10:00Z", source="GROK", payload="BCB|v=1|id=R3|phase=RESULT"))
+        self.assertEqual({"gemini": ["A1"]}, w.idle_asks(rows, {}, NOW)[1])
+
+    def test_each_agent_keeps_at_most_the_newest_hundred_open_asks(self):
+        self.assertEqual(100, w.IDLE_CAP)
+        rows = [self.ask("A%03d" % i, "2026-09-24T02:%02d:%02dZ" % (i // 60, i % 60), to="grok") for i in range(101)]
+        opened, idle = w.idle_asks(rows, {}, NOW)
+        self.assertEqual(["A%03d" % i for i in range(1, 101)], [i["id"] for i in opened["grok"]])
+        self.assertEqual(100, len(idle["grok"]))
+        held = {"grok": opened["grok"]}
+        again, _ = w.idle_asks([self.ask("B1", "2026-09-24T03:00:00Z", to="grok")], held, NOW)
+        self.assertEqual(100, len(again["grok"]))
+        self.assertEqual("A002", again["grok"][0]["id"], "the oldest falls off first")
+        self.assertEqual("B1", again["grok"][-1]["id"])
 
 if __name__ == "__main__":
     unittest.main()
