@@ -1061,9 +1061,61 @@ class EndToEndThroughTheBoardWorker(unittest.TestCase):
         self.assertEqual(gov.WITHHELD, shown["value"][0]["text"])
         refused = {"ok": False, "op": "get", "key": "gov:callbridge:proposal:x", "refused": "no"}
         self.assertIs(refused, gov.board_safe(refused))
-        for key in ("v1:conf:r:check", "v1:conf:r:events:x", "gov:callbridge:task:call-1", "conf:briefing"):
+        for key in ("v1:conf:r:check", "v1:conf:r:retired", "gov:callbridge:task:call-1", "conf:briefing",
+                    "v1:confx:r:state", "fleet:v1:conf:r:state"):
             plain = {"ok": True, "op": "get", "key": key, "value": "v"}
             self.assertIs(plain, gov.board_safe(plain), key)
+
+    # Codex HOLD on 2ee91bba: a room-state read could show his agenda on the public board.
+    ROOM = "conf-0123456789abcdef-89abcdef"
+    AGENDA_TEXT = {"agenda_title": "Vans: " + WORDS, "agenda_current_text": WORDS,
+                   "agenda_items": '[{"lead":"grok","minutes":5,"status":"now","text":"%s"}]' % WORDS}
+    AGENDA_META = {"room_id": ROOM, "session_epoch": "e-1", "proj_count": "7", "kind": "agenda.updated",
+                   "agenda_state": "running", "agenda_items_total": "3", "agenda_items_done": "1",
+                   "agenda_current_index": "2", "agenda_ends_at": "1762180000", "agenda_digest": "ab" * 8,
+                   "closed": "1", "closed_epoch": "e-1"}
+
+    def test_the_rooms_state_on_the_board_keeps_where_the_call_is_and_never_its_agenda(self):
+        conn = FakeRedis()
+        conn.hset("v1:conf:%s:state" % self.ROOM, mapping=dict(self.AGENDA_META, **self.AGENDA_TEXT))
+        out, rows, _ = self.run_rows([self.row(
+            "claude-code-cli", "do=redis-op|op=hgetall|key=v1:conf:%s:state" % self.ROOM, req="REQ-ST-1")], conn)
+        body = rows[0]["payload"]
+        self.assertNotIn("sample queue flow", body)
+        self.assertNotIn("Vans", body)
+        self.assertIn(gov.WITHHELD, body)
+        for field in ("agenda_items_total", "agenda_current_index", "closed_epoch"):
+            self.assertIn(field, body, "where the call is stays readable")
+
+    def test_the_state_hash_shows_only_the_fields_it_names(self):
+        answer = {"ok": True, "op": "hgetall", "key": "v1:conf:%s:state" % self.ROOM, "fields": 99,
+                  "value": dict(self.AGENDA_META, **self.AGENDA_TEXT, some_field_added_later=self.WORDS)}
+        shown = gov.board_safe(answer)
+        self.assertEqual(self.WORDS, answer["value"]["agenda_current_text"], "the caller's dict is untouched")
+        for field in list(self.AGENDA_TEXT) + ["some_field_added_later"]:
+            self.assertEqual(gov.WITHHELD, shown["value"][field], field)
+        for field, value in self.AGENDA_META.items():
+            self.assertEqual(value, shown["value"][field], field)
+        self.assertEqual(99, shown["fields"])
+        for field in gov.STATE_SHOWN:
+            self.assertEqual("x", gov.board_safe(dict(answer, value={field: "x"}))["value"][field], field)
+        self.assertEqual(21, len(gov.STATE_SHOWN))
+        self.assertFalse({"agenda_title", "agenda_current_text", "agenda_items"} & gov.STATE_SHOWN)
+
+    def test_any_other_chair_key_is_withheld_whole(self):
+        for key, op, value in (("v1:conf:%s:state" % self.ROOM, "get", self.WORDS),
+                               ("v1:conf:%s:state" % self.ROOM, "hgetall", self.WORDS),
+                               ("v1:conf:%s:state:x" % self.ROOM, "hgetall", {"agenda_title": self.WORDS}),
+                               ("v1:conf:%s:events:x" % self.ROOM, "get", self.WORDS),
+                               ("v1:conf:%s:notes" % self.ROOM, "hgetall", {"text": self.WORDS}),
+                               ("v1:conf:index", "get", self.WORDS)):
+            with self.subTest(key=key, op=op):
+                shown = gov.board_safe({"ok": True, "op": op, "key": key, "value": value})
+                self.assertEqual(gov.WITHHELD, shown["value"])
+        stream = gov.board_safe({"ok": True, "op": "xrange", "key": "v1:conf:%s:notes" % self.ROOM,
+                                 "value": [{"id": "1-0", "fields": {"text": self.WORDS}}]})
+        self.assertEqual([{"id": "1-0", "withheld": gov.WITHHELD}], stream["value"], "a page keeps its ids")
+        self.assertIsNone(gov.board_safe({"ok": True, "op": "get", "key": "v1:conf:r:notes", "value": None})["value"])
 
     def test_a_protected_write_is_refused_on_the_board_and_in_the_audit(self):
         out, rows, conn = self.run_rows([self.row(
