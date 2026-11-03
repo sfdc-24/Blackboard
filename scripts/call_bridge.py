@@ -501,15 +501,22 @@ def wake_row(ask: str, agent: str, room: str, claimed_at) -> dict:
                 row_id, agent, safe(ask), safe(text))}
 
 
+# DO THE WORK (the owner, 2026-11-03 ~20:36Z, on the board as CLAUDE-CLI-VSEXT-OWNER-REPLY-20261103T2036Z-42: every
+# voice listens, processes, works in parallel and puts up cards; "EXECUTE FOR FUNCTIONALITY AND NOT HOLD BACK
+# EXECUTION"). The old line told every agent without the v6 helper to HOLD, so no card was ever made. It now
+# tells the agent to do the work and post through call-task; the helper stays the way to the exact input, and
+# an agent working from this preview says so on its card. Completion still needs call-task receipts.
 def inbox_text(ask: str, agent: str, room: str, said: str, now) -> str:
-    return ("CALL ASK %s from the owner, said in the conference room at %s (%s): %s -- Preview only: do not "
-            "reconstruct task input from this text. Use tools/cli_call_helper/call_ask.py, the reviewed v6 "
-            "private-input helper, for its bound agent "
-            "with a complete private --input-file; if that flow is unavailable, HOLD. Only verified call-task "
+    return ("CALL ASK %s from the owner, said in the conference room at %s (%s): %s -- Do the work now and put "
+            "up your card through call-task: op=status for this ask (its source_revision and rev), op=card with "
+            "your card (ask=%s and that source_revision), then op=complete with the card_hash. For the exact "
+            "task input use tools/cli_call_helper/call_ask.py, the reviewed private-input helper, for its bound "
+            "agent with a complete private --input-file; without it, work from this preview and say on your "
+            "card that you did. Only verified call-task "
             "card/complete receipts establish artifact acceptance and completion. A free RESULT board row "
             "(answers=%s) never completes this task; generic call-card writes are refused. Never post private "
             "task bytes to the board." % (
-                ask, eastern(now), stamp(now), said[:ASK_CHARS].replace("|", "/"), ask))
+                ask, eastern(now), stamp(now), said[:ASK_CHARS].replace("|", "/"), ask, ask))
 
 
 class Bridge:
