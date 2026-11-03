@@ -674,7 +674,7 @@ def handle(rows, conn, now=None, append=None, max_per_run=MAX_PER_RUN, clock=tim
                 # stale pass add a second row under this Row_ID.
                 if _mark_answering(conn, req):
                     append(row_for(RESULT_ACTION, req, (_call_summary(result, req) if req["action"] == "call-task"
-                                                       else redis_gov.summarise(result)),
+                                                       else redis_gov.summarise(redis_gov.board_safe(result))),
                                    ("%s %s %s" % ("OK" if result.get("ok") else "NOT DONE",
                                                   req.get("op") or "?", req.get("key") or "?"))[:100]))
                     _mark_answered(conn, req)

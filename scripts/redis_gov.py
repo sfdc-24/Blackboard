@@ -1583,6 +1583,58 @@ def _summarise_verify(result: dict) -> str:
                 (" error=%s" % result["error"]) if result.get("error") else ""))
 
 
+# THE OWNER'S CALL WORDS NEVER REACH THE PUBLIC BOARD (2026-11-02 23:06Z: a governed read of fleet:inbox:claude-code-cli
+# put a short call ask's exact words in a public RESULT row, through the call bridge's inbox preview). The board route
+# answers in public rows, so before it summarises a read it withholds every value that can hold his words: the room's
+# event stream and read-back key, the bridge's proposal, asked and pending records, and the text of an inbox entry the
+# call bridge wrote. Ids, counts and paging stay, so a cursor still moves. The direct route answers only its caller
+# and is unchanged. The full words stay where they were: Redis, read privately.
+#
+# THE CHAIR'S NAMESPACE FAILS CLOSED (Codex HOLD on 2ee91bba: a room-state read could show his agenda). The room's
+# state hash, v1:conf:<room>:state, carries the agenda's title, the current item's text and every item's text when the
+# chair runs with CONF_REDIS_TEXT=1 (conference chair/conf_chair/redis_state.py, agenda_progress). A list of what to
+# hide missed it, so v1:conf: is now the other way round: a key there is withheld whole unless it is one of
+# CONF_SHOWN, and the state hash shows only the STATE_SHOWN fields, by name; any other field, today's text fields or a
+# field added later, reads as WITHHELD. What stays is what a reader needs to know where a call is: epochs, counts,
+# item numbers and times, digests, and whether it closed.
+WITHHELD = "withheld on the public board: the owner's call words; read them by the private route"
+_PRIVATE_KEY = re.compile(r"^(?:v1:conf:[^:]+:(?:events|readback)"
+                          r"|gov:callbridge:(?:proposal|asked|pending):.+)$")
+CALL_BRIDGE_BY = "call-bridge"
+_CONF_KEY = re.compile(r"^v1:conf:[^:]+:(?P<tail>.+)$")
+CONF_SHOWN = frozenset({"check", "retired"})     # a Redis check's code, the retired epochs: no words in either
+STATE_SHOWN = frozenset({
+    "room_id", "updated_at", "proj_count", "session_epoch", "mode", "context_version", "board_revision",
+    "control_sequence", "kind", "history_gap", "closed", "closed_at", "closed_epoch", "retired_epochs",
+    "agenda_state", "agenda_items_total", "agenda_items_done", "agenda_current_index", "agenda_ends_at",
+    "agenda_started_at", "agenda_digest"})
+
+
+def board_safe(result: dict) -> dict:
+    """`result` as the PUBLIC board may show it (WITHHELD above). Never mutates the caller's dict."""
+    if not isinstance(result, dict) or not result.get("ok") or result.get("op") not in OPS_READ:
+        return result
+    key = str(result.get("key") or "")
+    value = result.get("value")
+    out = dict(result)
+    conf = _CONF_KEY.match(key) if key.startswith("v1:conf:") else None
+    if conf and conf.group("tail") == "state" and result["op"] == "hgetall" and isinstance(value, dict):
+        out["value"] = {field: (shown if field in STATE_SHOWN else WITHHELD) for field, shown in value.items()}
+        return out
+    if _PRIVATE_KEY.match(key) or (key.startswith("v1:conf:") and not (conf and conf.group("tail") in CONF_SHOWN)):
+        if result["op"] == "xrange" and isinstance(value, list):
+            out["value"] = [{"id": e.get("id"), "withheld": WITHHELD} if isinstance(e, dict) else WITHHELD
+                            for e in value]
+        else:
+            out["value"] = WITHHELD if value is not None else None
+        return out
+    if result["op"] == "xrange" and key.startswith("fleet:inbox:") and isinstance(value, list):
+        out["value"] = [dict(e, text=WITHHELD) if isinstance(e, dict) and e.get("by") == CALL_BRIDGE_BY else e
+                        for e in value]
+        return out
+    return result                                   # nothing of his here: the answer as it is
+
+
 def summarise(result: dict) -> str:
     """One line for a board RESULT row: pipe-free, newline-free, bounded."""
     if result.get("op") == VERIFY_OP:
