@@ -683,6 +683,8 @@ class NoIdleWaiting(unittest.TestCase):
                 opened, idle = w.idle_asks([], held, NOW)
                 bad_time = isinstance(held, dict) and held.get("grok") == [{"id": "A1", "asked_at": 12345}]
                 self.assertEqual({"grok": ["A1"]} if bad_time else {}, idle, "a time that is not text stays listed")
+                if bad_time:
+                    self.assertEqual([{"id": "A1", "asked_at": "12345"}], opened["grok"], "the state holds text")
         mixed = {"grok": [None, "A1", {"id": 5}, good, dict(good)], "codex": "junk"}
         opened, idle = w.idle_asks([], mixed, NOW)
         self.assertEqual({"grok": ["A9"]}, idle, "the well-formed ask is kept, once")
