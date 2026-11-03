@@ -369,7 +369,7 @@ def proposal_card(agent: str, asked_at, now) -> dict:
             "activity": PROPOSED,
             "title": "Say: %s, go ahead (asked %s)" % (name, eastern(asked_at)),
             "body": "Heard in the room at %s. It is read back on the call; nothing starts until the owner then says this name and go ahead within %d minutes. "
-                    "Cancel drops it; a newer ask waits behind it (A2)." % (eastern(asked_at), READBACK_SECONDS // 60)}
+                    "Cancel drops it; a newer ask waits behind it." % (eastern(asked_at), READBACK_SECONDS // 60)}
 
 
 def unstarted_card(agent: str, asked_at, why: str, now) -> dict:
@@ -963,9 +963,10 @@ class Bridge:
                 "spoken": spoken if isinstance(spoken, str) and spoken else None}
 
     def _keep(self, room, proposal) -> None:
-        """Write the room's open proposal and, for the chair, its read-back: v1:conf:<room>:readback, the exact
-        task and who it is for, under the proposal's read-back id. A changed recipient set is a new id, so the
-        chair reads it back again and an earlier readback.spoken no longer counts."""
+        """Write the room's open proposal and, for the chair, its read-back key: v1:conf:<room>:readback, the
+        read-back id, ask entry, recipient set and word bound, NEVER his words (contract v2: the named voice
+        heard him live and restates in its own words). A changed recipient set is a new id, so the chair reads
+        it back again and an earlier readback.spoken no longer counts."""
         rid = readback_id(room, proposal["entry"], proposal["agents"])
         record = {k: proposal[k] for k in ("entry", "said", "agents", "actor", "epoch")}
         if proposal.get("spoken") and proposal.get("rid") == rid:
@@ -1017,9 +1018,15 @@ class Bridge:
         elif older:
             if not _after(entry_id, older["entry"]):
                 return                                    # an older turn read late never replaces a newer one
-            # A2: the open proposal stands. The newer ask is refused visibly and claims nothing.
-            self._refuse(room, entry_id, agents, WAITING_BEHIND, now)
-            return
+            if _within(older["spoken"] or older["entry"], entry_id, READBACK_SECONDS):
+                # A2: the open proposal stands. The newer ask is refused visibly and claims nothing.
+                self._refuse(room, entry_id, agents, WAITING_BEHIND, now)
+                return
+            # The older proposal's window had already closed when this ask was said (Grok on PR 452, H2): with
+            # the cursor kept there is no replay, so waiting would lose this ask for good. The old one closes
+            # exactly as the sweep would close it, and this ask takes its place.
+            self._close(room, older, older["agents"], "Not started, no go-ahead in time" if older["spoken"]
+                        else "Not started, the read-back was not heard", now)
         asked = event_time(entry_id) or now
         self._keep(room, {"entry": entry_id, "said": said, "agents": joined, "actor": actor, "epoch": epoch})
         for agent in agents:

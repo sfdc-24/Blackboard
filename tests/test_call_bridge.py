@@ -1867,6 +1867,30 @@ class ReadBack(unittest.TestCase):
         turn(self.conn, "Codex, go ahead.", seconds_ago=2)
         self.assertEqual([cb.ask_id(ROOM, second, self.CODEX)], self.b().tick())
 
+    def test_a5_h2_an_expired_unheard_proposal_yields_to_the_newer_ask_with_the_cursor_kept(self):
+        """Grok on PR 452, H2: with the cursor kept there is no replay, so an ask that waited behind a proposal
+        whose window had already closed would be lost for good. The expired one closes; the newer one proposes."""
+        first = turn(self.conn, "Codex, draft the sample queue flow.", seconds_ago=300)
+        second = turn(self.conn, "Codex, draft the sample price table.", seconds_ago=30)
+        self.assertEqual([], self.b().tick())                            # ONE tick, both read, cursor kept
+        old = self.cards(self.CODEX)[cb.proposal_id(ROOM, first, self.CODEX)]
+        self.assertTrue(old["title"].startswith("Not started, the read-back was not heard"), old["title"])
+        got = self.cards(self.CODEX)[cb.proposal_id(ROOM, second, self.CODEX)]
+        self.assertEqual(("review", cb.PROPOSED), (got["status"], got["activity"]), "the newer ask took its place")
+        self.assertEqual(second, json.loads(self.conn.get(cb.PROPOSAL_KEY % ROOM))["entry"])
+        self.heard(second, [self.CODEX], 20)
+        turn(self.conn, "Codex, go ahead.", seconds_ago=10)
+        self.assertEqual([cb.ask_id(ROOM, second, self.CODEX)], self.b().tick())
+
+    def test_a5_h2_an_expired_heard_proposal_yields_too_and_says_no_go_ahead_in_time(self):
+        first = turn(self.conn, "Codex, draft the sample queue flow.", seconds_ago=300)
+        self.heard(first, [self.CODEX], 200)
+        second = turn(self.conn, "Codex, draft the sample price table.", seconds_ago=30)
+        self.assertEqual([], self.b().tick())
+        old = self.cards(self.CODEX)[cb.proposal_id(ROOM, first, self.CODEX)]
+        self.assertTrue(old["title"].startswith("Not started, no go-ahead in time"), old["title"])
+        self.assertEqual(second, json.loads(self.conn.get(cb.PROPOSAL_KEY % ROOM))["entry"])
+
     def test_a5_an_unreadable_card_still_blocks_a_replayed_proposal(self):
         """Only a WAITING card yields to the replay; a card that cannot be read blocks, as it always did."""
         entry = turn(self.conn, "Codex, draft the sample queue flow.", seconds_ago=60)
