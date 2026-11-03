@@ -1848,6 +1848,32 @@ class ReadBack(unittest.TestCase):
         self.b(now=NOW + datetime.timedelta(seconds=30)).tick()         # a later tick must not rewrite them
         self.assertEqual(before, self.cards(self.CODEX))
 
+    def test_a5_a_waiting_ask_gets_its_turn_after_a_restart_once_the_earlier_one_is_gone(self):
+        """Grok on PR 452: a bridge restart or backlog replay must not lose the queued ask. Its waiting card
+        does not block the replayed proposal once the earlier ask is closed."""
+        turn(self.conn, "Codex, draft the sample queue flow.", seconds_ago=170)
+        second = turn(self.conn, "Codex, draft the sample price table.", seconds_ago=60)
+        self.b(now=NOW - datetime.timedelta(seconds=55)).tick()         # first proposed, second waits behind it
+        field = cb.proposal_id(ROOM, second, self.CODEX)
+        self.assertTrue(self.cards(self.CODEX)[field]["title"].startswith(cb.WAITING_BEHIND))
+        self.b().tick()                                                 # the first ask expires unheard
+        self.assertIsNone(self.conn.get(cb.PROPOSAL_KEY % ROOM))
+        self.conn.store.pop(cb.CURSOR_KEY % ROOM)                       # a restart: the cursor is gone
+        self.b().tick()
+        got = self.cards(self.CODEX)[field]
+        self.assertEqual(("review", cb.PROPOSED), (got["status"], got["activity"]), "its turn now")
+        self.assertEqual(second, json.loads(self.conn.get(cb.PROPOSAL_KEY % ROOM))["entry"])
+        self.heard(second, [self.CODEX], 5)
+        turn(self.conn, "Codex, go ahead.", seconds_ago=2)
+        self.assertEqual([cb.ask_id(ROOM, second, self.CODEX)], self.b().tick())
+
+    def test_a5_the_proposal_card_says_a_newer_ask_waits_and_never_that_it_drops(self):
+        """Grok on PR 452: the card still said a newer ask drops the waiting one."""
+        card = cb.proposal_card(self.CODEX, NOW, NOW)
+        self.assertIn("a newer ask waits behind it", card["body"])
+        for stale in ("drops it. ", "newer ask drops", "Replaced"):
+            self.assertNotIn(stale, card["title"] + " " + card["body"].replace("Cancel drops it;", ""), stale)
+
     def test_b1_a_turn_at_the_word_bound_still_proposes(self):
         words = "Codex, draft " + " ".join(["sample"] * (cb.ASK_MAX_WORDS - 2)) + "."
         self.assertEqual(cb.ASK_MAX_WORDS, len(words.split()))

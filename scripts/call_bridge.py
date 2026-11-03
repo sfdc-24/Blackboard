@@ -143,8 +143,9 @@ FLOOR_FRESH_SECONDS = 3 * 60  # an unnamed task ask goes to the floor holder onl
 # READ-BACK (the owner's order 2026-11-02, "go ahead and build the on-call read-back"; contract v1, sha256 d494097d):
 # a turn that asks a voice for work no longer claims. It PROPOSES: a public card in status review, who and when only,
 # titled with the phrase that starts it. His go-ahead within READBACK_SECONDS of the ask (both stream ids, the same
-# Redis clock) CONFIRMS it through the existing claim path, under the same ask id. A cancellation, the window running
-# out, or a newer ask closes it visibly and claims nothing. A voice's own "I can't" still claims at once.
+# Redis clock) CONFIRMS it through the existing claim path, under the same ask id. A cancellation or the window
+# running out closes it visibly and claims nothing; a newer ask WAITS behind it (A2). A voice's own "I can't"
+# only joins or proposes.
 # CALL_BRIDGE_READBACK=off is the rollback switch, and it FAILS CLOSED (Codex's review of row 9443, F1): nothing
 # said on a call starts anything, and an open proposal closes as "Not started, the read-back is off". The
 # environment never brings back claiming at once: READBACK is the code's own setting, pinned False only by tests.
@@ -368,7 +369,7 @@ def proposal_card(agent: str, asked_at, now) -> dict:
             "activity": PROPOSED,
             "title": "Say: %s, go ahead (asked %s)" % (name, eastern(asked_at)),
             "body": "Heard in the room at %s. It is read back on the call; nothing starts until the owner then says this name and go ahead within %d minutes. "
-                    "Cancel or a newer ask drops it." % (eastern(asked_at), READBACK_SECONDS // 60)}
+                    "Cancel drops it; a newer ask waits behind it (A2)." % (eastern(asked_at), READBACK_SECONDS // 60)}
 
 
 def unstarted_card(agent: str, asked_at, why: str, now) -> dict:
@@ -1006,7 +1007,7 @@ class Bridge:
             return
         if not actor or actor == "chair" or not epoch:
             return
-        if any(self.conn.hget(partition % (self.canvas_room, agent), proposal_id(room, entry_id, agent)) is not None
+        if any(self._card_blocks(partition % (self.canvas_room, agent), proposal_id(room, entry_id, agent))
                or self._claimed(room, entry_id, agent) for agent in agents):
             return
         older = self._proposal(room)
@@ -1027,6 +1028,17 @@ class Bridge:
             if self.bucket:
                 self.open_if_shut(now, "%s/%s" % (agent, field))
             self.log.info("call bridge: %s proposed for %s, waiting for a go-ahead", field, agent)
+
+    def _card_blocks(self, key, field) -> bool:
+        """A card at this field blocks a new proposal, EXCEPT a waiting-behind card (Grok on PR 452: a restart
+        or backlog replay must still give the queued ask its turn once the earlier proposal is gone)."""
+        held = self.conn.hget(key, field)
+        if held is None:
+            return False
+        try:
+            return not str(json.loads(_text(held)).get("title", "")).startswith(WAITING_BEHIND)
+        except (TypeError, ValueError):
+            return True                                   # an unreadable card blocks, as it always did
 
     def _refuse(self, room, entry_id, agents, why, now) -> None:
         """A visible card for an ask that never becomes a proposal (too long, or one is already waiting).
