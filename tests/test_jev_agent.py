@@ -53,6 +53,19 @@ class TheSpec(unittest.TestCase):
         self.assertLessEqual(len(q.get("context", "")), jev_agent.CONTEXT_CHARS)
 
 
+class TheWakerPrompt(unittest.TestCase):
+    def test_only_the_row_is_parsed_and_sent_never_the_doctrine(self):
+        cfg = agent_waker.AGENTS["jev"]
+        row = "BCB|v=1|id=X|phase=ASK|to=jev|text=jev:yesno: is the CI green?"
+        prompt = (cfg["doctrine"] + "\n\nThis board row is addressed to you by grok"
+                  + ". Answer it.\n\n---\n" + row + "\n---")
+        self.assertIn("jev:choice:(a; b; c)", cfg["doctrine"], "the trap this test guards")
+        self.assertEqual(row, jev_agent.row_text(prompt))
+        q, found = jev_agent.parse_spec(jev_agent.row_text(prompt))
+        self.assertEqual((True, "yesno", "is the CI green?"), (found, q["type"], q["question"]))
+        self.assertNotIn("TypeSafe", q["context"])
+
+
 class TheCall(unittest.TestCase):
     def setUp(self):
         self.env = mock.patch.dict("os.environ", {"JEV_API_KEY": "k-test"})

@@ -86,7 +86,7 @@ import state_store  # noqa: E402
 # allowance and reserved for his exclusive use, "not for typical work;
 # everyone else should be servicing that".
 # foundry dropped by Mr Salam the same day; see cloud/board-watcher/main.py.
-AGENTS = ("gemini", "claude-api")
+AGENTS = ("gemini", "claude-api", "jev")
 AGENT = (os.environ.get("AGENT") or "gemini").strip()
 CURSOR = os.environ.get("CURSOR_NAME") or "%s_waker" % AGENT.replace("-", "_")
 # Longer than a model call. A lease shorter than the work would let the next

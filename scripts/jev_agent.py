@@ -87,6 +87,22 @@ def _band_label(band):
     return str(low) if low == high else "%d to %d" % (low, high)
 
 
+def row_text(prompt):
+    """Only the board row out of a waker prompt. agent_waker wraps the row as
+    doctrine + a newline-dashes-newline marker + row + a newline-dashes marker. The doctrine
+    itself quotes the spec syntax (jev:choice:(a; b; c):), so parsing the whole prompt
+    would answer the doctrine's example instead of the row, and would send prose that is
+    not board data to TypeSafe. A bare string (the CLI's say) is its own row."""
+    text = str(prompt or "")
+    marker = "\n---\n"
+    start = text.find(marker)
+    if start < 0:
+        return text
+    body = text[start + len(marker):]
+    end = body.rfind("\n---")
+    return body[:end] if end >= 0 else body
+
+
 def parse_spec(text):
     """(question dict, found spec?) from a request's text. The whole capped text is the
     state Jev reads; the question is what follows the spec."""
@@ -154,7 +170,7 @@ def ask(prompt, model=None):
     key = _key()
     if not key:
         return None, "no JEV_API_KEY in the environment or .env"
-    question, had_spec = parse_spec(prompt)
+    question, had_spec = parse_spec(row_text(prompt))
     body = {"model": model or MODEL, "state": question.get("context") or question["question"],
             "questions": {"q": wire_question(question)}}
     request = urllib.request.Request(
