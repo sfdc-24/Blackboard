@@ -569,5 +569,65 @@ class ProjectAliasSafety(ExecutionStateSafety):
                     w.job_running("gemini-waker", "fake")
 
 
+class NoIdleWaiting(unittest.TestCase):
+    """The owner, 2026-11-03 (docs/REDIS-ORCHESTRATION-V1-GEMINI.md, rule 5): an agent may not simply wait. The
+    watcher REPORTS who has an ASK addressed to it and has posted nothing since; it never posts or acts on it."""
+
+    def ask(self, rid, ts, source="claude-code-cli", to="codex;aya", phase="ASK", ask_id=None):
+        return row(rid, ts, source=source, target=to,
+                   payload="BCB|v=1|id=%s|phase=%s|to=%s|text=please review" % (ask_id or rid, phase, to.replace(";", ",")))
+
+    def test_an_ask_nobody_answered_for_longer_than_the_bound_is_reported(self):
+        rows = [self.ask("A1", "2026-09-24T03:00:00Z")]
+        opened, idle = w.idle_asks(rows, {}, NOW)                         # NOW is 04:00Z: an hour later
+        self.assertEqual({"codex": ["A1"], "aya": ["A1"]}, idle)
+        self.assertEqual({"codex", "aya"}, set(opened))
+
+    def test_an_agent_that_posts_anything_after_the_ask_is_not_idle(self):
+        rows = [self.ask("A1", "2026-09-24T03:00:00Z"), row("R2", "2026-09-24T03:10:00Z", source="codex",
+                                                            target="claude-code-cli", payload="BCB|v=1|id=R2|phase=RESULT")]
+        opened, idle = w.idle_asks(rows, {}, NOW)
+        self.assertEqual({"aya": ["A1"]}, idle)
+        self.assertNotIn("codex", opened)
+
+    def test_a_fresh_ask_is_open_but_not_yet_reported(self):
+        opened, idle = w.idle_asks([self.ask("A1", "2026-09-24T03:45:00Z")], {}, NOW)
+        self.assertEqual({}, idle)
+        self.assertEqual(["A1"], [i["id"] for i in opened["codex"]])
+
+    def test_only_asks_count_and_never_the_asker_the_owner_or_everyone(self):
+        rows = [self.ask("D1", "2026-09-24T03:00:00Z", phase="RESULT"),
+                self.ask("A2", "2026-09-24T03:00:00Z", to="claude-code-cli;owner;ALL;everyone")]
+        opened, idle = w.idle_asks(rows, {}, NOW)
+        self.assertEqual({}, idle)
+        self.assertEqual({}, opened)
+
+    def test_what_was_open_carries_across_ticks_and_a_reread_row_adds_nothing(self):
+        first, _ = w.idle_asks([self.ask("A1", "2026-09-24T03:00:00Z")], {}, NOW)
+        again, idle = w.idle_asks([self.ask("A1", "2026-09-24T03:00:00Z")], first, NOW)
+        self.assertEqual(1, len(again["codex"]), "the overlap re-reads rows: the ask is added once")
+        self.assertEqual({"codex": ["A1"], "aya": ["A1"]}, idle)
+        later, idle = w.idle_asks([row("R9", "2026-09-24T03:59:00Z", source="aya", payload="BCB|v=1|id=R9")], again, NOW)
+        self.assertEqual({"codex": ["A1"]}, idle, "aya spoke on a later tick: cleared")
+
+    def test_the_target_column_names_the_agents_when_the_payload_has_no_to(self):
+        bare = row("A3", "2026-09-24T03:00:00Z", target="grok", payload="BCB|v=1|id=A3|phase=ASK|text=x")
+        self.assertEqual({"grok": ["A3"]}, w.idle_asks([bare], {}, NOW)[1])
+
+    def test_the_tick_keeps_the_report_in_its_own_state_and_posts_nothing(self):
+        store = MemStore({"watermark": "2026-09-24T02:50:00Z", "seen": []})
+        started = []
+        out = w.tick(store, read_since=lambda since: [self.ask("A1", "2026-09-24T03:00:00Z", to="grok")],
+                     routes={}, running=lambda job: False, start=lambda job: started.append(job) or "x", now=NOW)
+        self.assertEqual({"grok": ["A1"]}, out["idle"])
+        self.assertEqual({"grok": ["A1"]}, store.state["idle"])
+        self.assertEqual(["A1"], [i["id"] for i in store.state["idle_open"]["grok"]])
+        self.assertEqual([], started, "the report starts nothing")
+        source = (REPO / "cloud" / "board-watcher" / "main.py").read_text(encoding="utf-8")
+        body = source[source.index("def idle_asks("):source.index("def plan(")]
+        for act in ("append", "post", "urlopen", "_call(", "start"):
+            self.assertNotIn(act + "(", body.replace("items.append(", ""), "the report never acts: %s" % act)
+
+
 if __name__ == "__main__":
     unittest.main()

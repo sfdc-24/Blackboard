@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import uuid
 import urllib.error
@@ -60,6 +61,12 @@ PROJECT = os.environ.get("RUN_PROJECT") or "sfdc24"
 REGION = os.environ.get("RUN_REGION") or "us-central1"
 OVERLAP = timedelta(minutes=int(os.environ.get("OVERLAP_MINUTES") or 10))
 SEEN_CAP = 1000
+# NO IDLE WAITING (the owner, 2026-11-03; Gemini's docs/REDIS-ORCHESTRATION-V1-GEMINI.md, rule 5): an agent may not
+# simply wait. The watcher REPORTS who has an ASK addressed to it and has posted nothing since, for longer than
+# IDLE_MINUTES, in its own state ("idle"); it never posts or acts on it, as it never sends anything.
+IDLE_MINUTES = int(os.environ.get("IDLE_MINUTES") or 30)
+IDLE_CAP = 100                      # open asks kept per agent
+NOT_AN_AGENT = frozenset({"all", "everyone", "owner", "abdus", ""})
 # Longer than the task timeout, so a tick killed mid-run cannot leave a lease
 # that expires while it is still starting jobs.
 LEASE = timedelta(seconds=int(os.environ.get("LEASE_SECONDS") or 120))
@@ -142,6 +149,41 @@ def _routes():
         "claude-api-waker": for_agent("claude-api"),
         "wa-outbox": lambda row: ob.parse_wa_request(row) is not None,
     }
+
+
+def idle_asks(rows, held, now) -> tuple:
+    """(open, report). `open`: {agent: [{"id", "asked_at"}]}, every ASK addressed to an agent that has posted no row
+    since it. `report`: {agent: [ids]} of those open longer than IDLE_MINUTES. Pure: no IO. Names are as rows write
+    them (to=, else the target column): an agent that answers under another tag stays open, a stated limit of a
+    report that never acts. A row seen twice adds its ask once."""
+    import agent_waker as aw
+    stamp = lambda ts: ts.strftime("%Y-%m-%dT%H:%M:%SZ")             # noqa: E731
+    opened = {agent: [dict(i) for i in items] for agent, items in (held or {}).items()
+              if isinstance(items, list)}
+    timed = [(aw.parse_ts(r[aw.C_TS] if len(r) > aw.C_TS else ""), r) for r in rows if r]
+    for ts, row in sorted(((t, r) for t, r in timed if t is not None), key=lambda pair: pair[0]):
+        at = stamp(ts)
+        source = str(row[aw.C_SOURCE] if len(row) > aw.C_SOURCE else "").strip().lower()
+        if source in opened:
+            opened[source] = [i for i in opened[source] if i.get("asked_at", "") >= at]   # it spoke: not idle
+        payload = str(row[aw.C_PAYLOAD] if len(row) > aw.C_PAYLOAD else "")
+        phase = re.search(r"(?:^|\|)phase=([A-Za-z_]+)", payload)
+        if not phase or phase.group(1).upper() != "ASK":
+            continue
+        to = re.search(r"(?:^|\|)to=([^|]+)", payload)
+        raw = to.group(1) if to else str(row[aw.C_TARGET] if len(row) > aw.C_TARGET else "")
+        ask = aw.bcb_id(row)
+        for name in (n.strip().lower() for n in re.split(r"[;,]", raw)):
+            if name in NOT_AN_AGENT or name == source:
+                continue
+            items = opened.setdefault(name, [])
+            if not any(i.get("id") == ask for i in items):
+                items.append({"id": ask, "asked_at": at})
+            opened[name] = items[-IDLE_CAP:]
+    opened = {agent: items for agent, items in opened.items() if items}
+    cutoff = stamp(now - timedelta(minutes=IDLE_MINUTES))
+    report = {agent: [i["id"] for i in items if i.get("asked_at", "") < cutoff] for agent, items in opened.items()}
+    return opened, {agent: ids for agent, ids in report.items() if ids}
 
 
 def plan(rows, seen, routes):
@@ -289,6 +331,7 @@ def tick(store, read_since, routes, running, start, now=None) -> dict:
     wm = aw.parse_ts(state["watermark"])
     since = (wm - OVERLAP).strftime("%Y-%m-%dT%H:%M:%SZ")
     rows = read_since(since)
+    idle_open, idle = idle_asks(rows, state.get("idle_open"), now)    # reported, never acted on
     # Completion is read from each route's cursor, not from the fact that
     # an earlier tick managed to start the job. A capped pass that answered
     # three of four leaves the fourth pending, and the next tick starts
@@ -394,13 +437,14 @@ def tick(store, read_since, routes, running, start, now=None) -> dict:
     target = max(target, wm)  # never backwards
 
     new_state = {"watermark": target.strftime("%Y-%m-%dT%H:%M:%SZ"), "seen": new_seen,
-                 "pending": pending,
+                 "pending": pending, "idle_open": idle_open, "idle": idle,
                  "last_tick": now.strftime("%Y-%m-%dT%H:%M:%SZ")}
     store.save(CURSOR, new_state, token)
     return {"ran": True, "since": since, "rows": len(rows), "new": len(fresh),
             "started": started, "skipped_running": skipped, "failed": failed,
             "routed": {job: [rid for _ts, rid, _wid in hits] for job, hits in wanted.items()},
             "route_errors": {rid: msgs for rid, (_, msgs) in errors.items()},
+            "idle": idle,
             "watermark": new_state["watermark"]}
 
 
