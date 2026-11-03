@@ -180,6 +180,11 @@ NO_WAKE = "agent did not wake"
 # The room's voices, by the chair's persona ids, and the fleet agent each one's work goes to: the canonical ids of
 # fleet:inbox (cloud/drive-intake ALIASES, agreed 2026-10-09) and of the canvas slots (canvas_publish.AGENTS).
 AGENT_OF = {"grok": "grok", "claude": "claude-code-cli", "codex": "chatgpt-codex-desktop", "gemini": "gemini"}
+# The chair's persona id for each fleet agent: the read-back key names voices as the CHAIR knows them (contract v2;
+# Codex on PR 452 R4: the key carried fleet ids, claude-code-cli and chatgpt-codex-desktop, the chair's personas
+# are claude and codex). The one inverse of AGENT_OF, checked whole at import.
+PERSONA_OF = {agent: persona for persona, agent in AGENT_OF.items()}
+assert len(PERSONA_OF) == len(AGENT_OF), "AGENT_OF must be one-to-one"
 NAME_OF = {"grok": "Grok", "claude-code-cli": "Claude", "chatgpt-codex-desktop": "Codex", "gemini": "Gemini"}
 # The board tags each agent posts its answers under (the board's tags, scripts/agent_roster.json and the aliases).
 ANSWERS_FROM = {
@@ -982,7 +987,7 @@ class Bridge:
         if left <= 0:
             return
         self.conn.hset(READBACK_KEY % room, mapping={"id": rid, "entry": proposal["entry"],
-                                                     "agents": ",".join(proposal["agents"]),
+                                                     "agents": ",".join(PERSONA_OF[a] for a in proposal["agents"]),
                                                      "max_words": str(READBACK_MAX_WORDS)})
         self.conn.expire(READBACK_KEY % room, int(left))
 

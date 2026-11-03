@@ -1940,6 +1940,19 @@ class ReadBack(unittest.TestCase):
         self.assertEqual([], self.b().tick())
         self.assertIsNotNone(self.conn.get(cb.PROPOSAL_KEY % ROOM))
 
+    def test_b3_the_key_names_voices_by_the_chairs_persona_ids_for_every_agent(self):
+        """Codex on PR 452 R4: the key carried fleet ids; the chair matches persona ids (claude, codex, ...)."""
+        self.assertEqual({"grok": "grok", "claude-code-cli": "claude", "chatgpt-codex-desktop": "codex",
+                          "gemini": "gemini"}, cb.PERSONA_OF)
+        for agent, persona in cb.PERSONA_OF.items():
+            self.assertEqual(agent, cb.AGENT_OF[persona], "the exact inverse")
+        entry = turn(self.conn, "Claude and Codex, compare the two sample plans.", seconds_ago=60)
+        self.b().tick()
+        held = self.conn.hgetall(cb.READBACK_KEY % ROOM)
+        self.assertEqual("claude,codex", held["agents"])
+        self.assertEqual(cb.readback_id(ROOM, entry, ["claude-code-cli", self.CODEX]), held["id"],
+                         "the id still binds the bridge's own recipient set")
+
     def test_b3_the_key_names_every_voice_of_the_recipient_set_in_order(self):
         entry = turn(self.conn, "Grok and Gemini, compare the two sample plans.", seconds_ago=60)
         self.b().tick()
@@ -2069,7 +2082,7 @@ class ReadBack(unittest.TestCase):
         self.b().tick()
         held = self.conn.hgetall(cb.READBACK_KEY % ROOM)
         self.assertEqual({"id": cb.readback_id(ROOM, entry, [self.CODEX]), "entry": entry,
-                          "agents": self.CODEX, "max_words": "60"}, held)
+                          "agents": "codex", "max_words": "60"}, held)           # the chair's persona id
         self.assertTrue((cb.READBACK_KEY % ROOM).startswith("v1:conf:%s:" % ROOM))   # the room's own key
         self.assertEqual(cb.READBACK_SECONDS - 60, self.conn.ttls[cb.READBACK_KEY % ROOM])   # F4
         self.assertNotIn("sample queue", json.dumps(cp.snapshot(self.conn, "workshop", NOW)))
