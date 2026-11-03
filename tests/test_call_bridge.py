@@ -1661,18 +1661,30 @@ class ReadBack(unittest.TestCase):
         self.assertTrue(got["title"].startswith("Cancelled"))
         self.assertEqual([], self.inbox(self.CODEX))
 
-    def test_a5_a_newer_ask_replaces_the_older_and_only_it_is_confirmed(self):
+    def test_a5_a_pending_ask_is_never_replaced_and_the_newer_one_says_it_waits(self):
+        """A2 (the owner, 2026-11-02): three replacements on his call meant no read-back ever finished."""
         first = turn(self.conn, "Codex, draft the sample queue flow.", seconds_ago=80)
         second = turn(self.conn, "Codex, draft the sample price table.", seconds_ago=60)
-        self.heard(second, [self.CODEX], 40)
+        self.heard(first, [self.CODEX], 40)
         turn(self.conn, "Codex, go ahead.", seconds_ago=20)
-        self.assertEqual([cb.ask_id(ROOM, second, self.CODEX)], self.b().tick())
-        old = self.cards(self.CODEX)[cb.proposal_id(ROOM, first, self.CODEX)]
-        self.assertEqual("done", old["status"])
-        self.assertTrue(old["title"].startswith("Replaced by a newer ask"))
+        self.assertEqual([cb.ask_id(ROOM, first, self.CODEX)], self.b().tick(), "the FIRST ask is the open one")
+        held = self.cards(self.CODEX)[cb.proposal_id(ROOM, second, self.CODEX)]
+        self.assertEqual(("done", cb.NOT_STARTED), (held["status"], held["activity"]))
+        self.assertTrue(held["title"].startswith(cb.WAITING_BEHIND))
         [(_, sent)] = self.inbox(self.CODEX)
-        self.assertIn("price table", sent["text"])
-        self.assertNotIn("queue flow", sent["text"])
+        self.assertIn("queue flow", sent["text"])
+        self.assertNotIn("price table", sent["text"])
+        self.assertIsNone(self.conn.get(cb.PROPOSAL_KEY % ROOM), "confirmed and closed")
+
+    def test_a5_the_waiting_card_is_written_once_however_often_the_turn_is_read(self):
+        turn(self.conn, "Codex, draft the sample queue flow.", seconds_ago=80)
+        second = turn(self.conn, "Codex, draft the sample price table.", seconds_ago=60)
+        self.b().tick()
+        field = cb.proposal_id(ROOM, second, self.CODEX)
+        before = self.cards(self.CODEX)[field]
+        self.conn.store.pop(cb.CURSOR_KEY % ROOM)                       # a lost cursor replays both turns
+        self.b(now=NOW + datetime.timedelta(seconds=30)).tick()         # a later tick must not rewrite it
+        self.assertEqual(before, self.cards(self.CODEX)[field])
 
     def test_a6_a_go_ahead_naming_a_voice_outside_the_proposal_claims_nothing(self):
         entry = turn(self.conn, "Grok, list the sample risks.", seconds_ago=60)
@@ -1789,6 +1801,164 @@ class ReadBack(unittest.TestCase):
         turn(self.conn, "Codex, go ahead.", seconds_ago=30)                               # a duplicate
         self.assertEqual([cb.ask_id(ROOM, entry, self.CODEX)], self.b().tick())
         self.assertEqual(1, len(self.inbox(self.CODEX)))
+
+    def granted(self, persona, turn_id, seconds_ago):
+        return turn(self.conn, None, reason="", actor=persona, seconds_ago=seconds_ago, kind="floor.granted",
+                    turn_id=turn_id)
+
+    def test_a2_an_unnamed_task_turn_is_never_assigned_to_the_floor_holder(self):
+        """A2 (the owner, 2026-11-02): his 36-char aside to the floor holder became tonight's claimed card."""
+        self.granted("grok", "t-1", seconds_ago=40)
+        turn(self.conn, "Draft the sample queue flow now please.", reason="continuity", seconds_ago=30, turn_id="t-1")
+        turn(self.conn, "That is a fine sample thought.", reason="continuity", seconds_ago=20, turn_id="t-1")
+        self.assertEqual([], self.b().tick())
+        self.assertEqual({}, self.cards("grok"))
+        self.assertIsNone(self.conn.get(cb.PROPOSAL_KEY % ROOM))
+        self.assertEqual({}, self.conn.hgetall(cb.READBACK_KEY % ROOM))
+
+    def test_a3_an_early_go_ahead_keeps_the_ask_open_for_the_one_after_the_read_back(self):
+        """A3 (the owner, 2026-11-02): his go-ahead before the read-back was dropped and the ask then expired."""
+        entry = turn(self.conn, "Codex, draft the sample queue flow.", seconds_ago=60)
+        turn(self.conn, "Codex, go ahead.", seconds_ago=50)              # before the read-back
+        self.assertEqual([], self.b().tick())
+        self.assertEqual("review", self.cards(self.CODEX)[cb.proposal_id(ROOM, entry, self.CODEX)]["status"])
+        self.assertIsNotNone(self.conn.get(cb.PROPOSAL_KEY % ROOM), "still open")
+        self.heard(entry, [self.CODEX], 30)
+        turn(self.conn, "Codex, go ahead.", seconds_ago=10)
+        self.assertEqual([cb.ask_id(ROOM, entry, self.CODEX)], self.b().tick())
+
+    def test_b1_a_long_turn_never_becomes_a_read_back_and_the_card_asks_for_a_restatement(self):
+        """B1 (the owner, 2026-11-02): a 1058-char capture was recited for 63 seconds on his call."""
+        words = "Codex, draft " + " ".join(["sample"] * (cb.ASK_MAX_WORDS - 1)) + "."
+        entry = turn(self.conn, words, seconds_ago=60)
+        self.assertEqual([], self.b().tick())
+        card = self.cards(self.CODEX)[cb.proposal_id(ROOM, entry, self.CODEX)]
+        self.assertEqual(("done", cb.NOT_STARTED), (card["status"], card["activity"]))
+        self.assertTrue(card["title"].startswith(cb.TOO_LONG))
+        self.assertNotIn("sample", str(card))
+        self.assertIsNone(self.conn.get(cb.PROPOSAL_KEY % ROOM))
+        self.assertEqual({}, self.conn.hgetall(cb.READBACK_KEY % ROOM))
+        long_chars = "Codex, draft " + "x" * cb.ASK_MAX_CHARS
+        chars = turn(self.conn, long_chars, seconds_ago=40)
+        self.assertEqual([], self.b().tick())
+        self.assertTrue(self.cards(self.CODEX)[cb.proposal_id(ROOM, chars, self.CODEX)]["title"]
+                        .startswith(cb.TOO_LONG))
+        before = self.cards(self.CODEX)
+        self.conn.store.pop(cb.CURSOR_KEY % ROOM)                       # a lost cursor replays both turns
+        self.b(now=NOW + datetime.timedelta(seconds=30)).tick()         # a later tick must not rewrite them
+        self.assertEqual(before, self.cards(self.CODEX))
+
+    def test_a5_a_waiting_ask_gets_its_turn_after_a_restart_once_the_earlier_one_is_gone(self):
+        """Grok on PR 452: a bridge restart or backlog replay must not lose the queued ask. Its waiting card
+        does not block the replayed proposal once the earlier ask is closed."""
+        turn(self.conn, "Codex, draft the sample queue flow.", seconds_ago=170)
+        second = turn(self.conn, "Codex, draft the sample price table.", seconds_ago=60)
+        self.b(now=NOW - datetime.timedelta(seconds=55)).tick()         # first proposed, second waits behind it
+        field = cb.proposal_id(ROOM, second, self.CODEX)
+        self.assertTrue(self.cards(self.CODEX)[field]["title"].startswith(cb.WAITING_BEHIND))
+        self.b().tick()                                                 # the first ask expires unheard
+        self.assertIsNone(self.conn.get(cb.PROPOSAL_KEY % ROOM))
+        self.conn.store.pop(cb.CURSOR_KEY % ROOM)                       # a restart: the cursor is gone
+        self.b().tick()
+        got = self.cards(self.CODEX)[field]
+        self.assertEqual(("review", cb.PROPOSED), (got["status"], got["activity"]), "its turn now")
+        self.assertEqual(second, json.loads(self.conn.get(cb.PROPOSAL_KEY % ROOM))["entry"])
+        self.heard(second, [self.CODEX], 5)
+        turn(self.conn, "Codex, go ahead.", seconds_ago=2)
+        self.assertEqual([cb.ask_id(ROOM, second, self.CODEX)], self.b().tick())
+
+    def test_a5_h2_an_expired_unheard_proposal_yields_to_the_newer_ask_with_the_cursor_kept(self):
+        """Grok on PR 452, H2: with the cursor kept there is no replay, so an ask that waited behind a proposal
+        whose window had already closed would be lost for good. The expired one closes; the newer one proposes."""
+        first = turn(self.conn, "Codex, draft the sample queue flow.", seconds_ago=300)
+        second = turn(self.conn, "Codex, draft the sample price table.", seconds_ago=30)
+        self.assertEqual([], self.b().tick())                            # ONE tick, both read, cursor kept
+        old = self.cards(self.CODEX)[cb.proposal_id(ROOM, first, self.CODEX)]
+        self.assertTrue(old["title"].startswith("Not started, the read-back was not heard"), old["title"])
+        got = self.cards(self.CODEX)[cb.proposal_id(ROOM, second, self.CODEX)]
+        self.assertEqual(("review", cb.PROPOSED), (got["status"], got["activity"]), "the newer ask took its place")
+        self.assertEqual(second, json.loads(self.conn.get(cb.PROPOSAL_KEY % ROOM))["entry"])
+        self.heard(second, [self.CODEX], 20)
+        turn(self.conn, "Codex, go ahead.", seconds_ago=10)
+        self.assertEqual([cb.ask_id(ROOM, second, self.CODEX)], self.b().tick())
+
+    def test_a5_h2_an_expired_heard_proposal_yields_too_and_says_no_go_ahead_in_time(self):
+        first = turn(self.conn, "Codex, draft the sample queue flow.", seconds_ago=300)
+        self.heard(first, [self.CODEX], 200)
+        second = turn(self.conn, "Codex, draft the sample price table.", seconds_ago=30)
+        self.assertEqual([], self.b().tick())
+        old = self.cards(self.CODEX)[cb.proposal_id(ROOM, first, self.CODEX)]
+        self.assertTrue(old["title"].startswith("Not started, no go-ahead in time"), old["title"])
+        self.assertEqual(second, json.loads(self.conn.get(cb.PROPOSAL_KEY % ROOM))["entry"])
+
+    def test_a5_h3_a_replay_never_closes_a_live_read_back_proposal(self):
+        """Grok's R3 probe: older ask, newer ask, THEN the read-back of the older; a replay must not close the
+        live proposal as "no go-ahead in time" and put the unheard newer ask in its place."""
+        older = turn(self.conn, "Codex, draft the sample queue flow.", seconds_ago=100)
+        second = turn(self.conn, "Codex, draft the sample price table.", seconds_ago=80)
+        self.heard(older, [self.CODEX], 60)                              # the read-back came AFTER the newer ask
+        self.b().tick()
+        self.conn.store.pop(cb.CURSOR_KEY % ROOM)                       # a restart or backlog replay
+        self.b().tick()
+        held = json.loads(self.conn.get(cb.PROPOSAL_KEY % ROOM))
+        self.assertEqual((older, True), (held["entry"], bool(held.get("spoken"))), "the older, still heard")
+        self.assertTrue(self.cards(self.CODEX)[cb.proposal_id(ROOM, second, self.CODEX)]["title"]
+                        .startswith(cb.WAITING_BEHIND))
+        turn(self.conn, "Codex, go ahead.", seconds_ago=10)
+        self.assertEqual([cb.ask_id(ROOM, older, self.CODEX)], self.b().tick(), "and his go-ahead still claims it")
+
+    def test_a5_h3_the_window_is_measured_from_the_read_back_once_heard(self):
+        """An old ask whose read-back is fresh is alive: the newer ask waits (the spoken leg of the window)."""
+        older = turn(self.conn, "Codex, draft the sample queue flow.", seconds_ago=200)
+        self.heard(older, [self.CODEX], 100)
+        second = turn(self.conn, "Codex, draft the sample price table.", seconds_ago=30)
+        self.assertEqual([], self.b().tick())
+        self.assertEqual(older, json.loads(self.conn.get(cb.PROPOSAL_KEY % ROOM))["entry"], "still his to confirm")
+        self.assertTrue(self.cards(self.CODEX)[cb.proposal_id(ROOM, second, self.CODEX)]["title"]
+                        .startswith(cb.WAITING_BEHIND))
+
+    def test_a5_an_unreadable_card_still_blocks_a_replayed_proposal(self):
+        """Only a WAITING card yields to the replay; a card that cannot be read blocks, as it always did."""
+        entry = turn(self.conn, "Codex, draft the sample queue flow.", seconds_ago=60)
+        field = cb.proposal_id(ROOM, entry, self.CODEX)
+        self.conn.hset(cp.PARTITION % ("workshop", self.CODEX), field, "not json {")
+        self.assertEqual([], self.b().tick())
+        self.assertEqual("not json {", self.conn.hgetall(cp.PARTITION % ("workshop", self.CODEX))[field])
+        self.assertIsNone(self.conn.get(cb.PROPOSAL_KEY % ROOM))
+
+    def test_a5_the_proposal_card_says_a_newer_ask_waits_and_never_that_it_drops(self):
+        """Grok on PR 452: the card still said a newer ask drops the waiting one."""
+        card = cb.proposal_card(self.CODEX, NOW, NOW)
+        self.assertIn("a newer ask waits behind it", card["body"])
+        for stale in ("drops it. ", "newer ask drops", "Replaced"):
+            self.assertNotIn(stale, card["title"] + " " + card["body"].replace("Cancel drops it;", ""), stale)
+
+    def test_b1_a_turn_at_the_word_bound_still_proposes(self):
+        words = "Codex, draft " + " ".join(["sample"] * (cb.ASK_MAX_WORDS - 2)) + "."
+        self.assertEqual(cb.ASK_MAX_WORDS, len(words.split()))
+        turn(self.conn, words, seconds_ago=60)
+        self.assertEqual([], self.b().tick())
+        self.assertIsNotNone(self.conn.get(cb.PROPOSAL_KEY % ROOM))
+
+    def test_b3_the_key_names_voices_by_the_chairs_persona_ids_for_every_agent(self):
+        """Codex on PR 452 R4: the key carried fleet ids; the chair matches persona ids (claude, codex, ...)."""
+        self.assertEqual({"grok": "grok", "claude-code-cli": "claude", "chatgpt-codex-desktop": "codex",
+                          "gemini": "gemini"}, cb.PERSONA_OF)
+        for agent, persona in cb.PERSONA_OF.items():
+            self.assertEqual(agent, cb.AGENT_OF[persona], "the exact inverse")
+        entry = turn(self.conn, "Claude and Codex, compare the two sample plans.", seconds_ago=60)
+        self.b().tick()
+        held = self.conn.hgetall(cb.READBACK_KEY % ROOM)
+        self.assertEqual("claude,codex", held["agents"])
+        self.assertEqual(cb.readback_id(ROOM, entry, ["claude-code-cli", self.CODEX]), held["id"],
+                         "the id still binds the bridge's own recipient set")
+
+    def test_b3_the_key_names_every_voice_of_the_recipient_set_in_order(self):
+        entry = turn(self.conn, "Grok and Gemini, compare the two sample plans.", seconds_ago=60)
+        self.b().tick()
+        held = self.conn.hgetall(cb.READBACK_KEY % ROOM)
+        self.assertEqual({"id": cb.readback_id(ROOM, entry, ["grok", "gemini"]), "entry": entry,
+                          "agents": "grok,gemini", "max_words": "60"}, held)
 
     def test_g2_a_refusal_to_a_turn_with_no_known_caller_proposes_nothing(self):
         turn(self.conn, None, reason="", actor="grok", kind="floor.granted", seconds_ago=40)   # the room is live
@@ -1912,8 +2082,7 @@ class ReadBack(unittest.TestCase):
         self.b().tick()
         held = self.conn.hgetall(cb.READBACK_KEY % ROOM)
         self.assertEqual({"id": cb.readback_id(ROOM, entry, [self.CODEX]), "entry": entry,
-                          "text": "Read-back for Codex: Codex, draft the sample queue flow. "
-                                  "To start it, say: Codex, go ahead."}, held)
+                          "agents": "codex", "max_words": "60"}, held)           # the chair's persona id
         self.assertTrue((cb.READBACK_KEY % ROOM).startswith("v1:conf:%s:" % ROOM))   # the room's own key
         self.assertEqual(cb.READBACK_SECONDS - 60, self.conn.ttls[cb.READBACK_KEY % ROOM])   # F4
         self.assertNotIn("sample queue", json.dumps(cp.snapshot(self.conn, "workshop", NOW)))
@@ -2039,9 +2208,10 @@ class ReadBack(unittest.TestCase):
         self.conn.xadd(self.side, {"by": "chair", "voice": "claude", "room": ROOM, "text": "I can't pull an image.",
                                    "at": cb.stamp(NOW)}, entry_id=at(25))
         self.assertEqual([], self.b().tick())
-        self.assertEqual(sorted([events, proposal, readback]), self.holders(words))
+        self.assertEqual(sorted([events, proposal]), self.holders(words), "never the read-back key (contract v2)")
         self.assertNotIn("said", json.loads(self.conn.get(cb.ASKED_KEY % ROOM)))
         self.assertIsNone(self.conn.get(cb.PENDING_KEY % ROOM))
+        self.assertNotEqual({}, self.conn.hgetall(readback), "the key exists, without his words")
         self.heard(entry, ["claude-code-cli"], 15)
         self.b().tick()
         self.assertEqual(sorted([events, proposal]), self.holders(words))
@@ -2053,8 +2223,7 @@ class ReadBack(unittest.TestCase):
         turn(self.conn, "Codex, draft the sample queue flow.", seconds_ago=60)
         self.b().tick()
         self.assertIsNone(self.conn.get(cb.PENDING_KEY % ROOM))
-        self.assertEqual(sorted([STREAM, cb.PROPOSAL_KEY % ROOM, cb.READBACK_KEY % ROOM]),
-                         self.holders("draft the sample queue flow"))
+        self.assertEqual(sorted([STREAM, cb.PROPOSAL_KEY % ROOM]), self.holders("draft the sample queue flow"))
 
     def test_f2_a_voice_that_cannot_reads_his_words_from_the_stream_or_proposes_nothing(self):
         """No copy: a turn gone from the room's stream (trimmed) proposes nothing, rather than an empty task."""
