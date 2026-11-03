@@ -290,7 +290,13 @@ class Claim(unittest.TestCase):
         self.assertIn("tools/cli_call_helper/call_ask.py", entry["text"])
         self.assertIn("--input-file", entry["text"])
         self.assertIn("bound agent", entry["text"])
-        self.assertIn("if that flow is unavailable, HOLD", entry["text"])
+        # The owner, 2026-11-03 20:36Z: do the work, never HOLD for want of the helper.
+        self.assertNotIn("HOLD", entry["text"])
+        self.assertIn("Do the work now and put up your card through call-task", entry["text"])
+        for op in ("op=status", "op=card", "op=complete"):
+            self.assertIn(op, entry["text"], op)
+        self.assertIn("ask=%s and that source_revision" % ask, entry["text"], "the card names its own ask")
+        self.assertIn("work from this preview and say on your card that you did", entry["text"])
         self.assertIn("Only verified call-task card/complete receipts", entry["text"])
         self.assertIn("A free RESULT board row", entry["text"])
         self.assertIn("never completes this task", entry["text"])
