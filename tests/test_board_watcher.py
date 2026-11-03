@@ -623,6 +623,11 @@ class NoIdleWaiting(unittest.TestCase):
         self.assertEqual({"grok": ["A1"]}, store.state["idle"])
         self.assertEqual(["A1"], [i["id"] for i in store.state["idle_open"]["grok"]])
         self.assertEqual([], started, "the report starts nothing")
+        # The next tick no longer reads the ask (past the overlap): what was open is carried in the state.
+        later = datetime(2026, 9, 24, 5, 0, tzinfo=timezone.utc)
+        out = w.tick(store, read_since=lambda since: [], routes={}, running=lambda job: False,
+                     start=lambda job: "x", now=later)
+        self.assertEqual({"grok": ["A1"]}, out["idle"])
         source = (REPO / "cloud" / "board-watcher" / "main.py").read_text(encoding="utf-8")
         body = source[source.index("def idle_asks("):source.index("def plan(")]
         for act in ("append", "post", "urlopen", "_call(", "start"):
