@@ -1867,6 +1867,15 @@ class ReadBack(unittest.TestCase):
         turn(self.conn, "Codex, go ahead.", seconds_ago=2)
         self.assertEqual([cb.ask_id(ROOM, second, self.CODEX)], self.b().tick())
 
+    def test_a5_an_unreadable_card_still_blocks_a_replayed_proposal(self):
+        """Only a WAITING card yields to the replay; a card that cannot be read blocks, as it always did."""
+        entry = turn(self.conn, "Codex, draft the sample queue flow.", seconds_ago=60)
+        field = cb.proposal_id(ROOM, entry, self.CODEX)
+        self.conn.hset(cp.PARTITION % ("workshop", self.CODEX), field, "not json {")
+        self.assertEqual([], self.b().tick())
+        self.assertEqual("not json {", self.conn.hgetall(cp.PARTITION % ("workshop", self.CODEX))[field])
+        self.assertIsNone(self.conn.get(cb.PROPOSAL_KEY % ROOM))
+
     def test_a5_the_proposal_card_says_a_newer_ask_waits_and_never_that_it_drops(self):
         """Grok on PR 452: the card still said a newer ask drops the waiting one."""
         card = cb.proposal_card(self.CODEX, NOW, NOW)
