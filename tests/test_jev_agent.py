@@ -59,35 +59,76 @@ class TheCall(unittest.TestCase):
         self.env.start()
         self.addCleanup(self.env.stop)
 
-    def test_a_decision_with_probability_becomes_the_reply(self):
+    def test_a_noul_answer_becomes_a_yes_with_its_probability(self):
         sent = {}
 
         def fake(request, timeout=None):
             sent["url"] = request.full_url
             sent["body"] = json.loads(request.data.decode("utf-8"))
             sent["auth"] = request.get_header("Authorization")
-            return FakeResponse({"decision": {"answer": "yes", "probability": 0.91}})
+            # the exact shape the live API returned on 2026-11-03
+            return FakeResponse({"model": "jev-1.14.0",
+                                 "answers": {"q": {"type": "noul", "noul": 0.98}},
+                                 "usage": {"input_tokens": 358, "output_tokens": 63}})
         with mock.patch.object(jev_agent.urllib.request, "urlopen", fake):
-            text, route = jev_agent.ask("jev:yesno: is the board healthy?")
+            text, route = jev_agent.ask("CI went green. jev:yesno: is the board healthy?")
         self.assertEqual("systemone api-key", route)
         self.assertIn("Jev decision (yesno): yes", text)
-        self.assertIn("0.910", text)
+        self.assertIn("probability 0.980", text)
+        self.assertIn("model jev-1.14.0", text)
         self.assertEqual(jev_agent.SYSTEMONE, sent["url"])
         self.assertEqual("Bearer k-test", sent["auth"])
-        self.assertEqual("yesno", sent["body"]["question"]["type"])
+        self.assertEqual("jev-latest", sent["body"]["model"])
+        self.assertIn("CI went green", sent["body"]["state"])
+        self.assertEqual({"type": "noul", "instructions": "is the board healthy?"},
+                         sent["body"]["questions"]["q"])
         self.assertNotIn("|", text, "a reply must never carry the board's field separator")
 
-    def test_a_score_reply_names_its_range(self):
+    def test_a_low_noul_is_a_no_with_the_no_probability(self):
         def fake(request, timeout=None):
-            return FakeResponse({"score": 212, "confidence": 0.62})
+            return FakeResponse({"answers": {"q": {"type": "noul", "noul": 0.1}}})
         with mock.patch.object(jev_agent.urllib.request, "urlopen", fake):
-            text, route = jev_agent.ask("jev:score:0..1500: average payload chars?")
-        self.assertIn("Jev decision (score): 212", text)
-        self.assertIn("range 0..1500", text)
+            text, _route = jev_agent.ask("jev:yesno: q?")
+        self.assertIn("Jev decision (yesno): no", text)
+        self.assertIn("probability 0.900", text)
+
+    def test_a_choice_sends_named_criteria_and_reads_the_choice(self):
+        sent = {}
+
+        def fake(request, timeout=None):
+            sent["body"] = json.loads(request.data.decode("utf-8"))
+            return FakeResponse({"answers": {"q": {"type": "choice", "choice": "hold",
+                                                   "confidence": 0.7,
+                                                   "probabilities": {"ship": 0.2, "hold": 0.7}}}})
+        with mock.patch.object(jev_agent.urllib.request, "urlopen", fake):
+            text, _route = jev_agent.ask("jev:choice:(ship; hold): what now?")
+        self.assertEqual({"ship": "ship", "hold": "hold"}, sent["body"]["questions"]["q"]["criteria"])
+        self.assertIn("Jev decision (choice): hold", text)
+        self.assertIn("probability 0.700", text)
+
+    def test_a_wide_score_range_is_ten_bands_and_the_reply_names_the_likeliest(self):
+        sent = {}
+
+        def fake(request, timeout=None):
+            sent["body"] = json.loads(request.data.decode("utf-8"))
+            return FakeResponse({"answers": {"q": {"type": "score", "score": 1.2, "confidence": 0.6,
+                                                   "probabilities": {"0": 0.1, "1": 0.6, "2": 0.3}}}})
+        with mock.patch.object(jev_agent.urllib.request, "urlopen", fake):
+            text, _route = jev_agent.ask("jev:score:0..1499: average payload chars?")
+        levels = sent["body"]["questions"]["q"]["criteria"]
+        self.assertEqual(10, len(levels))
+        self.assertEqual("0 to 149", levels[0])
+        self.assertEqual("1350 to 1499", levels[-1])
+        self.assertIn("Jev decision (score): 150 to 299", text)
+        self.assertIn("range 0..1499", text)
+
+    def test_a_narrow_score_range_is_one_level_per_value(self):
+        self.assertEqual([(1, 1), (2, 2), (3, 3)], jev_agent._bands(1, 3))
+        self.assertEqual(10, len(jev_agent._bands(0, 10)))
 
     def test_no_spec_still_answers_and_teaches_the_shape(self):
         def fake(request, timeout=None):
-            return FakeResponse({"answer": "no", "p": 0.8})
+            return FakeResponse({"answers": {"q": {"type": "noul", "noul": 0.2}}})
         with mock.patch.object(jev_agent.urllib.request, "urlopen", fake):
             text, _route = jev_agent.ask("average the last 50 rows please")
         self.assertIn("jev:score", text, "the usage hint rides along")
@@ -98,7 +139,7 @@ class TheCall(unittest.TestCase):
         with mock.patch.object(jev_agent.urllib.request, "urlopen", fake):
             text, reason = jev_agent.ask("jev:yesno: q?")
         self.assertIsNone(text)
-        self.assertIn("shape v0 mismatch", reason)
+        self.assertIn("shape mismatch", reason)
         self.assertIn("outputs", reason)
         self.assertNotIn("k-test", reason)
 
