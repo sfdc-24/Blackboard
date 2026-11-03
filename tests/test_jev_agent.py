@@ -163,11 +163,77 @@ class TheCall(unittest.TestCase):
             text, reason = jev_agent.ask("jev:yesno: q?")
         self.assertIsNone(text)
         self.assertIn("HTTP 401", reason)
+        self.assertNotIn("bad token", reason)
         with mock.patch.dict("os.environ", {"JEV_API_KEY": ""}):
             with mock.patch.object(jev_agent, "ENV", "does-not-exist"):
                 text, reason = jev_agent.ask("jev:yesno: q?")
         self.assertIsNone(text)
         self.assertIn("no JEV_API_KEY", reason)
+
+
+
+class MalformedAnswers(unittest.TestCase):
+    """A provider shape error must never become a board decision."""
+
+    def test_yesno_rejects_invalid_type_and_probability(self):
+        question = {"type": "yesno"}
+        for answer in (
+            {"type": "choice", "noul": 0.8},
+            {"type": "noul", "noul": True},
+            {"type": "noul", "noul": [0.8]},
+            {"type": "noul", "noul": -0.01},
+            {"type": "noul", "noul": 2.0},
+            {"type": "noul", "noul": float("nan")},
+            {"type": "noul", "noul": float("inf")},
+        ):
+            with self.subTest(answer=answer):
+                self.assertEqual((None, None), jev_agent.read_answer(question, answer))
+
+    def test_choice_rejects_unknown_option_and_bad_probabilities(self):
+        question = {"type": "choice", "options": ["ship", "hold"]}
+        for answer in (
+            {"type": "noul", "choice": "hold", "confidence": 0.7},
+            {"type": "choice", "choice": "erase", "confidence": 0.7},
+            {"type": "choice", "choice": ["hold"], "confidence": 0.7},
+            {"type": "choice", "choice": "hold", "confidence": 2.0},
+            {"type": "choice", "choice": "hold", "confidence": True},
+            {"type": "choice", "choice": "hold", "probabilities": {"erase": 0.8}},
+            {"type": "choice", "choice": "hold", "probabilities": {"hold": float("nan")}},
+            {"type": "choice", "choice": "hold"},
+        ):
+            with self.subTest(answer=answer):
+                self.assertEqual((None, None), jev_agent.read_answer(question, answer))
+        self.assertEqual(("hold", 0.7), jev_agent.read_answer(
+            question, {"type": "choice", "choice": "hold",
+                       "probabilities": {"ship": 0.3, "hold": 0.7}}))
+
+    def test_score_rejects_out_of_range_index_and_probability(self):
+        question = {"type": "score", "min": 0, "max": 1499}
+        for answer in (
+            {"type": "choice", "score": 1.2, "confidence": 0.6},
+            {"type": "score", "score": 999, "probabilities": {"1": 0.6}},
+            {"type": "score", "score": -1, "confidence": 0.8},
+            {"type": "score", "score": True, "confidence": 0.8},
+            {"type": "score", "score": float("inf"), "confidence": 0.8},
+            {"type": "score", "score": 1.2, "confidence": 2.0},
+            {"type": "score", "score": 1.2, "probabilities": {"10": 0.7}},
+            {"type": "score", "score": 1.2, "probabilities": {"1": -0.1}},
+            {"type": "score", "score": 1.2},
+        ):
+            with self.subTest(answer=answer):
+                self.assertEqual((None, None), jev_agent.read_answer(question, answer))
+        self.assertEqual(("150 to 299", 0.6), jev_agent.read_answer(
+            question, {"type": "score", "score": 1.2, "confidence": 0.6}))
+
+    def test_invalid_provider_reply_fails_before_board_text(self):
+        with mock.patch.dict("os.environ", {"JEV_API_KEY": "k-test"}):
+            with mock.patch.object(jev_agent.urllib.request, "urlopen",
+                                   return_value=FakeResponse({"answers": {
+                                       "q": {"type": "noul", "noul": 2.0}}})):
+                text, reason = jev_agent.ask("jev:yesno: ship?")
+        self.assertIsNone(text)
+        self.assertIn("shape mismatch", reason)
+
 
 
 class TheRegistry(unittest.TestCase):
