@@ -1018,8 +1018,10 @@ class Bridge:
         elif older:
             if not _after(entry_id, older["entry"]):
                 return                                    # an older turn read late never replaces a newer one
-            if _within(older["spoken"] or older["entry"], entry_id, READBACK_SECONDS):
-                # A2: the open proposal stands. The newer ask is refused visibly and claims nothing.
+            since = older["spoken"] or older["entry"]
+            if not _after(entry_id, since) or _within(since, entry_id, READBACK_SECONDS):
+                # A2: the open proposal stands (a read-back AFTER this ask means it is alive too: Grok's R3
+                # replay probe closed a live, read-back proposal). The newer ask waits and claims nothing.
                 self._refuse(room, entry_id, agents, WAITING_BEHIND, now)
                 return
             # The older proposal's window had already closed when this ask was said (Grok on PR 452, H2): with

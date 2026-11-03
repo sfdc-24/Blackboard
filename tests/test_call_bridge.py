@@ -1891,6 +1891,32 @@ class ReadBack(unittest.TestCase):
         self.assertTrue(old["title"].startswith("Not started, no go-ahead in time"), old["title"])
         self.assertEqual(second, json.loads(self.conn.get(cb.PROPOSAL_KEY % ROOM))["entry"])
 
+    def test_a5_h3_a_replay_never_closes_a_live_read_back_proposal(self):
+        """Grok's R3 probe: older ask, newer ask, THEN the read-back of the older; a replay must not close the
+        live proposal as "no go-ahead in time" and put the unheard newer ask in its place."""
+        older = turn(self.conn, "Codex, draft the sample queue flow.", seconds_ago=100)
+        second = turn(self.conn, "Codex, draft the sample price table.", seconds_ago=80)
+        self.heard(older, [self.CODEX], 60)                              # the read-back came AFTER the newer ask
+        self.b().tick()
+        self.conn.store.pop(cb.CURSOR_KEY % ROOM)                       # a restart or backlog replay
+        self.b().tick()
+        held = json.loads(self.conn.get(cb.PROPOSAL_KEY % ROOM))
+        self.assertEqual((older, True), (held["entry"], bool(held.get("spoken"))), "the older, still heard")
+        self.assertTrue(self.cards(self.CODEX)[cb.proposal_id(ROOM, second, self.CODEX)]["title"]
+                        .startswith(cb.WAITING_BEHIND))
+        turn(self.conn, "Codex, go ahead.", seconds_ago=10)
+        self.assertEqual([cb.ask_id(ROOM, older, self.CODEX)], self.b().tick(), "and his go-ahead still claims it")
+
+    def test_a5_h3_the_window_is_measured_from_the_read_back_once_heard(self):
+        """An old ask whose read-back is fresh is alive: the newer ask waits (the spoken leg of the window)."""
+        older = turn(self.conn, "Codex, draft the sample queue flow.", seconds_ago=200)
+        self.heard(older, [self.CODEX], 100)
+        second = turn(self.conn, "Codex, draft the sample price table.", seconds_ago=30)
+        self.assertEqual([], self.b().tick())
+        self.assertEqual(older, json.loads(self.conn.get(cb.PROPOSAL_KEY % ROOM))["entry"], "still his to confirm")
+        self.assertTrue(self.cards(self.CODEX)[cb.proposal_id(ROOM, second, self.CODEX)]["title"]
+                        .startswith(cb.WAITING_BEHIND))
+
     def test_a5_an_unreadable_card_still_blocks_a_replayed_proposal(self):
         """Only a WAITING card yields to the replay; a card that cannot be read blocks, as it always did."""
         entry = turn(self.conn, "Codex, draft the sample queue flow.", seconds_ago=60)
