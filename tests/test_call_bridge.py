@@ -1886,6 +1886,27 @@ class ReadBack(unittest.TestCase):
         turn(self.conn, "Codex, go ahead.", seconds_ago=2)
         self.assertEqual([cb.ask_id(ROOM, second, self.CODEX)], self.b().tick())
 
+    def test_a5_a_waiting_card_under_the_old_wording_still_yields_to_the_replay(self):
+        """Codex's HOLD on adc6558e: a waiting card PR 452 wrote, under its own wording, must not block the
+        queued ask once the earlier one is gone."""
+        turn(self.conn, "Codex, draft the sample queue flow.", seconds_ago=170)
+        second = turn(self.conn, "Codex, draft the sample price table.", seconds_ago=60)
+        self.b(now=NOW - datetime.timedelta(seconds=55)).tick()
+        key, field = cp.PARTITION % ("workshop", self.CODEX), cb.proposal_id(ROOM, second, self.CODEX)
+        card = self.cards(self.CODEX)[field]
+        card["title"] = "Not started, an earlier ask is still waiting for its read-back" + card["title"][len(cb.WAITING_BEHIND):]
+        self.conn.hset(key, field, json.dumps(card))                    # as PR 452 would have written it
+        self.b().tick()                                                 # the first ask expires unheard
+        self.conn.store.pop(cb.CURSOR_KEY % ROOM)                       # a restart: the cursor is gone
+        self.b().tick()
+        got = self.cards(self.CODEX)[field]
+        self.assertEqual(("review", cb.PROPOSED), (got["status"], got["activity"]), "its turn now")
+        self.assertEqual(second, json.loads(self.conn.get(cb.PROPOSAL_KEY % ROOM))["entry"])
+
+    def test_a5_every_waiting_wording_ever_written_is_kept(self):
+        self.assertEqual(cb.WAITING_BEHIND, cb.WAITING_TITLES[0], "the current wording is the one written")
+        self.assertIn("Not started, an earlier ask is still waiting for its read-back", cb.WAITING_TITLES)
+
     def test_a5_h2_an_expired_unheard_proposal_yields_to_the_newer_ask_with_the_cursor_kept(self):
         """Grok on PR 452, H2: with the cursor kept there is no replay, so an ask that waited behind a proposal
         whose window had already closed would be lost for good. The expired one closes; the newer one proposes."""

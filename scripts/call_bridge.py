@@ -170,6 +170,10 @@ TOO_LONG = "Not started, too long to read back: please restate it briefly"
 # Grok's N1 on PR 452: the earlier ask may already be read back and waiting for his go-ahead, so the card says
 # only what is true in both cases.
 WAITING_BEHIND = "Not started, an earlier ask is still waiting to start"
+# Codex's HOLD on adc6558e: a card written under PR 452's wording (if 452 runs a call before this ships) must still
+# read as a waiting card on replay, or it blocks the queued ask for good. Every wording a waiting card was ever
+# written under; a new wording is added here, never swapped in.
+WAITING_TITLES = (WAITING_BEHIND, "Not started, an earlier ask is still waiting for its read-back")
 READBACK_SPOKEN = "readback.spoken"
 PROPOSED = "proposed in the room"
 NOT_STARTED = "not started"
@@ -1066,7 +1070,7 @@ class Bridge:
         if held is None:
             return False
         try:
-            return not str(json.loads(_text(held)).get("title", "")).startswith(WAITING_BEHIND)
+            return not str(json.loads(_text(held)).get("title", "")).startswith(WAITING_TITLES)
         except (TypeError, ValueError):
             return True                                   # an unreadable card blocks, as it always did
 
