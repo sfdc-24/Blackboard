@@ -1342,7 +1342,7 @@ class Bridge:
         for agent in agents:
             field = proposal_id(room, entry_id, agent)
             # R6a: a proposal card is shown under the project current when it was made (the same key its claim uses).
-            projects.stamp(self.conn, ask_id(room, entry_id, agent), self.canvas_room, call_lifecycle.MAX_AGE)
+            projects.stamp(self.conn, ask_id(room, entry_id, agent), self.canvas_room)
             self.conn.hset(partition % (self.canvas_room, agent), field, json.dumps(proposal_card(agent, asked, now)))
             if self.bucket:
                 self.open_if_shut(now, "%s/%s" % (agent, field))
@@ -1661,7 +1661,7 @@ class Bridge:
         # failure in between left a delivered ask with no project). Every card of this ask - the bridge's own
         # claimed, waiting and done cards and the agent's card - is shown under it (canvas_publish.project_of). A
         # claim that is then refused leaves only this key, which expires with the ask's age.
-        projects.stamp(self.conn, ask, self.canvas_room, call_lifecycle.MAX_AGE)
+        projects.stamp(self.conn, ask, self.canvas_room)
         try:
             info = call_lifecycle.claim(self.conn, ask, room, entry_id, agent, self.canvas_room,
                                         now, claimed_card(agent, now), inbox, ring, asked_entry)

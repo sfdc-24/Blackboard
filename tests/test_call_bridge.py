@@ -2728,6 +2728,26 @@ class LivingCardRouting(unittest.TestCase):
                           "the duplicate is refused")
         self.assertEqual("acme", cb._text(self.conn.get("gov:callbridge:project:%s" % ask)))
 
+    def test_a_finished_card_stays_in_its_project_long_after_max_age(self):
+        """Codex's HOLD on 6b8750a: a DONE card stays visible past MAX_AGE; its project binding must too."""
+        self.make_project("acme", "Acme")
+        self.make_project("beta", "Beta")
+        self.conn.set("conf:project:%s:current" % cb.CANVAS_ROOM, "acme")
+        turn(self.conn, "Codex, draft a kickoff checklist.", seconds_ago=10)
+        [ask] = self.b().tick()
+        agent = "chatgpt-codex-desktop"
+        self.assertTrue(put_card(self.conn, agent, ask))
+        self.assertTrue(complete(self.conn, agent, ask))
+        self.assertNotIn("gov:callbridge:project:%s" % ask, {k: v for k, v in self.conn.ttls.items() if v},
+                         "the binding has no expiry")
+        later = NOW + datetime.timedelta(seconds=cb.call_lifecycle.MAX_AGE + 3600)
+        self.conn.set("conf:project:%s:current" % cb.CANVAS_ROOM, "beta")
+        self.assertNotIn(agent + "/" + ask + "-work",
+                         [i["id"] for i in cb.canvas_publish.snapshot(self.conn, cb.CANVAS_ROOM, later)["items"]])
+        self.conn.set("conf:project:%s:current" % cb.CANVAS_ROOM, "acme")
+        shown = [i["id"] for i in cb.canvas_publish.snapshot(self.conn, cb.CANVAS_ROOM, later)["items"]]
+        self.assertTrue(any(i.startswith(agent + "/" + ask) for i in shown), shown)
+
     def test_a_negated_switch_switches_nothing(self):
         self.make_project("acme", "Acme")
         turn(self.conn, "Don't switch to the Acme project.", seconds_ago=10)

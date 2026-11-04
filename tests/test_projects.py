@@ -89,27 +89,27 @@ class Stamp(unittest.TestCase):
     def test_an_ask_carries_the_project_current_at_claim_time_and_expires_with_it(self):
         add(self.conn, "acme", "Acme")
         pj.set_current(self.conn, ROOM, "acme")
-        self.assertEqual("acme", pj.stamp(self.conn, "call-0123456789ab", ROOM, 7200))
-        self.assertEqual(7200, self.conn.ttls[pj.STAMP_KEY % "call-0123456789ab"])
+        self.assertEqual("acme", pj.stamp(self.conn, "call-0123456789ab", ROOM))
+        self.assertNotIn(pj.STAMP_KEY % "call-0123456789ab", self.conn.ttls, "no expiry: it lives as the task does")
         add(self.conn, "beta", "Beta")
         pj.set_current(self.conn, ROOM, "beta")
         self.assertEqual("acme", pj.stamped(self.conn, "call-0123456789ab"), "switching later does not move it")
 
     def test_no_current_project_is_recorded_as_none_and_stays_none(self):
-        self.assertEqual("", pj.stamp(self.conn, "call-0123456789ab", ROOM, 7200))
+        self.assertEqual("", pj.stamp(self.conn, "call-0123456789ab", ROOM))
         self.assertEqual("", self.conn.kv[pj.STAMP_KEY % "call-0123456789ab"])
         add(self.conn, "acme", "Acme")
         pj.set_current(self.conn, ROOM, "acme")
-        self.assertEqual("", pj.stamp(self.conn, "call-0123456789ab", ROOM, 7200), "a replay gives it no project")
+        self.assertEqual("", pj.stamp(self.conn, "call-0123456789ab", ROOM), "a replay gives it no project")
 
     def test_a_replay_after_a_switch_keeps_the_first_project(self):
         """Codex's HOLD on d519e34: the stamp is written once and never moved."""
         add(self.conn, "acme", "Acme")
         add(self.conn, "beta", "Beta")
         pj.set_current(self.conn, ROOM, "acme")
-        self.assertEqual("acme", pj.stamp(self.conn, "call-0123456789ab", ROOM, 7200))
+        self.assertEqual("acme", pj.stamp(self.conn, "call-0123456789ab", ROOM))
         pj.set_current(self.conn, ROOM, "beta")
-        self.assertEqual("acme", pj.stamp(self.conn, "call-0123456789ab", ROOM, 7200))
+        self.assertEqual("acme", pj.stamp(self.conn, "call-0123456789ab", ROOM))
         self.assertEqual("acme", pj.stamped(self.conn, "call-0123456789ab"))
 
     def test_a_malformed_stamp_is_no_project(self):

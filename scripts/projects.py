@@ -81,13 +81,17 @@ def current(conn, room: str):
     return pid, info["name"]
 
 
-def stamp(conn, ask: str, room: str, ttl: int) -> str:
+def stamp(conn, ask: str, room: str) -> str:
     """Record the room's current project for an ask the FIRST time it is seen, and never change it (Codex's HOLD on
     d519e34: a replay after a switch re-stamped an Acme ask as Beta, moving its untagged cards). "No project" is
     recorded too, as "", so a replay cannot give a project to an ask made without one. The ask's project: the id,
-    or "" for none."""
+    or "" for none.
+
+    NO EXPIRY (Codex's HOLD on 6b8750a): the lifecycle keeps an ask's task record without a TTL and still shows its
+    DONE card after MAX_AGE, so the project binding must outlive MAX_AGE too, or a finished card would leave its
+    project's canvas and archive once the stamp lapsed. It is one short string per ask, like the task record."""
     now = current(conn, room)
-    conn.set(STAMP_KEY % ask, now[0] if now else "", ex=int(ttl), nx=True)
+    conn.set(STAMP_KEY % ask, now[0] if now else "", nx=True)
     return stamped(conn, ask)
 
 
