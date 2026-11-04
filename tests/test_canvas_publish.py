@@ -316,56 +316,76 @@ LOG = logging.getLogger("canvas-publish-test")
 
 class ProjectArchives(unittest.TestCase):
     """R6a (CARDS-ARCHITECTURE R6.1): at the end of his call each active project's cards go to the PRIVATE fleet-state
-    bucket, one file per project, never to the public canvas bucket. Synthetic only."""
+    bucket, one file per project, never to the public canvas bucket; only cards the canvas itself would show; and an
+    archive a failure interrupted is finished on a later round. Synthetic only."""
+    NAME = "projects/acme/20261020T220000Z.json"
 
     def setUp(self):
-        self.conn = FakeRedis()
+        self.conn = CallRedis()
+        self.conn.store[cp.LEASE_KEY] = ME
         room = cp.CALL_ROOM
         put(self.conn, "grok", "a1", item(title="Acme one", project="acme"), room=room)
         put(self.conn, "gemini", "a2", item(title="Acme two", project="acme"), room=room)
         put(self.conn, "grok", "b1", item(title="Beta card", project="beta"), room=room)
         put(self.conn, "grok", "old", item(title="Untagged"), room=room)
         put(self.conn, "grok", "secret", item(title="Private", project="acme", public=False), room=room)
+        # Shape-valid, but a lifecycle card whose ask is not open: the canvas's fence hides it, so must the archive.
+        put(self.conn, "grok", "call-0123456789ab-work",
+            item(title="Fenced out", project="acme", ask="call-0123456789ab", source_revision="r"), room=room)
         projects = {"acme": {"name": "Acme", "status": "active"}, "beta": {"name": "Beta", "status": "archived"},
                     "empty": {"name": "Empty", "status": "active"}}
         self.conn.hashes["conf:projects:%s" % room] = {k: json.dumps(v) for k, v in projects.items()}
+        self.sent = []
 
-    def test_one_file_per_active_project_with_cards_holding_only_its_published_cards(self):
+    def pub(self, upload=None):
+        return cp.Publisher(self.conn, "sfdc24-canvas", upload or (lambda b, n, d, allow=None: self.sent.append((b, n))),
+                            LOG, clock=lambda: NOW, holds=lambda: self.conn.store.get(cp.LEASE_KEY) == ME,
+                            family=FAMILY)
+
+    def test_one_file_per_active_project_with_only_the_cards_the_canvas_would_show(self):
         docs = cp.archive_docs(self.conn, cp.CALL_ROOM, NOW)
-        self.assertEqual(["projects/acme/20261020T220000Z.json"], [name for name, _ in docs])
+        self.assertEqual([self.NAME], [name for name, _ in docs])
         doc = json.loads(docs[0][1])
         self.assertEqual("project-archive/1", doc["format"])
         self.assertEqual({"id": "acme", "name": "Acme"}, doc["project"])
         self.assertEqual(["Acme one", "Acme two"], sorted(i["title"] for i in doc["items"]))
-        blob = docs[0][1].decode()
-        for absent in ("Beta card", "Untagged", "Private"):
-            self.assertNotIn(absent, blob)
+        for absent in ("Beta card", "Untagged", "Private", "Fenced out"):
+            self.assertNotIn(absent, docs[0][1].decode())
 
-    def test_the_end_of_his_call_writes_the_archive_to_the_private_bucket_only(self):
-        sent = []
-        pub = cp.Publisher(self.conn, "sfdc24-canvas", lambda b, n, d, allow=None: sent.append((b, n)), LOG,
-                           clock=lambda: NOW, holds=lambda: True, family="conf-0123456789abcdef")
+    def test_the_end_of_his_call_writes_the_archive_to_the_private_bucket_and_clears_what_it_owed(self):
         with mock.patch.object(cp, "keep_call_window", lambda *a: "closed"):
-            self.assertEqual("closed", pub.calls())
-        self.assertEqual([("sfdc24-fleet-state", "projects/acme/20261020T220000Z.json")], sent)
-        self.assertNotIn("sfdc24-canvas", [b for b, _ in sent])
+            self.assertEqual("closed", self.pub().calls())
+        self.assertEqual([("sfdc24-fleet-state", self.NAME)], self.sent)
+        self.assertIsNone(self.conn.store.get(cp.ARCHIVE_PENDING_KEY % cp.CALL_ROOM))
 
-    def test_no_archive_while_the_call_goes_on_or_without_the_lease(self):
-        sent = []
-        pub = cp.Publisher(self.conn, "sfdc24-canvas", lambda b, n, d, allow=None: sent.append(n), LOG,
-                           clock=lambda: NOW, holds=lambda: True, family="conf-0123456789abcdef")
-        with mock.patch.object(cp, "keep_call_window", lambda *a: "open"):
-            pub.calls()
-        self.assertEqual([], sent)
-        self.assertEqual(0, cp.Publisher(self.conn, "sfdc24-canvas", lambda *a, **k: sent.append(a), LOG,
-                                         clock=lambda: NOW, holds=lambda: False).archive(cp.CALL_ROOM, NOW))
-        self.assertEqual([], sent)
-
-    def test_a_failed_upload_is_logged_and_never_raised(self):
+    def test_a_failed_upload_keeps_the_archive_owed_and_a_later_round_writes_it_once(self):
         def boom(*a, **k):
-            raise OSError("403")
-        pub = cp.Publisher(self.conn, "sfdc24-canvas", boom, LOG, clock=lambda: NOW, holds=lambda: True)
-        self.assertEqual(0, pub.archive(cp.CALL_ROOM, NOW))
+            raise OSError("503")
+        with mock.patch.object(cp, "keep_call_window", lambda *a: "closed"):
+            self.pub(boom).calls()
+        self.assertIn(cp.ARCHIVE_PENDING_KEY % cp.CALL_ROOM, self.conn.store, "still owed after the failure")
+        later = self.pub()
+        with mock.patch.object(cp, "keep_call_window", lambda *a: "idle"):
+            later.calls()
+            later.call_at = None
+            later.calls()
+        self.assertEqual([("sfdc24-fleet-state", self.NAME)], self.sent, "written once, named for the call's end")
+        self.assertIsNone(self.conn.store.get(cp.ARCHIVE_PENDING_KEY % cp.CALL_ROOM))
+
+    def test_a_file_already_written_is_not_sent_again(self):
+        self.conn.store[cp.ARCHIVE_PENDING_KEY % cp.CALL_ROOM] = json.dumps({"at": "2026-10-20T22:00:00Z",
+                                                                             "done": [self.NAME]})
+        self.assertEqual(0, self.pub().archive(cp.CALL_ROOM, NOW))
+        self.assertEqual([], self.sent)
+
+    def test_nothing_owed_or_no_lease_writes_nothing(self):
+        with mock.patch.object(cp, "keep_call_window", lambda *a: "open"):
+            self.pub().calls()
+        self.assertEqual([], self.sent)
+        self.conn.store[cp.ARCHIVE_PENDING_KEY % cp.CALL_ROOM] = json.dumps({"at": "2026-10-20T22:00:00Z", "done": []})
+        self.conn.store[cp.LEASE_KEY] = "someone-else"
+        self.assertEqual(0, self.pub().archive(cp.CALL_ROOM, NOW))
+        self.assertEqual([], self.sent)
 
 
 class Window(unittest.TestCase):

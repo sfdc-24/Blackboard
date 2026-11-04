@@ -681,11 +681,20 @@ def keep_call_window(conn, family: str, now, bucket: str, fence) -> str:
 # published form (clean_item), so nothing goes into an archive that the canvas would not have shown.
 ARCHIVE_BUCKET = "sfdc24-fleet-state"
 ARCHIVE_FORMAT = "project-archive/1"
+# A call's archive is owed until every file is written (Codex's HOLD on d1bde3a: a transient failure right after the
+# window closed lost it). The marker names the call's end time (each file's name) and the files already written; every
+# round of his calls retries the rest, under the lease, until none is left or the marker expires.
+ARCHIVE_PENDING_KEY = "gov:canvas:archive-pending:%s"
+ARCHIVE_PENDING_SECONDS = 24 * 60 * 60
 
 
-def archive_docs(conn, room: str, now) -> list:
-    """[(object name, bytes)]: one archive per active project of `room` that has cards. Reads only."""
+def archive_docs(conn, room: str, now, at=None) -> list:
+    """[(object name, bytes)]: one archive per active project of `room` that has cards, named for `at` (the call's
+    end; default `now`). Only cards the canvas itself would show: clean_item AND the lifecycle fence (Codex's HOLD on
+    d1bde3a: a shape-valid card the fence excludes must not reach a durable archive). Reads only."""
     import projects  # local import: the chair vendors this module without projects.py
+    import call_lifecycle  # local import avoids publisher/lifecycle import cycle
+    at = at or now
     found = {}
     for agent in AGENTS:
         stored = conn.hgetall(PARTITION % (room, agent)) or {}
@@ -694,15 +703,16 @@ def archive_docs(conn, room: str, now) -> list:
             if raw is None:
                 raw = stored.get(item_id.encode("utf-8"))
             published = clean_item(agent, item_id, raw)
-            if published and published.get("project"):
+            if (published and published.get("project")
+                    and call_lifecycle.visible(conn, agent, item_id, raw, room=room, now=now)):
                 found.setdefault(published["project"], []).append(published)
     out = []
     for pid, info in sorted(projects.read_projects(conn, room).items()):
         if info["status"] != "active" or not found.get(pid):
             continue
         doc = {"format": ARCHIVE_FORMAT, "v": 1, "room": room, "project": {"id": pid, "name": info["name"]},
-               "archived_at": stamp(now), "items": found[pid][:MAX_ITEMS]}
-        name = "projects/%s/%s.json" % (pid, now.astimezone(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
+               "archived_at": stamp(at), "items": found[pid][:MAX_ITEMS]}
+        name = "projects/%s/%s.json" % (pid, at.astimezone(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
         out.append((name, json.dumps(doc, sort_keys=True).encode("utf-8")))
     return out
 
@@ -796,22 +806,49 @@ class Publisher:
             self.log.info("canvas %s: his call window %s", CALL_ROOM, said)
         self.call_said = said
         if said == "closed":
-            self.archive(CALL_ROOM, now)
+            self.owe_archive(CALL_ROOM, now)
+        self.archive(CALL_ROOM, now)
         return said
 
+    def owe_archive(self, room, now) -> bool:
+        """His call ended: an archive is owed for `room`. One owed archive at a time (SET NX), under the lease."""
+        key = ARCHIVE_PENDING_KEY % room
+        value = json.dumps({"at": stamp(now), "done": []}, sort_keys=True)
+        try:
+            return bool(_fenced(self.conn, self.may_govern, (key,), lambda pipe: (
+                [("set", key, value, ARCHIVE_PENDING_SECONDS, True)])))
+        except Exception as error:                                       # noqa: BLE001 - the TYPE only
+            self.log.warning("canvas %s: the owed archive could not be marked (%s)", room, type(error).__name__)
+            return False
+
     def archive(self, room, now) -> int:
-        """His call ended: each active project's cards to the private bucket (archive_docs). How many files were
-        written. Never raises; a failure is logged by type only and the call's end is not held up."""
+        """Write what the owed archive still lacks (archive_docs, named for the call's end), recording each file as
+        it lands, and clear the marker once none is left. How many files this round wrote. Never raises: a failure
+        is logged by type and retried on a later round, under the lease."""
+        key = ARCHIVE_PENDING_KEY % room
         written = 0
         try:
-            for name, data in archive_docs(self.conn, room, now):
+            seen = self.conn.get(key)
+            owed = _json_of(seen)
+            if owed is None:
+                return 0
+            at = datetime.datetime.fromisoformat(str(owed.get("at", "")).replace("Z", "+00:00"))
+            done = [str(n) for n in owed.get("done") or []]
+            for name, data in archive_docs(self.conn, room, now, at):
+                if name in done:
+                    continue
                 if not self.may_govern():
-                    break
+                    return written
                 self.upload(ARCHIVE_BUCKET, name, data, self.may_govern)
+                done.append(name)
                 written += 1
                 self.log.info("canvas %s: archived %s", room, name)
+                value = json.dumps(dict(owed, done=done), sort_keys=True)
+                _fenced(self.conn, self.may_govern, (key,), lambda pipe: [("set", key, value, ARCHIVE_PENDING_SECONDS,
+                                                                          False)])
+            _fenced(self.conn, self.may_govern, (key,), lambda pipe: [("delete", key)])
         except Exception as error:                                       # noqa: BLE001 - the TYPE only
-            self.log.warning("canvas %s: a project archive was not written (%s)", room, type(error).__name__)
+            self.log.warning("canvas %s: a project archive was not written yet (%s)", room, type(error).__name__)
         return written
 
     def may_write(self, room) -> bool:
