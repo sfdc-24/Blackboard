@@ -64,6 +64,7 @@ import re
 import secrets
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -539,7 +540,8 @@ class Token:
         return self.value
 
 
-def gcs_upload(bucket: str, name: str, data: bytes, token, opener=urllib.request.urlopen, allow=None) -> int:
+def gcs_upload(bucket: str, name: str, data: bytes, token, opener=urllib.request.urlopen, allow=None,
+               if_absent: bool = False) -> int:
     """One multipart upload, so the object's Cache-Control is set in the same call as its bytes.
 
     `allow`, when given, is asked again after the body is built and before the request is sent. An upload
@@ -553,6 +555,8 @@ def gcs_upload(bucket: str, name: str, data: bytes, token, opener=urllib.request
         raise Aborted()
     url = ("https://storage.googleapis.com/upload/storage/v1/b/%s/o?uploadType=multipart"
            % urllib.parse.quote(bucket, safe=""))
+    if if_absent:
+        url += "&ifGenerationMatch=0"          # create only: an object already there answers 412, never overwritten
     req = urllib.request.Request(url, data=body, method="POST", headers={
         "Authorization": "Bearer " + token(), "Content-Type": "multipart/related; boundary=" + boundary})
     with opener(req, timeout=10) as resp:
@@ -776,8 +780,10 @@ class Publisher:
     upload must not commit after a stop, a deletion, a lost lease or an expiry, and a reopen or a privacy
     change must not publish the old bytes). The send asks again after it has been entered."""
 
-    def __init__(self, conn, bucket, upload, log, clock=None, holds=None, family=""):
+    def __init__(self, conn, bucket, upload, log, clock=None, holds=None, family="", archive_upload=None):
         self.conn, self.bucket, self.upload, self.log = conn, bucket, upload, log
+        # Archives are created only, never overwritten (ifGenerationMatch=0): see archive().
+        self.archive_upload = archive_upload or upload
         self.clock = clock or (lambda: datetime.datetime.now(datetime.timezone.utc))
         self.holds = holds
         self.last = {}          # room -> (digest, time of the last write)
@@ -840,9 +846,17 @@ class Publisher:
                 for name in sorted(files):
                     if not self.may_govern():
                         return written
-                    self.upload(ARCHIVE_BUCKET, name, files[name].encode("utf-8"), self.may_govern)
+                    try:
+                        self.archive_upload(ARCHIVE_BUCKET, name, files[name].encode("utf-8"), self.may_govern)
+                        self.log.info("canvas %s: archived %s", room, name)
+                    except urllib.error.HTTPError as error:
+                        if error.code != 412:
+                            raise
+                        # Already there (Codex's HOLD on 96cf37e: an upload that landed but whose marker update was
+                        # lost). The name is this call's and this project's, written by this path alone, from bytes
+                        # frozen at the call's end: the object there IS this file, so it counts as written.
+                        self.log.info("canvas %s: %s was already archived", room, name)
                     written += 1
-                    self.log.info("canvas %s: archived %s", room, name)
                     del files[name]
                     value = json.dumps(dict(owed, files=files), sort_keys=True)
                     _fenced(self.conn, self.may_govern, (key,), lambda pipe, v=value, k=key: (
@@ -973,6 +987,14 @@ class Publisher:
             self.stop.wait(interval)
 
 
+def uploaders(token, send=None):
+    """(room file upload, archive upload) over one token: the room file is replaced each round; an archive is
+    created only, never overwritten (ifGenerationMatch=0)."""
+    send = send or gcs_upload
+    return (lambda b, n, d, allow=None: send(b, n, d, token, allow=allow),
+            lambda b, n, d, allow=None: send(b, n, d, token, allow=allow, if_absent=True))
+
+
 def start(conn, bucket, log, upload=None, holds=None, family=None):
     """The publisher on its own thread, or None when no bucket is configured.
 
@@ -984,12 +1006,13 @@ def start(conn, bucket, log, upload=None, holds=None, family=None):
     if not BUCKET.fullmatch(bucket or "") or holds is None:
         return None
     if upload is None:
-        token = Token()
-        upload = lambda b, n, d, allow=None: gcs_upload(b, n, d, token, allow=allow)  # noqa: E731
+        upload, archive_upload = uploaders(Token())
+    else:
+        archive_upload = upload
     if family is None:
         import os                                                        # noqa: PLC0415
         family = call_family(os.environ)
-    publisher = Publisher(conn, bucket, upload, log, holds=holds, family=family)
+    publisher = Publisher(conn, bucket, upload, log, holds=holds, family=family, archive_upload=archive_upload)
     thread = threading.Thread(target=publisher.run, name="canvas-publish", daemon=True)
     thread.start()
     publisher.thread = thread

@@ -11,6 +11,7 @@ import json
 import sys
 import logging
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
@@ -380,6 +381,60 @@ class ProjectArchives(unittest.TestCase):
         doc = json.loads(bodies[0][2])
         self.assertEqual(["Acme one", "Acme two"], sorted(i["title"] for i in doc["items"]))
         self.assertEqual([], self.owed())
+
+    def test_a_landed_upload_whose_record_was_lost_counts_as_written_on_retry(self):
+        """Codex's HOLD on 96cf37e: the object was created but the marker update failed; the create-only retry gets
+        412 and must clear the file instead of failing every round and blocking later files."""
+        created = set()
+
+        def create_only(bucket, name, data, allow=None):
+            if name in created:
+                raise urllib.error.HTTPError(name, 412, "Precondition Failed", None, None)
+            created.add(name)
+            self.sent.append((bucket, name))
+        pub = self.pub()
+        pub.archive_upload = create_only
+        pub.owe_archive(cp.CALL_ROOM, NOW)
+        pub.owe_archive(cp.CALL_ROOM, NOW + datetime.timedelta(hours=1))
+        real = cp._fenced
+        with mock.patch.object(cp, "_fenced", lambda *a, **k: None):     # every marker update is lost
+            pub.archive(cp.CALL_ROOM, NOW)
+        self.assertEqual(2, len(self.owed()), "both still owed: their records were lost")
+        with mock.patch.object(cp, "_fenced", real):
+            self.assertEqual(2, pub.archive(cp.CALL_ROOM, NOW))
+        self.assertEqual([], self.owed(), "cleared, nothing blocked")
+        self.assertEqual(2, len(self.sent), "each object created once")
+
+    def test_another_http_error_keeps_the_file_owed(self):
+        pub = self.pub()
+        pub.owe_archive(cp.CALL_ROOM, NOW)
+        pub.archive_upload = lambda *a, **k: (_ for _ in ()).throw(
+            urllib.error.HTTPError("x", 403, "Forbidden", None, None))
+        self.assertEqual(0, pub.archive(cp.CALL_ROOM, NOW))
+        self.assertEqual(1, len(self.owed()))
+
+    def test_the_real_archive_upload_is_create_only(self):
+        seen = []
+
+        class Resp:
+            status = 200
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+        cp.gcs_upload("sfdc24-fleet-state", "projects/acme/x.json", b"{}", lambda: "t",
+                      opener=lambda req, timeout=None: (seen.append(req.full_url), Resp())[1], if_absent=True)
+        cp.gcs_upload("sfdc24-canvas", "rooms/demo.json", b"{}", lambda: "t",
+                      opener=lambda req, timeout=None: (seen.append(req.full_url), Resp())[1])
+        self.assertIn("ifGenerationMatch=0", seen[0])
+        self.assertNotIn("ifGenerationMatch", seen[1], "the room file is still replaced each round")
+
+    def test_the_live_publisher_wires_create_only_for_archives_and_replace_for_the_room_file(self):
+        calls = []
+        room, archive = cp.uploaders("tok", send=lambda *a, **k: calls.append(k.get("if_absent", False)))
+        room("b", "n", b"d")
+        archive("b", "n", b"d")
+        self.assertEqual([False, True], calls)
 
     def test_two_calls_owed_at_once_are_both_written(self):
         self.pub(lambda *a, **k: (_ for _ in ()).throw(OSError("503"))).owe_archive(cp.CALL_ROOM, NOW)
