@@ -681,9 +681,10 @@ def keep_call_window(conn, family: str, now, bucket: str, fence) -> str:
 # published form (clean_item), so nothing goes into an archive that the canvas would not have shown.
 ARCHIVE_BUCKET = "sfdc24-fleet-state"
 ARCHIVE_FORMAT = "project-archive/1"
-# A call's archive is owed until every file is written (Codex's HOLD on d1bde3a: a transient failure right after the
-# window closed lost it). The marker names the call's end time (each file's name) and the files already written; every
-# round of his calls retries the rest, under the lease, until none is left or the marker expires.
+# A call's archive is owed until every file is written (Codex's HOLDs on d1bde3a and bacb41a: a transient failure right
+# after the window closed lost it, and a retry must not rebuild it from later state). At the call's end its files are
+# built once and kept, bytes and names, under ARCHIVE_PENDING_KEY:<end time>; every round of his calls writes what is
+# left, under the lease, until none is or the marker expires.
 ARCHIVE_PENDING_KEY = "gov:canvas:archive-pending:%s"
 ARCHIVE_PENDING_SECONDS = 24 * 60 * 60
 
@@ -811,10 +812,15 @@ class Publisher:
         return said
 
     def owe_archive(self, room, now) -> bool:
-        """His call ended: an archive is owed for `room`. One owed archive at a time (SET NX), under the lease."""
-        key = ARCHIVE_PENDING_KEY % room
-        value = json.dumps({"at": stamp(now), "done": []}, sort_keys=True)
+        """His call ended: build its archive NOW and keep those exact bytes owed until each file is written (Codex's
+        HOLD on bacb41a: a retry rebuilt from live Redis, so a card revised or expired after the call changed or
+        dropped it). One marker per call, keyed by its end time, so a later call never replaces an earlier one."""
         try:
+            files = {name: data.decode("utf-8") for name, data in archive_docs(self.conn, room, now)}
+            if not files:
+                return False
+            key = ARCHIVE_PENDING_KEY % room + ":" + stamp(now)
+            value = json.dumps({"at": stamp(now), "files": files}, sort_keys=True)
             return bool(_fenced(self.conn, self.may_govern, (key,), lambda pipe: (
                 [("set", key, value, ARCHIVE_PENDING_SECONDS, True)])))
         except Exception as error:                                       # noqa: BLE001 - the TYPE only
@@ -822,31 +828,27 @@ class Publisher:
             return False
 
     def archive(self, room, now) -> int:
-        """Write what the owed archive still lacks (archive_docs, named for the call's end), recording each file as
-        it lands, and clear the marker once none is left. How many files this round wrote. Never raises: a failure
-        is logged by type and retried on a later round, under the lease."""
-        key = ARCHIVE_PENDING_KEY % room
+        """Write the owed archives' frozen files, oldest call first, dropping each file from its marker as it lands and
+        the marker once it is empty. How many files this round wrote. Never raises: a failure is logged by type and
+        the rest stays owed for a later round, under the lease."""
         written = 0
         try:
-            seen = self.conn.get(key)
-            owed = _json_of(seen)
-            if owed is None:
-                return 0
-            at = datetime.datetime.fromisoformat(str(owed.get("at", "")).replace("Z", "+00:00"))
-            done = [str(n) for n in owed.get("done") or []]
-            for name, data in archive_docs(self.conn, room, now, at):
-                if name in done:
-                    continue
-                if not self.may_govern():
-                    return written
-                self.upload(ARCHIVE_BUCKET, name, data, self.may_govern)
-                done.append(name)
-                written += 1
-                self.log.info("canvas %s: archived %s", room, name)
-                value = json.dumps(dict(owed, done=done), sort_keys=True)
-                _fenced(self.conn, self.may_govern, (key,), lambda pipe: [("set", key, value, ARCHIVE_PENDING_SECONDS,
-                                                                          False)])
-            _fenced(self.conn, self.may_govern, (key,), lambda pipe: [("delete", key)])
+            prefix = ARCHIVE_PENDING_KEY % room + ":"
+            for key in sorted(_text(k) for k in self.conn.scan_iter(match=prefix + "*", count=100)):
+                owed = _json_of(self.conn.get(key))
+                files = dict(owed.get("files") or {}) if owed else {}
+                for name in sorted(files):
+                    if not self.may_govern():
+                        return written
+                    self.upload(ARCHIVE_BUCKET, name, files[name].encode("utf-8"), self.may_govern)
+                    written += 1
+                    self.log.info("canvas %s: archived %s", room, name)
+                    del files[name]
+                    value = json.dumps(dict(owed, files=files), sort_keys=True)
+                    _fenced(self.conn, self.may_govern, (key,), lambda pipe, v=value, k=key: (
+                        [("set", k, v, ARCHIVE_PENDING_SECONDS, False)] if files else [("delete", k)]))
+                if not files:
+                    _fenced(self.conn, self.may_govern, (key,), lambda pipe, k=key: [("delete", k)])
         except Exception as error:                                       # noqa: BLE001 - the TYPE only
             self.log.warning("canvas %s: a project archive was not written yet (%s)", room, type(error).__name__)
         return written

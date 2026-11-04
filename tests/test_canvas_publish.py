@@ -352,37 +352,47 @@ class ProjectArchives(unittest.TestCase):
         for absent in ("Beta card", "Untagged", "Private", "Fenced out"):
             self.assertNotIn(absent, docs[0][1].decode())
 
+    def owed(self):
+        return sorted(k for k in self.conn.store if k.startswith(cp.ARCHIVE_PENDING_KEY % cp.CALL_ROOM + ":"))
+
     def test_the_end_of_his_call_writes_the_archive_to_the_private_bucket_and_clears_what_it_owed(self):
         with mock.patch.object(cp, "keep_call_window", lambda *a: "closed"):
             self.assertEqual("closed", self.pub().calls())
         self.assertEqual([("sfdc24-fleet-state", self.NAME)], self.sent)
-        self.assertIsNone(self.conn.store.get(cp.ARCHIVE_PENDING_KEY % cp.CALL_ROOM))
+        self.assertEqual([], self.owed())
 
-    def test_a_failed_upload_keeps_the_archive_owed_and_a_later_round_writes_it_once(self):
+    def test_a_retry_sends_the_bytes_frozen_at_the_call_end_even_after_a_card_changes(self):
+        """Codex's HOLD on bacb41a: a failed upload, then a live revision; the retry must send the call's archive."""
+        bodies = []
+
         def boom(*a, **k):
             raise OSError("503")
         with mock.patch.object(cp, "keep_call_window", lambda *a: "closed"):
             self.pub(boom).calls()
-        self.assertIn(cp.ARCHIVE_PENDING_KEY % cp.CALL_ROOM, self.conn.store, "still owed after the failure")
-        later = self.pub()
+        self.assertEqual(1, len(self.owed()), "still owed after the failure")
+        put(self.conn, "grok", "a1", item(title="Acme one REVISED LATER", project="acme", version=2),
+            room=cp.CALL_ROOM)
+        del self.conn.hashes[cp.PARTITION % (cp.CALL_ROOM, "gemini")]          # and a card gone after the call
+        later = self.pub(lambda b, n, d, allow=None: bodies.append((b, n, d)))
         with mock.patch.object(cp, "keep_call_window", lambda *a: "idle"):
             later.calls()
-            later.call_at = None
-            later.calls()
-        self.assertEqual([("sfdc24-fleet-state", self.NAME)], self.sent, "written once, named for the call's end")
-        self.assertIsNone(self.conn.store.get(cp.ARCHIVE_PENDING_KEY % cp.CALL_ROOM))
+        self.assertEqual([("sfdc24-fleet-state", self.NAME)], [(b, n) for b, n, _ in bodies], "written once")
+        doc = json.loads(bodies[0][2])
+        self.assertEqual(["Acme one", "Acme two"], sorted(i["title"] for i in doc["items"]))
+        self.assertEqual([], self.owed())
 
-    def test_a_file_already_written_is_not_sent_again(self):
-        self.conn.store[cp.ARCHIVE_PENDING_KEY % cp.CALL_ROOM] = json.dumps({"at": "2026-10-20T22:00:00Z",
-                                                                             "done": [self.NAME]})
-        self.assertEqual(0, self.pub().archive(cp.CALL_ROOM, NOW))
-        self.assertEqual([], self.sent)
+    def test_two_calls_owed_at_once_are_both_written(self):
+        self.pub(lambda *a, **k: (_ for _ in ()).throw(OSError("503"))).owe_archive(cp.CALL_ROOM, NOW)
+        self.pub().owe_archive(cp.CALL_ROOM, NOW + datetime.timedelta(hours=1))
+        self.assertEqual(2, len(self.owed()))
+        self.assertEqual(2, self.pub().archive(cp.CALL_ROOM, NOW))
+        self.assertEqual([self.NAME, "projects/acme/20261020T230000Z.json"], [n for _, n in self.sent])
 
     def test_nothing_owed_or_no_lease_writes_nothing(self):
         with mock.patch.object(cp, "keep_call_window", lambda *a: "open"):
             self.pub().calls()
         self.assertEqual([], self.sent)
-        self.conn.store[cp.ARCHIVE_PENDING_KEY % cp.CALL_ROOM] = json.dumps({"at": "2026-10-20T22:00:00Z", "done": []})
+        self.pub().owe_archive(cp.CALL_ROOM, NOW)
         self.conn.store[cp.LEASE_KEY] = "someone-else"
         self.assertEqual(0, self.pub().archive(cp.CALL_ROOM, NOW))
         self.assertEqual([], self.sent)
