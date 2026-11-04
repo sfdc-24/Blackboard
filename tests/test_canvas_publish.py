@@ -9,6 +9,7 @@ import datetime
 import fnmatch
 import json
 import sys
+import logging
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -308,6 +309,63 @@ class ProjectsOnTheCanvas(unittest.TestCase):
         self.assertIsNone(cp.clean_item("grok", "x", item(project="Bad Tag!")))
         self.assertIsNone(cp.clean_item("grok", "x", item(project=7)))
         self.assertEqual("acme", cp.clean_item("grok", "x", item(project="acme"))["project"])
+
+
+LOG = logging.getLogger("canvas-publish-test")
+
+
+class ProjectArchives(unittest.TestCase):
+    """R6a (CARDS-ARCHITECTURE R6.1): at the end of his call each active project's cards go to the PRIVATE fleet-state
+    bucket, one file per project, never to the public canvas bucket. Synthetic only."""
+
+    def setUp(self):
+        self.conn = FakeRedis()
+        room = cp.CALL_ROOM
+        put(self.conn, "grok", "a1", item(title="Acme one", project="acme"), room=room)
+        put(self.conn, "gemini", "a2", item(title="Acme two", project="acme"), room=room)
+        put(self.conn, "grok", "b1", item(title="Beta card", project="beta"), room=room)
+        put(self.conn, "grok", "old", item(title="Untagged"), room=room)
+        put(self.conn, "grok", "secret", item(title="Private", project="acme", public=False), room=room)
+        projects = {"acme": {"name": "Acme", "status": "active"}, "beta": {"name": "Beta", "status": "archived"},
+                    "empty": {"name": "Empty", "status": "active"}}
+        self.conn.hashes["conf:projects:%s" % room] = {k: json.dumps(v) for k, v in projects.items()}
+
+    def test_one_file_per_active_project_with_cards_holding_only_its_published_cards(self):
+        docs = cp.archive_docs(self.conn, cp.CALL_ROOM, NOW)
+        self.assertEqual(["projects/acme/20261020T220000Z.json"], [name for name, _ in docs])
+        doc = json.loads(docs[0][1])
+        self.assertEqual("project-archive/1", doc["format"])
+        self.assertEqual({"id": "acme", "name": "Acme"}, doc["project"])
+        self.assertEqual(["Acme one", "Acme two"], sorted(i["title"] for i in doc["items"]))
+        blob = docs[0][1].decode()
+        for absent in ("Beta card", "Untagged", "Private"):
+            self.assertNotIn(absent, blob)
+
+    def test_the_end_of_his_call_writes_the_archive_to_the_private_bucket_only(self):
+        sent = []
+        pub = cp.Publisher(self.conn, "sfdc24-canvas", lambda b, n, d, allow=None: sent.append((b, n)), LOG,
+                           clock=lambda: NOW, holds=lambda: True, family="conf-0123456789abcdef")
+        with mock.patch.object(cp, "keep_call_window", lambda *a: "closed"):
+            self.assertEqual("closed", pub.calls())
+        self.assertEqual([("sfdc24-fleet-state", "projects/acme/20261020T220000Z.json")], sent)
+        self.assertNotIn("sfdc24-canvas", [b for b, _ in sent])
+
+    def test_no_archive_while_the_call_goes_on_or_without_the_lease(self):
+        sent = []
+        pub = cp.Publisher(self.conn, "sfdc24-canvas", lambda b, n, d, allow=None: sent.append(n), LOG,
+                           clock=lambda: NOW, holds=lambda: True, family="conf-0123456789abcdef")
+        with mock.patch.object(cp, "keep_call_window", lambda *a: "open"):
+            pub.calls()
+        self.assertEqual([], sent)
+        self.assertEqual(0, cp.Publisher(self.conn, "sfdc24-canvas", lambda *a, **k: sent.append(a), LOG,
+                                         clock=lambda: NOW, holds=lambda: False).archive(cp.CALL_ROOM, NOW))
+        self.assertEqual([], sent)
+
+    def test_a_failed_upload_is_logged_and_never_raised(self):
+        def boom(*a, **k):
+            raise OSError("403")
+        pub = cp.Publisher(self.conn, "sfdc24-canvas", boom, LOG, clock=lambda: NOW, holds=lambda: True)
+        self.assertEqual(0, pub.archive(cp.CALL_ROOM, NOW))
 
 
 class Window(unittest.TestCase):

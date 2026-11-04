@@ -675,6 +675,38 @@ def keep_call_window(conn, family: str, now, bucket: str, fence) -> str:
     return "idle"
 
 
+# PROJECT ARCHIVES (R6a, conference docs/CARDS-ARCHITECTURE.md R6.1, Gemini AGREE 2026-11-04 15:29Z): when his call
+# ends (keep_call_window closed the window it opened), each active project's cards in CALL_ROOM are written to the
+# PRIVATE fleet-state bucket, never to the public canvas bucket: one file per project per call. The cards are the
+# published form (clean_item), so nothing goes into an archive that the canvas would not have shown.
+ARCHIVE_BUCKET = "sfdc24-fleet-state"
+ARCHIVE_FORMAT = "project-archive/1"
+
+
+def archive_docs(conn, room: str, now) -> list:
+    """[(object name, bytes)]: one archive per active project of `room` that has cards. Reads only."""
+    import projects  # local import: the chair vendors this module without projects.py
+    found = {}
+    for agent in AGENTS:
+        stored = conn.hgetall(PARTITION % (room, agent)) or {}
+        for item_id in sorted(_text(k) for k in stored):
+            raw = stored.get(item_id)
+            if raw is None:
+                raw = stored.get(item_id.encode("utf-8"))
+            published = clean_item(agent, item_id, raw)
+            if published and published.get("project"):
+                found.setdefault(published["project"], []).append(published)
+    out = []
+    for pid, info in sorted(projects.read_projects(conn, room).items()):
+        if info["status"] != "active" or not found.get(pid):
+            continue
+        doc = {"format": ARCHIVE_FORMAT, "v": 1, "room": room, "project": {"id": pid, "name": info["name"]},
+               "archived_at": stamp(now), "items": found[pid][:MAX_ITEMS]}
+        name = "projects/%s/%s.json" % (pid, now.astimezone(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
+        out.append((name, json.dumps(doc, sort_keys=True).encode("utf-8")))
+    return out
+
+
 def _json_of(raw):
     try:
         value = json.loads(_text(raw)) if raw else None
@@ -763,7 +795,24 @@ class Publisher:
         if said in ("opened", "closed") or said != self.call_said:
             self.log.info("canvas %s: his call window %s", CALL_ROOM, said)
         self.call_said = said
+        if said == "closed":
+            self.archive(CALL_ROOM, now)
         return said
+
+    def archive(self, room, now) -> int:
+        """His call ended: each active project's cards to the private bucket (archive_docs). How many files were
+        written. Never raises; a failure is logged by type only and the call's end is not held up."""
+        written = 0
+        try:
+            for name, data in archive_docs(self.conn, room, now):
+                if not self.may_govern():
+                    break
+                self.upload(ARCHIVE_BUCKET, name, data, self.may_govern)
+                written += 1
+                self.log.info("canvas %s: archived %s", room, name)
+        except Exception as error:                                       # noqa: BLE001 - the TYPE only
+            self.log.warning("canvas %s: a project archive was not written (%s)", room, type(error).__name__)
+        return written
 
     def may_write(self, room) -> bool:
         """The publisher is running, the lease is this worker's, and the room's window is open now."""
