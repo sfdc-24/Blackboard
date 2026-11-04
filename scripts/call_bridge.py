@@ -152,7 +152,9 @@ FLOOR_FRESH_SECONDS = 3 * 60  # an unnamed task ask goes to the floor holder onl
 READBACK = True
 READBACK_OFF = os.environ.get("CALL_BRIDGE_READBACK", "on").strip().lower() == "off"
 READ_BACK_OFF = "Not started, the read-back is off"
-READBACK_SECONDS = 2 * 60
+# THE FORGIVING GO-AHEAD (the owner's decision, 2026-11-03 21:25 ET, after two calls where no ask ever started).
+# Two minutes was too short on a live call: five.
+READBACK_SECONDS = 5 * 60
 PROPOSAL_KEY = "gov:callbridge:proposal:%s"   # the room's one open proposal: {entry, agents, asks, at}
 # THE SPOKEN READ-BACK (the owner's orders 2026-11-02; his B3 decision, GROK-OWNER-GO-CALLFIX-20261102T2324Z): the
 # card is public, so it can never hold his words. The ask is read back on the call as a SHORT PARAPHRASE: the
@@ -164,7 +166,9 @@ PROPOSAL_KEY = "gov:callbridge:proposal:%s"   # the room's one open proposal: {e
 # goes when the proposal closes or is heard.
 READBACK_KEY = "v1:conf:%s:readback"
 READBACK_MAX_WORDS = 60      # the paraphrase bound the chair passes its voice (contract v2)
-ASK_MAX_WORDS = 40           # B1: a longer turn never becomes a read-back; he is asked to restate
+# B1: a longer turn never becomes a read-back; he is asked to restate. The voice restates in its own words within
+# READBACK_MAX_WORDS, so a longer ask is never recited: 40 refused his ordinary asks (2026-11-03 21:11 ET); 120 now.
+ASK_MAX_WORDS = 120
 ASK_MAX_CHARS = 1000         # B1: the pinned chair truncates there, so a longer ask is already cut
 TOO_LONG = "Not started, too long to read back: please restate it briefly"
 # Grok's N1 on PR 452: the earlier ask may already be read back and waiting for his go-ahead, so the card says
@@ -291,6 +295,11 @@ _GO = (r"(?:(?:please\s+)?(?:go\s+ahead(?:\s+and\s+do\s+(?:it|that|this))?|do\s+
        r"make\s+it\s+so|please\s+do|proceed|ship\s+it|run\s+with\s+it|yes\s+please|let['’]?s\s+do\s+(?:it|that)|"
        r"start\s+(?:it|on\s+it)|get\s+(?:it|that)\s+done|you\s+can\s+do\s+(?:it|that)))")
 GO_AHEAD = re.compile(r"(?i)^(?:%s\s+)*%s(?:\s+%s)*$" % (_FILL, _GO, _FILL))
+# An UNNAMED go-ahead confirms the room's one open proposal only when it says to go ("go ahead", "do it", "proceed"),
+# after that proposal was read back on the call, from the caller who asked, within READBACK_SECONDS. A bare "yes
+# please" or "okay" can answer anything said on the call (Codex's row 9443), so it still confirms nothing unnamed.
+EXPLICIT_GO = re.compile(r"(?i)\b(?:go\s+ahead|do\s+(?:it|that|this)|go\s+for\s+it|proceed|start\s+(?:it|on\s+it)|"
+                         r"make\s+it\s+so|ship\s+it|run\s+with\s+it|get\s+(?:it|that)\s+done)\b")
 
 
 def go_ahead(fields: dict) -> bool:
@@ -393,7 +402,7 @@ def proposal_card(agent: str, asked_at, now) -> dict:
     return {"v": 1, "type": "note", "status": "review", "public": True, "version": 1, "ts": stamp(now),
             "activity": PROPOSED,
             "title": "Say: %s, go ahead (asked %s)" % (name, eastern(asked_at)),
-            "body": "Heard in the room at %s. It is read back on the call; nothing starts until the owner then says this name and go ahead within %d minutes. "
+            "body": "Heard in the room at %s. It is read back on the call; nothing starts until the owner then says go ahead (or this name and go ahead) within %d minutes. "
                     "Cancel drops it; a newer ask waits behind it." % (eastern(asked_at), READBACK_SECONDS // 60)}
 
 
@@ -863,8 +872,8 @@ class Bridge:
                 continue
             if go_ahead(fields) and self.readback:
                 # READ-BACK: a go-ahead confirms only the room's open proposal, said at most READBACK_SECONDS before
-                # it, and only for the proposed voices it NAMES, as the card says ("Codex, go ahead"). An unnamed
-                # "go ahead" or "yes please" may answer anything said on the call, so it confirms nothing.
+                # it, for the proposed voices it NAMES ("Codex, go ahead"), or for all of them when it names nobody
+                # and says to go (EXPLICIT_GO). A bare "yes please" may answer anything said on the call: nothing.
                 agents = []
                 proposal = None if self.paused else self._proposal(room)
                 go_names = named_in(said)
@@ -875,7 +884,7 @@ class Bridge:
                     self.log.info("call bridge: a go-ahead in %s before the read-back; nothing claimed", room)
                 elif not _within(proposal["spoken"], entry_id, READBACK_SECONDS):
                     self._close(room, proposal, proposal["agents"], "Not started, no go-ahead in time", now)
-                elif not go_names:
+                elif not go_names and not EXPLICIT_GO.search(said):
                     self.log.info("call bridge: a go-ahead in %s names no voice; nothing claimed", room)
                 elif (fields.get("actor_id"), fields.get("session_epoch")) != (proposal["actor"], proposal["epoch"]):
                     # Only the caller who asked, in the same chair session, confirms his own ask.

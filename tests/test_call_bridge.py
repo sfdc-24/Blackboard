@@ -1581,6 +1581,11 @@ class ReadBack(unittest.TestCase):
         self.conn = FakeRedis()
         open_window(self.conn)
         self.side = cb.SIDE_KEY % NOW.strftime("%Y%m%d")
+        # These cases pin the window's LOGIC at the two-minute length they were written for; the forgiving
+        # five-minute default is pinned in ForgivingReadBack below.
+        saved = cb.READBACK_SECONDS
+        cb.READBACK_SECONDS = 120
+        self.addCleanup(setattr, cb, "READBACK_SECONDS", saved)
 
     def b(self, holds=True, now=NOW):
         lease = holds if callable(holds) else (lambda: holds)
@@ -1629,12 +1634,11 @@ class ReadBack(unittest.TestCase):
         self.assertEqual(1, len(self.inbox(self.CODEX)))
         self.assertIsNone(self.conn.get(cb.PROPOSAL_KEY % ROOM))
 
-    def test_a2_an_unnamed_go_ahead_or_yes_confirms_nothing_the_names_do(self):
-        """Codex's row 9443: an unrelated yes must not dispatch. The card says the name, so the go-ahead must."""
+    def test_a2_an_unnamed_yes_confirms_nothing_the_names_do(self):
+        """Codex's row 9443: an unrelated yes must not dispatch. A bare yes or okay never confirms unnamed."""
         entry = turn(self.conn, "Grok and Gemini, compare the two sample plans.", seconds_ago=60)
         self.heard(entry, ["grok", "gemini"], 58)
-        for ago, unnamed in ((55, "yes, go ahead please"), (50, "Yes please."), (45, "Okay, do it."), (40, "proceed")):
-            self.assertTrue(cb.go_ahead({"kind": "turn.started", "actor_id": "o", "utterance": unnamed}), unnamed)
+        for ago, unnamed in ((55, "Yes please."), (50, "yes"), (45, "Okay."), (40, "sounds good")):
             turn(self.conn, unnamed, reason="continuity", seconds_ago=ago)
             self.assertEqual([], self.b().tick(), unnamed)
             self.assertEqual(at(ago), self.conn.get(cb.CURSOR_KEY % ROOM), "the turn was read")
@@ -2359,6 +2363,111 @@ class ReadBack(unittest.TestCase):
         self.assertEqual(cb.readback_id(ROOM, entry, ["grok", "gemini"]),
                          self.conn.hgetall(cb.READBACK_KEY % ROOM)["id"])
         self.assertEqual(30, self.conn.ttls[cb.READBACK_KEY % ROOM])
+
+
+class ForgivingReadBack(unittest.TestCase):
+    """The owner, 2026-11-03 21:25 ET, after two calls where none of his asks started: the go-ahead is forgiving.
+    Five minutes, asks up to 120 words, and an unnamed "go ahead" confirms the one open proposal once it was read
+    back, from the caller who asked. A bare yes still confirms nothing. Synthetic sentences only."""
+    CODEX = "chatgpt-codex-desktop"
+
+    def setUp(self):
+        self.conn = FakeRedis()
+        open_window(self.conn)
+
+    def b(self, now=NOW):
+        return cb.Bridge(self.conn, LOG, lambda: True, clock=lambda: now, readback=True)
+
+    def inbox(self, agent):
+        return self.conn.streams.get("fleet:inbox:%s" % agent, [])
+
+    def cards(self, agent):
+        return {k: json.loads(v) for k, v in self.conn.hgetall(cp.PARTITION % ("workshop", agent)).items()}
+
+    def heard(self, entry, agents, seconds_ago):
+        return self.conn.xadd(STREAM, {
+            "kind": cb.READBACK_SPOKEN, "actor_id": "chair", "room_id": ROOM, "session_epoch": "fixture-epoch",
+            "control_sequence": "4", "proj_n": "2", "readback_id": cb.readback_id(ROOM, entry, agents)},
+            entry_id=at(seconds_ago))
+
+    def test_the_defaults_are_five_minutes_and_120_words(self):
+        self.assertEqual((300, 120), (cb.READBACK_SECONDS, cb.ASK_MAX_WORDS))
+
+    def test_explicit_go_words_and_bare_yes(self):
+        for said in ("go ahead", "Okay, go ahead.", "yes, go ahead please", "do it", "proceed", "go for it"):
+            self.assertTrue(cb.EXPLICIT_GO.search(said), said)
+        for said in ("Yes please.", "yes", "Okay.", "sounds good", "ahead of time", "undo it"):
+            self.assertFalse(cb.EXPLICIT_GO.search(said), said)
+
+    def test_an_unnamed_go_ahead_after_the_read_back_claims_the_open_proposal(self):
+        entry = turn(self.conn, "Codex, draft the sample queue flow.", seconds_ago=60)
+        self.b().tick()
+        self.heard(entry, [self.CODEX], 40)
+        turn(self.conn, "Okay, go ahead.", reason="continuity", seconds_ago=20)
+        self.assertEqual([cb.ask_id(ROOM, entry, self.CODEX)], self.b().tick())
+        [(_, sent)] = self.inbox(self.CODEX)
+        self.assertIn("draft the sample queue flow", sent["text"])
+
+    def test_an_unnamed_go_ahead_confirms_every_voice_of_the_proposal(self):
+        entry = turn(self.conn, "Grok and Gemini, compare the two sample plans.", seconds_ago=60)
+        self.b().tick()
+        self.heard(entry, ["grok", "gemini"], 40)
+        turn(self.conn, "do it", reason="continuity", seconds_ago=20)
+        self.assertEqual(2, len(self.b().tick()))
+        self.assertEqual((1, 1), (len(self.inbox("grok")), len(self.inbox("gemini"))))
+
+    def test_a_bare_yes_after_the_read_back_claims_nothing(self):
+        entry = turn(self.conn, "Codex, draft the sample queue flow.", seconds_ago=60)
+        self.b().tick()
+        self.heard(entry, [self.CODEX], 40)
+        turn(self.conn, "Yes please.", reason="continuity", seconds_ago=20)
+        self.assertEqual([], self.b().tick())
+        self.assertEqual([], self.inbox(self.CODEX))
+
+    def test_an_unnamed_go_ahead_before_the_read_back_claims_nothing(self):
+        turn(self.conn, "Codex, draft the sample queue flow.", seconds_ago=60)
+        self.b().tick()
+        turn(self.conn, "go ahead", reason="continuity", seconds_ago=20)
+        self.assertEqual([], self.b().tick())
+        self.assertEqual([], self.inbox(self.CODEX))
+
+    def test_an_unnamed_go_ahead_from_another_caller_claims_nothing(self):
+        entry = turn(self.conn, "Codex, draft the sample queue flow.", seconds_ago=60)
+        self.b().tick()
+        self.heard(entry, [self.CODEX], 40)
+        turn(self.conn, "go ahead", reason="continuity", actor="someone_else", seconds_ago=20)
+        self.assertEqual([], self.b().tick())
+        self.assertEqual([], self.inbox(self.CODEX))
+
+    def test_a_go_ahead_four_minutes_after_the_read_back_still_starts_it(self):
+        entry = turn(self.conn, "Codex, draft the sample queue flow.", seconds_ago=280)
+        self.heard(entry, [self.CODEX], 260)
+        turn(self.conn, "Codex, go ahead.", seconds_ago=20)            # 240 s after the read-back
+        self.assertEqual([cb.ask_id(ROOM, entry, self.CODEX)], self.b().tick())
+
+    def test_a_go_ahead_past_five_minutes_starts_nothing(self):
+        entry = turn(self.conn, "Codex, draft the sample queue flow.", seconds_ago=340)
+        self.heard(entry, [self.CODEX], 330)
+        turn(self.conn, "Codex, go ahead.", seconds_ago=20)            # 310 s after the read-back
+        self.assertEqual([], self.b().tick())
+        self.assertEqual([], self.inbox(self.CODEX))
+
+    def test_a_hundred_word_ask_is_proposed_not_refused(self):
+        said = "Codex, draft the sample queue flow " + " ".join(["with detail"] * 45) + "."
+        self.assertTrue(40 < len(said.split()) <= cb.ASK_MAX_WORDS)
+        entry = turn(self.conn, said, seconds_ago=60)
+        self.b().tick()
+        got = self.cards(self.CODEX)[cb.proposal_id(ROOM, entry, self.CODEX)]
+        self.assertEqual(("review", cb.PROPOSED), (got["status"], got["activity"]))
+
+    def test_an_ask_over_120_words_is_still_refused(self):
+        said = "Codex, draft the sample queue flow " + " ".join(["with detail"] * 60) + "."
+        self.assertTrue(len(said.split()) > cb.ASK_MAX_WORDS)
+        entry = turn(self.conn, said, seconds_ago=60)
+        self.b().tick()
+        got = self.cards(self.CODEX)[cb.proposal_id(ROOM, entry, self.CODEX)]
+        self.assertTrue(got["title"].startswith(cb.TOO_LONG))
+
 
 
 if __name__ == "__main__":
