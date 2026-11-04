@@ -2600,6 +2600,163 @@ class LivingCardRouting(unittest.TestCase):
         self.assertEqual(life.MAX_AGE, self.conn.ttls[cb.REVISE_KEY % ask])
 
 
+class CardNameRouting(unittest.TestCase):
+    """R2b, conference docs/CARDS-ARCHITECTURE.md decision c: his words that say a living card's name go to that
+    card, whichever voice made it, unless he names another voice. Synthetic sentences only."""
+    CODEX = "chatgpt-codex-desktop"
+
+    def setUp(self):
+        self.conn = FakeRedis()
+        open_window(self.conn)
+
+    def b(self):
+        return cb.Bridge(self.conn, LOG, lambda: True, clock=lambda: NOW)
+
+    def living(self, agent, said, name, title, seconds_ago):
+        """A claim whose worker put up its named card."""
+        turn(self.conn, said, seconds_ago=seconds_ago)
+        [ask] = self.b().tick()
+        info = json.loads(self.conn.hget(life.OPEN_KEY, ask))
+        info["field"] = ask + "-work"
+        self.conn.hset(life.OPEN_KEY, ask, json.dumps(info))
+        self.conn.hset("conf:canvas:%s:%s" % (info["room"], agent), ask + "-work",
+                       json.dumps({"type": "note", "title": title, "body": "x", "name": name}))
+        return ask
+
+    def revisions(self, ask):
+        return [json.loads(x) for x in getattr(self.conn, "lists", {}).get(cb.REVISE_KEY % ask, [])]
+
+    def two_cards(self):
+        logo = self.living("grok", "Grok, design a logo for SFDC24.", "SFDC24 logo", "SFDC24 logo concepts", 90)
+        plan = self.living(self.CODEX, "Codex, draft an onboarding plan.", "Onboarding plan",
+                           "Onboarding plan, three steps", 60)
+        return logo, plan
+
+    def test_the_names_he_says(self):
+        self.assertEqual(2, cb.card_named("Make the onboarding plan shorter.", "Onboarding plan"))
+        self.assertEqual(1, cb.card_named("Make the logo card bolder.", "SFDC24 logo"))
+        self.assertEqual(1, cb.card_named("Make Grok's logo card bolder.", "SFDC24 logo"))
+        self.assertEqual(1, cb.card_named("Update the logos card.", "Brand mark", "SFDC24 logo concepts"))
+        self.assertEqual(0, cb.card_named("Make the joke card funnier.", "SFDC24 logo"))
+        self.assertEqual(0, cb.card_named("Make that card bolder.", "SFDC24 logo"), "no name said")
+        self.assertEqual(0, cb.card_named("Make an onboarding plan.", "Onboarding plan"), "a new one, not the one")
+        self.assertEqual(0, cb.card_named("Make the card bolder.", "card 2"))
+        self.assertEqual(0, cb.card_named("Make the logo card bolder.", "<b>logo</b>"), "a name the publisher refuses")
+
+    def test_an_unnamed_change_goes_to_the_named_card_not_the_newest(self):
+        logo, plan = self.two_cards()
+        entry = turn(self.conn, "Make the logo card bolder.", reason="", seconds_ago=10)
+        self.assertEqual([], self.b().tick(), "no new claim")
+        self.assertEqual([{"entry": entry}], self.revisions(logo))
+        self.assertEqual([], self.revisions(plan))
+
+    def test_the_named_card_beats_the_floor_holder(self):
+        logo, plan = self.two_cards()
+        turn(self.conn, None, reason="", actor=self.CODEX, seconds_ago=20, kind="floor.granted", turn_id="t-9")
+        entry = turn(self.conn, "Now make the logo card bolder.", reason="continuity", seconds_ago=10, turn_id="t-9")
+        self.assertEqual([], self.b().tick())
+        self.assertEqual([{"entry": entry}], self.revisions(logo), "the logo card's own voice")
+        self.assertEqual([], self.revisions(plan))
+
+    def test_the_whole_name_without_the_word_card(self):
+        logo, plan = self.two_cards()
+        entry = turn(self.conn, "Grok, shorten the onboarding plan.", seconds_ago=10)
+        self.b().tick()
+        self.assertEqual([], self.revisions(logo), "he named Grok but the plan is Codex's: Grok makes a new card")
+        self.assertEqual([], self.revisions(plan))
+        entry = turn(self.conn, "Please shorten the onboarding plan.", reason="", seconds_ago=5)
+        self.b().tick()
+        self.assertEqual([{"entry": entry}], self.revisions(plan))
+
+    def test_a_named_final_freezes_that_card(self):
+        logo, plan = self.two_cards()
+        final = turn(self.conn, "The logo card is final.", reason="", seconds_ago=10)
+        self.assertEqual([], self.b().tick())
+        self.assertEqual([{"final": True, "entry": final}], self.revisions(logo))
+        self.assertEqual([], self.revisions(plan), "not the newest card")
+
+    def test_a_name_from_another_caller_routes_nothing(self):
+        logo, _plan = self.two_cards()
+        turn(self.conn, "Make the logo card bolder.", reason="", actor="someone_else", seconds_ago=10)
+        self.b().tick()
+        self.assertEqual([], self.revisions(logo))
+
+    def test_the_fullest_name_wins_over_a_newer_shorter_one(self):
+        # Codex's review of PR 463: "Launch logo" (older) and "Launch" (newer) both match "the launch logo".
+        logo = self.living("grok", "Grok, design a launch logo.", "Launch logo", "Launch logo", 90)
+        launch = self.living(self.CODEX, "Codex, draft a launch plan.", "Launch", "Launch", 60)
+        entry = turn(self.conn, "Make the launch logo shorter.", reason="", seconds_ago=10)
+        self.b().tick()
+        self.assertEqual([{"entry": entry}], self.revisions(logo))
+        self.assertEqual([], self.revisions(launch))
+
+    def test_a_new_card_is_still_a_new_card(self):
+        logo, _plan = self.two_cards()
+        turn(self.conn, "Grok, put the logo card ideas on a new card.", seconds_ago=10)
+        self.assertEqual(1, len(self.b().tick()))
+        self.assertEqual([], self.revisions(logo))
+
+
+class CardNamesInReadBackMode(unittest.TestCase):
+    """Codex's review of PR 463: with the read-back ON, a confirmed change that says a card's name reaches that
+    card, not the voice's newest. Synthetic sentences only."""
+    CODEX = "chatgpt-codex-desktop"
+
+    def setUp(self):
+        self.conn = FakeRedis()
+        open_window(self.conn)
+
+    def b(self):
+        return cb.Bridge(self.conn, LOG, lambda: True, clock=lambda: NOW, readback=True)
+
+    def heard(self, entry, seconds_ago):
+        return self.conn.xadd(STREAM, {
+            "kind": cb.READBACK_SPOKEN, "actor_id": "chair", "room_id": ROOM, "session_epoch": "fixture-epoch",
+            "control_sequence": "4", "proj_n": "2", "readback_id": cb.readback_id(ROOM, entry, [self.CODEX])},
+            entry_id=at(seconds_ago))
+
+    def revisions(self, ask):
+        return [json.loads(x) for x in getattr(self.conn, "lists", {}).get(cb.REVISE_KEY % ask, [])]
+
+    def claimed(self, said, name, title, seconds_ago):
+        entry = turn(self.conn, said, seconds_ago=seconds_ago)
+        self.b().tick()
+        self.heard(entry, seconds_ago - 5)
+        turn(self.conn, "Codex, go ahead.", seconds_ago=seconds_ago - 8)
+        [ask] = self.b().tick()
+        info = json.loads(self.conn.hget(life.OPEN_KEY, ask))
+        info["field"] = ask + "-work"
+        self.conn.hset(life.OPEN_KEY, ask, json.dumps(info))
+        self.conn.hset("conf:canvas:%s:%s" % (info["room"], self.CODEX), ask + "-work",
+                       json.dumps({"type": "note", "title": title, "body": "x", "name": name}))
+        return ask
+
+    def test_a_confirmed_change_reaches_the_card_he_named_not_the_newest(self):
+        logo = self.claimed("Codex, design a logo for SFDC24.", "SFDC24 logo", "SFDC24 logo concepts", 200)
+        plan = self.claimed("Codex, draft an onboarding plan on a new card.", "Onboarding plan", "Onboarding plan", 150)
+        change = turn(self.conn, "Codex, make the logo card bolder.", seconds_ago=60)
+        self.assertEqual([], self.b().tick())
+        self.assertEqual([], self.revisions(logo), "not before his go-ahead")
+        self.heard(change, 50)
+        turn(self.conn, "Codex, go ahead.", seconds_ago=45)
+        self.assertEqual([], self.b().tick(), "no new claim")
+        self.assertEqual([{"entry": change}], self.revisions(logo))
+        self.assertEqual([], self.revisions(plan), "not the newest card")
+        self.assertNotIn(cb.proposal_id(ROOM, change, self.CODEX), self.conn.hgetall(cp.PARTITION % ("workshop",
+                                                                                                      self.CODEX)))
+
+    def test_the_fullest_name_wins_in_read_back_mode_too(self):
+        logo = self.claimed("Codex, design a launch logo.", "Launch logo", "Launch logo", 200)
+        launch = self.claimed("Codex, draft a launch plan on a new card.", "Launch", "Launch", 150)
+        change = turn(self.conn, "Codex, make the launch logo shorter.", seconds_ago=60)
+        self.b().tick()
+        self.heard(change, 50)
+        turn(self.conn, "Codex, go ahead.", seconds_ago=45)
+        self.assertEqual([], self.b().tick())
+        self.assertEqual([{"entry": change}], self.revisions(logo))
+        self.assertEqual([], self.revisions(launch))
+
+
 class LivingCardsInReadBackMode(unittest.TestCase):
     """Codex's HOLD on PR 461: with the read-back ON, a living card is claimed, revised and made final. A revision
     is authorized exactly like a claim: proposed, read back, then his go-ahead routes it; final needs no read-back
