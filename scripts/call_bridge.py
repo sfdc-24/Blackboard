@@ -282,7 +282,8 @@ TEAM_HOST = "gemini"
 NEW_WORK = re.compile(
     r"(?i)\b(?:(?:design|draw|create|write|make|build|draft|sketch|plan|prepare|outline|mock\s+up|prototype|"
     r"come\s+up\s+with|put\s+up|give\s+(?:me|us)|show\s+(?:me|us))\s+(?:me\s+|us\s+)?(?:a|an|some|one|two|three|"
-    r"four|five|\d+|your|our|pros|options|ideas|versions|the\s+(?:pros|options|best))\b"
+    # "Make the options bolder" is a change to the options (Codex's review of PR 464); "options for a tagline" is new.
+    r"four|five|\d+|your|our|pros|the\s+pros|(?:options|ideas|versions)\s+(?:for|on|of|about))\b"
     # "Make a change to it", "make a few tweaks", "give us a bit more contrast": a change, not new work (Codex's
     # review of PR 464).
     r"(?!\s+(?:(?:small|quick|minor|little|few|couple(?:\s+of)?|bit|tiny|final|last)\s+)*(?:change|tweak|edit|fix|"
@@ -1084,7 +1085,7 @@ class Bridge:
             by_name, fresh, proposed = None, False, list(agents)
             actor, epoch = fields.get("actor_id"), fields.get("session_epoch")
             spoken = (fields.get("kind") == "turn.started" and actor not in ("", None, "chair")
-                      and not NEW_CARD.search(said or "") and not final_said(said))
+                      and not self._new_card(said) and not final_said(said))
             # Direct start, or in read-back mode his go-ahead confirming a proposal (Codex's reviews of PRs 463 and
             # 464: a confirmed change must reach the card he named, and a confirmed team ask is one team card).
             # `said` then holds his original words; the go-ahead's caller and session are the proposal's.
@@ -1122,7 +1123,7 @@ class Bridge:
             for agent in agents:
                 if not self.holds():
                     return claimed
-                living = None if NEW_CARD.search(said or "") or fresh else (
+                living = None if self._new_card(said) or fresh else (
                     # He named a card of another voice: this voice's own card is not the one he means.
                     (by_name if by_name.get("agent") == agent else None) if by_name else
                     self._living(room, agent, fields.get("actor_id"), fields.get("session_epoch")))
@@ -1393,6 +1394,12 @@ class Bridge:
         if not isinstance(agents, list) or any(a not in NAME_OF for a in agents):
             return None                                      # an old or unreadable record binds nothing
         return {"entry": str(held["entry"]), "said": held["said"], "agents": agents, "named": held.get("named") is True}
+
+    @staticmethod
+    def _new_card(said) -> bool:
+        """He asked for a new card. "Let's take the second one" is a pick, not "a second one" (Codex's review of
+        PR 464)."""
+        return bool(NEW_CARD.search(said or "")) and not picked(said)
 
     def _stored(self, info) -> dict:
         """The card the worker put up for a living ask, or {}."""

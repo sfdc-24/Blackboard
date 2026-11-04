@@ -2781,6 +2781,21 @@ class TeamCardRouting(unittest.TestCase):
         self.assertEqual(1, len(self.b().tick()))
         self.assertEqual([], self.revisions(ask))
 
+    def test_an_ordinal_pick_is_a_pick_not_a_new_card(self):
+        # Codex's review of PR 464: "second one" also reads as NEW_CARD ("a second one").
+        ask = self.team_card()
+        entry = turn(self.conn, "Let's take the second one.", reason="", seconds_ago=10)
+        self.assertEqual([], self.b().tick(), "no new card")
+        self.assertEqual([{"entry": entry}], self.revisions(ask))
+
+    def test_making_the_options_bolder_changes_the_team_card(self):
+        ask = self.team_card()
+        self.assertIsNone(cb.NEW_WORK.search("Everyone, make the options bolder."))
+        self.assertIsNotNone(cb.NEW_WORK.search("Everyone, give me options for a tagline."))
+        entry = turn(self.conn, "Everyone, make the options bolder.", reason="everyone", seconds_ago=10)
+        self.assertEqual([], self.b().tick(), "no new team card")
+        self.assertEqual([{"entry": entry}], self.revisions(ask))
+
     def test_another_callers_pick_routes_nothing(self):
         ask = self.team_card()
         turn(self.conn, "I like Grok's.", reason="", actor="someone_else", seconds_ago=10)
@@ -2849,6 +2864,18 @@ class TeamCardsInReadBackMode(unittest.TestCase):
         ask = self.team_card()
         entry = turn(self.conn, "I like Grok's.", reason="", seconds_ago=30)
         self.assertEqual([], self.b().tick())
+        self.assertEqual([{"entry": entry}], self.revisions(ask))
+
+    def test_an_ordinal_pick_needs_no_read_back(self):
+        ask = self.team_card()
+        entry = turn(self.conn, "Let's take the second one.", reason="", seconds_ago=30)
+        self.assertEqual([], self.b().tick())
+        self.assertEqual([{"entry": entry}], self.revisions(ask))
+
+    def test_a_confirmed_make_the_options_bolder_reaches_the_team_card(self):
+        ask = self.team_card()
+        entry, claimed = self.confirmed("Everyone, make the options bolder.", 60)
+        self.assertEqual([], claimed)
         self.assertEqual([{"entry": entry}], self.revisions(ask))
 
     def test_a_change_said_as_make_a_change_is_not_new_work(self):
