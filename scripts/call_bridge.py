@@ -333,17 +333,28 @@ CHANGE = re.compile(r"(?i)\b(?:%s)\b" % _COMPARE)
 _CLAUSE = re.compile(r"[,.;:!?]")
 _FILLERS = {"please", "a", "bit", "little", "tad", "touch", "slightly", "much", "way", "even", "just", "ok", "okay",
             "now", "maybe", "and", "so", "yeah", "yes", "then", "also", "lot"}
+# After the comparative, in its clause (Codex's HOLD on 7eda4f3: "shorter is unnecessary" passed): only fillers,
+# thanks, or what the card is, never a verb or a judgement.
+_AFTER = _FILLERS | {"thanks", "thank", "you", "again", "than", "the", "last", "one", "this", "that", "it", "version",
+                     "time", "for", "me", "us", "card", "joke", "logo", "plan", "text", "title", "list", "diagram",
+                     "drawing", "answer", "summary"}
+
+
+def _clause_words(text: str) -> list:
+    for pattern in NAMES.values():
+        text = pattern.sub(" ", text)
+    return re.findall(r"[\w'’]+", text.lower())
 
 
 def change_ask(said: str) -> bool:
-    """A comparative asking for a change ("shorter please", "a bit bolder"): only fillers and names before it in
-    its clause, so negations ("no need for anything shorter"), descriptions and praise are not asks."""
+    """A comparative asking for a change ("shorter please", "a bit bolder"): in its clause, only fillers and names
+    before it and only fillers or what the card is after it, so negations ("no need for anything shorter"),
+    judgements ("shorter is unnecessary"), descriptions and praise are not asks."""
     said = said or ""
     for match in CHANGE.finditer(said):
-        clause = _CLAUSE.split(said[:match.start()])[-1]
-        for pattern in NAMES.values():
-            clause = pattern.sub(" ", clause)
-        if all(word in _FILLERS for word in re.findall(r"[\w'’]+", clause.lower())):
+        before = _CLAUSE.split(said[:match.start()])[-1]
+        after = _CLAUSE.split(said[match.end():])[0]
+        if all(w in _FILLERS for w in _clause_words(before)) and all(w in _AFTER for w in _clause_words(after)):
             return True
     return False
 
