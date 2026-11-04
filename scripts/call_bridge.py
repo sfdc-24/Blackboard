@@ -327,15 +327,25 @@ _COMPARE = (r"shorter|longer|funnier|bolder|bigger|smaller|simpler|clearer|darke
             r"more\s+(?:colou?rful|detailed|formal|casual|professional|playful|modern|minimal|concise|specific|vivid|"
             r"serious|creative)|less\s+(?:wordy|busy|cluttered|formal|casual|serious|detailed)")
 CHANGE = re.compile(r"(?i)\b(?:%s)\b" % _COMPARE)
-# Praise is not an ask: "that's funnier", "it's much shorter now", "this looks bolder".
-_PRAISE = re.compile(r"(?i)\b(?:that|it|this)(?:['’]s|\s+(?:is|was|looks|sounds|reads|feels))"
-                     r"(?:\s+(?:much|way|a\s+lot|so|even|now|definitely|already|really))*\s*$")
+# AFFIRMATIVE ONLY (Codex's HOLD on a578301): in its own clause, only fillers and voices' names may come before the
+# comparative. "Grok, shorter please", "okay, a bit bolder" and "that's fine, punchier" ask for a change; "no need for
+# anything shorter", "it's much shorter now" (praise) and "nothing longer" do not.
+_CLAUSE = re.compile(r"[,.;:!?]")
+_FILLERS = {"please", "a", "bit", "little", "tad", "touch", "slightly", "much", "way", "even", "just", "ok", "okay",
+            "now", "maybe", "and", "so", "yeah", "yes", "then", "also", "lot"}
 
 
 def change_ask(said: str) -> bool:
-    """A comparative asking for a change ("shorter please", "a bit bolder"), not praise and not already a task."""
+    """A comparative asking for a change ("shorter please", "a bit bolder"): only fillers and names before it in
+    its clause, so negations ("no need for anything shorter"), descriptions and praise are not asks."""
     said = said or ""
-    return any(_PRAISE.search(said[:m.start()]) is None for m in CHANGE.finditer(said))
+    for match in CHANGE.finditer(said):
+        clause = _CLAUSE.split(said[:match.start()])[-1]
+        for pattern in NAMES.values():
+            clause = pattern.sub(" ", clause)
+        if all(word in _FILLERS for word in re.findall(r"[\w'’]+", clause.lower())):
+            return True
+    return False
 
 
 def work_said(said: str) -> bool:

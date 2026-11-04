@@ -2630,6 +2630,26 @@ class LivingCardRouting(unittest.TestCase):
                 self.assertEqual([], self.b().tick())
                 self.assertEqual([], self.revisions(ask))
 
+    def test_a_negated_or_descriptive_comparative_is_not_a_change(self):
+        """Codex's HOLD on a578301: "Grok, no need for anything shorter" reached the living card."""
+        for said in ("Grok, no need for anything shorter.", "Grok, nothing longer please.",
+                     "Grok, I don't want it bolder.", "Grok, keep it, not funnier."):
+            with self.subTest(said=said):
+                self.setUp()
+                ask, _ = self.living()
+                turn(self.conn, said, seconds_ago=10)
+                self.assertEqual([], self.b().tick())
+                self.assertEqual([], self.revisions(ask))
+
+    def test_fillers_and_clauses_before_a_comparative_still_ask(self):
+        for said in ("Okay Grok, a bit bolder.", "Grok, that's fine, punchier please.", "Grok, just a little shorter."):
+            with self.subTest(said=said):
+                self.setUp()
+                ask, _ = self.living()
+                entry = turn(self.conn, said, seconds_ago=10)
+                self.b().tick()
+                self.assertEqual([{"entry": entry}], self.revisions(ask))
+
     def test_the_change_words(self):
         for said in ("shorter please", "a little punchier", "less wordy", "make it longer"):
             self.assertTrue(cb.work_said(said), said)
