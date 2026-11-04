@@ -213,6 +213,33 @@ NAMES = {persona: re.compile(r"(?i)\b(?:%s)\b(?!['’]s\b)" % "|".join(spellings
     "gemini": ("gemini", "jemini", "gemeni")}.items()}
 # The chair names an agent with one of these (addressing.py). "everyone", "room", "host" and "continuity" name nobody.
 NAMED = ("vocative", "mention", "view_request")
+EVERYONE = "everyone"           # the chair's reason for "everyone", "all of you", "team"
+# Only words that ask every voice ("could someone" is routed the same way and asks nobody in particular).
+ALL_OF_YOU = re.compile(r"(?i)\b(?:everyone|everybody|all\s+of\s+you|each\s+of\s+you|all\s+four|all\s+agents|"
+                        r"you\s+all|y['’]all)\b")
+# LIVING CARDS (the owner, 2026-11-04): a card is updated in place until it is final, never re-made as a new
+# card. A task turn for an agent that already has a LIVING card in this call - its ask OPEN, in this conference
+# room, with a card the worker put up - is not claimed: it is appended to REVISE_KEY % ask for the chair's fleet
+# work, which updates that card (conference chair/conf_chair/fleet_work.py). "New card", "another card", ... still
+# claim a new one. "That's final", "lock it", ... make the living card final. The list lives as long as an ask can.
+REVISE_KEY = "gov:callbridge:revise:%s"
+# Each routed event's destination, written atomically with the revision entry, so a replay (cursor loss) never
+# appends it twice and a later "do it" or voice refusal can never claim it as a new card (_claim checks it).
+ROUTED_KEY = "gov:callbridge:routed:%s:%s"      # <source entry>, <agent or "final">
+NEW_CARD = re.compile(r"(?i)\b(?:new|another|separate|fresh|second|different)\s+(?:card|one)\b")
+FINAL = re.compile(r"(?i)\b(?:that['’]?s\s+(?:it,?\s+)?final|it['’]?s\s+final|(?:make|mark)\s+(?:it|that|this)\s+final|"
+                   r"lock\s+(?:it|that|this)(?:\s+in)?|finali[sz]e\s+(?:it|that|this)|"
+                   r"we['’]?re\s+done\s+with\s+(?:it|that|this))\b")
+# "Don't make it final", "never lock it": a negation before the phrase is not a final (Copilot on PR 461).
+NOT_FINAL = re.compile(r"(?i)\b(?:don['’]?t|do\s+not|not|never|no|won['’]?t|isn['’]?t)\b")
+
+
+def final_said(said: str) -> bool:
+    """An affirmative final: a FINAL phrase with no negation before it."""
+    match = FINAL.search(said or "")
+    return bool(match) and NOT_FINAL.search((said or "")[:match.start()]) is None
+
+
 # A task, not a question: one of these words anywhere in what he said.
 TASK = re.compile(
     r"(?i)\b(?:build|draft|make|create|write|design|mock(?:\s+up)?|prototype|add|fix|check|review|draw|diagram|"
@@ -221,7 +248,10 @@ TASK = re.compile(
     r"cent(?:er|re)|align|remove|delete|replace|edit|rename|resize|"
     # The owner's demo, 2026-10-28 09:14 ET (CLAUDE-ACTIONS-1313Z-20261028T1328Z): an ask for a picture got
     # no claim, and the voice said "I can't pull an image". Asking for something to be shown counts.
-    r"pull|get|bring|show|pictures?|images?)\b")
+    r"pull|get|bring|show|pictures?|images?|"
+    # LIVING CARDS (the owner, 2026-11-04 03:38Z): asks to modify or improve a card got no claim, and the voice
+    # still acknowledged them. Asking for a card to be changed is asking for work.
+    r"modify|improve|revise|rewrite|re-?do|change|tweak|refine|polish|expand|extend|shorten|simplify|iterate)\b")
 
 
 # A VOICE SAYING IT CANNOT (refusal). The chair writes every line a voice speaks to conf:side:<yyyymmdd> (conference
@@ -264,9 +294,13 @@ def asks_in(fields: dict) -> list:
     """The agents an event asks for work, or []: an owner turn naming them, with a task verb in his words."""
     if fields.get("kind") != "turn.started" or fields.get("actor_id") in ("", None, "chair"):
         return []
+    said = fields.get("utterance") or ""
+    if fields.get("reason") == EVERYONE and ALL_OF_YOU.search(said) and TASK.search(said):
+        # An ask addressed to every voice (2026-11-04 03:36Z) went unclaimed: the chair routed it to all of
+        # them, so every voice is asked.
+        return list(AGENT_OF.values())
     if fields.get("reason") not in NAMED:
         return []
-    said = fields.get("utterance") or ""
     if not said.strip() or not TASK.search(said):
         return []
     # The projection keeps no persona list (redis_state.METADATA_FIELDS), so the names are read from his words, as the
@@ -530,6 +564,15 @@ def inbox_text(ask: str, agent: str, room: str, said: str, now) -> str:
             "(answers=%s) never completes this task; generic call-card writes are refused. Never post private "
             "task bytes to the board." % (
                 ask, eastern(now), stamp(now), said[:ASK_CHARS].replace("|", "/"), ask, ask))
+
+
+def _stream_order(entry) -> tuple:
+    """A stream id ("<ms>-<seq>") as a sortable pair; anything else sorts first."""
+    try:
+        ms, _, seq = str(entry).partition("-")
+        return int(ms), int(seq or 0)
+    except ValueError:
+        return (-1, -1)
 
 
 class Bridge:
@@ -956,9 +999,40 @@ class Bridge:
                             self._propose(room, entry_id, agents, said, now, fields.get("actor_id"),
                                           fields.get("session_epoch"))
                     agents = []
+            if fields.get("kind") == "turn.started" and fields.get("actor_id") not in ("", None, "chair") \
+                    and final_said(said) and not go_ahead(fields):
+                # Either mode: "final" is his decision about a card that already exists, not a new task, so it
+                # needs no read-back (Codex's HOLD on PR 461: read-back mode must reach final too). Only the
+                # card's own asker, in the same session, can make it final, and the command carries its source
+                # event, validated here and again by the worker (Codex's second HOLD on PR 461).
+                named = named_in(said)
+                actor, epoch = fields.get("actor_id"), fields.get("session_epoch")
+                targets = ([self._living(room, a, actor, epoch) for a in named] if named
+                           else [self._living(room, None, actor, epoch)])
+                for living in [t for t in targets if t]:
+                    if not self.holds():
+                        return claimed               # not consumed: the next lease holder retries this event
+                    if self._bound(room, entry_id, living) and \
+                            self._route(living["ask"], entry_id, "final", {"final": True, "entry": entry_id}):
+                        self.log.info("call bridge: %s final, said in %s", living["ask"], room)
+                agents = []
             for agent in agents:
                 if not self.holds():
                     return claimed
+                living = None if NEW_CARD.search(said or "") else \
+                    self._living(room, agent, fields.get("actor_id"), fields.get("session_epoch"))
+                source_entry = confirms["entry"] if confirms else entry_id
+                if living and self._bound(room, source_entry, living):
+                    # His words update the agent's living card in place (no new ask, no new card). In read-back
+                    # mode this runs only once his go-ahead confirmed the read-back (confirms), exactly where a new
+                    # claim would have been authorized; the revision's words are his original ask's entry. Only
+                    # the card's asker in the same session revises it; anyone else's task makes a new card.
+                    if self._route(living["ask"], source_entry, agent, {"entry": source_entry}):
+                        self.log.info("call bridge: %s revision for %s routed to its living card", living["ask"],
+                                      agent)
+                    if self.readback and confirms:
+                        self._close(room, confirms, [agent], "Updating its card", now, retire=True)
+                    continue
                 ask = self._claim(room, confirms["entry"] if confirms else entry_id, agent, said, now,
                                   asked_entry=asked_entry)
                 if ask:
@@ -1109,7 +1183,7 @@ class Bridge:
                 self.open_if_shut(now, "%s/%s" % (agent, field))
             self.log.info("call bridge: %s refused for %s (%s)", field, agent, why)
 
-    def _close(self, room, proposal, agents, why, now) -> None:
+    def _close(self, room, proposal, agents, why, now, retire=False) -> None:
         """Close the given voices' proposal cards and drop the proposal once none is left. A voice whose ask was
         claimed after all (a go-ahead, its own "I can't") loses the proposal card: its claimed card says the rest.
         Otherwise a card that is still a proposal flips to done with the reason; nothing else is touched."""
@@ -1124,9 +1198,11 @@ class Bridge:
                 item = None
             if not (isinstance(item, dict) and item.get("activity") == PROPOSED):
                 continue
-            if self._claimed(room, proposal["entry"], agent):
+            if retire or self._claimed(room, proposal["entry"], agent):
+                # Claimed, or routed to its living card (retire): the proposal card goes; the card says the rest.
                 self.conn.hdel(partition % (self.canvas_room, agent), field)
-                self.log.info("call bridge: %s claimed; its proposal card is retired", field)
+                self.log.info("call bridge: %s %s; its proposal card is retired", field,
+                              "routed to its living card" if retire else "claimed")
             else:
                 self.conn.hset(partition % (self.canvas_room, agent), field,
                                json.dumps(unstarted_card(agent, asked, why, now)))
@@ -1213,6 +1289,70 @@ class Bridge:
             return None                                      # an old or unreadable record binds nothing
         return {"entry": str(held["entry"]), "said": held["said"], "agents": agents, "named": held.get("named") is True}
 
+    def _living(self, room, agent=None, actor=None, epoch=None):
+        """The newest living ask in this conference room (of `agent`, when given), as its OPEN record: OPEN, not
+        expired (its deadline and its active token both hold: cleanup is lazy, Copilot on PR 461), the worker has
+        put its card up (the lifecycle records the card's field), and asked by `actor` in session `epoch`. None
+        when there is none."""
+        best = None
+        now = self.clock().timestamp()
+        for raw in (self.conn.hgetall(call_lifecycle.OPEN_KEY) or {}).values():
+            try:
+                info = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
+            except (ValueError, AttributeError):
+                continue
+            if (not isinstance(info, dict) or info.get("state") != "OPEN" or info.get("conf_room") != room
+                    or not info.get("field") or (agent is not None and info.get("agent") != agent)):
+                continue
+            source = info.get("source") or {}
+            if (actor is None or source.get("owner") != actor or info.get("session_epoch") != epoch
+                    or not isinstance(info.get("expires_at"), (int, float)) or now >= info["expires_at"]
+                    or _text(self.conn.get(call_lifecycle.EXPIRY_KEY % info.get("ask"))) != info.get("source_revision")):
+                continue
+            # Newest by his ask's own stream id (the source event); claims in one second share claimed_at.
+            if best is None or _stream_order((info.get("source") or {}).get("event")) >                     _stream_order((best.get("source") or {}).get("event")):
+                best = info
+        return best
+
+    def _bound(self, room, entry, living) -> bool:
+        """The command's source event is a complete owner turn in this room (call_lifecycle.capture, as for a
+        claim), by the living card's own asker, in its session."""
+        try:
+            source, _words = call_lifecycle.capture(self.conn, room, entry, living["agent"])
+        except (call_lifecycle.Refused, TypeError, ValueError, KeyError):
+            return False
+        held = living.get("source") or {}
+        # Only words said AFTER the card's own ask: a replayed older turn (the card's own ask after a cursor loss)
+        # is never read as a revision of the card it created (Copilot on PR 461).
+        return (source.get("owner") == held.get("owner") and source.get("session_epoch") == living.get("session_epoch")
+                and source.get("conference_room") == living.get("conf_room")
+                and _stream_order(entry) > _stream_order(held.get("event")))
+
+    def _route(self, ask, entry, target, item) -> bool:
+        """Append one command to the living card's list and record the event's destination, atomically. False
+        when this event was already routed there (a replay)."""
+        marker = ROUTED_KEY % (entry, target)
+        # The check and the write are ONE transaction: the marker is WATCHed, so two bridges racing across a
+        # lease hand-over cannot both append (Codex's third review of PR 461). A lost race re-reads the marker.
+        for _attempt in range(5):
+            pipe = self.conn.pipeline(transaction=True)
+            try:
+                pipe.watch(marker)
+                if pipe.get(marker):
+                    return False
+                pipe.multi()
+                pipe.set(marker, ask, ex=call_lifecycle.MAX_AGE)
+                pipe.rpush(REVISE_KEY % ask, json.dumps(item, sort_keys=True))
+                pipe.expire(REVISE_KEY % ask, call_lifecycle.MAX_AGE)
+                pipe.execute()
+                return True
+            except Exception as error:                   # noqa: BLE001 - only a lost WATCH is retried
+                if type(error).__name__ not in ("WatchError", "WatchConflict"):
+                    raise
+            finally:
+                pipe.reset()
+        return False
+
     @staticmethod
     def _go_agents(pending, go_names) -> list:
         """Who a go-ahead's claim is for. His ask named voices: those, or the ones of them the go-ahead names; a
@@ -1263,6 +1403,8 @@ class Bridge:
         """A protected complete source revision, not the caller's preview, authorizes
         one PREPARED→OPEN claim. Ambiguous outcomes stay quarantined, never retried."""
         ask = ask_id(room, entry_id, agent)
+        if self.conn.get(ROUTED_KEY % (entry_id, agent)):
+            return None                  # this event went to the agent's living card; it is never a new claim
         def inbox(source_text):
             return {"by": BY, "text": inbox_text(ask, agent, self.canvas_room, source_text, now),
                     "at": stamp(now), "task_id": ask, "ask": ask,

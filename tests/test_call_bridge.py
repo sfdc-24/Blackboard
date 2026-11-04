@@ -111,6 +111,17 @@ class FakeRedis:
                 self.ttls.pop(key, None); self.touch(key)
         return count
 
+    def rpush(self, key, *values):
+        with self.mutex:
+            self.lists = getattr(self, "lists", {})
+            self.lists.setdefault(key, []).extend(values)
+            self.touch(key)
+            return len(self.lists[key])
+
+    def lrange(self, key, start, stop):
+        items = getattr(self, "lists", {}).get(key, [])
+        return items[start:] if stop == -1 else items[start:stop + 1]
+
     def expire(self, key, seconds):
         self.ttls[key] = seconds
         self.touch(key)
@@ -1318,7 +1329,9 @@ class BoundedPublication(unittest.TestCase):
         self.conn.hset(slot, "other", json.dumps(other))
         self.conn.hset(slot, "loose", json.dumps(loose))
         self.conn.hset(cp.PARTITION % ("workshop", "grok"), "boxes", json.dumps(own))   # another slot naming it
-        self.assertEqual(sorted(["gemini/" + ask + "-work", "gemini/" + ask]), sorted(self.published()))
+        # Living cards (PR 461): once the worker's own card exists, the claim placeholder is hidden, so one
+        # piece of work is one card.
+        self.assertEqual(["gemini/" + ask + "-work"], sorted(self.published()))
 
     def test_each_claim_in_its_window_adds_its_own_card(self):
         turn(self.conn, "Gemini, draw the five boxes.", seconds_ago=20)
@@ -2500,6 +2513,255 @@ class DirectStart(unittest.TestCase):
     def test_a_remark_with_no_task_starts_nothing(self):
         turn(self.conn, "Grok, that sounds good to me.", seconds_ago=20)
         self.assertEqual([], cb.Bridge(self.conn, LOG, lambda: True, clock=lambda: NOW).tick())
+
+
+class LivingCardRouting(unittest.TestCase):
+    """R1 living cards (the owner, 2026-11-04): a task for an agent with a living card in this call updates that
+    card (a revision entry for the chair's fleet work), never a new claim. Synthetic sentences only."""
+
+    def setUp(self):
+        self.conn = FakeRedis()
+        open_window(self.conn)
+
+    def b(self):
+        return cb.Bridge(self.conn, LOG, lambda: True, clock=lambda: NOW)
+
+    def living(self, agent="grok", said="Grok, write a joke on a card.", seconds_ago=60):
+        """A claim whose worker put its card up (the lifecycle records the card's field)."""
+        entry = turn(self.conn, said, seconds_ago=seconds_ago)
+        [ask] = self.b().tick()
+        info = json.loads(self.conn.hget(life.OPEN_KEY, ask))
+        info["field"] = ask + "-work"
+        self.conn.hset(life.OPEN_KEY, ask, json.dumps(info))
+        return ask, entry
+
+    def revisions(self, ask):
+        return [json.loads(x) for x in getattr(self.conn, "lists", {}).get(cb.REVISE_KEY % ask, [])]
+
+    def test_a_named_change_goes_to_the_living_card_not_a_new_claim(self):
+        ask, _ = self.living()
+        entry = turn(self.conn, "Grok, modify the joke and make it funnier.", seconds_ago=10)
+        self.assertEqual([], self.b().tick(), "no new claim")
+        self.assertEqual([{"entry": entry}], self.revisions(ask))
+        self.assertEqual([ask], list(self.conn.hgetall(life.OPEN_KEY)))
+
+    def test_an_unnamed_follow_up_to_the_floor_holder_goes_to_its_living_card(self):
+        ask, _ = self.living()
+        turn(self.conn, None, reason="", actor="grok", seconds_ago=20, kind="floor.granted", turn_id="t-9")
+        entry = turn(self.conn, "Make it even funnier.", reason="continuity", seconds_ago=10, turn_id="t-9")
+        self.assertEqual([], self.b().tick())
+        self.assertEqual([{"entry": entry}], self.revisions(ask))
+
+    def test_asking_for_a_new_card_claims_a_new_one(self):
+        ask, _ = self.living()
+        turn(self.conn, "Grok, write another joke on a new card.", seconds_ago=10)
+        self.assertEqual(1, len(self.b().tick()))
+        self.assertEqual([], self.revisions(ask))
+
+    def test_another_agent_without_a_living_card_is_claimed_as_usual(self):
+        ask, _ = self.living()
+        turn(self.conn, "Codex, draft a kickoff checklist.", seconds_ago=10)
+        self.assertEqual(1, len(self.b().tick()))
+        self.assertEqual([], self.revisions(ask))
+
+    def test_a_card_not_yet_put_up_is_not_living(self):
+        turn(self.conn, "Grok, write a joke on a card.", seconds_ago=60)
+        [first] = self.b().tick()
+        turn(self.conn, "Grok, make it funnier.", seconds_ago=10)
+        self.assertEqual(1, len(self.b().tick()), "no card yet: a new claim")
+        self.assertEqual([], self.revisions(first))
+
+    def test_named_final_makes_that_agents_living_card_final(self):
+        ask, _ = self.living()
+        final = turn(self.conn, "Grok, that's final.", seconds_ago=10)
+        self.assertEqual([], self.b().tick())
+        self.assertEqual([{"final": True, "entry": final}], self.revisions(ask))
+
+    def test_unnamed_final_makes_the_rooms_newest_living_card_final(self):
+        older, _ = self.living(seconds_ago=90)
+        newer, _ = self.living(agent="chatgpt-codex-desktop", said="Codex, draft a kickoff checklist.",
+                               seconds_ago=60)
+        final = turn(self.conn, "Okay, lock it in.", reason="continuity", seconds_ago=10)
+        self.b().tick()
+        self.assertEqual([{"final": True, "entry": final}], self.revisions(newer))
+        self.assertEqual([], self.revisions(older))
+
+    def test_everyone_revises_every_living_card(self):
+        mine, _ = self.living()
+        entry = turn(self.conn, "All of you, make it shorter.", reason="everyone", seconds_ago=10)
+        claimed = self.b().tick()
+        self.assertEqual([{"entry": entry}], self.revisions(mine))
+        self.assertEqual(3, len(claimed), "the three voices without a living card are claimed")
+
+    def test_the_revision_list_expires_with_the_ask(self):
+        ask, _ = self.living()
+        turn(self.conn, "Grok, make it funnier.", seconds_ago=10)
+        self.b().tick()
+        self.assertEqual(life.MAX_AGE, self.conn.ttls[cb.REVISE_KEY % ask])
+
+
+class LivingCardsInReadBackMode(unittest.TestCase):
+    """Codex's HOLD on PR 461: with the read-back ON, a living card is claimed, revised and made final. A revision
+    is authorized exactly like a claim: proposed, read back, then his go-ahead routes it; final needs no read-back
+    (it decides about a card that exists). Synthetic sentences only."""
+    CODEX = "chatgpt-codex-desktop"
+
+    def setUp(self):
+        self.conn = FakeRedis()
+        open_window(self.conn)
+
+    def b(self):
+        return cb.Bridge(self.conn, LOG, lambda: True, clock=lambda: NOW, readback=True)
+
+    def heard(self, entry, seconds_ago):
+        return self.conn.xadd(STREAM, {
+            "kind": cb.READBACK_SPOKEN, "actor_id": "chair", "room_id": ROOM, "session_epoch": "fixture-epoch",
+            "control_sequence": "4", "proj_n": "2", "readback_id": cb.readback_id(ROOM, entry, [self.CODEX])},
+            entry_id=at(seconds_ago))
+
+    def revisions(self, ask):
+        return [json.loads(x) for x in getattr(self.conn, "lists", {}).get(cb.REVISE_KEY % ask, [])]
+
+    def cards(self):
+        return self.conn.hgetall(cp.PARTITION % ("workshop", self.CODEX))
+
+    def test_claim_then_revise_then_final(self):
+        first = turn(self.conn, "Codex, draft the sample queue flow.", seconds_ago=110)
+        self.b().tick()
+        self.heard(first, 100)
+        turn(self.conn, "Codex, go ahead.", seconds_ago=95)
+        [ask] = self.b().tick()
+        info = json.loads(self.conn.hget(life.OPEN_KEY, ask))
+        info["field"] = ask + "-work"                                    # the worker put its card up
+        self.conn.hset(life.OPEN_KEY, ask, json.dumps(info))
+        # A change is proposed and read back like any ask; nothing reaches the card before his go-ahead.
+        change = turn(self.conn, "Codex, improve the flow with a retry step.", seconds_ago=60)
+        self.assertEqual([], self.b().tick())
+        self.assertEqual([], self.revisions(ask), "not authorized yet")
+        self.assertIn(cb.proposal_id(ROOM, change, self.CODEX), self.cards())
+        self.heard(change, 50)
+        turn(self.conn, "Codex, go ahead.", seconds_ago=45)
+        self.assertEqual([], self.b().tick(), "routed, never a second claim")
+        self.assertEqual([{"entry": change}], self.revisions(ask), "his original words, by their entry")
+        self.assertNotIn(cb.proposal_id(ROOM, change, self.CODEX), self.cards(), "its proposal card is retired")
+        self.assertEqual([ask], list(self.conn.hgetall(life.OPEN_KEY)))
+        # Final needs no read-back.
+        final = turn(self.conn, "Codex, that's final.", seconds_ago=20)
+        self.b().tick()
+        self.assertEqual([{"entry": change}, {"final": True, "entry": final}], self.revisions(ask))
+
+    def test_a_change_that_is_never_confirmed_reaches_nothing(self):
+        first = turn(self.conn, "Codex, draft the sample queue flow.", seconds_ago=110)
+        self.b().tick()
+        self.heard(first, 100)
+        turn(self.conn, "Codex, go ahead.", seconds_ago=95)
+        [ask] = self.b().tick()
+        info = json.loads(self.conn.hget(life.OPEN_KEY, ask))
+        info["field"] = ask + "-work"
+        self.conn.hset(life.OPEN_KEY, ask, json.dumps(info))
+        turn(self.conn, "Codex, improve the flow with a retry step.", seconds_ago=60)
+        self.b().tick()
+        turn(self.conn, "Yes please.", reason="continuity", seconds_ago=40)
+        self.b().tick()
+        self.assertEqual([], self.revisions(ask))
+
+
+class LivingCardBoundaries(unittest.TestCase):
+    """Codex's second HOLD and Copilot's inline findings on PR 461: who may revise or finalize a living card, replay
+    safety, negation, expiry, and the lease. Synthetic sentences only."""
+
+    def setUp(self):
+        self.conn = FakeRedis()
+        open_window(self.conn)
+
+    def b(self, holds=True):
+        return cb.Bridge(self.conn, LOG, (lambda: holds), clock=lambda: NOW)
+
+    def living(self):
+        turn(self.conn, "Grok, write a joke on a card.", seconds_ago=60)
+        [ask] = self.b().tick()
+        info = json.loads(self.conn.hget(life.OPEN_KEY, ask))
+        info["field"] = ask + "-work"
+        self.conn.hset(life.OPEN_KEY, ask, json.dumps(info))
+        return ask
+
+    def revisions(self, ask):
+        return [json.loads(x) for x in getattr(self.conn, "lists", {}).get(cb.REVISE_KEY % ask, [])]
+
+    def test_another_participant_cannot_finalize_or_revise_the_owners_card(self):
+        ask = self.living()
+        turn(self.conn, "Grok, that's final.", actor="someone_else", seconds_ago=20)
+        turn(self.conn, "Grok, make it funnier.", actor="someone_else", seconds_ago=10)
+        self.b().tick()
+        self.assertEqual([], self.revisions(ask), "never the owner's card")
+
+    def test_a_stale_session_cannot_finalize_or_revise(self):
+        ask = self.living()
+        turn(self.conn, "Grok, that's final.", session_epoch="older-epoch", seconds_ago=20)
+        turn(self.conn, "Grok, make it funnier.", session_epoch="older-epoch", seconds_ago=10)
+        self.b().tick()
+        self.assertEqual([], self.revisions(ask))
+
+    def test_a_negated_final_is_not_final(self):
+        ask = self.living()
+        for said in ("Grok, don't make it final, revise the title first.", "Grok, never lock it in."):
+            self.assertFalse(cb.final_said(said), said)
+        entry = turn(self.conn, "Grok, don't make it final, revise the title first.", seconds_ago=10)
+        self.b().tick()
+        self.assertEqual([{"entry": entry}], self.revisions(ask), "a revision, not a final")
+
+    def test_a_replay_never_appends_twice_and_a_routed_event_is_never_claimed(self):
+        ask = self.living()
+        entry = turn(self.conn, "Grok, make it funnier.", seconds_ago=10)
+        self.b().tick()
+        self.conn.delete(cb.CURSOR_KEY % ROOM) if hasattr(self.conn, "delete") else             self.conn.store.pop(cb.CURSOR_KEY % ROOM, None)
+        self.b().tick()
+        self.assertEqual([{"entry": entry}], self.revisions(ask), "once")
+        self.assertIsNone(self.b()._claim(ROOM, entry, "grok", "Grok, make it funnier.", NOW))
+
+    def test_two_bridges_racing_route_one_event_once(self):
+        """Codex's third review of PR 461: the marker check and the append are one WATCHed transaction."""
+        ask = self.living()
+        entry = turn(self.conn, "Grok, make it funnier.", seconds_ago=10)
+        first, second = self.b(), self.b()
+        real_pipeline = self.conn.pipeline
+        raced = [True]
+
+        def racing_pipeline(transaction=True):
+            pipe = real_pipeline(transaction)
+            real_watch = pipe.watch
+
+            def watch(*keys):
+                real_watch(*keys)
+                if raced and raced.pop():
+                    # The other bridge routes the same event between this one's WATCH and its EXEC.
+                    self.conn.pipeline = real_pipeline
+                    self.assertTrue(second._route(ask, entry, "grok", {"entry": entry}))
+            pipe.watch = watch
+            return pipe
+        self.conn.pipeline = racing_pipeline
+        self.assertFalse(first._route(ask, entry, "grok", {"entry": entry}), "the loser sees the marker")
+        self.conn.pipeline = real_pipeline
+        self.assertEqual([{"entry": entry}], self.revisions(ask), "appended once")
+
+    def test_an_expired_ask_is_not_living(self):
+        ask = self.living()
+        self.conn.store.pop(life.EXPIRY_KEY % ask, None)            # its active token is gone (lazy cleanup)
+        turn(self.conn, "Grok, make it funnier.", seconds_ago=10)
+        self.assertEqual(1, len(self.b().tick()), "a new card instead of a dead one")
+        self.assertEqual([], self.revisions(ask))
+
+    def test_a_lost_lease_does_not_consume_the_final(self):
+        ask = self.living()
+        final = turn(self.conn, "Grok, that's final.", seconds_ago=10)
+        before = self.conn.get(cb.CURSOR_KEY % ROOM)
+        held = [True, False]                                          # the lease is lost at the write
+        bridge = cb.Bridge(self.conn, LOG, lambda: held.pop(0) if held else False, clock=lambda: NOW)
+        bridge.tick()
+        self.assertEqual([], self.revisions(ask))
+        self.assertEqual(before, self.conn.get(cb.CURSOR_KEY % ROOM), "the event is not consumed")
+        self.b().tick()
+        self.assertEqual([{"final": True, "entry": final}], self.revisions(ask), "the next holder makes it final")
 
 
 if __name__ == "__main__":

@@ -423,6 +423,8 @@ def visible(conn, agent, field, raw, *, room, now):
             return False
         if work:
             return info.get("field") == field and digest(item) == info.get("card_hash")
-        return info["state"] == "OPEN" and digest(item) == info.get("claim_hash")
+        # The claim placeholder shows only until the worker's own card exists: a living card stays OPEN, and its
+        # "In the making" card beside it would be a second card for one piece of work.
+        return info["state"] == "OPEN" and digest(item) == info.get("claim_hash") and not info.get("field")
     except (TypeError, ValueError, UnicodeError, KeyError, AttributeError):
         return False
