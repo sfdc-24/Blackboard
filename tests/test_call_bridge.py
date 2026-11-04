@@ -2219,7 +2219,7 @@ class ReadBack(unittest.TestCase):
         """Codex's review of row 9443, F1: the environment reads one switch, and it can only pause the read-back."""
         source = (ROOT / "scripts" / "call_bridge.py").read_text(encoding="utf-8")
         lines = [x for x in source.splitlines() if x.startswith(("READBACK = ", "READBACK_OFF = "))]
-        self.assertEqual(['READBACK = True',
+        self.assertEqual(['READBACK = False',
                           'READBACK_OFF = os.environ.get("CALL_BRIDGE_READBACK", "on").strip().lower() == "off"'], lines)
         self.assertEqual(1, source.count('os.environ.get("CALL_BRIDGE_READBACK"'))
         for value, off in (("on", False), ("", False), ("OFF", True), ("off ", True), ("no", False)):
@@ -2232,6 +2232,7 @@ class ReadBack(unittest.TestCase):
         fresh = importlib.util.module_from_spec(spec)
         with mock.patch.dict("os.environ", {"CALL_BRIDGE_READBACK": value}):
             spec.loader.exec_module(fresh)
+        fresh.READBACK = True       # the switch is pinned in read-back mode; the code default is direct start
         return fresh
 
     def test_f1_switched_off_the_bridge_is_paused_never_claiming_at_once(self):
@@ -2469,7 +2470,37 @@ class ForgivingReadBack(unittest.TestCase):
         self.assertTrue(got["title"].startswith(cb.TOO_LONG))
 
 
+class DirectStart(unittest.TestCase):
+    """The owner's decision, 2026-11-04 03:15Z: a named ask for work claims at once, with no read-back and no
+    go-ahead. Synthetic sentences only."""
+
+    def setUp(self):
+        self.conn = FakeRedis()
+        open_window(self.conn)
+
+    def test_the_code_default_is_direct_start(self):
+        self.assertFalse(cb.READBACK)
+        self.assertFalse(cb.Bridge(self.conn, LOG, lambda: True, clock=lambda: NOW).readback)
+
+    def test_a_named_ask_claims_at_once_with_no_proposal(self):
+        entry = turn(self.conn, "Grok, draft a three-step onboarding plan.", seconds_ago=20)
+        claimed = cb.Bridge(self.conn, LOG, lambda: True, clock=lambda: NOW).tick()
+        self.assertEqual([cb.ask_id(ROOM, entry, "grok")], claimed)
+        self.assertIsNone(self.conn.get(cb.PROPOSAL_KEY % ROOM))
+        [(_, sent)] = self.conn.streams.get("fleet:inbox:grok", [])
+        self.assertIn("three-step onboarding plan", sent["text"])
+
+    def test_two_named_asks_in_a_row_both_claim(self):
+        first = turn(self.conn, "Claude, write a one-paragraph summary of the line.", seconds_ago=30)
+        second = turn(self.conn, "Codex, draft a five-item kickoff checklist.", seconds_ago=20)
+        claimed = cb.Bridge(self.conn, LOG, lambda: True, clock=lambda: NOW).tick()
+        self.assertEqual({cb.ask_id(ROOM, first, "claude-code-cli"), cb.ask_id(ROOM, second, "chatgpt-codex-desktop")},
+                         set(claimed))
+
+    def test_a_remark_with_no_task_starts_nothing(self):
+        turn(self.conn, "Grok, that sounds good to me.", seconds_ago=20)
+        self.assertEqual([], cb.Bridge(self.conn, LOG, lambda: True, clock=lambda: NOW).tick())
+
 
 if __name__ == "__main__":
     unittest.main()
-
