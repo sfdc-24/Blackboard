@@ -406,6 +406,14 @@ def ask_id(room: str, entry_id: str, agent: str) -> str:
     return "call-" + hashlib.sha256(("%s|%s|%s" % (room, entry_id, agent)).encode("utf-8")).hexdigest()[:12]
 
 
+OWNERS_ENV = "CALL_BRIDGE_OWNER_ACTORS"
+
+
+def _owners(raw: str) -> list:
+    """The owner identities in OWNERS_ENV: separated by commas, semicolons or spaces; blanks dropped."""
+    return [part for part in re.split(r"[,;\s]+", raw or "") if part]
+
+
 def asks_in(fields: dict) -> list:
     """The agents an event asks for work, or []: an owner turn naming them, with a task verb in his words."""
     if fields.get("kind") != "turn.started" or fields.get("actor_id") in ("", None, "chair"):
@@ -692,8 +700,13 @@ def _stream_order(entry) -> tuple:
 
 
 class Bridge:
-    def __init__(self, conn, log, holds, clock=None, canvas_room=CANVAS_ROOM, ring=None, bucket=None, readback=None):
+    def __init__(self, conn, log, holds, clock=None, canvas_room=CANVAS_ROOM, ring=None, bucket=None, readback=None,
+                 owners=None):
         self.conn, self.log, self.holds = conn, log, holds
+        # Who may switch the canvas's project by voice (Codex's HOLD on PR 467: a guest must not change what the
+        # public canvas shows). The chair stamps every turn with the gateway-verified owner identity (conference
+        # chair session.owner_id); those identities are listed in OWNERS_ENV. Unset or empty: nobody switches.
+        self.owners = frozenset(owners if owners is not None else _owners(os.environ.get(OWNERS_ENV, "")))
         self.readback = READBACK if readback is None else bool(readback)
         # Switched off: still the read-back path (never claiming at once), but nothing is proposed or confirmed.
         self.paused = self.readback and READBACK_OFF
@@ -1038,7 +1051,8 @@ class Bridge:
                 # PROJECTS (R6a, conference docs/CARDS-ARCHITECTURE.md R6.2): "switch to the Acme project" makes an
                 # existing active project current, by whole name only. It is never a task ("let's work on project
                 # Acme" holds TASK's "work on"), so it claims nothing; with no project matching, the turn goes on.
-                target = projects.switch_target(said, projects.read_projects(self.conn, self.canvas_room))
+                target = (projects.switch_target(said, projects.read_projects(self.conn, self.canvas_room))
+                          if fields.get("actor_id") in self.owners else None)
                 if target:
                     if projects.set_current(self.conn, self.canvas_room, target):
                         self.log.info("call bridge: project %s is current in %s", target, self.canvas_room)

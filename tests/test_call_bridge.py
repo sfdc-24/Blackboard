@@ -10,6 +10,7 @@ import datetime
 import fnmatch
 import hashlib
 import json
+import os
 import re
 import logging
 import threading
@@ -2663,12 +2664,33 @@ class LivingCardRouting(unittest.TestCase):
     def make_project(self, pid, name, status="active"):
         self.conn.hset("conf:projects:%s" % cb.CANVAS_ROOM, pid, json.dumps({"name": name, "status": status}))
 
+    def owner_bridge(self):
+        return cb.Bridge(self.conn, LOG, lambda: True, clock=lambda: NOW, owners=["own_fixture_owner"])
+
     def test_a_project_switch_makes_it_current_and_claims_nothing(self):
         """R6a: "let's work on project Acme" holds TASK's "work on"; it must switch, never claim a card."""
         self.make_project("acme", "Acme")
         turn(self.conn, "Grok, let's work on project Acme.", seconds_ago=10)
-        self.assertEqual([], self.b().tick())
+        self.assertEqual([], self.owner_bridge().tick())
         self.assertEqual("acme", cb._text(self.conn.get("conf:project:%s:current" % cb.CANVAS_ROOM)))
+
+    def test_only_a_listed_owner_switches_the_project(self):
+        """Codex's HOLD on PR 467: a guest's switch changes neither the selector nor the published snapshot."""
+        self.make_project("acme", "Acme")
+        turn(self.conn, "Switch to the Acme project.", actor="guest_fixture", seconds_ago=10)
+        self.owner_bridge().tick()
+        self.assertIsNone(self.conn.get("conf:project:%s:current" % cb.CANVAS_ROOM))
+        self.assertNotIn("project", cb.canvas_publish.snapshot(self.conn, cb.CANVAS_ROOM, NOW))
+
+    def test_with_no_owner_listed_nobody_switches(self):
+        self.make_project("acme", "Acme")
+        with mock.patch.dict(os.environ, {cb.OWNERS_ENV: ""}):
+            bridge = cb.Bridge(self.conn, LOG, lambda: True, clock=lambda: NOW)
+        turn(self.conn, "Switch to the Acme project.", seconds_ago=10)
+        bridge.tick()
+        self.assertIsNone(self.conn.get("conf:project:%s:current" % cb.CANVAS_ROOM))
+        with mock.patch.dict(os.environ, {cb.OWNERS_ENV: "someone, own_fixture_owner"}):
+            self.assertIn("own_fixture_owner", cb.Bridge(self.conn, LOG, lambda: True, clock=lambda: NOW).owners)
 
     def test_no_matching_project_lets_the_turn_go_on_as_before(self):
         turn(self.conn, "Grok, let's work on project Nova.", seconds_ago=10)
