@@ -709,10 +709,11 @@ ARCHIVE_PENDING_KEY = "gov:canvas:archive-pending:%s"
 ARCHIVE_PENDING_SECONDS = 24 * 60 * 60
 
 
-def archive_docs(conn, room: str, now, at=None) -> list:
+def archive_docs(conn, room: str, now, at=None, only=None) -> list:
     """[(object name, bytes)]: one archive per active project of `room` that has cards, named for `at` (the call's
     end; default `now`). Only cards the canvas itself would show: clean_item AND the lifecycle fence (Codex's HOLD on
-    d1bde3a: a shape-valid card the fence excludes must not reach a durable archive). Reads only."""
+    d1bde3a: a shape-valid card the fence excludes must not reach a durable archive). `only`: that one project's
+    archive alone (R6b, a project archived from the console). Reads only."""
     import projects  # local import: the chair vendors this module without projects.py
     import call_lifecycle  # local import avoids publisher/lifecycle import cycle
     at = at or now
@@ -729,7 +730,7 @@ def archive_docs(conn, room: str, now, at=None) -> list:
                 found.setdefault(pid, []).append(dict(published, project=pid))
     out = []
     for pid, info in sorted(projects.read_projects(conn, room).items()):
-        if info["status"] != "active" or not found.get(pid):
+        if info["status"] != "active" or not found.get(pid) or (only is not None and pid != only):
             continue
         doc = {"format": ARCHIVE_FORMAT, "v": 1, "room": room, "project": {"id": pid, "name": info["name"]},
                "archived_at": stamp(at), "items": found[pid][:MAX_ITEMS]}
@@ -740,6 +741,21 @@ def archive_docs(conn, room: str, now, at=None) -> list:
                                            hashlib.sha256(data).hexdigest()[:32])
         out.append((name, data))
     return out
+
+
+def owe_project_archive(conn, room: str, pid: str, now, fence) -> bool:
+    """R6b: the owner archives a project from the console, while his call may still be on. The call's end archives only
+    ACTIVE projects (archive_docs), so this project's archive is built NOW, while it is still active, and owed under its
+    own marker (ARCHIVE_PENDING_KEY:<time>-<id>; Publisher.archive() writes every marker's files on a later round, under
+    the lease, like a call's). True when its files are owed, or when it has no cards to archive; False when the marker
+    could not be written (the lease is not this worker's): the caller must then leave the project active, so its cards
+    are still archived when his call ends."""
+    files = {name: data.decode("utf-8") for name, data in archive_docs(conn, room, now, only=pid)}
+    if not files:
+        return True
+    key = ARCHIVE_PENDING_KEY % room + ":" + stamp(now) + "-" + pid
+    value = json.dumps({"at": stamp(now), "files": files}, sort_keys=True)
+    return bool(_fenced(conn, fence, (key,), lambda pipe: [("set", key, value, ARCHIVE_PENDING_SECONDS, True)]))
 
 
 def _json_of(raw):

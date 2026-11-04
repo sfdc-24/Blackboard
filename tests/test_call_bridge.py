@@ -93,6 +93,15 @@ class FakeRedis:
     def hget(self, key, field):
         return self.hashes.get(key, {}).get(field)
 
+    def hsetnx(self, key, field, value):
+        with self.mutex:
+            if self.type(key) not in ('none', 'hash'):
+                raise TypeError('WRONGTYPE')
+            if field in self.hashes.get(key, {}):
+                return 0
+            self.hashes.setdefault(key, {})[field] = value; self.touch(key)
+            return 1
+
     def hgetall(self, key):
         return dict(self.hashes.get(key, {}))
 
@@ -158,6 +167,13 @@ class FakeRedis:
 class FakePipe:
     def __init__(self, conn):
         self.conn, self.queued, self.watched, self.in_multi = conn, [], {}, False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        self.reset()
+        return False
 
     def watch(self, *keys):
         with self.conn.mutex:
@@ -2769,6 +2785,227 @@ class LivingCardRouting(unittest.TestCase):
         turn(self.conn, "Grok, make it funnier.", seconds_ago=10)
         self.b().tick()
         self.assertEqual(life.MAX_AGE, self.conn.ttls[cb.REVISE_KEY % ask])
+
+
+def command(conn, action, actor="own_fixture_owner", seconds_ago=10, reason="", **extra):
+    """The owner console's project.command entry on the chair's stream (R6b; the schema is the conference repo's).
+    An inert fixture: the actor tag stands for the gateway-verified identity the chair stamps, not a real check."""
+    fields = dict(action=action, command_id="cmd-%d" % seconds_ago, room=ROOM)
+    fields.update(extra)
+    utterance = fields.pop("utterance", None)          # none in the real schema; a test may smuggle one in
+    return turn(conn, utterance, reason=reason, actor=actor, seconds_ago=seconds_ago, kind=cb.PROJECT_COMMAND, **fields)
+
+
+class ProjectCommands(unittest.TestCase):
+    """R6b (CARDS-ARCHITECTURE R6.2): new projects come from the owner console only, as project.command entries the
+    chair writes; the bridge obeys a listed owner's create, switch, archive and clear, and nothing else. Synthetic."""
+    CODEX = "chatgpt-codex-desktop"
+    CURRENT = "conf:project:%s:current" % cb.CANVAS_ROOM
+
+    def setUp(self):
+        self.conn = FakeRedis()
+        open_window(self.conn)
+
+    def b(self, owners=("own_fixture_owner",), holds=True):
+        return cb.Bridge(self.conn, LOG, lambda: holds, clock=lambda: NOW, owners=list(owners))
+
+    def projects(self):
+        return cb.projects.read_projects(self.conn, cb.CANVAS_ROOM)
+
+    def current(self):
+        return cb._text(self.conn.get(self.CURRENT))
+
+    def snapshot(self):
+        return cb.canvas_publish.snapshot(self.conn, cb.CANVAS_ROOM, NOW)
+
+    def owed(self):
+        return sorted(k for k in self.conn.store if k.startswith(cp.ARCHIVE_PENDING_KEY % cb.CANVAS_ROOM + ":"))
+
+    def test_an_owners_create_makes_an_active_current_project_and_the_next_claim_carries_it(self):
+        command(self.conn, "create", project_name="Acme Rollout", project_id="acme-rollout", seconds_ago=20)
+        turn(self.conn, "Codex, draft a kickoff checklist.", seconds_ago=10)
+        [ask] = self.b().tick()
+        self.assertEqual({"acme-rollout": {"name": "Acme Rollout", "status": "active",
+                                           "created": "2026-10-24T14:02:00Z"}}, self.projects())
+        self.assertEqual("acme-rollout", self.current())
+        self.assertEqual("acme-rollout", cb._text(self.conn.get("gov:callbridge:project:%s" % ask)))
+        doc = self.snapshot()
+        self.assertEqual({"id": "acme-rollout", "name": "Acme Rollout"}, doc["project"])
+        self.assertIn(self.CODEX + "/" + ask, [i["id"] for i in doc["items"]])
+
+    def test_the_id_is_the_slug_of_the_name_whatever_id_the_console_sent(self):
+        command(self.conn, "create", project_name="Acme Rollout", project_id="something-else", seconds_ago=20)
+        self.assertEqual([], self.b().tick())
+        self.assertEqual(["acme-rollout"], list(self.projects()))
+        self.assertEqual("acme-rollout", self.current())
+        command(self.conn, "create", project_name="Beta", seconds_ago=10)
+        self.b().tick()
+        self.assertEqual("beta", self.current(), "no id sent at all: still slug(name)")
+
+    def test_a_command_from_no_listed_owner_changes_nothing(self):
+        cb.projects.create(self.conn, cb.CANVAS_ROOM, "Acme", NOW)
+        cb.projects.create(self.conn, cb.CANVAS_ROOM, "Beta", NOW)
+        cb.projects.set_current(self.conn, cb.CANVAS_ROOM, "acme")
+        before = (self.projects(), self.current())
+        for actor in ("guest_fixture", "chair", "", None):
+            command(self.conn, "create", actor=actor, project_name="Gamma", project_id="gamma", seconds_ago=50)
+            command(self.conn, "switch", actor=actor, project_id="beta", seconds_ago=40)
+            command(self.conn, "archive", actor=actor, project_id="acme", seconds_ago=30)
+            command(self.conn, "clear", actor=actor, seconds_ago=20)
+            self.assertEqual([], self.b().tick())
+            self.assertEqual(before, (self.projects(), self.current()), repr(actor))
+            self.assertEqual("acme", self.snapshot()["project"]["id"])
+            self.conn.streams.pop(STREAM, None)
+            self.conn.delete(cb.CURSOR_KEY % ROOM)
+        with mock.patch.dict(os.environ, {cb.OWNERS_ENV: ""}):
+            nobody = cb.Bridge(self.conn, LOG, lambda: True, clock=lambda: NOW)
+        command(self.conn, "clear", seconds_ago=10)
+        nobody.tick()
+        self.assertEqual("acme", self.current(), "no owner listed: nobody commands")
+
+    def test_a_duplicate_create_is_refused_and_switches_nothing(self):
+        cb.projects.create(self.conn, cb.CANVAS_ROOM, "Acme", NOW)
+        self.conn.hset("conf:projects:%s" % cb.CANVAS_ROOM, "old",
+                       json.dumps({"name": "Old", "status": "archived", "created": "2026-10-01T00:00:00Z"}))
+        command(self.conn, "create", project_name="ACME", project_id="acme", seconds_ago=30)
+        command(self.conn, "create", project_name="Old", project_id="old", seconds_ago=20)
+        self.b().tick()
+        self.assertEqual({"acme": "Acme", "old": "Old"}, {k: v["name"] for k, v in self.projects().items()},
+                         "neither renamed")
+        self.assertEqual("archived", self.projects()["old"]["status"], "not revived")
+        self.assertIsNone(self.current(), "a refused create makes nothing current")
+
+    def test_an_invalid_name_is_refused(self):
+        for bad in ("", "<script>", "x" * 41, "-first", "two|parts"):
+            command(self.conn, "create", project_name=bad, project_id="x", seconds_ago=10)
+            self.b().tick()
+            self.assertEqual({}, self.projects(), repr(bad))
+            self.assertIsNone(self.current())
+            self.conn.streams.pop(STREAM, None)
+            self.conn.delete(cb.CURSOR_KEY % ROOM)
+        command(self.conn, "create", project_id="acme", seconds_ago=10)
+        self.b().tick()
+        self.assertEqual({}, self.projects(), "no name at all")
+
+    def test_switch_takes_an_active_project_only(self):
+        cb.projects.create(self.conn, cb.CANVAS_ROOM, "Acme", NOW)
+        cb.projects.create(self.conn, cb.CANVAS_ROOM, "Beta", NOW)
+        cb.projects.archive(self.conn, cb.CANVAS_ROOM, "beta")
+        command(self.conn, "switch", project_id="acme", seconds_ago=40)
+        self.b().tick()
+        self.assertEqual("acme", self.current())
+        for pid in ("beta", "nope", "Bad Id", ""):
+            command(self.conn, "switch", project_id=pid, seconds_ago=30)
+            self.b().tick()
+            self.assertEqual("acme", self.current(), repr(pid))
+            self.conn.streams.pop(STREAM, None)
+            self.conn.delete(cb.CURSOR_KEY % ROOM)
+
+    def test_archiving_the_current_project_clears_it_and_the_canvas_shows_untagged_cards_only(self):
+        turn(self.conn, "Grok, write a joke on a card.", seconds_ago=60)
+        [plain] = self.b().tick()
+        command(self.conn, "create", project_name="Acme", project_id="acme", seconds_ago=50)
+        turn(self.conn, "Codex, draft a kickoff checklist.", seconds_ago=40)
+        [tagged] = self.b().tick()
+        self.assertEqual([self.CODEX + "/" + tagged], [i["id"] for i in self.snapshot()["items"]])
+        command(self.conn, "archive", project_id="acme", seconds_ago=30)
+        self.assertEqual([], self.b().tick())
+        self.assertEqual("archived", self.projects()["acme"]["status"])
+        self.assertIsNone(self.current())
+        doc = self.snapshot()
+        self.assertNotIn("project", doc)
+        self.assertEqual(["grok/" + plain], [i["id"] for i in doc["items"]], "untagged cards only")
+        self.assertEqual("acme", cb._text(self.conn.get("gov:callbridge:project:%s" % tagged)), "its stamp stays")
+
+    def test_archiving_owes_the_projects_private_archive_which_the_publisher_then_writes(self):
+        """R6.1: the call's end archives ACTIVE projects only, so a project archived mid-call is archived now."""
+        command(self.conn, "create", project_name="Acme", project_id="acme", seconds_ago=50)
+        turn(self.conn, "Codex, draft a kickoff checklist.", seconds_ago=40)
+        [ask] = self.b().tick()
+        command(self.conn, "archive", project_id="acme", seconds_ago=30)
+        self.b().tick()
+        [key] = self.owed()
+        self.assertTrue(key.endswith("-acme"), key)
+        owed = json.loads(self.conn.get(key))
+        [(name, body)] = list(owed["files"].items())
+        self.assertTrue(name.startswith("projects/acme/"), name)
+        self.assertEqual([self.CODEX + "/" + ask], [i["id"] for i in json.loads(body)["items"]])
+        self.assertEqual([], cp.archive_docs(self.conn, cb.CANVAS_ROOM, NOW), "archived: the call's end owes nothing")
+        sent = []
+        pub = cp.Publisher(self.conn, "sfdc24-canvas", lambda b, n, d, allow=None: sent.append((b, n, d)), LOG,
+                           clock=lambda: NOW, holds=lambda: True)
+        self.assertEqual(1, pub.archive(cb.CANVAS_ROOM, NOW))
+        self.assertEqual([(cp.ARCHIVE_BUCKET, name, body.encode("utf-8"))], sent, "to the private bucket, as frozen")
+        self.assertEqual([], self.owed())
+
+    def test_an_archive_that_cannot_be_owed_leaves_the_project_active(self):
+        """The lease lapses between reading the command and owing the archive: the fenced write fails, so the
+        project stays active (and current) and its cards are still archived when his call ends."""
+        command(self.conn, "create", project_name="Acme", project_id="acme", seconds_ago=50)
+        turn(self.conn, "Codex, draft a kickoff checklist.", seconds_ago=40)
+        self.b().tick()
+        command(self.conn, "archive", project_id="acme", seconds_ago=30)
+        with mock.patch.object(cp, "_fenced", lambda *a, **k: None):
+            self.b().tick()
+        self.assertEqual("active", self.projects()["acme"]["status"])
+        self.assertEqual("acme", self.current())
+        self.assertEqual([], self.owed())
+        self.assertEqual(at(30), cb._text(self.conn.get(cb.CURSOR_KEY % ROOM)), "consumed all the same")
+
+    def test_archiving_a_project_without_cards_needs_no_archive(self):
+        command(self.conn, "create", project_name="Acme", project_id="acme", seconds_ago=40)
+        command(self.conn, "archive", project_id="acme", seconds_ago=30)
+        self.b().tick()
+        self.assertEqual("archived", self.projects()["acme"]["status"])
+        self.assertEqual([], self.owed())
+        command(self.conn, "archive", project_id="acme", seconds_ago=20)
+        command(self.conn, "archive", project_id="nope", seconds_ago=10)
+        self.b().tick()
+        self.assertEqual("archived", self.projects()["acme"]["status"], "again, or unknown: refused, nothing raised")
+
+    def test_clear_with_no_project_is_a_no_op_and_with_one_clears_it(self):
+        command(self.conn, "clear", seconds_ago=40)
+        self.assertEqual([], self.b().tick())
+        self.assertIsNone(self.current())
+        self.assertEqual({}, self.projects())
+        command(self.conn, "create", project_name="Acme", project_id="acme", seconds_ago=30)
+        command(self.conn, "clear", project_id="", seconds_ago=20)
+        self.b().tick()
+        self.assertIsNone(self.current())
+        self.assertEqual("active", self.projects()["acme"]["status"], "cleared, not archived")
+        self.assertNotIn("project", self.snapshot())
+
+    def test_a_project_command_is_never_an_ask_a_go_ahead_a_follow_up_or_a_cancellation(self):
+        smuggled = {"kind": cb.PROJECT_COMMAND, "action": "clear", "actor_id": "own_fixture_owner",
+                    "reason": "vocative", "utterance": "Codex, draft a kickoff checklist.", "session_epoch": "e"}
+        self.assertEqual([], cb.asks_in(smuggled))
+        self.assertFalse(cb.task_ask(smuggled))
+        self.assertFalse(cb.follow_up(dict(smuggled, reason="continuity", utterance="Draft the checklist.")))
+        self.assertFalse(cb.go_ahead(dict(smuggled, utterance="Codex, go ahead.")))
+        self.assertFalse(cb.cancellation(dict(smuggled, utterance="Cancel that.")))
+        command(self.conn, "create", project_name="Acme", project_id="acme", seconds_ago=20, reason="vocative",
+                utterance="Codex, draft a kickoff checklist.")
+        self.assertEqual([], self.b().tick(), "nothing claimed")
+        self.assertEqual({}, dict(self.conn.hgetall(life.OPEN_KEY) or {}))
+        self.assertIsNone(self.conn.get(cb.PENDING_KEY % ROOM), "not a pending ask either")
+        self.assertEqual("acme", self.current(), "the command itself was obeyed")
+
+    def test_an_unknown_action_changes_nothing_and_is_consumed(self):
+        cb.projects.create(self.conn, cb.CANVAS_ROOM, "Acme", NOW)
+        cb.projects.set_current(self.conn, cb.CANVAS_ROOM, "acme")
+        entry = command(self.conn, "delete", project_id="acme", seconds_ago=10)
+        self.b().tick()
+        self.assertEqual("active", self.projects()["acme"]["status"])
+        self.assertEqual("acme", self.current())
+        self.assertEqual(entry, cb._text(self.conn.get(cb.CURSOR_KEY % ROOM)))
+
+    def test_a_command_is_obeyed_once(self):
+        command(self.conn, "create", project_name="Acme", project_id="acme", seconds_ago=20)
+        bridge = self.b()
+        bridge.tick()
+        cb.projects.clear_current(self.conn, cb.CANVAS_ROOM)
+        bridge.tick()
+        self.assertIsNone(self.current(), "the cursor passed it: not replayed")
 
 
 class CardNameRouting(unittest.TestCase):

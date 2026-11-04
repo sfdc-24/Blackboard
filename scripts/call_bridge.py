@@ -407,6 +407,12 @@ def ask_id(room: str, entry_id: str, agent: str) -> str:
 
 
 OWNERS_ENV = "CALL_BRIDGE_OWNER_ACTORS"
+# PROJECTS (R6b): the owner console's command on the chair's event stream. Fields: kind=project.command;
+# action create|switch|archive|clear; project_id (switch, archive; the console's slug on create, recomputed here);
+# project_name (create); actor_id, the gateway-verified owner identity, as on every turn. No utterance: it is never
+# an ask, a go-ahead, a follow-up or a cancellation (each of those reads turn.started only).
+PROJECT_COMMAND = "project.command"
+PROJECT_ACTIONS = ("create", "switch", "archive", "clear")
 
 
 def _owners(raw: str) -> list:
@@ -1021,6 +1027,17 @@ class Bridge:
                     self.log.warning("call bridge: cancellation refused (%s)", refused)
                 self.conn.set(CURSOR_KEY % room, entry_id, ex=TTL_SECONDS)
                 continue
+            if fields.get("kind") == PROJECT_COMMAND:
+                # PROJECTS (R6b, conference docs/CARDS-ARCHITECTURE.md R6.2): the owner console creates, switches,
+                # archives and clears the canvas's project; a heard name never creates one. Only a listed owner's
+                # command is obeyed (the same gate as the R6a voice switch: a guest must not change what the public
+                # canvas shows). Handled here, before every turn path, and consumed whatever it did.
+                if fields.get("actor_id") in self.owners:
+                    self._project_command(fields, now)
+                else:
+                    self.log.info("call bridge: a project command in %s from no listed owner; ignored", room)
+                self.conn.set(CURSOR_KEY % room, entry_id, ex=TTL_SECONDS)
+                continue
             if self.readback and fields.get("kind") == READBACK_SPOKEN and fields.get("actor_id") == "chair":
                 # The chair read the open proposal back into the call, verbatim, under this read-back id. Only the
                 # current id counts: a read-back of an older or changed proposal is not one of this.
@@ -1250,6 +1267,50 @@ class Bridge:
             if done:
                 self._close(room, proposal, done, "Claimed", now)
         return claimed
+
+    def _project_command(self, fields: dict, now) -> bool:
+        """One owner-console command on the canvas room's projects (R6b). Whether it changed anything.
+
+        create   the id is slug(project_name), computed here (the console's own project_id is not consulted, so a
+                 mismatching one is simply ignored); refused for an invalid name or a taken id; the new project is
+                 made current.
+        switch   an existing ACTIVE project becomes current (projects.set_current: nothing else).
+        archive  an active project is retired and, if current, no project is current. Its cards are archived to the
+                 private bucket FIRST (R6.1): the call's end archives active projects only, so the archive is owed
+                 now, under the lease; if it cannot be owed the project stays active and the command is refused.
+        clear    no project is current.
+        The log says ids and outcomes only, never the name the owner typed."""
+        action = fields.get("action") or ""
+        if action not in PROJECT_ACTIONS:
+            self.log.info("call bridge: an unknown project command in %s; ignored", self.canvas_room)
+            return False
+        pid = fields.get("project_id") or ""
+        if not projects.PROJECT_ID.fullmatch(pid):
+            pid = ""
+        done = False
+        if action == "create":
+            made = projects.create(self.conn, self.canvas_room, fields.get("project_name") or "", now)
+            same = bool(made) and made == pid
+            pid = made or ""
+            done = bool(made) and projects.set_current(self.conn, self.canvas_room, made)
+            if made and not same:
+                self.log.info("call bridge: project %s created in %s under its own id, not the console's", made,
+                              self.canvas_room)
+        elif action == "switch":
+            done = bool(pid) and projects.set_current(self.conn, self.canvas_room, pid)
+        elif action == "archive":
+            info = projects.read_projects(self.conn, self.canvas_room).get(pid) if pid else None
+            if info and info["status"] == "active":
+                if canvas_publish.owe_project_archive(self.conn, self.canvas_room, pid, now, self.holds):
+                    done = projects.archive(self.conn, self.canvas_room, pid)
+                else:
+                    self.log.warning("call bridge: project %s stays active in %s: its archive could not be owed",
+                                     pid, self.canvas_room)
+        elif action == "clear":
+            done = projects.clear_current(self.conn, self.canvas_room)
+        self.log.info("call bridge: project command %s %s in %s: %s", action, pid or "-", self.canvas_room,
+                      "done" if done else "refused")
+        return done
 
     def _proposal(self, room):
         """The room's open proposal {entry, said, agents}, or None."""

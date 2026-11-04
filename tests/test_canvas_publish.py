@@ -487,6 +487,31 @@ class ProjectArchives(unittest.TestCase):
         self.assertEqual(0, self.pub().archive(cp.CALL_ROOM, NOW))
         self.assertEqual([], self.sent)
 
+    def test_one_projects_archive_alone(self):
+        self.assertEqual([self.NAME], [n for n, _ in cp.archive_docs(self.conn, cp.CALL_ROOM, NOW, only="acme")])
+        self.assertEqual([], cp.archive_docs(self.conn, cp.CALL_ROOM, NOW, only="empty"), "no cards")
+        self.assertEqual([], cp.archive_docs(self.conn, cp.CALL_ROOM, NOW, only="beta"), "archived already")
+
+    def test_a_project_archived_from_the_console_is_owed_now_and_written_like_a_calls(self):
+        """R6b under R6.1: the call's end archives active projects only, so the console's archive owes it first."""
+        holds = lambda: self.conn.store.get(cp.LEASE_KEY) == ME                                   # noqa: E731
+        self.assertTrue(cp.owe_project_archive(self.conn, cp.CALL_ROOM, "acme", NOW, holds))
+        [key] = self.owed()
+        self.assertEqual(cp.ARCHIVE_PENDING_KEY % cp.CALL_ROOM + ":" + cp.stamp(NOW) + "-acme", key)
+        self.assertEqual({self.NAME: self.BYTES.decode("utf-8")}, json.loads(self.conn.store[key])["files"])
+        self.assertEqual(cp.ARCHIVE_PENDING_SECONDS, self.conn.ttls[key])
+        self.assertEqual(1, self.pub().archive(cp.CALL_ROOM, NOW))
+        self.assertEqual([("sfdc24-fleet-state", self.NAME)], self.sent)
+        self.assertEqual([], self.owed())
+
+    def test_a_project_with_no_cards_owes_nothing_and_no_lease_owes_nothing(self):
+        holds = lambda: self.conn.store.get(cp.LEASE_KEY) == ME                                   # noqa: E731
+        self.assertTrue(cp.owe_project_archive(self.conn, cp.CALL_ROOM, "empty", NOW, holds), "nothing to archive")
+        self.assertEqual([], self.owed())
+        self.conn.store[cp.LEASE_KEY] = "someone-else"
+        self.assertFalse(cp.owe_project_archive(self.conn, cp.CALL_ROOM, "acme", NOW, holds))
+        self.assertEqual([], self.owed())
+
 
 class Window(unittest.TestCase):
     def test_a_window_is_time_boxed_and_one_per_room(self):
