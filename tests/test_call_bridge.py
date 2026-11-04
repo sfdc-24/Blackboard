@@ -2688,6 +2688,55 @@ class CardNameRouting(unittest.TestCase):
         self.assertEqual([], self.revisions(logo))
 
 
+class CardNamesInReadBackMode(unittest.TestCase):
+    """Codex's review of PR 463: with the read-back ON, a confirmed change that says a card's name reaches that
+    card, not the voice's newest. Synthetic sentences only."""
+    CODEX = "chatgpt-codex-desktop"
+
+    def setUp(self):
+        self.conn = FakeRedis()
+        open_window(self.conn)
+
+    def b(self):
+        return cb.Bridge(self.conn, LOG, lambda: True, clock=lambda: NOW, readback=True)
+
+    def heard(self, entry, seconds_ago):
+        return self.conn.xadd(STREAM, {
+            "kind": cb.READBACK_SPOKEN, "actor_id": "chair", "room_id": ROOM, "session_epoch": "fixture-epoch",
+            "control_sequence": "4", "proj_n": "2", "readback_id": cb.readback_id(ROOM, entry, [self.CODEX])},
+            entry_id=at(seconds_ago))
+
+    def revisions(self, ask):
+        return [json.loads(x) for x in getattr(self.conn, "lists", {}).get(cb.REVISE_KEY % ask, [])]
+
+    def claimed(self, said, name, title, seconds_ago):
+        entry = turn(self.conn, said, seconds_ago=seconds_ago)
+        self.b().tick()
+        self.heard(entry, seconds_ago - 5)
+        turn(self.conn, "Codex, go ahead.", seconds_ago=seconds_ago - 8)
+        [ask] = self.b().tick()
+        info = json.loads(self.conn.hget(life.OPEN_KEY, ask))
+        info["field"] = ask + "-work"
+        self.conn.hset(life.OPEN_KEY, ask, json.dumps(info))
+        self.conn.hset("conf:canvas:%s:%s" % (info["room"], self.CODEX), ask + "-work",
+                       json.dumps({"type": "note", "title": title, "body": "x", "name": name}))
+        return ask
+
+    def test_a_confirmed_change_reaches_the_card_he_named_not_the_newest(self):
+        logo = self.claimed("Codex, design a logo for SFDC24.", "SFDC24 logo", "SFDC24 logo concepts", 200)
+        plan = self.claimed("Codex, draft an onboarding plan on a new card.", "Onboarding plan", "Onboarding plan", 150)
+        change = turn(self.conn, "Codex, make the logo card bolder.", seconds_ago=60)
+        self.assertEqual([], self.b().tick())
+        self.assertEqual([], self.revisions(logo), "not before his go-ahead")
+        self.heard(change, 50)
+        turn(self.conn, "Codex, go ahead.", seconds_ago=45)
+        self.assertEqual([], self.b().tick(), "no new claim")
+        self.assertEqual([{"entry": change}], self.revisions(logo))
+        self.assertEqual([], self.revisions(plan), "not the newest card")
+        self.assertNotIn(cb.proposal_id(ROOM, change, self.CODEX), self.conn.hgetall(cp.PARTITION % ("workshop",
+                                                                                                      self.CODEX)))
+
+
 class LivingCardsInReadBackMode(unittest.TestCase):
     """Codex's HOLD on PR 461: with the read-back ON, a living card is claimed, revised and made final. A revision
     is authorized exactly like a claim: proposed, read back, then his go-ahead routes it; final needs no read-back

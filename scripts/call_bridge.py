@@ -1056,14 +1056,20 @@ class Bridge:
                             self._route(living["ask"], entry_id, "final", {"final": True, "entry": entry_id}):
                         self.log.info("call bridge: %s final, said in %s", living["ask"], room)
                 agents = []
-            by_name = None
-            if (not self.readback and fields.get("kind") == "turn.started"
+            by_name, proposed = None, list(agents)
+            # Direct start, or in read-back mode his go-ahead confirming a proposal (Codex's review of PR 463: a
+            # confirmed change must reach the card he named too, not the voice's newest). `said` then holds his
+            # original words; the go-ahead's caller and session are the proposal's (checked above).
+            if ((not self.readback or confirms) and fields.get("kind") == "turn.started"
                     and fields.get("actor_id") not in ("", None, "chair") and not NEW_CARD.search(said or "")
                     and not final_said(said) and TASK.search(said or "")):
                 by_name = self._named_card(room, said, fields.get("actor_id"), fields.get("session_epoch"))
                 if by_name and not named_in(said):
                     # "Make the logo card bolder": the logo card's own voice, not whoever holds the floor.
                     agents = [by_name["agent"]]
+            if self.readback and confirms and [a for a in proposed if a not in agents]:
+                self._close(room, confirms, [a for a in proposed if a not in agents], "Updating the card he named",
+                            now, retire=True)
             for agent in agents:
                 if not self.holds():
                     return claimed
