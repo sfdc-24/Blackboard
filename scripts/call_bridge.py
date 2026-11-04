@@ -228,10 +228,49 @@ REVISE_KEY = "gov:callbridge:revise:%s"
 ROUTED_KEY = "gov:callbridge:routed:%s:%s"      # <source entry>, <agent or "final">
 NEW_CARD = re.compile(r"(?i)\b(?:new|another|separate|fresh|second|different)\s+(?:card|one)\b")
 FINAL = re.compile(r"(?i)\b(?:that['’]?s\s+(?:it,?\s+)?final|it['’]?s\s+final|(?:make|mark)\s+(?:it|that|this)\s+final|"
+                   r"(?:card|plan|one|it|that|this)\s+is\s+final|"
+                   r"(?:make|mark)\s+the\s+(?:[\w'’-]+\s+){1,4}?final|lock\s+(?:in\s+)?the\s+(?:[\w'’-]+\s+){0,3}?card|"
                    r"lock\s+(?:it|that|this)(?:\s+in)?|finali[sz]e\s+(?:it|that|this)|"
                    r"we['’]?re\s+done\s+with\s+(?:it|that|this))\b")
 # "Don't make it final", "never lock it": a negation before the phrase is not a final (Copilot on PR 461).
 NOT_FINAL = re.compile(r"(?i)\b(?:don['’]?t|do\s+not|not|never|no|won['’]?t|isn['’]?t)\b")
+
+
+# CARD NAMES (conference docs/CARDS-ARCHITECTURE.md, decision c): the chair names each living card from its first
+# title ("Onboarding plan"), shown on the card and kept for its life. His words that say it - "the onboarding
+# plan", or "the <words> card" whose words are all in the card's name or title ("the logo card") - go to THAT
+# card, whichever voice made it, unless he names another voice (that voice makes its own card). Same checks as any
+# living card: OPEN, this room, his own ask in this session, put up and not expired.
+CARD_SAID = re.compile(r"(?i)\b(?:the|that|this|my|our|[a-z]+['’]s)\s+((?:[\w'’-]+\s+){1,4}?)card\b")
+CARD_LEAD = {"the", "that", "this", "my", "our"}
+CARD_SKIP = CARD_LEAD | {"a", "an", "his", "its", "your", "s"}
+VOICE_WORDS = ("grok", "grock", "groq", "claude", "claud", "codex", "kodex", "gemini", "jemini", "gemeni")  # NAMES
+CARD_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 '\-]{0,39}$")     # canvas_publish.NAME
+
+
+def _card_words(text: str) -> list:
+    """Lower-case words, possessives and plurals folded: "Grok's logos" is ["grok", "logo"]."""
+    words = re.findall(r"[a-z0-9]+", re.sub(r"['’]s\b", "", (text or "").lower()))
+    return [w[:-1] if len(w) > 3 and w.endswith("s") and not w.endswith("ss") else w for w in words]
+
+
+def card_named(said: str, name: str, title: str = "") -> int:
+    """How surely his words name this card: 2 when they say its whole name after "the" (or that, this, ...), 1 when
+    a "the <words> card" has every word in its name or title (voice names aside), else 0."""
+    if not isinstance(name, str) or not CARD_NAME.fullmatch(name):
+        return 0
+    named, heard = _card_words(name), _card_words(said)
+    if named and named[0] != "card":
+        for i in range(1, len(heard) - len(named) + 1):
+            if heard[i:i + len(named)] == named and heard[i - 1] in CARD_LEAD:
+                return 2
+    voices = set(VOICE_WORDS)
+    known = set(named) | set(_card_words(title))
+    for match in CARD_SAID.finditer(said or ""):
+        words = [w for w in _card_words(match.group(1)) if w not in CARD_SKIP and w not in voices]
+        if words and all(w in known for w in words):
+            return 1
+    return 0
 
 
 def final_said(said: str) -> bool:
@@ -1007,7 +1046,8 @@ class Bridge:
                 # event, validated here and again by the worker (Codex's second HOLD on PR 461).
                 named = named_in(said)
                 actor, epoch = fields.get("actor_id"), fields.get("session_epoch")
-                targets = ([self._living(room, a, actor, epoch) for a in named] if named
+                by_name = self._named_card(room, said, actor, epoch)
+                targets = ([by_name] if by_name else [self._living(room, a, actor, epoch) for a in named] if named
                            else [self._living(room, None, actor, epoch)])
                 for living in [t for t in targets if t]:
                     if not self.holds():
@@ -1016,11 +1056,21 @@ class Bridge:
                             self._route(living["ask"], entry_id, "final", {"final": True, "entry": entry_id}):
                         self.log.info("call bridge: %s final, said in %s", living["ask"], room)
                 agents = []
+            by_name = None
+            if (not self.readback and fields.get("kind") == "turn.started"
+                    and fields.get("actor_id") not in ("", None, "chair") and not NEW_CARD.search(said or "")
+                    and not final_said(said) and TASK.search(said or "")):
+                by_name = self._named_card(room, said, fields.get("actor_id"), fields.get("session_epoch"))
+                if by_name and not named_in(said):
+                    # "Make the logo card bolder": the logo card's own voice, not whoever holds the floor.
+                    agents = [by_name["agent"]]
             for agent in agents:
                 if not self.holds():
                     return claimed
-                living = None if NEW_CARD.search(said or "") else \
-                    self._living(room, agent, fields.get("actor_id"), fields.get("session_epoch"))
+                living = None if NEW_CARD.search(said or "") else (
+                    # He named a card of another voice: this voice's own card is not the one he means.
+                    (by_name if by_name.get("agent") == agent else None) if by_name else
+                    self._living(room, agent, fields.get("actor_id"), fields.get("session_epoch")))
                 source_entry = confirms["entry"] if confirms else entry_id
                 if living and self._bound(room, source_entry, living):
                     # His words update the agent's living card in place (no new ask, no new card). In read-back
@@ -1289,12 +1339,39 @@ class Bridge:
             return None                                      # an old or unreadable record binds nothing
         return {"entry": str(held["entry"]), "said": held["said"], "agents": agents, "named": held.get("named") is True}
 
+    def _named_card(self, room, said, actor, epoch):
+        """The living card his words name (card_named), as its OPEN record: the surest match, then the newest.
+        The name and title are read from the card the worker put up. None when his words name no card."""
+        best, rank = None, (0, (-1, -1))
+        for info in self._living_all(room, None, actor, epoch):
+            try:
+                stored = json.loads(_text(self.conn.hget("conf:canvas:%s:%s" % (info.get("room"), info.get("agent")),
+                                                         info.get("field"))) or "{}")
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(stored, dict):
+                continue
+            score = card_named(said, stored.get("name"), str(stored.get("title") or ""))
+            order = (score, _stream_order((info.get("source") or {}).get("event")))
+            if score and order > rank:
+                best, rank = info, order
+        return best
+
     def _living(self, room, agent=None, actor=None, epoch=None):
         """The newest living ask in this conference room (of `agent`, when given), as its OPEN record: OPEN, not
         expired (its deadline and its active token both hold: cleanup is lazy, Copilot on PR 461), the worker has
         put its card up (the lifecycle records the card's field), and asked by `actor` in session `epoch`. None
         when there is none."""
         best = None
+        for info in self._living_all(room, agent, actor, epoch):
+            # Newest by his ask's own stream id (the source event); claims in one second share claimed_at.
+            if best is None or _stream_order((info.get("source") or {}).get("event")) > \
+                    _stream_order((best.get("source") or {}).get("event")):
+                best = info
+        return best
+
+    def _living_all(self, room, agent=None, actor=None, epoch=None):
+        """Every living ask in this room (of `agent`, when given) that `actor` asked in session `epoch`."""
         now = self.clock().timestamp()
         for raw in (self.conn.hgetall(call_lifecycle.OPEN_KEY) or {}).values():
             try:
@@ -1309,10 +1386,7 @@ class Bridge:
                     or not isinstance(info.get("expires_at"), (int, float)) or now >= info["expires_at"]
                     or _text(self.conn.get(call_lifecycle.EXPIRY_KEY % info.get("ask"))) != info.get("source_revision")):
                 continue
-            # Newest by his ask's own stream id (the source event); claims in one second share claimed_at.
-            if best is None or _stream_order((info.get("source") or {}).get("event")) >                     _stream_order((best.get("source") or {}).get("event")):
-                best = info
-        return best
+            yield info
 
     def _bound(self, room, entry, living) -> bool:
         """The command's source event is a complete owner turn in this room (call_lifecycle.capture, as for a
