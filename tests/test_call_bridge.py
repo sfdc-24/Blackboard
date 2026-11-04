@@ -349,12 +349,14 @@ class Claim(unittest.TestCase):
         self.assertEqual(1, len(first))
         self.assertEqual(1, len(self.conn.streams["fleet:inbox:chatgpt-codex-desktop"]))
 
-    def test_two_names_two_asks(self):
+    def test_two_names_one_team_ask_for_the_first_named(self):
+        # R3 (conference docs/CARDS-ARCHITECTURE.md, Team cards): two voices on one task share ONE card, hosted by
+        # the first voice he named; the chair runs both on it.
         turn(self.conn, "Grok and Gemini, compare the two plans.")
         asks = bridge(self.conn).tick()
-        self.assertEqual(2, len(set(asks)))
+        self.assertEqual(1, len(asks))
         self.assertIsNotNone(card(self.conn, "grok", asks[0]))
-        self.assertIsNotNone(card(self.conn, "gemini", asks[1]))
+        self.assertNotIn("fleet:inbox:gemini", self.conn.streams)
 
     def test_nothing_while_the_window_is_shut_or_the_lease_is_not_ours(self):
         turn(self.conn, "Codex, draft the queue flow.")
@@ -1657,9 +1659,10 @@ class ReadBack(unittest.TestCase):
             self.assertEqual(at(ago), self.conn.get(cb.CURSOR_KEY % ROOM), "the turn was read")
         self.assertEqual([], self.inbox("grok") + self.inbox("gemini"))
         turn(self.conn, "Grok and Gemini, go ahead.", seconds_ago=30)
-        self.assertEqual(2, len(self.b().tick()))
+        # R3: the two named voices' one task is one team card, hosted by Grok, the first named.
+        self.assertEqual(1, len(self.b().tick()))
         self.assertEqual(1, len(self.inbox("grok")))
-        self.assertEqual(1, len(self.inbox("gemini")))
+        self.assertEqual(0, len(self.inbox("gemini")))
 
     def test_a3_a_late_go_ahead_claims_nothing_and_the_card_says_not_started(self):
         entry = turn(self.conn, "Codex, draft the sample queue flow.", seconds_ago=200)
@@ -2427,8 +2430,9 @@ class ForgivingReadBack(unittest.TestCase):
         self.b().tick()
         self.heard(entry, ["grok", "gemini"], 40)
         turn(self.conn, "do it", reason="continuity", seconds_ago=20)
-        self.assertEqual(2, len(self.b().tick()))
-        self.assertEqual((1, 1), (len(self.inbox("grok")), len(self.inbox("gemini"))))
+        # R3: both voices confirmed on one task are ONE team card, hosted by the first named (Codex's review of 464).
+        self.assertEqual(1, len(self.b().tick()))
+        self.assertEqual((1, 0), (len(self.inbox("grok")), len(self.inbox("gemini"))))
 
     def test_a_bare_yes_after_the_read_back_claims_nothing(self):
         entry = turn(self.conn, "Codex, draft the sample queue flow.", seconds_ago=60)
@@ -2591,7 +2595,8 @@ class LivingCardRouting(unittest.TestCase):
         entry = turn(self.conn, "All of you, make it shorter.", reason="everyone", seconds_ago=10)
         claimed = self.b().tick()
         self.assertEqual([{"entry": entry}], self.revisions(mine))
-        self.assertEqual(3, len(claimed), "the three voices without a living card are claimed")
+        # R3: a change is not new work; no new card is made for the voices without one.
+        self.assertEqual(0, len(claimed), "no new cards for a change")
 
     def test_the_revision_list_expires_with_the_ask(self):
         ask, _ = self.living()
@@ -2695,6 +2700,194 @@ class CardNameRouting(unittest.TestCase):
         turn(self.conn, "Grok, put the logo card ideas on a new card.", seconds_ago=10)
         self.assertEqual(1, len(self.b().tick()))
         self.assertEqual([], self.revisions(logo))
+
+
+class TeamCardRouting(unittest.TestCase):
+    """R3, conference docs/CARDS-ARCHITECTURE.md "Team cards (R3)": a team ask is ONE claim for its host; later team
+    words and picks go to the living team card. Synthetic sentences only."""
+
+    def setUp(self):
+        self.conn = FakeRedis()
+        open_window(self.conn)
+
+    def b(self):
+        return cb.Bridge(self.conn, LOG, lambda: True, clock=lambda: NOW)
+
+    def inboxes(self):
+        return sorted(k.split(":")[-1] for k in self.conn.streams if k.startswith("fleet:inbox:"))
+
+    def revisions(self, ask):
+        return [json.loads(x) for x in getattr(self.conn, "lists", {}).get(cb.REVISE_KEY % ask, [])]
+
+    def team_card(self, said="Everyone, design a logo for SFDC24.", host="gemini", seconds_ago=90):
+        """A team ask whose round put its board up (Plan first, then the voices' tiles)."""
+        turn(self.conn, said, reason="everyone", seconds_ago=seconds_ago)
+        [ask] = self.b().tick()
+        info = json.loads(self.conn.hget(life.OPEN_KEY, ask))
+        info["field"] = ask + "-work"
+        self.conn.hset(life.OPEN_KEY, ask, json.dumps(info))
+        board = {"layout": "grid", "chosen": None, "blocks": [
+            {"kind": "text", "by": host, "title": "Plan", "body": "Options."},
+            {"kind": "text", "by": "grok", "title": "Grok mark", "body": "x"}]}
+        self.conn.hset("conf:canvas:%s:%s" % (info["room"], host), ask + "-work",
+                       json.dumps({"type": "board", "title": "Team options: Design a logo", "name": "logo",
+                                   "body": json.dumps(board)}))
+        return ask
+
+    def test_picks_that_point_at_a_tile(self):
+        self.assertTrue(cb.picked("I like Grok's."))
+        self.assertTrue(cb.picked("Let's take the second one."))
+        self.assertTrue(cb.picked("Go with Codex."))
+        self.assertFalse(cb.picked("I like that idea."))
+        self.assertFalse(cb.picked("Grok's logo is nice."), "no pick word")
+
+    def test_everyone_with_new_work_is_one_claim_for_gemini(self):
+        turn(self.conn, "Everyone, design a logo for SFDC24.", reason="everyone")
+        self.assertEqual(1, len(self.b().tick()))
+        self.assertEqual(["gemini"], self.inboxes())
+
+    def test_two_named_voices_are_one_claim_for_the_first(self):
+        turn(self.conn, "Codex and Grok, draft a launch plan.")
+        self.assertEqual(1, len(self.b().tick()))
+        self.assertEqual(["chatgpt-codex-desktop"], self.inboxes())
+
+    def test_a_team_change_goes_to_the_team_card(self):
+        ask = self.team_card()
+        entry = turn(self.conn, "Everyone, make them bolder.", reason="everyone", seconds_ago=10)
+        self.assertEqual([], self.b().tick(), "no new card")
+        self.assertEqual([{"entry": entry}], self.revisions(ask))
+
+    def test_a_pick_goes_to_the_team_card_without_a_task_word(self):
+        ask = self.team_card()
+        entry = turn(self.conn, "I like Grok's.", reason="", seconds_ago=10)
+        self.b().tick()
+        self.assertEqual([{"entry": entry}], self.revisions(ask))
+
+    def test_praise_that_picks_nothing_routes_nothing(self):
+        ask = self.team_card()
+        turn(self.conn, "I like that idea.", reason="", seconds_ago=10)
+        self.assertEqual([], self.b().tick())
+        self.assertEqual([], self.revisions(ask))
+
+    def test_naming_a_member_with_the_team_cards_name_goes_to_the_team_card(self):
+        ask = self.team_card()
+        entry = turn(self.conn, "Grok, make the logo card bolder.", seconds_ago=10)
+        self.assertEqual([], self.b().tick(), "not a new Grok card")
+        self.assertEqual([{"entry": entry}], self.revisions(ask))
+
+    def test_new_team_work_beside_a_living_team_card_is_a_new_team_card(self):
+        ask = self.team_card()
+        turn(self.conn, "Everyone, design a mascot for SFDC24.", reason="everyone", seconds_ago=10)
+        self.assertEqual(1, len(self.b().tick()))
+        self.assertEqual([], self.revisions(ask))
+
+    def test_an_ordinal_pick_is_a_pick_not_a_new_card(self):
+        # Codex's review of PR 464: "second one" also reads as NEW_CARD ("a second one").
+        ask = self.team_card()
+        entry = turn(self.conn, "Let's take the second one.", reason="", seconds_ago=10)
+        self.assertEqual([], self.b().tick(), "no new card")
+        self.assertEqual([{"entry": entry}], self.revisions(ask))
+
+    def test_making_the_options_bolder_changes_the_team_card(self):
+        ask = self.team_card()
+        self.assertIsNone(cb.NEW_WORK.search("Everyone, make the options bolder."))
+        self.assertIsNotNone(cb.NEW_WORK.search("Everyone, give me options for a tagline."))
+        entry = turn(self.conn, "Everyone, make the options bolder.", reason="everyone", seconds_ago=10)
+        self.assertEqual([], self.b().tick(), "no new team card")
+        self.assertEqual([{"entry": entry}], self.revisions(ask))
+
+    def test_another_callers_pick_routes_nothing(self):
+        ask = self.team_card()
+        turn(self.conn, "I like Grok's.", reason="", actor="someone_else", seconds_ago=10)
+        self.b().tick()
+        self.assertEqual([], self.revisions(ask))
+
+
+class TeamCardsInReadBackMode(unittest.TestCase):
+    """Codex's review of PR 464: with the read-back ON, a confirmed team ask is ONE team card, a confirmed team
+    change reaches the team card, and a pick needs no read-back. Synthetic sentences only."""
+
+    def setUp(self):
+        self.conn = FakeRedis()
+        open_window(self.conn)
+
+    def b(self):
+        return cb.Bridge(self.conn, LOG, lambda: True, clock=lambda: NOW, readback=True)
+
+    def heard(self, entry, seconds_ago):
+        agents = json.loads(self.conn.get(cb.PROPOSAL_KEY % ROOM))["agents"]
+        return self.conn.xadd(STREAM, {
+            "kind": cb.READBACK_SPOKEN, "actor_id": "chair", "room_id": ROOM, "session_epoch": "fixture-epoch",
+            "control_sequence": "4", "proj_n": "2", "readback_id": cb.readback_id(ROOM, entry, agents)},
+            entry_id=at(seconds_ago))
+
+    def inboxes(self):
+        return sorted(k.split(":")[-1] for k in self.conn.streams if k.startswith("fleet:inbox:"))
+
+    def revisions(self, ask):
+        return [json.loads(x) for x in getattr(self.conn, "lists", {}).get(cb.REVISE_KEY % ask, [])]
+
+    def confirmed(self, said, seconds_ago, reason="everyone"):
+        entry = turn(self.conn, said, reason=reason, seconds_ago=seconds_ago)
+        self.assertEqual([], self.b().tick(), "proposed, nothing claimed")
+        self.heard(entry, seconds_ago - 5)
+        turn(self.conn, "Okay, go ahead.", reason="continuity", seconds_ago=seconds_ago - 8)
+        return entry, self.b().tick()
+
+    def team_card(self):
+        entry, [ask] = self.confirmed("Everyone, design a logo for SFDC24.", 200)
+        info = json.loads(self.conn.hget(life.OPEN_KEY, ask))
+        info["field"] = ask + "-work"
+        self.conn.hset(life.OPEN_KEY, ask, json.dumps(info))
+        board = {"layout": "grid", "chosen": None, "blocks": [
+            {"kind": "text", "by": "gemini", "title": "Plan", "body": "Options."},
+            {"kind": "text", "by": "grok", "title": "Grok mark", "body": "x"}]}
+        self.conn.hset("conf:canvas:%s:%s" % (info["room"], "gemini"), ask + "-work",
+                       json.dumps({"type": "board", "title": "Team options", "name": "logo",
+                                   "body": json.dumps(board)}))
+        return ask
+
+    def test_a_confirmed_team_ask_is_one_team_card(self):
+        entry, claimed = self.confirmed("Everyone, design a logo for SFDC24.", 200)
+        self.assertEqual(1, len(claimed))
+        self.assertEqual(["gemini"], self.inboxes())
+        partition = self.conn.hgetall(cp.PARTITION % ("workshop", "grok"))
+        self.assertNotIn(cb.proposal_id(ROOM, entry, "grok"), partition, "the other voices' proposals are closed")
+
+    def test_a_confirmed_team_change_reaches_the_team_card(self):
+        ask = self.team_card()
+        entry, claimed = self.confirmed("Everyone, make them bolder.", 60)
+        self.assertEqual([], claimed, "no new card")
+        self.assertEqual([{"entry": entry}], self.revisions(ask))
+
+    def test_a_pick_needs_no_read_back(self):
+        ask = self.team_card()
+        entry = turn(self.conn, "I like Grok's.", reason="", seconds_ago=30)
+        self.assertEqual([], self.b().tick())
+        self.assertEqual([{"entry": entry}], self.revisions(ask))
+
+    def test_an_ordinal_pick_needs_no_read_back(self):
+        ask = self.team_card()
+        entry = turn(self.conn, "Let's take the second one.", reason="", seconds_ago=30)
+        self.assertEqual([], self.b().tick())
+        self.assertEqual([{"entry": entry}], self.revisions(ask))
+
+    def test_a_confirmed_make_the_options_bolder_reaches_the_team_card(self):
+        ask = self.team_card()
+        entry, claimed = self.confirmed("Everyone, make the options bolder.", 60)
+        self.assertEqual([], claimed)
+        self.assertEqual([{"entry": entry}], self.revisions(ask))
+
+    def test_a_change_said_as_make_a_change_is_not_new_work(self):
+        for said in ("Everyone, make a change to it.", "All of you, make a few small tweaks.",
+                     "Everyone, give us a bit more contrast."):
+            self.assertIsNone(cb.NEW_WORK.search(said), said)
+        for said in ("Everyone, design a logo for SFDC24.", "Grok and Codex, give me pros and cons of a monorepo."):
+            self.assertIsNotNone(cb.NEW_WORK.search(said), said)
+        ask = self.team_card()
+        entry, claimed = self.confirmed("Everyone, make a change to it: darker blue.", 60)
+        self.assertEqual([], claimed)
+        self.assertEqual([{"entry": entry}], self.revisions(ask))
 
 
 class CardNamesInReadBackMode(unittest.TestCase):

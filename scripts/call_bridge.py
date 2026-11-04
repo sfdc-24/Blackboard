@@ -273,6 +273,32 @@ def card_named(said: str, name: str, title: str = "") -> int:
     return 0
 
 
+# TEAM CARDS (conference docs/CARDS-ARCHITECTURE.md, "Team cards (R3)", Gemini 2026-11-04 07:06Z): a task for
+# every voice, or for two or more voices by name, is ONE ask - claimed for its host, the first voice he named, or
+# Gemini when he named nobody - and the chair's fleet work runs the team round on that one card. A team card is a
+# board whose first block is the Plan. Asked again without new work ("everyone, make them bolder"), his words go
+# to the living team card; a pick that points at a tile ("I like Grok's", "the second one") goes there too.
+TEAM_HOST = "gemini"
+NEW_WORK = re.compile(
+    r"(?i)\b(?:(?:design|draw|create|write|make|build|draft|sketch|plan|prepare|outline|mock\s+up|prototype|"
+    r"come\s+up\s+with|put\s+up|give\s+(?:me|us)|show\s+(?:me|us))\s+(?:me\s+|us\s+)?(?:a|an|some|one|two|three|"
+    # "Make the options bolder" is a change to the options (Codex's review of PR 464); "options for a tagline" is new.
+    r"four|five|\d+|your|our|pros|the\s+pros|(?:options|ideas|versions)\s+(?:for|on|of|about))\b"
+    # "Make a change to it", "make a few tweaks", "give us a bit more contrast": a change, not new work (Codex's
+    # review of PR 464).
+    r"(?!\s+(?:(?:small|quick|minor|little|few|couple(?:\s+of)?|bit|tiny|final|last)\s+)*(?:change|tweak|edit|fix|"
+    r"revision|correction|adjustment|update|pass|bit|more|less)s?\b)|pros\s+and\s+cons|should\s+we|discuss|debate)\b")
+PICK = re.compile(r"(?i)\b(?:pick|choose|go\s+with|i\s+(?:like|prefer|want|love)|let['’]?s\s+(?:use|take))\b")
+_VOICE = r"(?:grok|grock|groq|claude|claud|codex|kodex|gemini|jemini|gemeni)"
+TILE = re.compile(r"(?i)\b%s['’]s\b|\b(?:the\s+|number\s+|option\s+)(?:first|second|third|fourth|last|1st|2nd|3rd|"
+                  r"4th|one|two|three|four)\b|\b(?:pick|choose|go\s+with)\s+%s\b" % (_VOICE, _VOICE))
+
+
+def picked(said: str) -> bool:
+    """A pick that points at a tile: a pick word and a voice's tile or a position ("I like Grok's")."""
+    return bool(PICK.search(said or "")) and bool(TILE.search(said or ""))
+
+
 def final_said(said: str) -> bool:
     """An affirmative final: a FINAL phrase with no negation before it."""
     match = FINAL.search(said or "")
@@ -1056,24 +1082,48 @@ class Bridge:
                             self._route(living["ask"], entry_id, "final", {"final": True, "entry": entry_id}):
                         self.log.info("call bridge: %s final, said in %s", living["ask"], room)
                 agents = []
-            by_name, proposed = None, list(agents)
-            # Direct start, or in read-back mode his go-ahead confirming a proposal (Codex's review of PR 463: a
-            # confirmed change must reach the card he named too, not the voice's newest). `said` then holds his
-            # original words; the go-ahead's caller and session are the proposal's (checked above).
-            if ((not self.readback or confirms) and fields.get("kind") == "turn.started"
-                    and fields.get("actor_id") not in ("", None, "chair") and not NEW_CARD.search(said or "")
-                    and not final_said(said) and TASK.search(said or "")):
-                by_name = self._named_card(room, said, fields.get("actor_id"), fields.get("session_epoch"))
-                if by_name and not named_in(said):
-                    # "Make the logo card bolder": the logo card's own voice, not whoever holds the floor.
+            by_name, fresh, proposed = None, False, list(agents)
+            actor, epoch = fields.get("actor_id"), fields.get("session_epoch")
+            spoken = (fields.get("kind") == "turn.started" and actor not in ("", None, "chair")
+                      and not self._new_card(said) and not final_said(said))
+            # Direct start, or in read-back mode his go-ahead confirming a proposal (Codex's reviews of PRs 463 and
+            # 464: a confirmed change must reach the card he named, and a confirmed team ask is one team card).
+            # `said` then holds his original words; the go-ahead's caller and session are the proposal's.
+            owner_turn = spoken and (not self.readback or bool(confirms))
+            if owner_turn and TASK.search(said or ""):
+                by_name = self._named_card(room, said, actor, epoch)
+                if by_name and (not named_in(said) or self._is_team(by_name)):
+                    # "Make the logo card bolder": the logo card's own voice, not whoever holds the floor. A team
+                    # card is the team's: whichever of its voices he names, the change goes to it.
                     agents = [by_name["agent"]]
+            if owner_turn and not by_name:
+                named = named_in(said)
+                team_ask = bool(TASK.search(said or "")) and len(set(agents)) >= 2 and (
+                    bool(ALL_OF_YOU.search(said or "")) or len(named) >= 2)
+                if team_ask and NEW_WORK.search(said or ""):
+                    agents, fresh = [named[0] if named else TEAM_HOST], True
+                elif team_ask or picked(said):
+                    team = self._team_card(room, actor, epoch)
+                    if team:
+                        by_name, agents = team, [team["agent"]]
+                    elif team_ask:
+                        # No team card: his change goes to the voices' own living cards, and no new card is
+                        # made for a change ("all of you, make it shorter"). With none living, a team card.
+                        mine = [a for a in agents if self._living(room, a, actor, epoch)]
+                        agents, fresh = (mine, False) if mine else ([named[0] if named else TEAM_HOST], True)
+            elif spoken and self.readback and not confirms and picked(said) and not TASK.search(said or ""):
+                # A pick needs no read-back, like a final: it decides about a card that exists.
+                team = self._team_card(room, actor, epoch)
+                if team:
+                    by_name, agents = team, [team["agent"]]
             if self.readback and confirms and [a for a in proposed if a not in agents]:
-                self._close(room, confirms, [a for a in proposed if a not in agents], "Updating the card he named",
-                            now, retire=True)
+                self._close(room, confirms, [a for a in proposed if a not in agents],
+                            "Part of the team card" if fresh or (by_name and self._is_team(by_name))
+                            else "Updating the card he named", now, retire=True)
             for agent in agents:
                 if not self.holds():
                     return claimed
-                living = None if NEW_CARD.search(said or "") else (
+                living = None if self._new_card(said) or fresh else (
                     # He named a card of another voice: this voice's own card is not the one he means.
                     (by_name if by_name.get("agent") == agent else None) if by_name else
                     self._living(room, agent, fields.get("actor_id"), fields.get("session_epoch")))
@@ -1345,19 +1395,48 @@ class Bridge:
             return None                                      # an old or unreadable record binds nothing
         return {"entry": str(held["entry"]), "said": held["said"], "agents": agents, "named": held.get("named") is True}
 
+    @staticmethod
+    def _new_card(said) -> bool:
+        """He asked for a new card. "Let's take the second one" is a pick, not "a second one" (Codex's review of
+        PR 464)."""
+        return bool(NEW_CARD.search(said or "")) and not picked(said)
+
+    def _stored(self, info) -> dict:
+        """The card the worker put up for a living ask, or {}."""
+        try:
+            stored = json.loads(_text(self.conn.hget("conf:canvas:%s:%s" % (info.get("room"), info.get("agent")),
+                                                     info.get("field"))) or "{}")
+        except (TypeError, ValueError):
+            return {}
+        return stored if isinstance(stored, dict) else {}
+
+    def _is_team(self, info) -> bool:
+        """A team card: a board whose first block is the Plan (conference fleet_work team rounds)."""
+        stored = self._stored(info)
+        if stored.get("type") != "board":
+            return False
+        try:
+            blocks = json.loads(stored.get("body") or "{}").get("blocks") or []
+        except (TypeError, ValueError, AttributeError):
+            return False
+        return bool(blocks) and isinstance(blocks[0], dict) and blocks[0].get("title") == "Plan"
+
+    def _team_card(self, room, actor, epoch):
+        """The newest living team card in this room that `actor` asked in session `epoch`, or None."""
+        best = None
+        for info in self._living_all(room, None, actor, epoch):
+            if self._is_team(info) and (best is None or _stream_order((info.get("source") or {}).get("event")) >
+                                        _stream_order((best.get("source") or {}).get("event"))):
+                best = info
+        return best
+
     def _named_card(self, room, said, actor, epoch):
         """The living card his words name (card_named), as its OPEN record: the surest match, then the fullest
         name (Codex's review of PR 463: "the launch logo" is the "Launch logo" card, not a newer "Launch"), then the
         newest. The name and title are read from the card the worker put up. None when his words name no card."""
         best, rank = None, (0, 0, (-1, -1))
         for info in self._living_all(room, None, actor, epoch):
-            try:
-                stored = json.loads(_text(self.conn.hget("conf:canvas:%s:%s" % (info.get("room"), info.get("agent")),
-                                                         info.get("field"))) or "{}")
-            except (TypeError, ValueError):
-                continue
-            if not isinstance(stored, dict):
-                continue
+            stored = self._stored(info)
             score = card_named(said, stored.get("name"), str(stored.get("title") or ""))
             order = (score, len(_card_words(stored.get("name"))) if score == 2 else 0,
                      _stream_order((info.get("source") or {}).get("event")))
