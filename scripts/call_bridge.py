@@ -359,14 +359,29 @@ def change_ask(said: str) -> bool:
     return False
 
 
+# A SPEECH-TO-TEXT SLIP (the owner's release 2 test, 2026-11-04 17:56Z, and Grok's at 14:28Z): "Grok, write a joke
+# about Salesforce admins" was transcribed "Grok wrote a joke about ...", so no TASK word was heard and nothing was
+# claimed. "Wrote" right after a voice's name (or "everyone") at the start of the turn, and before what is to be
+# written, is that ask. Anywhere else it is past tense: "Grok, you wrote a great joke" is praise, not work.
+_HEARD_WROTE = re.compile(r"(?i)^\W*(?:(?:hey|okay|ok|so|and)\W+)?(?:grok|grock|groq|claude|claud|codex|kodex|gemini|"
+                          r"jemini|gemeni|everyone|everybody|all\s+of\s+you)[\s,.!]+wrote\s+"
+                          r"(?:a|an|me|us|some|up|down|another)\b")
+
+
+def task_said(said: str) -> bool:
+    """A TASK word in his words, or the heard-as-"wrote" slip of "write" (_HEARD_WROTE)."""
+    said = said or ""
+    return bool(TASK.search(said)) or bool(_HEARD_WROTE.search(said))
+
+
 def work_said(said: str) -> bool:
     """A task word, or a change to a card (which only revises; see CHANGE)."""
-    return bool(TASK.search(said or "")) or change_ask(said)
+    return bool(task_said(said)) or change_ask(said)
 
 
 def change_only(said: str) -> bool:
     """Only a comparative, no task word: it may revise a living card and must never claim a new card."""
-    return change_ask(said) and not TASK.search(said or "")
+    return change_ask(said) and not task_said(said)
 
 
 # A VOICE SAYING IT CANNOT (refusal). The chair writes every line a voice speaks to conf:side:<yyyymmdd> (conference
@@ -410,7 +425,7 @@ def asks_in(fields: dict) -> list:
     if fields.get("kind") != "turn.started" or fields.get("actor_id") in ("", None, "chair"):
         return []
     said = fields.get("utterance") or ""
-    if fields.get("reason") == EVERYONE and ALL_OF_YOU.search(said) and TASK.search(said):
+    if fields.get("reason") == EVERYONE and ALL_OF_YOU.search(said) and task_said(said):
         # An ask addressed to every voice (2026-11-04 03:36Z) went unclaimed: the chair routed it to all of
         # them, so every voice is asked.
         return list(AGENT_OF.values())
@@ -488,7 +503,7 @@ def task_ask(fields: dict) -> bool:
     if fields.get("kind") != "turn.started" or fields.get("actor_id") in ("", None, "chair") or go_ahead(fields):
         return False
     said = fields.get("utterance") or ""
-    return bool(said.strip()) and (bool(TASK.search(said)) or bool(named_in(said)))
+    return bool(said.strip()) and (bool(task_said(said)) or bool(named_in(said)))
 
 
 def named_in(said: str) -> list:
@@ -1101,7 +1116,7 @@ class Bridge:
                             self.conn.set(PENDING_KEY % room, json.dumps(
                                 {"entry": entry_id, "said": said, "agents": assigned, "named": bool(named)},
                                 sort_keys=True), ex=PENDING_SECONDS)
-                        if self.readback and TASK.search(said):
+                        if self.readback and task_said(said):
                             agents = list(dict.fromkeys(agents + assigned))
                 if self.readback:
                     # READ-BACK: an ask PROPOSES; nothing is claimed until his go-ahead.
@@ -1148,7 +1163,7 @@ class Bridge:
                     agents = [by_name["agent"]]
             if owner_turn and not by_name:
                 named = named_in(said)
-                team_ask = bool(TASK.search(said or "")) and len(set(agents)) >= 2 and (
+                team_ask = bool(task_said(said)) and len(set(agents)) >= 2 and (
                     bool(ALL_OF_YOU.search(said or "")) or len(named) >= 2)
                 if team_ask and NEW_WORK.search(said or ""):
                     agents, fresh = [named[0] if named else TEAM_HOST], True
@@ -1161,7 +1176,7 @@ class Bridge:
                         # made for a change ("all of you, make it shorter"). With none living, a team card.
                         mine = [a for a in agents if self._living(room, a, actor, epoch)]
                         agents, fresh = (mine, False) if mine else ([named[0] if named else TEAM_HOST], True)
-            elif spoken and self.readback and not confirms and picked(said) and not TASK.search(said or ""):
+            elif spoken and self.readback and not confirms and picked(said) and not task_said(said):
                 # A pick needs no read-back, like a final: it decides about a card that exists.
                 team = self._team_card(room, actor, epoch)
                 if team:

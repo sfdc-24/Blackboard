@@ -2667,6 +2667,33 @@ class LivingCardRouting(unittest.TestCase):
         self.assertEqual(life.MAX_AGE, self.conn.ttls[cb.REVISE_KEY % ask])
 
 
+class HeardAsWrote(unittest.TestCase):
+    """The owner's release 2 test, 2026-11-04 17:56Z: "Grok, write a joke about Salesforce admins" was transcribed
+    "Grok wrote a joke ...", no TASK word was heard, and nothing was claimed. Synthetic sentences only."""
+
+    def setUp(self):
+        self.conn = FakeRedis()
+        open_window(self.conn)
+
+    def test_a_name_then_wrote_then_what_to_write_is_an_ask(self):
+        for said in ("Grok wrote a joke about Salesforce admins.", "Grok, wrote a joke about Salesforce admins",
+                     "Okay Grok, wrote me a poem.", "Codex wrote up a kickoff checklist."):
+            with self.subTest(said=said):
+                self.setUp()
+                turn(self.conn, said, seconds_ago=10)
+                self.assertEqual(1, len(cb.Bridge(self.conn, LOG, lambda: True, clock=lambda: NOW).tick()))
+
+    def test_wrote_anywhere_else_is_past_tense_not_work(self):
+        for said in ("Grok, you wrote a great joke.", "Grok wrote the best one.", "I wrote a joke for Grok.",
+                     "Grok, that wrote itself."):
+            with self.subTest(said=said):
+                self.assertFalse(cb.task_said(said), said)
+
+    def test_everyone_wrote_a_logo_is_one_team_ask(self):
+        turn(self.conn, "Everyone wrote a logo for SFDC24.", reason="everyone", seconds_ago=10)
+        self.assertEqual(1, len(cb.Bridge(self.conn, LOG, lambda: True, clock=lambda: NOW).tick()))
+
+
 class CardNameRouting(unittest.TestCase):
     """R2b, conference docs/CARDS-ARCHITECTURE.md decision c: his words that say a living card's name go to that
     card, whichever voice made it, unless he names another voice. Synthetic sentences only."""
