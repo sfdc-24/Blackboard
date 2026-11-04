@@ -337,6 +337,22 @@ def image_ok(url: str) -> bool:
             and (parts.hostname or "") in IMAGE_HOSTS and parts.port in (None, 443))
 
 
+_ASK_FIELD = re.compile(r"^(?:call-|readback-)([0-9a-f]{12})(?:-work)?$")
+
+
+def project_of(conn, item_id: str, published: dict) -> str:
+    """The project a published card belongs to: its own tag, else the stamp of the ask its field belongs to (Codex's
+    HOLD on c7da999: the bridge's claimed, waiting, done and read-back cards carry no tag, and were hidden whenever a
+    project was current). "" for none. Reads only; the card's bytes, and so its hash, are never touched."""
+    if published.get("project"):
+        return published["project"]
+    match = _ASK_FIELD.fullmatch(_text(item_id) or "")
+    if not match:
+        return ""
+    import projects  # local import: the chair vendors this module without projects.py
+    return projects.stamped(conn, "call-" + match.group(1))
+
+
 def snapshot(conn, room: str, generated, until=None, scope=None) -> dict:
     """The room file: every public item of every allowlisted agent, in a stable order. `scope` (a scoped
     window's list, scope_of): only the listed items and the cards bound to them (module docstring)."""
@@ -353,7 +369,7 @@ def snapshot(conn, room: str, generated, until=None, scope=None) -> dict:
             import call_lifecycle  # local import avoids publisher/lifecycle import cycle
             if (published and call_lifecycle.visible(conn, agent, item_id, raw, room=room, now=generated)
                     and (scope is None or in_scope(scope, agent, item_id, raw))
-                    and published.get("project", "") == (current[0] if current else "")):
+                    and project_of(conn, item_id, published) == (current[0] if current else "")):
                 # R6a (CARDS-ARCHITECTURE R6.3): only the current project's cards; untagged cards (made before
                 # projects, or with none current) only while no project is current.
                 items.append(published)
@@ -708,9 +724,9 @@ def archive_docs(conn, room: str, now, at=None) -> list:
             if raw is None:
                 raw = stored.get(item_id.encode("utf-8"))
             published = clean_item(agent, item_id, raw)
-            if (published and published.get("project")
-                    and call_lifecycle.visible(conn, agent, item_id, raw, room=room, now=now)):
-                found.setdefault(published["project"], []).append(published)
+            pid = project_of(conn, item_id, published) if published else ""
+            if pid and call_lifecycle.visible(conn, agent, item_id, raw, room=room, now=now):
+                found.setdefault(pid, []).append(dict(published, project=pid))
     out = []
     for pid, info in sorted(projects.read_projects(conn, room).items()):
         if info["status"] != "active" or not found.get(pid):

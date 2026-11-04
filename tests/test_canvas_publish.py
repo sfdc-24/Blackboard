@@ -307,6 +307,18 @@ class ProjectsOnTheCanvas(unittest.TestCase):
         self.conn.set("conf:project:demo:current", "nope")
         self.assertEqual(["Before projects"], self.titles())
 
+    def test_an_untagged_card_of_a_stamped_ask_follows_the_asks_project(self):
+        """The bridge's own cards (claimed, waiting, read-back proposal) carry no tag: their ask's stamp decides."""
+        self.make("acme", "Acme")
+        self.conn.set("conf:project:demo:current", "acme")
+        self.conn.set("gov:callbridge:project:call-0123456789ab", "acme")
+        self.assertEqual("acme", cp.project_of(self.conn, "readback-0123456789ab", {"title": "x"}))
+        self.assertEqual("acme", cp.project_of(self.conn, "call-0123456789ab", {"title": "x"}))
+        self.assertEqual("", cp.project_of(self.conn, "call-ffffffffffff", {"title": "x"}), "no stamp, no project")
+        self.assertEqual("beta", cp.project_of(self.conn, "call-0123456789ab", {"project": "beta"}), "a tag wins")
+        put(self.conn, "grok", "readback-0123456789ab", item(title="Proposal"))
+        self.assertIn("Proposal", self.titles())
+
     def test_a_malformed_project_tag_drops_the_card(self):
         self.assertIsNone(cp.clean_item("grok", "x", item(project="Bad Tag!")))
         self.assertIsNone(cp.clean_item("grok", "x", item(project=7)))

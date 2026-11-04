@@ -119,6 +119,12 @@ class VoiceSwitch(unittest.TestCase):
                      "Grok, switch to the logo card.", "Move to the next item.", "Switch to the Nova project."):
             self.assertIsNone(pj.switch_target(said, self.PROJECTS), said)
 
+    def test_a_negated_switch_switches_nothing(self):
+        for said in ("Don't switch to the Acme Rollout project.", "No need to open project Acme Rollout",
+                     "Never go to project Acme Rollout", "We won't switch to the Acme Rollout project"):
+            self.assertIsNone(pj.switch_target(said, self.PROJECTS), said)
+        self.assertEqual("acme-rollout", pj.switch_target("Okay, switch to the Acme Rollout project", self.PROJECTS))
+
     def test_ambiguous_or_too_many_projects_switch_nothing(self):
         twins = {"a": {"name": "Acme", "status": "active", "created": ""},
                  "b": {"name": "ACME", "status": "active", "created": ""}}

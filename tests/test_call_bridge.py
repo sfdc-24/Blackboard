@@ -2697,6 +2697,31 @@ class LivingCardRouting(unittest.TestCase):
         self.assertEqual(1, len(self.b().tick()), "no such project: an ordinary task turn")
         self.assertIsNone(self.conn.get("conf:project:%s:current" % cb.CANVAS_ROOM))
 
+    def test_the_bridges_own_claimed_card_shows_under_the_current_project(self):
+        """Codex's HOLD on c7da999: the claimed card carries no tag and was hidden while a project was current."""
+        self.make_project("acme", "Acme")
+        self.conn.set("conf:project:%s:current" % cb.CANVAS_ROOM, "acme")
+        turn(self.conn, "Codex, draft a kickoff checklist.", seconds_ago=10)
+        [ask] = self.b().tick()
+        doc = cb.canvas_publish.snapshot(self.conn, cb.CANVAS_ROOM, NOW)
+        self.assertIn("chatgpt-codex-desktop/" + ask, [i["id"] for i in doc["items"]])
+
+    def test_a_stamp_that_fails_delivers_nothing_untagged(self):
+        """The project is recorded BEFORE the claim: if recording fails, no claim (and no inbox ask) is made."""
+        self.make_project("acme", "Acme")
+        self.conn.set("conf:project:%s:current" % cb.CANVAS_ROOM, "acme")
+        turn(self.conn, "Codex, draft a kickoff checklist.", seconds_ago=10)
+        with mock.patch.object(cb.projects, "stamp", side_effect=ConnectionError("redis")):
+            with self.assertRaises(ConnectionError):
+                self.b().tick()
+        self.assertEqual({}, dict(self.conn.hgetall(cb.call_lifecycle.OPEN_KEY) or {}), "nothing claimed")
+
+    def test_a_negated_switch_switches_nothing(self):
+        self.make_project("acme", "Acme")
+        turn(self.conn, "Don't switch to the Acme project.", seconds_ago=10)
+        self.owner_bridge().tick()
+        self.assertIsNone(self.conn.get("conf:project:%s:current" % cb.CANVAS_ROOM))
+
     def test_a_claim_carries_the_current_project_and_none_without_one(self):
         turn(self.conn, "Grok, write a joke on a card.", seconds_ago=30)
         [plain] = self.b().tick()

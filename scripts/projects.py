@@ -34,6 +34,11 @@ _SWITCH = re.compile(
     r"(?P<before>[A-Za-z0-9][A-Za-z0-9 '\-]{0,39}?)\s+project)\s*[.!?]*\s*$")
 
 
+# "Don't switch to the Acme project", "no need to open project Acme": a negation before the switch phrase (Codex's
+# HOLD on c7da999) means no switch.
+_NEGATED = re.compile(r"(?i)\b(?:don['’]?t|do\s+not|not|never|no|won['’]?t|stop|cancel|without)\b")
+
+
 def _text(value):
     return value.decode("utf-8", "replace") if isinstance(value, bytes) else value
 
@@ -94,8 +99,9 @@ def stamped(conn, ask: str) -> str:
 def switch_target(said: str, projects: dict):
     """The id of the ACTIVE project his words switch to, or None. Whole-name match only, among at most VOICE_MAX
     active projects whose names are distinct as words; anything ambiguous switches nothing (R6.2)."""
-    match = _SWITCH.search((said or "").strip())
-    if not match:
+    said = (said or "").strip()
+    match = _SWITCH.search(said)
+    if not match or _NEGATED.search(said[:match.start()]):
         return None
     heard = _words(match.group("after") or match.group("before"))
     active = {pid: _words(info["name"]) for pid, info in projects.items() if info["status"] == "active"}

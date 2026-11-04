@@ -1341,6 +1341,8 @@ class Bridge:
         self._keep(room, {"entry": entry_id, "said": said, "agents": joined, "actor": actor, "epoch": epoch})
         for agent in agents:
             field = proposal_id(room, entry_id, agent)
+            # R6a: a proposal card is shown under the project current when it was made (the same key its claim uses).
+            projects.stamp(self.conn, ask_id(room, entry_id, agent), self.canvas_room, call_lifecycle.MAX_AGE)
             self.conn.hset(partition % (self.canvas_room, agent), field, json.dumps(proposal_card(agent, asked, now)))
             if self.bucket:
                 self.open_if_shut(now, "%s/%s" % (agent, field))
@@ -1655,6 +1657,11 @@ class Bridge:
                     "conference_room": room, "canvas_room": self.canvas_room}
         ring = ({"agent": agent, "claimed_at": stamp(now), "room": self.canvas_room}
                 if self.ring is not None else None)
+        # R6a: the project current now is recorded BEFORE the claim (Codex's HOLD on c7da999: stamped after it, a
+        # failure in between left a delivered ask with no project). Every card of this ask - the bridge's own
+        # claimed, waiting and done cards and the agent's card - is shown under it (canvas_publish.project_of). A
+        # claim that is then refused leaves only this key, which expires with the ask's age.
+        projects.stamp(self.conn, ask, self.canvas_room, call_lifecycle.MAX_AGE)
         try:
             info = call_lifecycle.claim(self.conn, ask, room, entry_id, agent, self.canvas_room,
                                         now, claimed_card(agent, now), inbox, ring, asked_entry)
@@ -1663,8 +1670,6 @@ class Bridge:
             return None
         if info is None:
             return None
-        # R6a: the ask carries the project that was current when it was claimed; the chair puts it on the card.
-        projects.stamp(self.conn, ask, self.canvas_room, call_lifecycle.MAX_AGE)
         if self.bucket:
             self.open_if_shut(now, "%s/%s" % (agent, ask))
         self.log.info("call bridge: %s source-bound claim for %s", ask, agent)
