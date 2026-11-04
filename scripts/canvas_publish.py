@@ -105,7 +105,27 @@ _MERMAID_REFUSED = re.compile(
     r"|`|\$\$|::icon|\bicon\s*\(|\bfa:fa-",                 # markdown strings, KaTeX, icons
     re.MULTILINE)
 # The same five types #353 draws (LIVE_TYPES in assets/proto-canvas.js).
-TYPES = ("mermaid", "note", "image_url", "datamodel", "wireframe")
+TYPES = ("mermaid", "note", "image_url", "datamodel", "wireframe", "board")
+# BOARD CARDS (conference docs/CARDS-ARCHITECTURE.md, decision a, Gemini 2026-11-04): one item made of typed
+# blocks, each with its author, so several agents' work (four logos side by side, a pick, build-on stages, a
+# discussion's synthesis) is ONE card. The body is JSON:
+#   {"layout": "stack" | "grid", "chosen": <block index> | null,
+#    "blocks": [{"kind": BLOCK_KINDS, "by": <agent tag>, "title": "...", "body": "..."}]}
+# Every block is checked with its kind's own rule; the item is dropped whole if any block fails (never repaired).
+BLOCK_KINDS = ("text", "mermaid", "svg", "wireframe", "slide", "datamodel", "image_url")
+BOARD_BODY_MAX = 16000
+BLOCK_BODY_MAX = 6000
+BLOCK_TITLE_MAX = 80
+BLOCKS_MAX = 8
+# A card's stable short name, said aloud ("the logo card"; decision c): plain words only.
+NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 '\-]{0,39}$")
+# SVG, checked server-side BEFORE the page's own safeSvg: shapes, text, gradients and clips only. No script,
+# style element, foreignObject, link, image or use (nothing that runs, styles globally or reaches outside).
+SVG_TAGS = frozenset(("svg", "g", "path", "rect", "circle", "ellipse", "line", "polyline", "polygon", "text",
+                      "tspan", "title", "desc", "defs", "lineargradient", "radialgradient", "stop", "clippath",
+                      "mask", "pattern", "symbol", "marker"))
+_SVG_URL = re.compile(r"(?i)url\(\s*(?!#)|javascript:|vbscript:|data:|expression\(|@import|://")
+_SVG_DECL = re.compile(r"(?i)<!(?:doctype|entity|\[cdata)|<\?(?!xml\s)")
 STATUSES = ("claimed", "working", "review", "done")
 # image_url bodies: https only, and only on these hosts. A short list on purpose; a host is one reviewed line.
 IMAGE_HOSTS = ("storage.googleapis.com", "sfdc24.com", "www.sfdc24.com")
@@ -170,7 +190,8 @@ def clean_item(agent: str, item_id: str, raw):
     title, body, ts = item.get("title"), item.get("body"), item.get("ts", "")
     if not (isinstance(title, str) and isinstance(body, str) and isinstance(ts, str)):
         return None
-    if len(title) > TITLE_MAX or len(body) > BODY_MAX or len(ts) > TS_MAX:
+    body_max = BOARD_BODY_MAX if item["type"] == "board" else BODY_MAX
+    if len(title) > TITLE_MAX or len(body) > body_max or len(ts) > TS_MAX:
         return None
     if _CONTROL.search(title + ts + body) or any(ch in title + ts for ch in "\t\r\n"):
         return None
@@ -179,7 +200,13 @@ def clean_item(agent: str, item_id: str, raw):
         return None
     if item["type"] == "image_url" and not image_ok(body):
         return None
-    if item["type"] == "mermaid" and not mermaid_ok(body):
+    # A data model is drawn by the page with Mermaid too, so it is checked as Mermaid (Codex's review of PR 462).
+    if item["type"] in ("mermaid", "datamodel") and not mermaid_ok(body):
+        return None
+    if item["type"] == "board" and not board_ok(body):
+        return None
+    name = item.get("name")
+    if name is not None and not (isinstance(name, str) and NAME.fullmatch(name)):
         return None
     if agent == CHAIR and (item["type"] not in CHAIR_TYPES or len(_text(raw).encode("utf-8")) > CHAIR_BYTES
                            or _LINKISH.search(title + "\n" + body + "\n" + (activity or ""))):
@@ -189,6 +216,8 @@ def clean_item(agent: str, item_id: str, raw):
            "agent": agent}
     if activity:
         out["activity"] = activity
+    if name:
+        out["name"] = name
     return out
 
 
@@ -209,6 +238,81 @@ def mermaid_ok(body: str) -> bool:
     if head is None or head.group(1) not in MERMAID_KINDS:
         return False
     return _MERMAID_REFUSED.search(body) is None
+
+
+def svg_ok(svg: str) -> bool:
+    """One <svg> document of SVG_TAGS only: no event attribute, no link or href except a #fragment, no url()
+    except url(#...), no DOCTYPE, entity or processing instruction. False drops the whole card."""
+    import xml.etree.ElementTree as ET
+    if not isinstance(svg, str) or not svg.strip().startswith(("<svg", "<?xml")) or _SVG_DECL.search(svg):
+        return False
+    try:
+        root = ET.fromstring(svg)
+    except ET.ParseError:
+        return False
+
+    def local(name):
+        return name.rsplit("}", 1)[-1].lower()
+    if local(root.tag) != "svg":
+        return False
+    for element in root.iter():
+        if not isinstance(element.tag, str) or local(element.tag) not in SVG_TAGS:
+            return False
+        for attr, value in element.attrib.items():
+            name = local(attr)
+            if name.startswith("on") or name in ("style",) and _SVG_URL.search(value):
+                return False
+            if name == "href" and not value.startswith("#"):
+                return False
+            if _SVG_URL.search(value):
+                return False
+    return True
+
+
+def html_ok(html: str) -> bool:
+    """A wireframe or slide block: markup the page draws in a sandbox="" iframe through safeHtml. Refused here
+    too: script, an event attribute, a URL scheme that runs, or a nested frame or object."""
+    return (isinstance(html, str) and re.search(
+        r"(?i)<\s*(?:script|iframe|object|embed|frame|base|meta|link)\b|\son[a-z]+\s*=|javascript:|vbscript:|"
+        r"data:\s*text/html|expression\(", html) is None)
+
+
+def board_ok(body: str) -> bool:
+    """A board card's JSON body: the layout, an optional chosen block, and 1..BLOCKS_MAX blocks, each valid for its
+    kind (BLOCK_KINDS), authored by an allowlisted agent."""
+    try:
+        board = json.loads(body)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(board, dict) or set(board) - {"layout", "chosen", "blocks"}:
+        return False
+    blocks = board.get("blocks")
+    if board.get("layout", "stack") not in ("stack", "grid") or not isinstance(blocks, list) \
+            or not 1 <= len(blocks) <= BLOCKS_MAX:
+        return False
+    chosen = board.get("chosen")
+    if chosen is not None and not (_whole(chosen) and 0 <= chosen < len(blocks)):
+        return False
+    for block in blocks:
+        if not isinstance(block, dict) or set(block) - {"kind", "by", "title", "body"}:
+            return False
+        kind, by, title, text = block.get("kind"), block.get("by"), block.get("title", ""), block.get("body")
+        if kind not in BLOCK_KINDS or by not in AGENTS or by == CHAIR:
+            return False
+        if not (isinstance(title, str) and isinstance(text, str)) or len(title) > BLOCK_TITLE_MAX \
+                or len(text) > BLOCK_BODY_MAX or not text.strip():
+            return False
+        if _CONTROL.search(title + text) or any(ch in title for ch in "\t\r\n"):
+            return False
+        if kind in ("mermaid", "datamodel") and not mermaid_ok(text):
+            return False
+        if kind == "image_url" and not image_ok(text):
+            return False
+        if kind == "svg" and not svg_ok(text):
+            return False
+        if kind in ("wireframe", "slide") and not html_ok(text):
+            return False
+    return True
 
 
 def image_ok(url: str) -> bool:

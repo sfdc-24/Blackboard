@@ -1122,5 +1122,96 @@ class LiveWithCanvas(unittest.TestCase):
         self.assertFalse(holds(), "nobody holds it")
 
 
+LOGO = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200"><defs><linearGradient id="g">'
+        '<stop offset="0" stop-color="#1a73e8"/><stop offset="1" stop-color="#34a853"/></linearGradient></defs>'
+        '<circle cx="100" cy="100" r="80" fill="url(#g)"/><text x="100" y="110" text-anchor="middle" '
+        'font-family="sans-serif" fill="white">SFDC24</text></svg>')
+
+
+def board(blocks, layout="grid", chosen=None):
+    return json.dumps({"layout": layout, "chosen": chosen, "blocks": blocks})
+
+
+def block(kind="svg", by="grok", body=LOGO, title="Grok's logo"):
+    return {"kind": kind, "by": by, "title": title, "body": body}
+
+
+class BoardCards(unittest.TestCase):
+    """R2a, conference docs/CARDS-ARCHITECTURE.md decision a: one card of typed blocks with authors. Every block is
+    checked with its kind's rule, and SVG is allowlisted server-side; anything else drops the whole card."""
+
+    def published(self, body, agent="grok", **over):
+        return cp.clean_item(agent, "call-0123456789ab-work", item(type="board", body=body, **over))
+
+    def test_four_logos_side_by_side_is_one_card(self):
+        out = self.published(board([block(by=a) for a in ("grok", "gemini", "claude-code-cli",
+                                                          "chatgpt-codex-desktop")]))
+        self.assertIsNotNone(out)
+        self.assertEqual("board", out["type"])
+        self.assertEqual(4, len(json.loads(out["body"])["blocks"]))
+
+    def test_a_chosen_tile_and_mixed_kinds(self):
+        out = self.published(board([block(), block(kind="text", body="Bold, simple, legible at 16 px."),
+                                    block(kind="mermaid", body="flowchart TD\n  A[Form] --> B[Paint]"),
+                                    block(kind="wireframe", body='<div style="padding:8px">Hero</div>'),
+                                    block(kind="slide", body="<h1>SFDC24</h1><p>Pilot plan</p>")],
+                                   layout="stack", chosen=0))
+        self.assertIsNotNone(out)
+
+    def test_a_data_model_is_checked_as_mermaid(self):
+        good = "erDiagram\n  ACCOUNT ||--o{ CONTACT : has"
+        self.assertIsNotNone(self.published(board([block(kind="datamodel", body=good)])))
+        self.assertIsNotNone(cp.clean_item("grok", "call-0123456789ab-work", item(type="datamodel", body=good)))
+        for bad in (good + "\n  click ACCOUNT href \"https://x.example\"", "%%{init: {'theme': 'dark'}}%%\n" + good,
+                    "erDiagram\n  A ||--o{ B : \"<img src=x onerror=alert(1)>\"", "not a diagram"):
+            self.assertIsNone(self.published(board([block(), block(kind="datamodel", body=bad)])), bad)
+            self.assertIsNone(cp.clean_item("grok", "call-0123456789ab-work", item(type="datamodel", body=bad)), bad)
+
+    def test_harmful_svg_drops_the_whole_card(self):
+        for svg in ('<svg><script>alert(1)</script></svg>', '<svg onload="x()"><rect/></svg>',
+                    '<svg><a href="https://x.example"><rect/></a></svg>',
+                    '<svg><rect style="fill:url(https://x.example/a)"/></svg>',
+                    '<!DOCTYPE svg [<!ENTITY a "b">]><svg/>', '<svg><foreignObject><div/></foreignObject></svg>',
+                    '<svg><image href="https://x.example/a.png"/></svg>', '<svg><use href="#a"/></svg>',
+                    '<svg><style>*{fill:red}</style></svg>', '<div/>', '<svg><rect fill="url(javascript:x)"/></svg>'):
+            self.assertIsNone(self.published(board([block(), block(body=svg)])), svg)
+
+    def test_harmful_markup_and_bad_shapes_drop_the_card(self):
+        for blocks in ([block(kind="wireframe", body="<script>x()</script>")],
+                       [block(kind="slide", body='<img src="x" onerror="x()">')],
+                       [block(kind="wireframe", body='<iframe src="https://x.example"></iframe>')],
+                       [block(kind="image_url", body="http://example.com/a.png")],
+                       [block(kind="mermaid", body="flowchart TD\n click A call x()")],
+                       [block(kind="video", body="x")],
+                       [block(by="chair")], [block(by="someone")],
+                       [dict(block(), extra=1)], [block(body="")],
+                       [block()] * (cp.BLOCKS_MAX + 1), []):
+            self.assertIsNone(self.published(board(blocks)), blocks)
+        self.assertIsNone(self.published(board([block()], layout="mosaic")))
+        self.assertIsNone(self.published(board([block()], chosen=1)))
+        self.assertIsNone(self.published("not json"))
+        self.assertIsNone(self.published(json.dumps({"blocks": [block()], "script": 1})))
+
+    def test_caps(self):
+        big = '<svg><text>%s</text></svg>' % ("a" * (cp.BLOCK_BODY_MAX - 30))
+        self.assertIsNotNone(self.published(board([block(body=big)])))
+        self.assertIsNone(self.published(board([block(body=big + "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")])))
+        self.assertIsNone(self.published(board([block(body=big)] * 3)), "past BOARD_BODY_MAX")
+
+    def test_other_types_keep_their_old_cap(self):
+        self.assertIsNone(cp.clean_item("grok", "x", item(type="note", body="a" * (cp.BODY_MAX + 1))))
+
+    def test_the_chair_cannot_publish_a_board(self):
+        self.assertIsNone(self.published(board([block()]), agent="chair"))
+
+    def test_a_card_name_is_published_when_it_is_plain_words(self):
+        out = self.published(board([block()]), name="logo")
+        self.assertEqual("logo", out["name"])
+        self.assertEqual("the onboarding plan",
+                         cp.clean_item("grok", "x", item(name="the onboarding plan"))["name"])
+        for bad in ("<b>x</b>", "a" * 41, "", 7, "line\nbreak"):
+            self.assertIsNone(cp.clean_item("grok", "x", item(name=bad)), bad)
+
+
 if __name__ == "__main__":
     unittest.main()
