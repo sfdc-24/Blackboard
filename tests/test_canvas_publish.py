@@ -1158,6 +1158,15 @@ class BoardCards(unittest.TestCase):
                                    layout="stack", chosen=0))
         self.assertIsNotNone(out)
 
+    def test_a_data_model_is_checked_as_mermaid(self):
+        good = "erDiagram\n  ACCOUNT ||--o{ CONTACT : has"
+        self.assertIsNotNone(self.published(board([block(kind="datamodel", body=good)])))
+        self.assertIsNotNone(cp.clean_item("grok", "call-0123456789ab-work", item(type="datamodel", body=good)))
+        for bad in (good + "\n  click ACCOUNT href \"https://x.example\"", "%%{init: {'theme': 'dark'}}%%\n" + good,
+                    "erDiagram\n  A ||--o{ B : \"<img src=x onerror=alert(1)>\"", "not a diagram"):
+            self.assertIsNone(self.published(board([block(), block(kind="datamodel", body=bad)])), bad)
+            self.assertIsNone(cp.clean_item("grok", "call-0123456789ab-work", item(type="datamodel", body=bad)), bad)
+
     def test_harmful_svg_drops_the_whole_card(self):
         for svg in ('<svg><script>alert(1)</script></svg>', '<svg onload="x()"><rect/></svg>',
                     '<svg><a href="https://x.example"><rect/></a></svg>',

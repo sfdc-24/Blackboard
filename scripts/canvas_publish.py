@@ -200,7 +200,8 @@ def clean_item(agent: str, item_id: str, raw):
         return None
     if item["type"] == "image_url" and not image_ok(body):
         return None
-    if item["type"] == "mermaid" and not mermaid_ok(body):
+    # A data model is drawn by the page with Mermaid too, so it is checked as Mermaid (Codex's review of PR 462).
+    if item["type"] in ("mermaid", "datamodel") and not mermaid_ok(body):
         return None
     if item["type"] == "board" and not board_ok(body):
         return None
@@ -303,7 +304,7 @@ def board_ok(body: str) -> bool:
             return False
         if _CONTROL.search(title + text) or any(ch in title for ch in "\t\r\n"):
             return False
-        if kind == "mermaid" and not mermaid_ok(text):
+        if kind in ("mermaid", "datamodel") and not mermaid_ok(text):
             return False
         if kind == "image_url" and not image_ok(text):
             return False
