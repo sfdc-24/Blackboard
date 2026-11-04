@@ -149,7 +149,11 @@ FLOOR_FRESH_SECONDS = 3 * 60  # an unnamed task ask goes to the floor holder onl
 # CALL_BRIDGE_READBACK=off is the rollback switch, and it FAILS CLOSED (Codex's review of row 9443, F1): nothing
 # said on a call starts anything, and an open proposal closes as "Not started, the read-back is off". The
 # environment never brings back claiming at once: READBACK is the code's own setting, pinned False only by tests.
-READBACK = True
+# DIRECT START (the owner's decision, 2026-11-04 03:15Z, after live calls showed the read-back's ask, restate and
+# go-ahead too cumbersome): a turn that NAMES a voice and asks for work claims at once, as before 2026-11-02. The
+# read-back code stays, pinned by its tests with readback=True; READBACK = True brings it back. A follow-up task
+# with no name goes to the voice he is talking to (FLOOR_FRESH_SECONDS), so he can keep shaping the work by talking.
+READBACK = False
 READBACK_OFF = os.environ.get("CALL_BRIDGE_READBACK", "on").strip().lower() == "off"
 READ_BACK_OFF = "Not started, the read-back is off"
 # THE FORGIVING GO-AHEAD (the owner's decision, 2026-11-03 21:25 ET, after two calls where no ask ever started).
