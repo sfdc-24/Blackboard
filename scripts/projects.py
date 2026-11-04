@@ -82,12 +82,13 @@ def current(conn, room: str):
 
 
 def stamp(conn, ask: str, room: str, ttl: int) -> str:
-    """Record the room's current project for an ask at claim time; the project id, or "" when there is none."""
+    """Record the room's current project for an ask the FIRST time it is seen, and never change it (Codex's HOLD on
+    d519e34: a replay after a switch re-stamped an Acme ask as Beta, moving its untagged cards). "No project" is
+    recorded too, as "", so a replay cannot give a project to an ask made without one. The ask's project: the id,
+    or "" for none."""
     now = current(conn, room)
-    if not now:
-        return ""
-    conn.set(STAMP_KEY % ask, now[0], ex=int(ttl))
-    return now[0]
+    conn.set(STAMP_KEY % ask, now[0] if now else "", ex=int(ttl), nx=True)
+    return stamped(conn, ask)
 
 
 def stamped(conn, ask: str) -> str:

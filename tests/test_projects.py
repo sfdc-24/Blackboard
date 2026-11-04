@@ -23,7 +23,9 @@ class FakeRedis:
     def get(self, key):
         return self.kv.get(key)
 
-    def set(self, key, value, ex=None):
+    def set(self, key, value, ex=None, nx=False):
+        if nx and key in self.kv:
+            return None
         self.kv[key] = value
         if ex is not None:
             self.ttls[key] = ex
@@ -93,10 +95,22 @@ class Stamp(unittest.TestCase):
         pj.set_current(self.conn, ROOM, "beta")
         self.assertEqual("acme", pj.stamped(self.conn, "call-0123456789ab"), "switching later does not move it")
 
-    def test_no_current_project_stamps_nothing(self):
+    def test_no_current_project_is_recorded_as_none_and_stays_none(self):
         self.assertEqual("", pj.stamp(self.conn, "call-0123456789ab", ROOM, 7200))
-        self.assertNotIn(pj.STAMP_KEY % "call-0123456789ab", self.conn.kv)
-        self.assertEqual("", pj.stamped(self.conn, "call-0123456789ab"))
+        self.assertEqual("", self.conn.kv[pj.STAMP_KEY % "call-0123456789ab"])
+        add(self.conn, "acme", "Acme")
+        pj.set_current(self.conn, ROOM, "acme")
+        self.assertEqual("", pj.stamp(self.conn, "call-0123456789ab", ROOM, 7200), "a replay gives it no project")
+
+    def test_a_replay_after_a_switch_keeps_the_first_project(self):
+        """Codex's HOLD on d519e34: the stamp is written once and never moved."""
+        add(self.conn, "acme", "Acme")
+        add(self.conn, "beta", "Beta")
+        pj.set_current(self.conn, ROOM, "acme")
+        self.assertEqual("acme", pj.stamp(self.conn, "call-0123456789ab", ROOM, 7200))
+        pj.set_current(self.conn, ROOM, "beta")
+        self.assertEqual("acme", pj.stamp(self.conn, "call-0123456789ab", ROOM, 7200))
+        self.assertEqual("acme", pj.stamped(self.conn, "call-0123456789ab"))
 
     def test_a_malformed_stamp_is_no_project(self):
         self.conn.set(pj.STAMP_KEY % "call-x", "Bad Id!")
