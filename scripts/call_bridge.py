@@ -1346,9 +1346,10 @@ class Bridge:
         return {"entry": str(held["entry"]), "said": held["said"], "agents": agents, "named": held.get("named") is True}
 
     def _named_card(self, room, said, actor, epoch):
-        """The living card his words name (card_named), as its OPEN record: the surest match, then the newest.
-        The name and title are read from the card the worker put up. None when his words name no card."""
-        best, rank = None, (0, (-1, -1))
+        """The living card his words name (card_named), as its OPEN record: the surest match, then the fullest
+        name (Codex's review of PR 463: "the launch logo" is the "Launch logo" card, not a newer "Launch"), then the
+        newest. The name and title are read from the card the worker put up. None when his words name no card."""
+        best, rank = None, (0, 0, (-1, -1))
         for info in self._living_all(room, None, actor, epoch):
             try:
                 stored = json.loads(_text(self.conn.hget("conf:canvas:%s:%s" % (info.get("room"), info.get("agent")),
@@ -1358,7 +1359,8 @@ class Bridge:
             if not isinstance(stored, dict):
                 continue
             score = card_named(said, stored.get("name"), str(stored.get("title") or ""))
-            order = (score, _stream_order((info.get("source") or {}).get("event")))
+            order = (score, len(_card_words(stored.get("name"))) if score == 2 else 0,
+                     _stream_order((info.get("source") or {}).get("event")))
             if score and order > rank:
                 best, rank = info, order
         return best

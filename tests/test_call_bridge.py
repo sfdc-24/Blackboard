@@ -2681,6 +2681,15 @@ class CardNameRouting(unittest.TestCase):
         self.b().tick()
         self.assertEqual([], self.revisions(logo))
 
+    def test_the_fullest_name_wins_over_a_newer_shorter_one(self):
+        # Codex's review of PR 463: "Launch logo" (older) and "Launch" (newer) both match "the launch logo".
+        logo = self.living("grok", "Grok, design a launch logo.", "Launch logo", "Launch logo", 90)
+        launch = self.living(self.CODEX, "Codex, draft a launch plan.", "Launch", "Launch", 60)
+        entry = turn(self.conn, "Make the launch logo shorter.", reason="", seconds_ago=10)
+        self.b().tick()
+        self.assertEqual([{"entry": entry}], self.revisions(logo))
+        self.assertEqual([], self.revisions(launch))
+
     def test_a_new_card_is_still_a_new_card(self):
         logo, _plan = self.two_cards()
         turn(self.conn, "Grok, put the logo card ideas on a new card.", seconds_ago=10)
@@ -2735,6 +2744,17 @@ class CardNamesInReadBackMode(unittest.TestCase):
         self.assertEqual([], self.revisions(plan), "not the newest card")
         self.assertNotIn(cb.proposal_id(ROOM, change, self.CODEX), self.conn.hgetall(cp.PARTITION % ("workshop",
                                                                                                       self.CODEX)))
+
+    def test_the_fullest_name_wins_in_read_back_mode_too(self):
+        logo = self.claimed("Codex, design a launch logo.", "Launch logo", "Launch logo", 200)
+        launch = self.claimed("Codex, draft a launch plan on a new card.", "Launch", "Launch", 150)
+        change = turn(self.conn, "Codex, make the launch logo shorter.", seconds_ago=60)
+        self.b().tick()
+        self.heard(change, 50)
+        turn(self.conn, "Codex, go ahead.", seconds_ago=45)
+        self.assertEqual([], self.b().tick())
+        self.assertEqual([{"entry": change}], self.revisions(logo))
+        self.assertEqual([], self.revisions(launch))
 
 
 class LivingCardsInReadBackMode(unittest.TestCase):
