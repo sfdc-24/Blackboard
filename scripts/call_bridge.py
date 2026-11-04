@@ -1332,15 +1332,26 @@ class Bridge:
         """Append one command to the living card's list and record the event's destination, atomically. False
         when this event was already routed there (a replay)."""
         marker = ROUTED_KEY % (entry, target)
-        if self.conn.get(marker):
-            return False
-        pipe = self.conn.pipeline(transaction=True)
-        pipe.multi()
-        pipe.set(marker, ask, ex=call_lifecycle.MAX_AGE)
-        pipe.rpush(REVISE_KEY % ask, json.dumps(item, sort_keys=True))
-        pipe.expire(REVISE_KEY % ask, call_lifecycle.MAX_AGE)
-        pipe.execute()
-        return True
+        # The check and the write are ONE transaction: the marker is WATCHed, so two bridges racing across a
+        # lease hand-over cannot both append (Codex's third review of PR 461). A lost race re-reads the marker.
+        for _attempt in range(5):
+            pipe = self.conn.pipeline(transaction=True)
+            try:
+                pipe.watch(marker)
+                if pipe.get(marker):
+                    return False
+                pipe.multi()
+                pipe.set(marker, ask, ex=call_lifecycle.MAX_AGE)
+                pipe.rpush(REVISE_KEY % ask, json.dumps(item, sort_keys=True))
+                pipe.expire(REVISE_KEY % ask, call_lifecycle.MAX_AGE)
+                pipe.execute()
+                return True
+            except Exception as error:                   # noqa: BLE001 - only a lost WATCH is retried
+                if type(error).__name__ not in ("WatchError", "WatchConflict"):
+                    raise
+            finally:
+                pipe.reset()
+        return False
 
     @staticmethod
     def _go_agents(pending, go_names) -> list:

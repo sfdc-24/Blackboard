@@ -2719,6 +2719,31 @@ class LivingCardBoundaries(unittest.TestCase):
         self.assertEqual([{"entry": entry}], self.revisions(ask), "once")
         self.assertIsNone(self.b()._claim(ROOM, entry, "grok", "Grok, make it funnier.", NOW))
 
+    def test_two_bridges_racing_route_one_event_once(self):
+        """Codex's third review of PR 461: the marker check and the append are one WATCHed transaction."""
+        ask = self.living()
+        entry = turn(self.conn, "Grok, make it funnier.", seconds_ago=10)
+        first, second = self.b(), self.b()
+        real_pipeline = self.conn.pipeline
+        raced = [True]
+
+        def racing_pipeline(transaction=True):
+            pipe = real_pipeline(transaction)
+            real_watch = pipe.watch
+
+            def watch(*keys):
+                real_watch(*keys)
+                if raced and raced.pop():
+                    # The other bridge routes the same event between this one's WATCH and its EXEC.
+                    self.conn.pipeline = real_pipeline
+                    self.assertTrue(second._route(ask, entry, "grok", {"entry": entry}))
+            pipe.watch = watch
+            return pipe
+        self.conn.pipeline = racing_pipeline
+        self.assertFalse(first._route(ask, entry, "grok", {"entry": entry}), "the loser sees the marker")
+        self.conn.pipeline = real_pipeline
+        self.assertEqual([{"entry": entry}], self.revisions(ask), "appended once")
+
     def test_an_expired_ask_is_not_living(self):
         ask = self.living()
         self.conn.store.pop(life.EXPIRY_KEY % ask, None)            # its active token is gone (lazy cleanup)
