@@ -7,6 +7,7 @@ one per room, time-boxed, refused rather than doubled. No network: the bucket an
 """
 import datetime
 import fnmatch
+import hashlib
 import json
 import sys
 import logging
@@ -319,7 +320,6 @@ class ProjectArchives(unittest.TestCase):
     """R6a (CARDS-ARCHITECTURE R6.1): at the end of his call each active project's cards go to the PRIVATE fleet-state
     bucket, one file per project, never to the public canvas bucket; only cards the canvas itself would show; and an
     archive a failure interrupted is finished on a later round. Synthetic only."""
-    NAME = "projects/acme/20261020T220000Z.json"
 
     def setUp(self):
         self.conn = CallRedis()
@@ -337,6 +337,7 @@ class ProjectArchives(unittest.TestCase):
                     "empty": {"name": "Empty", "status": "active"}}
         self.conn.hashes["conf:projects:%s" % room] = {k: json.dumps(v) for k, v in projects.items()}
         self.sent = []
+        [(self.NAME, self.BYTES)] = cp.archive_docs(self.conn, room, NOW)
 
     def pub(self, upload=None):
         return cp.Publisher(self.conn, "sfdc24-canvas", upload or (lambda b, n, d, allow=None: self.sent.append((b, n))),
@@ -346,6 +347,8 @@ class ProjectArchives(unittest.TestCase):
     def test_one_file_per_active_project_with_only_the_cards_the_canvas_would_show(self):
         docs = cp.archive_docs(self.conn, cp.CALL_ROOM, NOW)
         self.assertEqual([self.NAME], [name for name, _ in docs])
+        self.assertEqual("projects/acme/20261020T220000Z-%s.json" % hashlib.sha256(docs[0][1]).hexdigest()[:32],
+                         self.NAME, "the name ends in the bytes' own digest")
         doc = json.loads(docs[0][1])
         self.assertEqual("project-archive/1", doc["format"])
         self.assertEqual({"id": "acme", "name": "Acme"}, doc["project"])
@@ -405,6 +408,25 @@ class ProjectArchives(unittest.TestCase):
         self.assertEqual([], self.owed(), "cleared, nothing blocked")
         self.assertEqual(2, len(self.sent), "each object created once")
 
+    def test_a_different_object_at_the_same_time_never_stands_in_for_the_archive(self):
+        """Codex's HOLD on 587a353: a 412 proved only that a name was taken. Another file for the same project and
+        second (different bytes) has a different name, so it neither blocks nor replaces this call's archive."""
+        bucket = {}
+
+        def create_only(b, name, data, allow=None):
+            if name in bucket:
+                raise urllib.error.HTTPError(name, 412, "Precondition Failed", None, None)
+            bucket[name] = data
+        other = "projects/acme/20261020T220000Z-%s.json" % hashlib.sha256(b"someone else's bytes").hexdigest()[:32]
+        bucket[other] = b"someone else's bytes"
+        pub = self.pub()
+        pub.archive_upload = create_only
+        pub.owe_archive(cp.CALL_ROOM, NOW)
+        self.assertEqual(1, pub.archive(cp.CALL_ROOM, NOW))
+        self.assertEqual(self.BYTES, bucket[self.NAME], "this call's own bytes are written under their own name")
+        self.assertEqual(b"someone else's bytes", bucket[other])
+        self.assertEqual([], self.owed())
+
     def test_another_http_error_keeps_the_file_owed(self):
         pub = self.pub()
         pub.owe_archive(cp.CALL_ROOM, NOW)
@@ -441,7 +463,8 @@ class ProjectArchives(unittest.TestCase):
         self.pub().owe_archive(cp.CALL_ROOM, NOW + datetime.timedelta(hours=1))
         self.assertEqual(2, len(self.owed()))
         self.assertEqual(2, self.pub().archive(cp.CALL_ROOM, NOW))
-        self.assertEqual([self.NAME, "projects/acme/20261020T230000Z.json"], [n for _, n in self.sent])
+        second = cp.archive_docs(self.conn, cp.CALL_ROOM, NOW + datetime.timedelta(hours=1))[0][0]
+        self.assertEqual([self.NAME, second], [n for _, n in self.sent])
 
     def test_nothing_owed_or_no_lease_writes_nothing(self):
         with mock.patch.object(cp, "keep_call_window", lambda *a: "open"):

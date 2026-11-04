@@ -717,8 +717,12 @@ def archive_docs(conn, room: str, now, at=None) -> list:
             continue
         doc = {"format": ARCHIVE_FORMAT, "v": 1, "room": room, "project": {"id": pid, "name": info["name"]},
                "archived_at": stamp(at), "items": found[pid][:MAX_ITEMS]}
-        name = "projects/%s/%s.json" % (pid, at.astimezone(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
-        out.append((name, json.dumps(doc, sort_keys=True).encode("utf-8")))
+        data = json.dumps(doc, sort_keys=True).encode("utf-8")
+        # The name carries the bytes' own digest (Codex's HOLD on 587a353): a create-only 412 on this name then proves
+        # these exact bytes are already there, not merely that some file took the name.
+        name = "projects/%s/%s-%s.json" % (pid, at.astimezone(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ"),
+                                           hashlib.sha256(data).hexdigest()[:32])
+        out.append((name, data))
     return out
 
 
@@ -852,9 +856,9 @@ class Publisher:
                     except urllib.error.HTTPError as error:
                         if error.code != 412:
                             raise
-                        # Already there (Codex's HOLD on 96cf37e: an upload that landed but whose marker update was
-                        # lost). The name is this call's and this project's, written by this path alone, from bytes
-                        # frozen at the call's end: the object there IS this file, so it counts as written.
+                        # Already there (Codex's HOLDs on 96cf37e and 587a353: an upload that landed but whose marker
+                        # update was lost). The name ends in the sha256 of these frozen bytes, so the object holding
+                        # it IS this file: it counts as written.
                         self.log.info("canvas %s: %s was already archived", room, name)
                     written += 1
                     del files[name]
