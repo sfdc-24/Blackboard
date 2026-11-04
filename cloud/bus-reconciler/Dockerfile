@@ -51,6 +51,9 @@ COPY scripts/canvas_publish.py /app/canvas_publish.py
 COPY scripts/call_bridge.py /app/call_bridge.py
 # Shared authoritative task CAS and publisher fence; source bytes are copied unchanged.
 COPY scripts/call_lifecycle.py /app/call_lifecycle.py
+# Projects (R6a): call_bridge stamps the current project on claims and canvas_publish shows only its cards.
+# Both import it, so without this line the worker dies on import.
+COPY scripts/projects.py /app/projects.py
 # The git channel: Redis requests from GitHub bot accounts the access list binds by numeric id (Cursor).
 COPY scripts/git_requests.py /app/git_requests.py
 # The scheduled rewrite of the live milestone chart from its durable repo copy (milestones-sync job).

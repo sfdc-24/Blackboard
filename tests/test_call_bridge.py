@@ -2660,6 +2660,31 @@ class LivingCardRouting(unittest.TestCase):
         self.assertTrue(cb.change_only("shorter please"))
         self.assertFalse(cb.change_only("make it shorter"), "a task word: the usual rules")
 
+    def make_project(self, pid, name, status="active"):
+        self.conn.hset("conf:projects:%s" % cb.CANVAS_ROOM, pid, json.dumps({"name": name, "status": status}))
+
+    def test_a_project_switch_makes_it_current_and_claims_nothing(self):
+        """R6a: "let's work on project Acme" holds TASK's "work on"; it must switch, never claim a card."""
+        self.make_project("acme", "Acme")
+        turn(self.conn, "Grok, let's work on project Acme.", seconds_ago=10)
+        self.assertEqual([], self.b().tick())
+        self.assertEqual("acme", cb._text(self.conn.get("conf:project:%s:current" % cb.CANVAS_ROOM)))
+
+    def test_no_matching_project_lets_the_turn_go_on_as_before(self):
+        turn(self.conn, "Grok, let's work on project Nova.", seconds_ago=10)
+        self.assertEqual(1, len(self.b().tick()), "no such project: an ordinary task turn")
+        self.assertIsNone(self.conn.get("conf:project:%s:current" % cb.CANVAS_ROOM))
+
+    def test_a_claim_carries_the_current_project_and_none_without_one(self):
+        turn(self.conn, "Grok, write a joke on a card.", seconds_ago=30)
+        [plain] = self.b().tick()
+        self.assertIsNone(self.conn.get("gov:callbridge:project:%s" % plain))
+        self.make_project("acme", "Acme")
+        self.conn.set("conf:project:%s:current" % cb.CANVAS_ROOM, "acme")
+        turn(self.conn, "Codex, draft a kickoff checklist.", seconds_ago=10)
+        [tagged] = self.b().tick()
+        self.assertEqual("acme", cb._text(self.conn.get("gov:callbridge:project:%s" % tagged)))
+
     def test_the_revision_list_expires_with_the_ask(self):
         ask, _ = self.living()
         turn(self.conn, "Grok, make it funnier.", seconds_ago=10)

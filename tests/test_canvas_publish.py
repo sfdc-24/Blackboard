@@ -269,6 +269,47 @@ class Snapshot(unittest.TestCase):
         self.assertNotEqual(a, cp.content_digest(cp.snapshot(conn, "demo", NOW)))
 
 
+class ProjectsOnTheCanvas(unittest.TestCase):
+    """R6a (conference docs/CARDS-ARCHITECTURE.md R6.3): cards carry their project; the room file shows only the
+    current project's cards, and untagged cards only while no project is current. Synthetic only."""
+
+    def setUp(self):
+        self.conn = FakeRedis()
+        put(self.conn, "grok", "old", item(title="Before projects"))
+        put(self.conn, "grok", "a", item(title="Acme card", project="acme"))
+        put(self.conn, "gemini", "b", item(title="Beta card", project="beta"))
+
+    def make(self, pid, name, status="active"):
+        self.conn.hashes.setdefault("conf:projects:demo", {})[pid] = json.dumps({"name": name, "status": status})
+
+    def titles(self):
+        return [i["title"] for i in cp.snapshot(self.conn, "demo", NOW)["items"]]
+
+    def test_no_current_project_shows_only_untagged_cards_as_before(self):
+        self.assertEqual(["Before projects"], self.titles())
+        self.assertNotIn("project", cp.snapshot(self.conn, "demo", NOW))
+
+    def test_the_current_project_shows_only_its_cards_and_names_itself(self):
+        self.make("acme", "Acme")
+        self.conn.set("conf:project:demo:current", "acme")
+        doc = cp.snapshot(self.conn, "demo", NOW)
+        self.assertEqual(["Acme card"], [i["title"] for i in doc["items"]])
+        self.assertEqual({"id": "acme", "name": "Acme"}, doc["project"])
+        self.assertEqual("acme", doc["items"][0]["project"])
+
+    def test_an_archived_or_unknown_current_project_is_no_project(self):
+        self.make("acme", "Acme", status="archived")
+        self.conn.set("conf:project:demo:current", "acme")
+        self.assertEqual(["Before projects"], self.titles())
+        self.conn.set("conf:project:demo:current", "nope")
+        self.assertEqual(["Before projects"], self.titles())
+
+    def test_a_malformed_project_tag_drops_the_card(self):
+        self.assertIsNone(cp.clean_item("grok", "x", item(project="Bad Tag!")))
+        self.assertIsNone(cp.clean_item("grok", "x", item(project=7)))
+        self.assertEqual("acme", cp.clean_item("grok", "x", item(project="acme"))["project"])
+
+
 class Window(unittest.TestCase):
     def test_a_window_is_time_boxed_and_one_per_room(self):
         conn = FakeRedis()

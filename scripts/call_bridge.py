@@ -92,6 +92,7 @@ import threading
 
 import canvas_publish
 import call_lifecycle
+import projects
 
 STREAM_MATCH = "v1:conf:*:events"
 CONF_ROOM = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -1032,6 +1033,17 @@ class Bridge:
                         self._close(room, proposal, proposal["agents"], "Cancelled", now)
                 self.conn.set(CURSOR_KEY % room, entry_id, ex=TTL_SECONDS)
                 continue
+            if fields.get("kind") == "turn.started" and fields.get("actor_id") not in ("", None, "chair") \
+                    and said.strip():
+                # PROJECTS (R6a, conference docs/CARDS-ARCHITECTURE.md R6.2): "switch to the Acme project" makes an
+                # existing active project current, by whole name only. It is never a task ("let's work on project
+                # Acme" holds TASK's "work on"), so it claims nothing; with no project matching, the turn goes on.
+                target = projects.switch_target(said, projects.read_projects(self.conn, self.canvas_room))
+                if target:
+                    if projects.set_current(self.conn, self.canvas_room, target):
+                        self.log.info("call bridge: project %s is current in %s", target, self.canvas_room)
+                    self.conn.set(CURSOR_KEY % room, entry_id, ex=TTL_SECONDS)
+                    continue
             if go_ahead(fields) and self.readback:
                 # READ-BACK: a go-ahead confirms only the room's open proposal, said at most READBACK_SECONDS before
                 # it, for the proposed voices it NAMES ("Codex, go ahead"), or for all of them when it names nobody
@@ -1637,6 +1649,8 @@ class Bridge:
             return None
         if info is None:
             return None
+        # R6a: the ask carries the project that was current when it was claimed; the chair puts it on the card.
+        projects.stamp(self.conn, ask, self.canvas_room, call_lifecycle.MAX_AGE)
         if self.bucket:
             self.open_if_shut(now, "%s/%s" % (agent, ask))
         self.log.info("call bridge: %s source-bound claim for %s", ask, agent)

@@ -166,6 +166,9 @@ def _whole(value) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
+_PROJECT = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")     # projects.PROJECT_ID
+
+
 def clean_item(agent: str, item_id: str, raw):
     """The published form of one stored item, or None when it must not be published.
 
@@ -218,6 +221,12 @@ def clean_item(agent: str, item_id: str, raw):
         out["activity"] = activity
     if name:
         out["name"] = name
+    project = item.get("project")
+    if project is not None:
+        # R6a: the project the card was made in (projects.PROJECT_ID). A malformed tag drops the item, like any field.
+        if not (isinstance(project, str) and _PROJECT.fullmatch(project)):
+            return None
+        out["project"] = project
     return out
 
 
@@ -330,6 +339,8 @@ def image_ok(url: str) -> bool:
 def snapshot(conn, room: str, generated, until=None, scope=None) -> dict:
     """The room file: every public item of every allowlisted agent, in a stable order. `scope` (a scoped
     window's list, scope_of): only the listed items and the cards bound to them (module docstring)."""
+    import projects  # local import: the chair vendors this module without projects.py
+    current = projects.current(conn, room)
     items = []
     for agent in AGENTS:
         stored = conn.hgetall(PARTITION % (room, agent)) or {}
@@ -340,9 +351,14 @@ def snapshot(conn, room: str, generated, until=None, scope=None) -> dict:
             published = clean_item(agent, item_id, raw)
             import call_lifecycle  # local import avoids publisher/lifecycle import cycle
             if (published and call_lifecycle.visible(conn, agent, item_id, raw, room=room, now=generated)
-                    and (scope is None or in_scope(scope, agent, item_id, raw))):
+                    and (scope is None or in_scope(scope, agent, item_id, raw))
+                    and published.get("project", "") == (current[0] if current else "")):
+                # R6a (CARDS-ARCHITECTURE R6.3): only the current project's cards; untagged cards (made before
+                # projects, or with none current) only while no project is current.
                 items.append(published)
     doc = {"format": FORMAT, "v": 1, "room": room, "generated": stamp(generated), "items": items[:MAX_ITEMS]}
+    if current:
+        doc["project"] = {"id": current[0], "name": current[1]}
     if until is not None:
         doc["until"] = stamp(until)
     return doc
