@@ -152,8 +152,8 @@ FLOOR_FRESH_SECONDS = 3 * 60  # an unnamed task ask goes to the floor holder onl
 READBACK = True
 READBACK_OFF = os.environ.get("CALL_BRIDGE_READBACK", "on").strip().lower() == "off"
 READ_BACK_OFF = "Not started, the read-back is off"
-# THE FORGIVING GO-AHEAD (the owner, 2026-11-03 21:25 ET, after two calls where no ask ever started: "YES", fix the
-# read-back so his asks start). Two minutes was too short on a live call: five.
+# THE FORGIVING GO-AHEAD (the owner's decision, 2026-11-03 21:25 ET, after two calls where no ask ever started).
+# Two minutes was too short on a live call: five.
 READBACK_SECONDS = 5 * 60
 PROPOSAL_KEY = "gov:callbridge:proposal:%s"   # the room's one open proposal: {entry, agents, asks, at}
 # THE SPOKEN READ-BACK (the owner's orders 2026-11-02; his B3 decision, GROK-OWNER-GO-CALLFIX-20261102T2324Z): the
