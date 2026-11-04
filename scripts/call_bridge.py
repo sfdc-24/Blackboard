@@ -318,6 +318,35 @@ TASK = re.compile(
     # still acknowledged them. Asking for a card to be changed is asking for work.
     r"modify|improve|revise|rewrite|re-?do|change|tweak|refine|polish|expand|extend|shorten|simplify|iterate)\b")
 
+# A CHANGE WITHOUT A VERB (Grok's live test, 2026-11-04 step 3): "Grok, shorter please" got the voice's
+# acknowledgement but no card change, because no TASK word was in it. A comparative asks to change a card that exists,
+# so it counts only to REVISE a living card: it never claims a new one (FleetBridge's claim loop skips it).
+_COMPARE = (r"shorter|longer|funnier|bolder|bigger|smaller|simpler|clearer|darker|lighter|brighter|cleaner|tighter|"
+            r"punchier|sharper|crisper|wider|narrower|taller|louder|softer|warmer|cooler|fancier|plainer|richer|"
+            r"thinner|thicker|rounder|"
+            r"more\s+(?:colou?rful|detailed|formal|casual|professional|playful|modern|minimal|concise|specific|vivid|"
+            r"serious|creative)|less\s+(?:wordy|busy|cluttered|formal|casual|serious|detailed)")
+CHANGE = re.compile(r"(?i)\b(?:%s)\b" % _COMPARE)
+# Praise is not an ask: "that's funnier", "it's much shorter now", "this looks bolder".
+_PRAISE = re.compile(r"(?i)\b(?:that|it|this)(?:['’]s|\s+(?:is|was|looks|sounds|reads|feels))"
+                     r"(?:\s+(?:much|way|a\s+lot|so|even|now|definitely|already|really))*\s*$")
+
+
+def change_ask(said: str) -> bool:
+    """A comparative asking for a change ("shorter please", "a bit bolder"), not praise and not already a task."""
+    said = said or ""
+    return any(_PRAISE.search(said[:m.start()]) is None for m in CHANGE.finditer(said))
+
+
+def work_said(said: str) -> bool:
+    """A task word, or a change to a card (which only revises; see CHANGE)."""
+    return bool(TASK.search(said or "")) or change_ask(said)
+
+
+def change_only(said: str) -> bool:
+    """Only a comparative, no task word: it may revise a living card and must never claim a new card."""
+    return change_ask(said) and not TASK.search(said or "")
+
 
 # A VOICE SAYING IT CANNOT (refusal). The chair writes every line a voice speaks to conf:side:<yyyymmdd> (conference
 # chair/conf_chair/side_lines.py: by=chair, voice=<persona id>, room, text). When a voice answers the owner's last turn
@@ -366,7 +395,7 @@ def asks_in(fields: dict) -> list:
         return list(AGENT_OF.values())
     if fields.get("reason") not in NAMED:
         return []
-    if not said.strip() or not TASK.search(said):
+    if not said.strip() or not work_said(said):
         return []
     # The projection keeps no persona list (redis_state.METADATA_FIELDS), so the names are read from his words, as the
     # chair's addressing spells them (HEARD_AS), never a possessive ("Codex's PR" names nobody).
@@ -386,7 +415,7 @@ def follow_up(fields: dict) -> bool:
     if fields.get("reason") != FOLLOW:
         return False
     said = fields.get("utterance") or ""
-    if not said.strip() or not TASK.search(said):
+    if not said.strip() or not work_said(said):
         return False
     return not any(pattern.search(said) for pattern in NAMES.values())
 
@@ -1090,7 +1119,7 @@ class Bridge:
             # 464: a confirmed change must reach the card he named, and a confirmed team ask is one team card).
             # `said` then holds his original words; the go-ahead's caller and session are the proposal's.
             owner_turn = spoken and (not self.readback or bool(confirms))
-            if owner_turn and TASK.search(said or ""):
+            if owner_turn and work_said(said):
                 by_name = self._named_card(room, said, actor, epoch)
                 if by_name and (not named_in(said) or self._is_team(by_name)):
                     # "Make the logo card bolder": the logo card's own voice, not whoever holds the floor. A team
@@ -1138,6 +1167,13 @@ class Bridge:
                                       agent)
                     if self.readback and confirms:
                         self._close(room, confirms, [agent], "Updating its card", now, retire=True)
+                    continue
+                if change_only(said):
+                    # "Shorter please" with no living card to change: nothing to revise, and a comparative
+                    # alone never makes a new card.
+                    self.log.info("call bridge: a change for %s in %s, but it has no living card", agent, room)
+                    if self.readback and confirms:
+                        self._close(room, confirms, [agent], "Not started, no card to change", now)
                     continue
                 ask = self._claim(room, confirms["entry"] if confirms else entry_id, agent, said, now,
                                   asked_entry=asked_entry)

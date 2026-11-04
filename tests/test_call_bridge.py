@@ -2598,6 +2598,46 @@ class LivingCardRouting(unittest.TestCase):
         # R3: a change is not new work; no new card is made for the voices without one.
         self.assertEqual(0, len(claimed), "no new cards for a change")
 
+    def test_a_comparative_without_a_verb_revises_the_living_card(self):
+        """Grok's live test, 2026-11-04 step 3: "Grok, shorter please" was acknowledged but changed nothing."""
+        for said in ("Grok, shorter please.", "Grok, a bit bolder.", "Grok, more colorful please."):
+            with self.subTest(said=said):
+                self.setUp()
+                ask, _ = self.living()
+                entry = turn(self.conn, said, seconds_ago=10)
+                self.assertEqual([], self.b().tick(), "no new claim")
+                self.assertEqual([{"entry": entry}], self.revisions(ask))
+
+    def test_an_unnamed_comparative_to_the_floor_holder_revises_its_card(self):
+        ask, _ = self.living()
+        turn(self.conn, None, reason="", actor="grok", seconds_ago=20, kind="floor.granted", turn_id="t-9")
+        entry = turn(self.conn, "Shorter, please.", reason="continuity", seconds_ago=10, turn_id="t-9")
+        self.assertEqual([], self.b().tick())
+        self.assertEqual([{"entry": entry}], self.revisions(ask))
+
+    def test_a_comparative_never_claims_a_new_card(self):
+        turn(self.conn, "Grok, shorter please.", seconds_ago=10)
+        self.assertEqual([], self.b().tick(), "nothing living to change: no claim")
+        turn(self.conn, "Codex, funnier.", seconds_ago=5)
+        self.assertEqual([], self.b().tick())
+
+    def test_praise_is_not_a_change(self):
+        for said in ("Grok, that's funnier.", "Grok, it's much shorter now, thanks.", "Grok, this looks bolder."):
+            with self.subTest(said=said):
+                self.setUp()
+                ask, _ = self.living()
+                turn(self.conn, said, seconds_ago=10)
+                self.assertEqual([], self.b().tick())
+                self.assertEqual([], self.revisions(ask))
+
+    def test_the_change_words(self):
+        for said in ("shorter please", "a little punchier", "less wordy", "make it longer"):
+            self.assertTrue(cb.work_said(said), said)
+        for said in ("tell me more", "that's better", "it's shorter now", "how long is it", ""):
+            self.assertFalse(cb.change_ask(said), said)
+        self.assertTrue(cb.change_only("shorter please"))
+        self.assertFalse(cb.change_only("make it shorter"), "a task word: the usual rules")
+
     def test_the_revision_list_expires_with_the_ask(self):
         ask, _ = self.living()
         turn(self.conn, "Grok, make it funnier.", seconds_ago=10)
