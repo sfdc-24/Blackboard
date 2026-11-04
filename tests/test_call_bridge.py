@@ -111,6 +111,17 @@ class FakeRedis:
                 self.ttls.pop(key, None); self.touch(key)
         return count
 
+    def rpush(self, key, *values):
+        with self.mutex:
+            self.lists = getattr(self, "lists", {})
+            self.lists.setdefault(key, []).extend(values)
+            self.touch(key)
+            return len(self.lists[key])
+
+    def lrange(self, key, start, stop):
+        items = getattr(self, "lists", {}).get(key, [])
+        return items[start:] if stop == -1 else items[start:stop + 1]
+
     def expire(self, key, seconds):
         self.ttls[key] = seconds
         self.touch(key)
@@ -2500,6 +2511,91 @@ class DirectStart(unittest.TestCase):
     def test_a_remark_with_no_task_starts_nothing(self):
         turn(self.conn, "Grok, that sounds good to me.", seconds_ago=20)
         self.assertEqual([], cb.Bridge(self.conn, LOG, lambda: True, clock=lambda: NOW).tick())
+
+
+class LivingCardRouting(unittest.TestCase):
+    """R1 living cards (the owner, 2026-11-04): a task for an agent with a living card in this call updates that
+    card (a revision entry for the chair's fleet work), never a new claim. Synthetic sentences only."""
+
+    def setUp(self):
+        self.conn = FakeRedis()
+        open_window(self.conn)
+
+    def b(self):
+        return cb.Bridge(self.conn, LOG, lambda: True, clock=lambda: NOW)
+
+    def living(self, agent="grok", said="Grok, write a joke on a card.", seconds_ago=60):
+        """A claim whose worker put its card up (the lifecycle records the card's field)."""
+        entry = turn(self.conn, said, seconds_ago=seconds_ago)
+        [ask] = self.b().tick()
+        info = json.loads(self.conn.hget(life.OPEN_KEY, ask))
+        info["field"] = ask + "-work"
+        self.conn.hset(life.OPEN_KEY, ask, json.dumps(info))
+        return ask, entry
+
+    def revisions(self, ask):
+        return [json.loads(x) for x in getattr(self.conn, "lists", {}).get(cb.REVISE_KEY % ask, [])]
+
+    def test_a_named_change_goes_to_the_living_card_not_a_new_claim(self):
+        ask, _ = self.living()
+        entry = turn(self.conn, "Grok, modify the joke and make it funnier.", seconds_ago=10)
+        self.assertEqual([], self.b().tick(), "no new claim")
+        self.assertEqual([{"entry": entry}], self.revisions(ask))
+        self.assertEqual([ask], list(self.conn.hgetall(life.OPEN_KEY)))
+
+    def test_an_unnamed_follow_up_to_the_floor_holder_goes_to_its_living_card(self):
+        ask, _ = self.living()
+        turn(self.conn, None, reason="", actor="grok", seconds_ago=20, kind="floor.granted", turn_id="t-9")
+        entry = turn(self.conn, "Make it even funnier.", reason="continuity", seconds_ago=10, turn_id="t-9")
+        self.assertEqual([], self.b().tick())
+        self.assertEqual([{"entry": entry}], self.revisions(ask))
+
+    def test_asking_for_a_new_card_claims_a_new_one(self):
+        ask, _ = self.living()
+        turn(self.conn, "Grok, write another joke on a new card.", seconds_ago=10)
+        self.assertEqual(1, len(self.b().tick()))
+        self.assertEqual([], self.revisions(ask))
+
+    def test_another_agent_without_a_living_card_is_claimed_as_usual(self):
+        ask, _ = self.living()
+        turn(self.conn, "Codex, draft a kickoff checklist.", seconds_ago=10)
+        self.assertEqual(1, len(self.b().tick()))
+        self.assertEqual([], self.revisions(ask))
+
+    def test_a_card_not_yet_put_up_is_not_living(self):
+        turn(self.conn, "Grok, write a joke on a card.", seconds_ago=60)
+        [first] = self.b().tick()
+        turn(self.conn, "Grok, make it funnier.", seconds_ago=10)
+        self.assertEqual(1, len(self.b().tick()), "no card yet: a new claim")
+        self.assertEqual([], self.revisions(first))
+
+    def test_named_final_makes_that_agents_living_card_final(self):
+        ask, _ = self.living()
+        turn(self.conn, "Grok, that's final.", seconds_ago=10)
+        self.assertEqual([], self.b().tick())
+        self.assertEqual([{"final": True}], self.revisions(ask))
+
+    def test_unnamed_final_makes_the_rooms_newest_living_card_final(self):
+        older, _ = self.living(seconds_ago=90)
+        newer, _ = self.living(agent="chatgpt-codex-desktop", said="Codex, draft a kickoff checklist.",
+                               seconds_ago=60)
+        turn(self.conn, "Okay, lock it in.", reason="continuity", seconds_ago=10)
+        self.b().tick()
+        self.assertEqual([{"final": True}], self.revisions(newer))
+        self.assertEqual([], self.revisions(older))
+
+    def test_everyone_revises_every_living_card(self):
+        mine, _ = self.living()
+        entry = turn(self.conn, "All of you, make it shorter.", reason="everyone", seconds_ago=10)
+        claimed = self.b().tick()
+        self.assertEqual([{"entry": entry}], self.revisions(mine))
+        self.assertEqual(3, len(claimed), "the three voices without a living card are claimed")
+
+    def test_the_revision_list_expires_with_the_ask(self):
+        ask, _ = self.living()
+        turn(self.conn, "Grok, make it funnier.", seconds_ago=10)
+        self.b().tick()
+        self.assertEqual(life.MAX_AGE, self.conn.ttls[cb.REVISE_KEY % ask])
 
 
 if __name__ == "__main__":

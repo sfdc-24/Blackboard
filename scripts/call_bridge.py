@@ -213,6 +213,20 @@ NAMES = {persona: re.compile(r"(?i)\b(?:%s)\b(?!['’]s\b)" % "|".join(spellings
     "gemini": ("gemini", "jemini", "gemeni")}.items()}
 # The chair names an agent with one of these (addressing.py). "everyone", "room", "host" and "continuity" name nobody.
 NAMED = ("vocative", "mention", "view_request")
+EVERYONE = "everyone"           # the chair's reason for "everyone", "all of you", "team"
+# Only words that ask every voice ("could someone" is routed the same way and asks nobody in particular).
+ALL_OF_YOU = re.compile(r"(?i)\b(?:everyone|everybody|all\s+of\s+you|each\s+of\s+you|all\s+four|all\s+agents|"
+                        r"you\s+all|y['’]all)\b")
+# LIVING CARDS (the owner, 2026-11-04): a card is updated in place until it is final, never re-made as a new
+# card. A task turn for an agent that already has a LIVING card in this call - its ask OPEN, in this conference
+# room, with a card the worker put up - is not claimed: it is appended to REVISE_KEY % ask for the chair's fleet
+# work, which updates that card (conference chair/conf_chair/fleet_work.py). "New card", "another card", ... still
+# claim a new one. "That's final", "lock it", ... make the living card final. The list lives as long as an ask can.
+REVISE_KEY = "gov:callbridge:revise:%s"
+NEW_CARD = re.compile(r"(?i)\b(?:new|another|separate|fresh|second|different)\s+(?:card|one)\b")
+FINAL = re.compile(r"(?i)\b(?:that['’]?s\s+(?:it,?\s+)?final|it['’]?s\s+final|(?:make|mark)\s+(?:it|that|this)\s+final|"
+                   r"lock\s+(?:it|that|this)(?:\s+in)?|finali[sz]e\s+(?:it|that|this)|"
+                   r"we['’]?re\s+done\s+with\s+(?:it|that|this))\b")
 # A task, not a question: one of these words anywhere in what he said.
 TASK = re.compile(
     r"(?i)\b(?:build|draft|make|create|write|design|mock(?:\s+up)?|prototype|add|fix|check|review|draw|diagram|"
@@ -221,7 +235,10 @@ TASK = re.compile(
     r"cent(?:er|re)|align|remove|delete|replace|edit|rename|resize|"
     # The owner's demo, 2026-10-28 09:14 ET (CLAUDE-ACTIONS-1313Z-20261028T1328Z): an ask for a picture got
     # no claim, and the voice said "I can't pull an image". Asking for something to be shown counts.
-    r"pull|get|bring|show|pictures?|images?)\b")
+    r"pull|get|bring|show|pictures?|images?|"
+    # LIVING CARDS (the owner, 2026-11-04 03:38Z): asks to modify or improve a card got no claim, and the voice
+    # still acknowledged them. Asking for a card to be changed is asking for work.
+    r"modify|improve|revise|rewrite|re-?do|change|tweak|refine|polish|expand|extend|shorten|simplify|iterate)\b")
 
 
 # A VOICE SAYING IT CANNOT (refusal). The chair writes every line a voice speaks to conf:side:<yyyymmdd> (conference
@@ -264,9 +281,13 @@ def asks_in(fields: dict) -> list:
     """The agents an event asks for work, or []: an owner turn naming them, with a task verb in his words."""
     if fields.get("kind") != "turn.started" or fields.get("actor_id") in ("", None, "chair"):
         return []
+    said = fields.get("utterance") or ""
+    if fields.get("reason") == EVERYONE and ALL_OF_YOU.search(said) and TASK.search(said):
+        # An ask addressed to every voice (2026-11-04 03:36Z) went unclaimed: the chair routed it to all of
+        # them, so every voice is asked.
+        return list(AGENT_OF.values())
     if fields.get("reason") not in NAMED:
         return []
-    said = fields.get("utterance") or ""
     if not said.strip() or not TASK.search(said):
         return []
     # The projection keeps no persona list (redis_state.METADATA_FIELDS), so the names are read from his words, as the
@@ -530,6 +551,15 @@ def inbox_text(ask: str, agent: str, room: str, said: str, now) -> str:
             "(answers=%s) never completes this task; generic call-card writes are refused. Never post private "
             "task bytes to the board." % (
                 ask, eastern(now), stamp(now), said[:ASK_CHARS].replace("|", "/"), ask, ask))
+
+
+def _stream_order(entry) -> tuple:
+    """A stream id ("<ms>-<seq>") as a sortable pair; anything else sorts first."""
+    try:
+        ms, _, seq = str(entry).partition("-")
+        return int(ms), int(seq or 0)
+    except ValueError:
+        return (-1, -1)
 
 
 class Bridge:
@@ -956,9 +986,26 @@ class Bridge:
                             self._propose(room, entry_id, agents, said, now, fields.get("actor_id"),
                                           fields.get("session_epoch"))
                     agents = []
+            if not self.readback and fields.get("kind") == "turn.started" \
+                    and fields.get("actor_id") not in ("", None, "chair") and FINAL.search(said or ""):
+                # "Grok, that's final" makes Grok's living card final; unnamed, the room's newest living card.
+                named = named_in(said)
+                targets = ([self._living(room, a) for a in named] if named else [self._living(room)])
+                for living in [t for t in targets if t]:
+                    if self.holds():
+                        self._revise(living, {"final": True})
+                        self.log.info("call bridge: %s final, said in %s", living, room)
+                agents = []
             for agent in agents:
                 if not self.holds():
                     return claimed
+                living = None if (self.readback or confirms or NEW_CARD.search(said or "")) else \
+                    self._living(room, agent)
+                if living:
+                    # His words update the agent's living card in place (no new ask, no new card).
+                    self._revise(living, {"entry": entry_id})
+                    self.log.info("call bridge: %s revision for %s routed to its living card", living, agent)
+                    continue
                 ask = self._claim(room, confirms["entry"] if confirms else entry_id, agent, said, now,
                                   asked_entry=asked_entry)
                 if ask:
@@ -1212,6 +1259,28 @@ class Bridge:
         if not isinstance(agents, list) or any(a not in NAME_OF for a in agents):
             return None                                      # an old or unreadable record binds nothing
         return {"entry": str(held["entry"]), "said": held["said"], "agents": agents, "named": held.get("named") is True}
+
+    def _living(self, room, agent=None):
+        """The newest living ask in this conference room (of `agent`, when given): OPEN, and the worker has put its
+        card up (the lifecycle records the card's field). None when there is none."""
+        best = None
+        for raw in (self.conn.hgetall(call_lifecycle.OPEN_KEY) or {}).values():
+            try:
+                info = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
+            except (ValueError, AttributeError):
+                continue
+            if (not isinstance(info, dict) or info.get("state") != "OPEN" or info.get("conf_room") != room
+                    or not info.get("field") or (agent is not None and info.get("agent") != agent)):
+                continue
+            # Newest by his ask's own stream id (the source event); claims in one second share claimed_at.
+            if best is None or _stream_order((info.get("source") or {}).get("event")) >                     _stream_order((best.get("source") or {}).get("event")):
+                best = info
+        return best.get("ask") if best else None
+
+    def _revise(self, ask, item) -> None:
+        key = REVISE_KEY % ask
+        self.conn.rpush(key, json.dumps(item, sort_keys=True))
+        self.conn.expire(key, call_lifecycle.MAX_AGE)
 
     @staticmethod
     def _go_agents(pending, go_names) -> list:
