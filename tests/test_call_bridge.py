@@ -2598,5 +2598,71 @@ class LivingCardRouting(unittest.TestCase):
         self.assertEqual(life.MAX_AGE, self.conn.ttls[cb.REVISE_KEY % ask])
 
 
+class LivingCardsInReadBackMode(unittest.TestCase):
+    """Codex's HOLD on PR 461: with the read-back ON, a living card is claimed, revised and made final. A revision
+    is authorized exactly like a claim: proposed, read back, then his go-ahead routes it; final needs no read-back
+    (it decides about a card that exists). Synthetic sentences only."""
+    CODEX = "chatgpt-codex-desktop"
+
+    def setUp(self):
+        self.conn = FakeRedis()
+        open_window(self.conn)
+
+    def b(self):
+        return cb.Bridge(self.conn, LOG, lambda: True, clock=lambda: NOW, readback=True)
+
+    def heard(self, entry, seconds_ago):
+        return self.conn.xadd(STREAM, {
+            "kind": cb.READBACK_SPOKEN, "actor_id": "chair", "room_id": ROOM, "session_epoch": "fixture-epoch",
+            "control_sequence": "4", "proj_n": "2", "readback_id": cb.readback_id(ROOM, entry, [self.CODEX])},
+            entry_id=at(seconds_ago))
+
+    def revisions(self, ask):
+        return [json.loads(x) for x in getattr(self.conn, "lists", {}).get(cb.REVISE_KEY % ask, [])]
+
+    def cards(self):
+        return self.conn.hgetall(cp.PARTITION % ("workshop", self.CODEX))
+
+    def test_claim_then_revise_then_final(self):
+        first = turn(self.conn, "Codex, draft the sample queue flow.", seconds_ago=110)
+        self.b().tick()
+        self.heard(first, 100)
+        turn(self.conn, "Codex, go ahead.", seconds_ago=95)
+        [ask] = self.b().tick()
+        info = json.loads(self.conn.hget(life.OPEN_KEY, ask))
+        info["field"] = ask + "-work"                                    # the worker put its card up
+        self.conn.hset(life.OPEN_KEY, ask, json.dumps(info))
+        # A change is proposed and read back like any ask; nothing reaches the card before his go-ahead.
+        change = turn(self.conn, "Codex, improve the flow with a retry step.", seconds_ago=60)
+        self.assertEqual([], self.b().tick())
+        self.assertEqual([], self.revisions(ask), "not authorized yet")
+        self.assertIn(cb.proposal_id(ROOM, change, self.CODEX), self.cards())
+        self.heard(change, 50)
+        turn(self.conn, "Codex, go ahead.", seconds_ago=45)
+        self.assertEqual([], self.b().tick(), "routed, never a second claim")
+        self.assertEqual([{"entry": change}], self.revisions(ask), "his original words, by their entry")
+        self.assertNotIn(cb.proposal_id(ROOM, change, self.CODEX), self.cards(), "its proposal card is retired")
+        self.assertEqual([ask], list(self.conn.hgetall(life.OPEN_KEY)))
+        # Final needs no read-back.
+        turn(self.conn, "Codex, that's final.", seconds_ago=20)
+        self.b().tick()
+        self.assertEqual([{"entry": change}, {"final": True}], self.revisions(ask))
+
+    def test_a_change_that_is_never_confirmed_reaches_nothing(self):
+        first = turn(self.conn, "Codex, draft the sample queue flow.", seconds_ago=110)
+        self.b().tick()
+        self.heard(first, 100)
+        turn(self.conn, "Codex, go ahead.", seconds_ago=95)
+        [ask] = self.b().tick()
+        info = json.loads(self.conn.hget(life.OPEN_KEY, ask))
+        info["field"] = ask + "-work"
+        self.conn.hset(life.OPEN_KEY, ask, json.dumps(info))
+        turn(self.conn, "Codex, improve the flow with a retry step.", seconds_ago=60)
+        self.b().tick()
+        turn(self.conn, "Yes please.", reason="continuity", seconds_ago=40)
+        self.b().tick()
+        self.assertEqual([], self.revisions(ask))
+
+
 if __name__ == "__main__":
     unittest.main()

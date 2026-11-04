@@ -986,8 +986,10 @@ class Bridge:
                             self._propose(room, entry_id, agents, said, now, fields.get("actor_id"),
                                           fields.get("session_epoch"))
                     agents = []
-            if not self.readback and fields.get("kind") == "turn.started" \
-                    and fields.get("actor_id") not in ("", None, "chair") and FINAL.search(said or ""):
+            if fields.get("kind") == "turn.started" and fields.get("actor_id") not in ("", None, "chair") \
+                    and FINAL.search(said or "") and not go_ahead(fields):
+                # Either mode: "final" is his decision about a card that already exists, not a new task, so it
+                # needs no read-back (Codex's HOLD on PR 461: read-back mode must reach final too).
                 # "Grok, that's final" makes Grok's living card final; unnamed, the room's newest living card.
                 named = named_in(said)
                 targets = ([self._living(room, a) for a in named] if named else [self._living(room)])
@@ -999,12 +1001,15 @@ class Bridge:
             for agent in agents:
                 if not self.holds():
                     return claimed
-                living = None if (self.readback or confirms or NEW_CARD.search(said or "")) else \
-                    self._living(room, agent)
+                living = None if NEW_CARD.search(said or "") else self._living(room, agent)
                 if living:
-                    # His words update the agent's living card in place (no new ask, no new card).
-                    self._revise(living, {"entry": entry_id})
+                    # His words update the agent's living card in place (no new ask, no new card). In read-back
+                    # mode this runs only once his go-ahead confirmed the read-back (confirms), exactly where a new
+                    # claim would have been authorized; the revision's words are his original ask's entry.
+                    self._revise(living, {"entry": confirms["entry"] if confirms else entry_id})
                     self.log.info("call bridge: %s revision for %s routed to its living card", living, agent)
+                    if self.readback and confirms:
+                        self._close(room, confirms, [agent], "Updating its card", now, retire=True)
                     continue
                 ask = self._claim(room, confirms["entry"] if confirms else entry_id, agent, said, now,
                                   asked_entry=asked_entry)
@@ -1156,7 +1161,7 @@ class Bridge:
                 self.open_if_shut(now, "%s/%s" % (agent, field))
             self.log.info("call bridge: %s refused for %s (%s)", field, agent, why)
 
-    def _close(self, room, proposal, agents, why, now) -> None:
+    def _close(self, room, proposal, agents, why, now, retire=False) -> None:
         """Close the given voices' proposal cards and drop the proposal once none is left. A voice whose ask was
         claimed after all (a go-ahead, its own "I can't") loses the proposal card: its claimed card says the rest.
         Otherwise a card that is still a proposal flips to done with the reason; nothing else is touched."""
@@ -1171,9 +1176,11 @@ class Bridge:
                 item = None
             if not (isinstance(item, dict) and item.get("activity") == PROPOSED):
                 continue
-            if self._claimed(room, proposal["entry"], agent):
+            if retire or self._claimed(room, proposal["entry"], agent):
+                # Claimed, or routed to its living card (retire): the proposal card goes; the card says the rest.
                 self.conn.hdel(partition % (self.canvas_room, agent), field)
-                self.log.info("call bridge: %s claimed; its proposal card is retired", field)
+                self.log.info("call bridge: %s %s; its proposal card is retired", field,
+                              "routed to its living card" if retire else "claimed")
             else:
                 self.conn.hset(partition % (self.canvas_room, agent), field,
                                json.dumps(unstarted_card(agent, asked, why, now)))
