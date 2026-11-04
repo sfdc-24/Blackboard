@@ -318,6 +318,56 @@ TASK = re.compile(
     # still acknowledged them. Asking for a card to be changed is asking for work.
     r"modify|improve|revise|rewrite|re-?do|change|tweak|refine|polish|expand|extend|shorten|simplify|iterate)\b")
 
+# A CHANGE WITHOUT A VERB (Grok's live test, 2026-11-04 step 3): "Grok, shorter please" got the voice's
+# acknowledgement but no card change, because no TASK word was in it. A comparative asks to change a card that exists,
+# so it counts only to REVISE a living card: it never claims a new one (FleetBridge's claim loop skips it).
+_COMPARE = (r"shorter|longer|funnier|bolder|bigger|smaller|simpler|clearer|darker|lighter|brighter|cleaner|tighter|"
+            r"punchier|sharper|crisper|wider|narrower|taller|louder|softer|warmer|cooler|fancier|plainer|richer|"
+            r"thinner|thicker|rounder|"
+            r"more\s+(?:colou?rful|detailed|formal|casual|professional|playful|modern|minimal|concise|specific|vivid|"
+            r"serious|creative)|less\s+(?:wordy|busy|cluttered|formal|casual|serious|detailed)")
+CHANGE = re.compile(r"(?i)\b(?:%s)\b" % _COMPARE)
+# AFFIRMATIVE ONLY (Codex's HOLD on a578301): in its own clause, only fillers and voices' names may come before the
+# comparative. "Grok, shorter please", "okay, a bit bolder" and "that's fine, punchier" ask for a change; "no need for
+# anything shorter", "it's much shorter now" (praise) and "nothing longer" do not.
+_CLAUSE = re.compile(r"[,.;:!?]")
+_FILLERS = {"please", "a", "bit", "little", "tad", "touch", "slightly", "much", "way", "even", "just", "ok", "okay",
+            "now", "maybe", "and", "so", "yeah", "yes", "then", "also", "lot"}
+# After the comparative, in its clause (Codex's HOLD on 7eda4f3: "shorter is unnecessary" passed): only fillers,
+# thanks, or what the card is, never a verb or a judgement.
+_AFTER = _FILLERS | {"thanks", "thank", "you", "again", "than", "the", "last", "one", "this", "that", "it", "version",
+                     "time", "for", "me", "us", "card", "joke", "logo", "plan", "text", "title", "list", "diagram",
+                     "drawing", "answer", "summary"}
+
+
+def _clause_words(text: str) -> list:
+    for pattern in NAMES.values():
+        text = pattern.sub(" ", text)
+    return re.findall(r"[\w'’]+", text.lower())
+
+
+def change_ask(said: str) -> bool:
+    """A comparative asking for a change ("shorter please", "a bit bolder"): in its clause, only fillers and names
+    before it and only fillers or what the card is after it, so negations ("no need for anything shorter"),
+    judgements ("shorter is unnecessary"), descriptions and praise are not asks."""
+    said = said or ""
+    for match in CHANGE.finditer(said):
+        before = _CLAUSE.split(said[:match.start()])[-1]
+        after = _CLAUSE.split(said[match.end():])[0]
+        if all(w in _FILLERS for w in _clause_words(before)) and all(w in _AFTER for w in _clause_words(after)):
+            return True
+    return False
+
+
+def work_said(said: str) -> bool:
+    """A task word, or a change to a card (which only revises; see CHANGE)."""
+    return bool(TASK.search(said or "")) or change_ask(said)
+
+
+def change_only(said: str) -> bool:
+    """Only a comparative, no task word: it may revise a living card and must never claim a new card."""
+    return change_ask(said) and not TASK.search(said or "")
+
 
 # A VOICE SAYING IT CANNOT (refusal). The chair writes every line a voice speaks to conf:side:<yyyymmdd> (conference
 # chair/conf_chair/side_lines.py: by=chair, voice=<persona id>, room, text). When a voice answers the owner's last turn
@@ -366,7 +416,7 @@ def asks_in(fields: dict) -> list:
         return list(AGENT_OF.values())
     if fields.get("reason") not in NAMED:
         return []
-    if not said.strip() or not TASK.search(said):
+    if not said.strip() or not work_said(said):
         return []
     # The projection keeps no persona list (redis_state.METADATA_FIELDS), so the names are read from his words, as the
     # chair's addressing spells them (HEARD_AS), never a possessive ("Codex's PR" names nobody).
@@ -386,7 +436,7 @@ def follow_up(fields: dict) -> bool:
     if fields.get("reason") != FOLLOW:
         return False
     said = fields.get("utterance") or ""
-    if not said.strip() or not TASK.search(said):
+    if not said.strip() or not work_said(said):
         return False
     return not any(pattern.search(said) for pattern in NAMES.values())
 
@@ -1090,7 +1140,7 @@ class Bridge:
             # 464: a confirmed change must reach the card he named, and a confirmed team ask is one team card).
             # `said` then holds his original words; the go-ahead's caller and session are the proposal's.
             owner_turn = spoken and (not self.readback or bool(confirms))
-            if owner_turn and TASK.search(said or ""):
+            if owner_turn and work_said(said):
                 by_name = self._named_card(room, said, actor, epoch)
                 if by_name and (not named_in(said) or self._is_team(by_name)):
                     # "Make the logo card bolder": the logo card's own voice, not whoever holds the floor. A team
@@ -1138,6 +1188,13 @@ class Bridge:
                                       agent)
                     if self.readback and confirms:
                         self._close(room, confirms, [agent], "Updating its card", now, retire=True)
+                    continue
+                if change_only(said):
+                    # "Shorter please" with no living card to change: nothing to revise, and a comparative
+                    # alone never makes a new card.
+                    self.log.info("call bridge: a change for %s in %s, but it has no living card", agent, room)
+                    if self.readback and confirms:
+                        self._close(room, confirms, [agent], "Not started, no card to change", now)
                     continue
                 ask = self._claim(room, confirms["entry"] if confirms else entry_id, agent, said, now,
                                   asked_entry=asked_entry)
