@@ -643,13 +643,18 @@ def live_call(conn, family: str, now) -> str:
     return best[1]
 
 
-def keep_call_window(conn, family: str, now, bucket: str, fence) -> str:
+def keep_call_window(conn, family: str, now, bucket: str, fence, closing=None) -> str:
     """One round: "opened", "open", "closed", "stopped" or "idle". Raises only what Redis raises.
 
     `fence()` says this worker may still write governance state: the publisher is not stopped and the lease
     is provably its own. Every write below is made in MULTI with gov:worker:lock WATCHed after fence() said
     yes, so a lease that moves before EXEC writes nothing (Aya on 0fde974: a lease lost during the scan, and
-    a stopped publisher, still opened the window)."""
+    a stopped publisher, still opened the window).
+
+    `closing(now)`, when given, performs the close itself and says whether it is done (Publisher.close_call:
+    the call's archive is owed and the window deleted as ONE transaction; Codex's HOLD on PR 470: the window
+    was deleted before the owe, so a failed owe left no retry trigger). Not done: the window is kept, and the
+    next round re-sees it and retries."""
     live = live_call(conn, family, now)
     seen = conn.get(CALL_STOP_KEY)
     stop = _json_of(seen)
@@ -691,6 +696,8 @@ def keep_call_window(conn, family: str, now, bucket: str, fence) -> str:
             return "idle"                    # not ours to write now: no lease, stopped, raced or a stop landed
         return "opened" if done and done[0] else "open"
     if held is not None:                     # closed only if it is still the one this rule opened
+        if closing is not None:
+            return "closed" if closing(now) else "idle"
         return "closed" if _drop_ours(conn, fence) else "idle"
     return "idle"
 
@@ -704,7 +711,9 @@ ARCHIVE_FORMAT = "project-archive/1"
 # A call's archive is owed until every file is written (Codex's HOLDs on d1bde3a and bacb41a: a transient failure right
 # after the window closed lost it, and a retry must not rebuild it from later state). At the call's end its files are
 # built once and kept, bytes and names, under ARCHIVE_PENDING_KEY:<end time>; every round of his calls writes what is
-# left, under the lease, until none is or the marker expires.
+# left, under the lease, until none is or the marker expires. The owe and the window's delete are ONE fenced
+# transaction (Publisher.close_call; Codex's HOLD on PR 470): a close whose marker did not land keeps the window, so
+# the next round retries it, and the archive is never owed twice for one close.
 ARCHIVE_PENDING_KEY = "gov:canvas:archive-pending:%s"
 ARCHIVE_PENDING_SECONDS = 24 * 60 * 60
 
@@ -846,22 +855,54 @@ class Publisher:
         try:
             if self.holds is None or not self.holds():
                 return ""
-            said = keep_call_window(self.conn, self.family, now, self.bucket, self.may_govern)
+            said = keep_call_window(self.conn, self.family, now, self.bucket, self.may_govern,
+                                    closing=lambda at: self.close_call(CALL_ROOM, at))
         except Exception as error:                                       # noqa: BLE001 - the TYPE only
             self.log.warning("canvas %s: his calls could not be read (%s)", CALL_ROOM, type(error).__name__)
             return ""
         if said in ("opened", "closed") or said != self.call_said:
             self.log.info("canvas %s: his call window %s", CALL_ROOM, said)
         self.call_said = said
-        if said == "closed":
-            self.owe_archive(CALL_ROOM, now)
         self.archive(CALL_ROOM, now)
         return said
 
+    def close_call(self, room, now) -> bool:
+        """His call is over: freeze its archive, owe it, and delete the window, as ONE fenced transaction (Codex's
+        HOLD on PR 470: the window was deleted before the owe, so a failed owe left no retry trigger and the call's
+        private archive could be lost). The owed marker and the window delete land together or not at all: a failed
+        EXEC keeps the window, so the next round re-sees it and retries the whole close, and the marker is written
+        only by the transaction that closes, so a retry can never owe twice. Only a window this rule opened
+        (by == CALL_BY, read again under the WATCH) is ever closed; False closed nothing. A call with no cards owes
+        no marker and simply closes."""
+        key = window_key(room)
+        try:
+            files = {name: data.decode("utf-8") for name, data in archive_docs(self.conn, room, now)}
+        except Exception as error:                                       # noqa: BLE001 - the TYPE only
+            self.log.warning("canvas %s: the closing call's archive could not be built (%s)", room,
+                             type(error).__name__)
+            return False
+        marker = ARCHIVE_PENDING_KEY % room + ":" + stamp(now)
+        value = json.dumps({"at": stamp(now), "files": files}, sort_keys=True)
+
+        def plan(pipe):
+            if (_json_of(pipe.get(key)) or {}).get("by") != CALL_BY:
+                return None                  # someone else's window, or gone: not ours to close
+            ops = [("delete", key)]
+            if files:
+                ops.insert(0, ("set", marker, value, ARCHIVE_PENDING_SECONDS, True))
+            return ops
+
+        done = bool(_fenced(self.conn, self.may_govern, (key, marker), plan))
+        if not done and (_json_of(self.conn.get(key)) or {}).get("by") == CALL_BY:
+            self.log.warning("canvas %s: his call's close is not done yet: the archive is not owed", room)
+        return done
+
     def owe_archive(self, room, now) -> bool:
-        """His call ended: build its archive NOW and keep those exact bytes owed until each file is written (Codex's
-        HOLD on bacb41a: a retry rebuilt from live Redis, so a card revised or expired after the call changed or
-        dropped it). One marker per call, keyed by its end time, so a later call never replaces an earlier one."""
+        """Build `room`'s archive NOW and keep those exact bytes owed until each file is written (Codex's HOLD on
+        bacb41a: a retry rebuilt from live Redis, so a card revised or expired after the call changed or dropped
+        it). One marker per call, keyed by its end time, so a later call never replaces an earlier one. The live
+        close owes through close_call(), atomically with the window's delete; this is the marker-writing
+        primitive itself."""
         try:
             files = {name: data.decode("utf-8") for name, data in archive_docs(self.conn, room, now)}
             if not files:
