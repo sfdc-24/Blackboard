@@ -139,6 +139,7 @@ on:
       - "tests/test_canvas_publish.py"
       - "scripts/call_bridge.py"
       - "tests/test_call_bridge.py"
+      - "tests/test_call_bridge_screen.py"
       - "scripts/fleet_doorbell.py"
       - "tests/test_fleet_doorbell.py"
       - "scripts/fleet_ring.py"
@@ -267,6 +268,7 @@ on:
       - "tests/test_canvas_publish.py"
       - "scripts/call_bridge.py"
       - "tests/test_call_bridge.py"
+      - "tests/test_call_bridge_screen.py"
       - "scripts/fleet_doorbell.py"
       - "tests/test_fleet_doorbell.py"
       - "scripts/fleet_ring.py"
@@ -1155,6 +1157,7 @@ jobs:
                       "test_live_mode:cloud/bus-reconciler/serve_requests.py" \
                       "test_canvas_publish:scripts/canvas_publish.py" \
                       "test_call_bridge:scripts/call_bridge.py" \
+                      "test_call_bridge_screen:scripts/call_bridge.py" \
                       "test_fleet_doorbell:scripts/fleet_doorbell.py" \
                       "test_fleet_ring:scripts/fleet_ring.py" \
                       "test_projects:scripts/projects.py" \
