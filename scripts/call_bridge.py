@@ -409,6 +409,7 @@ DRIVE_SECONDS = 60 * 60
 SCREEN_STOP_KEY = "gov:callbridge:screenstop:%s:%s"    # <room>, <entry>: a STOP is written once per turn
 NO_CREDENTIALS = "Not started: no agent types a password, token or code. Please sign in yourself"
 NO_SCREEN_READBACK = "Not started: screen steps need the read-back"
+NOT_OWNERS = "Not started: screen steps are the owner's"
 # Only the screen can be meant by these verbs.
 _SCREEN_ONLY = r"(?:double[\s-]?click|right[\s-]?click|click|tap|scroll|hover|mouse\s+over|drag)"
 # These also mean other work ("open a PR"), so they count only beside a thing on a screen.
@@ -1380,7 +1381,12 @@ class Bridge:
             screen_step = (SCREEN and bool(confirms) and SCREEN_AGENT in named_in(confirms["said"])
                            and screen_ask(confirms["said"]))
             if screen_step:
-                agents, by_name, fresh = [a for a in proposed if a == SCREEN_AGENT], None, True
+                if confirms.get("actor") in self.owners:
+                    agents, by_name, fresh = [a for a in proposed if a == SCREEN_AGENT], None, True
+                else:
+                    # Only a listed owner's step is ever claimed (Codex's HOLD on 921c35c6), however it was proposed.
+                    self._close(room, confirms, proposed, NOT_OWNERS, now)
+                    agents, proposed, by_name, fresh = [], [], None, True
             if self.readback and confirms and [a for a in proposed if a not in agents]:
                 self._close(room, confirms, [a for a in proposed if a not in agents],
                             "Part of the team card" if fresh or (by_name and self._is_team(by_name))
@@ -1965,7 +1971,8 @@ class Bridge:
         """The turn of his standing look-only go that covers this step, or "": the same caller and chair session,
         given before this step and not stopped since."""
         held = self._drive_record(room)
-        if not held or held.get("stopped") or (held.get("actor"), held.get("epoch")) != (actor, epoch):
+        if (not held or held.get("stopped") or actor not in self.owners
+                or (held.get("actor"), held.get("epoch")) != (actor, epoch)):
             return ""
         return held["entry"] if _after(entry_id, held["entry"]) else ""
 
@@ -1990,6 +1997,11 @@ class Bridge:
         read-back and his go-ahead. Returns the ask claimed, or None."""
         actor, epoch = fields.get("actor_id"), fields.get("session_epoch")
         self._asked(room, entry_id, said, now, actor, epoch)        # a voice's "I can't" answers this turn only
+        if actor not in self.owners:
+            # Only a listed owner moves Grokbot's browser (Codex's HOLD on 921c35c6: a guest's step became a proposal
+            # the same guest could confirm). Nothing is proposed, carded, put in an inbox or rung.
+            self.log.info("call bridge: a screen step in %s from no listed owner; ignored", room)
+            return None
         kind = screen_kind(said)
         why = (NO_CREDENTIALS if kind == "refused" else NO_SCREEN_READBACK if not self.readback or self.paused
                else TOO_LONG if len(said) >= ASK_MAX_CHARS or len(said.split()) > ASK_MAX_WORDS else "")

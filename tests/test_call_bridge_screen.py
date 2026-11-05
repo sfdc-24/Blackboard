@@ -164,6 +164,7 @@ class ScreenSteps(unittest.TestCase):
         turn(self.conn, "Greg, scroll down the page.", actor="own_someone_else", seconds_ago=50)
         self.assertEqual([], self.b().tick())
         self.assertEqual([], self.inbox(), "not a listed owner: no standing go")
+        self.assertIsNone(self.conn.get(cb.DRIVE_KEY % ROOM), "a guest's go is never held")
         self.conn.delete(cb.PROPOSAL_KEY % ROOM)
         turn(self.conn, "Greg, you can drive.", seconds_ago=40, session_epoch="another-epoch")
         turn(self.conn, "Greg, go to the OmniScripts tab.", seconds_ago=30)
@@ -254,6 +255,47 @@ class ScreenSteps(unittest.TestCase):
         self.assertEqual([cb.ask_id(ROOM, step, "grok")], self.b().tick())
         self.assertEqual("screen-action", self.inbox()[-1].get("kind"))
         self.assertEqual([], getattr(self.conn, "lists", {}).get(cb.REVISE_KEY % first, []))
+
+    def test_a_guests_screen_step_is_never_proposed_carded_put_in_an_inbox_or_rung(self):
+        """Codex's HOLD on 921c35c6: a guest's step became a proposal the same guest could confirm."""
+        rings = []
+        b = cb.Bridge(self.conn, LOG, lambda: True, clock=lambda: NOW, readback=True, owners=[OWNER],
+                      ring=rings.append)
+        guest = "own_someone_else"
+        for said in ("Greg, click New on the Integration Procedures tab.", "Greg, click Activate on the FlexCard.",
+                     "Greg, scroll down the page."):
+            self.conn.delete(cb.CURSOR_KEY % ROOM)
+            entry = turn(self.conn, said, actor=guest, seconds_ago=60)
+            self.heard(entry, 40)
+            turn(self.conn, "Greg, go ahead.", actor=guest, seconds_ago=30)
+            self.assertEqual([], b.tick(), said)
+            self.assertIsNone(self.conn.get(cb.PROPOSAL_KEY % ROOM), said)
+            self.assertEqual({}, self.cards(), said)
+            self.assertEqual([], self.inbox(), said)
+            self.assertEqual({}, self.conn.hgetall(cb.RING_KEY), said)
+            self.assertEqual({}, self.conn.hgetall(life.OPEN_KEY), said)
+        self.assertEqual([], rings)
+
+    def test_a_guests_proposal_however_it_came_is_closed_not_claimed(self):
+        guest = "own_someone_else"
+        entry = turn(self.conn, "Greg, click New on the Integration Procedures tab.", actor=guest, seconds_ago=60)
+        self.conn.set(cb.CURSOR_KEY % ROOM, entry)
+        b = self.b()
+        b._keep(ROOM, {"entry": entry, "said": "Greg, click New on the Integration Procedures tab.",
+                       "agents": ["grok"], "actor": guest, "epoch": "fixture-epoch"})
+        self.heard(entry, 40)
+        turn(self.conn, "Greg, go ahead.", actor=guest, seconds_ago=30)
+        self.assertEqual([], b.tick())
+        self.assertEqual([], self.inbox())
+        self.assertEqual({}, self.conn.hgetall(life.OPEN_KEY))
+        self.assertIsNone(self.conn.get(cb.PROPOSAL_KEY % ROOM))
+
+    def test_a_standing_go_held_for_a_guest_covers_nothing(self):
+        guest = "own_someone_else"
+        self.conn.set(cb.DRIVE_KEY % ROOM, json.dumps({"entry": at(60), "actor": guest, "epoch": "fixture-epoch"}))
+        self.assertEqual("", self.b()._driving(ROOM, guest, "fixture-epoch", at(10)))
+        self.conn.set(cb.DRIVE_KEY % ROOM, json.dumps({"entry": at(60), "actor": OWNER, "epoch": "fixture-epoch"}))
+        self.assertEqual(at(60), self.b()._driving(ROOM, OWNER, "fixture-epoch", at(10)))
 
     def test_a_screen_step_is_groks_alone(self):
         turn(self.conn, "Claude and Greg, click New on the Integration Procedures tab.", seconds_ago=60)
