@@ -1031,11 +1031,19 @@ class Bridge:
                 # PROJECTS (R6b, conference docs/CARDS-ARCHITECTURE.md R6.2): the owner console creates, switches,
                 # archives and clears the canvas's project; a heard name never creates one. Only a listed owner's
                 # command is obeyed (the same gate as the R6a voice switch: a guest must not change what the public
-                # canvas shows). Handled here, before every turn path, and consumed whatever it did.
-                if fields.get("actor_id") in self.owners:
-                    self._project_command(fields, now)
-                else:
+                # canvas shows), and only under the lease (Codex's HOLD on PR 470): read without it, the event is
+                # left unconsumed, like a final, so the next lease holder retries it instead of a former worker
+                # writing project state. The one compound write, the archive's owed marker, is fenced on the lease
+                # itself (canvas_publish._fenced); when it fails the event is left unconsumed too, so the archive
+                # is retried until it lands or the entry goes stale.
+                if fields.get("actor_id") not in self.owners:
                     self.log.info("call bridge: a project command in %s from no listed owner; ignored", room)
+                    self.conn.set(CURSOR_KEY % room, entry_id, ex=TTL_SECONDS)
+                    continue
+                if not self.holds():
+                    return claimed               # not consumed: the next lease holder retries this event
+                if self._project_command(fields, now) is None:
+                    return claimed               # the archive was not owed: nothing changed; retried next round
                 self.conn.set(CURSOR_KEY % room, entry_id, ex=TTL_SECONDS)
                 continue
             if self.readback and fields.get("kind") == READBACK_SPOKEN and fields.get("actor_id") == "chair":
@@ -1268,8 +1276,9 @@ class Bridge:
                 self._close(room, proposal, done, "Claimed", now)
         return claimed
 
-    def _project_command(self, fields: dict, now) -> bool:
-        """One owner-console command on the canvas room's projects (R6b). Whether it changed anything.
+    def _project_command(self, fields: dict, now):
+        """One owner-console command on the canvas room's projects (R6b). Whether it changed anything; None for
+        an archive whose files could not be owed (nothing changed, and the caller must not consume the event).
 
         create   the id is slug(project_name), computed here (the console's own project_id is not consulted, so a
                  mismatching one is simply ignored); refused for an invalid name or a taken id; the new project is
@@ -1306,6 +1315,7 @@ class Bridge:
                 else:
                     self.log.warning("call bridge: project %s stays active in %s: its archive could not be owed",
                                      pid, self.canvas_room)
+                    return None                  # the caller leaves the event unconsumed: retried, never lost
         elif action == "clear":
             done = projects.clear_current(self.conn, self.canvas_room)
         self.log.info("call bridge: project command %s %s in %s: %s", action, pid or "-", self.canvas_room,
@@ -1604,8 +1614,14 @@ class Bridge:
         return best
 
     def _living_all(self, room, agent=None, actor=None, epoch=None):
-        """Every living ask in this room (of `agent`, when given) that `actor` asked in session `epoch`."""
+        """Every living ask in this room (of `agent`, when given) that `actor` asked in session `epoch`, made in
+        the canvas room's CURRENT project (Codex's HOLD on PR 470: lookups were scoped by room, actor and session
+        but not project, so after a switch his words could revise another project's open card, one the canvas no
+        longer shows). The ask's stamp must equal the current project's id, "" for none: an untagged ask is living
+        only while no project is current, exactly as its card is shown (canvas_publish.snapshot)."""
         now = self.clock().timestamp()
+        held = projects.current(self.conn, self.canvas_room)
+        current = held[0] if held else ""
         for raw in (self.conn.hgetall(call_lifecycle.OPEN_KEY) or {}).values():
             try:
                 info = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
@@ -1618,6 +1634,8 @@ class Bridge:
             if (actor is None or source.get("owner") != actor or info.get("session_epoch") != epoch
                     or not isinstance(info.get("expires_at"), (int, float)) or now >= info["expires_at"]
                     or _text(self.conn.get(call_lifecycle.EXPIRY_KEY % info.get("ask"))) != info.get("source_revision")):
+                continue
+            if projects.stamped(self.conn, str(info.get("ask") or "")) != current:
                 continue
             yield info
 

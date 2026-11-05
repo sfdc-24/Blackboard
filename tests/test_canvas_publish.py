@@ -504,6 +504,17 @@ class ProjectArchives(unittest.TestCase):
         self.assertEqual([("sfdc24-fleet-state", self.NAME)], self.sent)
         self.assertEqual([], self.owed())
 
+    def test_a_publisher_with_no_call_family_still_writes_owed_archives(self):
+        """Codex's HOLD on PR 470: the drain ran only under a call family, so a project archived from the console
+        (owed by the bridge, not by a call's end) would never have reached the private bucket without one."""
+        holds = lambda: self.conn.store.get(cp.LEASE_KEY) == ME                                   # noqa: E731
+        self.assertTrue(cp.owe_project_archive(self.conn, cp.CALL_ROOM, "acme", NOW, holds))
+        pub = cp.Publisher(self.conn, "sfdc24-canvas", lambda b, n, d, allow=None: self.sent.append((b, n)), LOG,
+                           clock=lambda: NOW, holds=holds)                      # no family: his calls are not read
+        self.assertEqual("", pub.calls())
+        self.assertEqual([("sfdc24-fleet-state", self.NAME)], self.sent)
+        self.assertEqual([], self.owed())
+
     def test_a_project_with_no_cards_owes_nothing_and_no_lease_owes_nothing(self):
         holds = lambda: self.conn.store.get(cp.LEASE_KEY) == ME                                   # noqa: E731
         self.assertTrue(cp.owe_project_archive(self.conn, cp.CALL_ROOM, "empty", NOW, holds), "nothing to archive")

@@ -835,9 +835,14 @@ class Publisher:
     def calls(self) -> str:
         """His calls' round, every CALL_SCAN_SECONDS, only while this worker provably holds the lease."""
         now = self.clock()
-        if not self.family or (self.call_at and (now - self.call_at).total_seconds() < CALL_SCAN_SECONDS):
+        if self.call_at and (now - self.call_at).total_seconds() < CALL_SCAN_SECONDS:
             return ""
         self.call_at = now
+        if not self.family:
+            # No call to read, but a project archived from the owner console (R6b) owes its files with or without
+            # one (Codex's HOLD on PR 470: this drain ran only under a family, so those archives never landed).
+            self.archive(CALL_ROOM, now)
+            return ""
         try:
             if self.holds is None or not self.holds():
                 return ""

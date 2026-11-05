@@ -2938,9 +2938,9 @@ class ProjectCommands(unittest.TestCase):
         self.assertEqual([(cp.ARCHIVE_BUCKET, name, body.encode("utf-8"))], sent, "to the private bucket, as frozen")
         self.assertEqual([], self.owed())
 
-    def test_an_archive_that_cannot_be_owed_leaves_the_project_active(self):
-        """The lease lapses between reading the command and owing the archive: the fenced write fails, so the
-        project stays active (and current) and its cards are still archived when his call ends."""
+    def test_an_archive_that_cannot_be_owed_leaves_the_project_active_and_is_retried(self):
+        """Codex's HOLD on PR 470: the fenced owe fails (the lease moved mid-write): the project stays active (and
+        current), and the command is NOT consumed, so the next round retries it until the archive is owed."""
         command(self.conn, "create", project_name="Acme", project_id="acme", seconds_ago=50)
         turn(self.conn, "Codex, draft a kickoff checklist.", seconds_ago=40)
         self.b().tick()
@@ -2950,7 +2950,42 @@ class ProjectCommands(unittest.TestCase):
         self.assertEqual("active", self.projects()["acme"]["status"])
         self.assertEqual("acme", self.current())
         self.assertEqual([], self.owed())
-        self.assertEqual(at(30), cb._text(self.conn.get(cb.CURSOR_KEY % ROOM)), "consumed all the same")
+        self.assertNotEqual(at(30), cb._text(self.conn.get(cb.CURSOR_KEY % ROOM)), "not consumed: kept for a retry")
+        self.b().tick()
+        self.assertEqual("archived", self.projects()["acme"]["status"], "the retry owes the archive and retires it")
+        self.assertEqual(1, len(self.owed()))
+        self.assertEqual(at(30), cb._text(self.conn.get(cb.CURSOR_KEY % ROOM)), "now consumed")
+
+    def test_a_command_read_without_the_lease_is_left_for_the_next_holder(self):
+        """Codex's HOLD on PR 470: a former worker must neither write project state nor consume the event."""
+        command(self.conn, "create", project_name="Acme", project_id="acme", seconds_ago=20)
+        flips = iter([True])             # tick()'s own gate holds; gone by the command's own check
+        former = cb.Bridge(self.conn, LOG, lambda: next(flips, False), clock=lambda: NOW,
+                           owners=["own_fixture_owner"])
+        self.assertEqual([], former.tick())
+        self.assertEqual({}, self.projects(), "nothing written without the lease")
+        self.assertIsNone(self.conn.get(cb.CURSOR_KEY % ROOM), "not consumed")
+        self.b().tick()
+        self.assertEqual("acme", self.current(), "the next lease holder obeys it")
+
+    def test_a_switch_takes_his_revisions_off_another_projects_living_card(self):
+        """Codex's HOLD on PR 470: living-card lookups were scoped by room, actor and session but not project, so
+        after a switch his words could revise an OPEN card from another project, one the canvas no longer shows."""
+        command(self.conn, "create", project_name="Acme", project_id="acme", seconds_ago=90)
+        turn(self.conn, "Grok, write a joke on a card.", seconds_ago=80)
+        [ask] = self.b().tick()
+        info = json.loads(self.conn.hget(life.OPEN_KEY, ask))
+        info["field"] = ask + "-work"
+        self.conn.hset(life.OPEN_KEY, ask, json.dumps(info))        # the worker put its card up: living
+        command(self.conn, "create", project_name="Beta", project_id="beta", seconds_ago=30)
+        turn(self.conn, "Grok, make it funnier.", seconds_ago=10)
+        self.assertEqual(1, len(self.b().tick()), "in Beta that is a new ask, not a revision of Acme's card")
+        self.assertEqual([], getattr(self.conn, "lists", {}).get(cb.REVISE_KEY % ask, []))
+        command(self.conn, "switch", project_id="acme", seconds_ago=5)
+        turn(self.conn, "Grok, make the joke funnier.", seconds_ago=1)
+        self.assertEqual([], self.b().tick())
+        self.assertEqual(1, len(getattr(self.conn, "lists", {}).get(cb.REVISE_KEY % ask, [])),
+                         "back in Acme, the same words revise its own living card again")
 
     def test_archiving_a_project_without_cards_needs_no_archive(self):
         command(self.conn, "create", project_name="Acme", project_id="acme", seconds_ago=40)
