@@ -410,6 +410,18 @@ SCREEN_STOP_KEY = "gov:callbridge:screenstop:%s:%s"    # <room>, <entry>: a STOP
 NO_CREDENTIALS = "Not started: no agent types a password, token or code. Please sign in yourself"
 NO_SCREEN_READBACK = "Not started: screen steps need the read-back"
 NOT_OWNERS = "Not started: screen steps are the owner's"
+NOT_PLAIN = "Not started: a screen step goes to Greg by name alone, then the read-back and your go"
+# DIRECT START KEEPS THE READ-BACK FOR THE SCREEN (Codex's HOLD on 0a4c516f: READBACK is False in production and
+# serve_requests passes no override, so every screen step was refused). With SCREEN on, the read-back machinery runs
+# for screen steps alone (Bridge.proposing); every other ask still claims at once. CALL_BRIDGE_READBACK=off still
+# pauses it, and then a screen step is refused (NO_SCREEN_READBACK): fail closed.
+# THE CHAIR'S PROMISE FOLLOWS THE BRIDGE (Codex's HOLD on conference 37dc359b): while this bridge proposes screen
+# steps for a room (SCREEN on, a listed owner, not paused), it keeps SCREEN_SIGNAL_KEY "on" for that room, for
+# SCREEN_SIGNAL_SECONDS. The chair tells Greg a screen step is work only while it reads that key and reads back
+# itself (conference personas.SCREEN_ASKS). Switched off, paused or stopped, the key runs out and the promise goes.
+SCREEN_SIGNAL_KEY = "v1:conf:%s:screen"
+SCREEN_SIGNAL_SECONDS = 120
+SCREEN_LIVE_SECONDS = 4 * 60 * 60        # a room said anything within this: its call may still be on
 # Only the screen can be meant by these verbs.
 _SCREEN_ONLY = r"(?:double[\s-]?click|right[\s-]?click|click|tap|scroll|hover|mouse\s+over|drag)"
 # These also mean other work ("open a PR"), so they count only beside a thing on a screen.
@@ -451,6 +463,20 @@ def screen_ask(said: str) -> bool:
     return bool(SCREEN_ONLY.search(said)) or (bool(SCREEN_MAYBE.search(said)) and bool(SCREEN_THING.search(said)))
 
 
+def screen_bound(said: str) -> bool:
+    """FAIL CLOSED (Codex's HOLD on 0a4c516f): what Grok is asked takes the screen path (the read-back, the refusal,
+    the hard limits) when it is a screen step, or names a credential, or an irreversible verb, even with no screen
+    word in it: "Greg, delete that record", "Greg, put the password in". Never a plain claim."""
+    said = said or ""
+    return screen_ask(said) or bool(CREDENTIAL.search(said)) or bool(OWN_GO.search(said))
+
+
+def screen_settled(said: str, agent: str) -> bool:
+    """A voice's "I can't" (Bridge._refusals) never makes a claim or a proposal of a turn the screen path holds:
+    one naming Grok (settled when it was read), or one it would hand to Grok itself."""
+    return SCREEN and screen_bound(said) and (SCREEN_AGENT in named_in(said) or agent == SCREEN_AGENT)
+
+
 def screen_kind(said: str) -> str:
     """look, change, own-go or refused (SCREEN above). Fail closed: anything not plainly looking changes."""
     said = said or ""
@@ -475,10 +501,13 @@ def _owner_turn(fields: dict) -> bool:
 
 
 def screen_turn(fields: dict) -> bool:
-    """A turn asking Grok for a screen step: Grok named in it and a screen step in it."""
+    """A turn asking Grok for a screen step: Grok named in it and a screen step in it, or Grok ALONE named and a
+    credential or an irreversible verb in it (screen_bound). With other voices named too, such a turn goes on to them,
+    and Grok's share of it is refused at the claim (Bridge._room), never claimed plain."""
     said = fields.get("utterance") or ""
-    return (_owner_turn(fields) and SCREEN_AGENT in named_in(said) and screen_ask(said)
-            and not STOPPING.search(said))
+    named = named_in(said)
+    return (_owner_turn(fields) and SCREEN_AGENT in named and not STOPPING.search(said)
+            and (screen_ask(said) or (named == [SCREEN_AGENT] and screen_bound(said))))
 
 
 def drive_go(fields: dict) -> bool:
@@ -489,10 +518,11 @@ def drive_go(fields: dict) -> bool:
 
 def screen_stop(fields: dict) -> bool:
     """"stop", "enough", "that's enough" as the whole turn (names stripped), or a screen step said with a stop word
-    ("Greg, stop scrolling"). Stopping is always safe, so any caller may."""
+    ("Greg, stop scrolling"), or what screen_bound holds said to Grok with a stop word ("Greg, don't delete that").
+    Stopping is always safe, so any caller may."""
     said = fields.get("utterance") or ""
-    return _owner_turn(fields) and (bool(_ENOUGH.fullmatch(_bare(said)))
-                                    or (screen_ask(said) and bool(STOPPING.search(said))))
+    return _owner_turn(fields) and (bool(_ENOUGH.fullmatch(_bare(said))) or (bool(STOPPING.search(said)) and (
+        screen_ask(said) or (SCREEN_AGENT in named_in(said) and screen_bound(said)))))
 
 
 def screen_inbox_text(ask: str, said: str, kind: str, now, standing: str = "") -> str:
@@ -848,7 +878,7 @@ class Bridge:
         self.owners = frozenset(owners if owners is not None else _owners(os.environ.get(OWNERS_ENV, "")))
         self.readback = READBACK if readback is None else bool(readback)
         # Switched off: still the read-back path (never claiming at once), but nothing is proposed or confirmed.
-        self.paused = self.readback and READBACK_OFF
+        self.paused = self.proposing() and READBACK_OFF
         self.ring = ring
         # The publisher's bucket: given, the bridge reads every call and opens the canvas window for its first claim.
         self.bucket = bucket
@@ -856,6 +886,10 @@ class Bridge:
         self.canvas_room = canvas_room
         self.stop = threading.Event()
         self.thread = None
+
+    def proposing(self) -> bool:
+        """The read-back machinery runs: for every ask (readback), or for screen steps alone (SCREEN, direct start)."""
+        return self.readback or SCREEN
 
     def window_open(self, now) -> bool:
         return any(room == self.canvas_room for room, _ in canvas_publish.active_windows(self.conn, now))
@@ -1140,6 +1174,8 @@ class Bridge:
             entries = self.conn.xrange(key, min="%d-0" % max(0, start), max="+", count=PAGE)
         entries = [(_text(entry_id), _fields(raw)) for entry_id, raw in entries or ()]
         claimed = []
+        if SCREEN:
+            self._screen_signal(room, entries[-1][0] if entries else cursor, now)
         for index, (entry_id, fields) in enumerate(entries):
             if entry_id == cursor:
                 continue
@@ -1152,6 +1188,7 @@ class Bridge:
                 self.conn.set(LAST_AT_KEY % room, entry_id, ex=LAST_SECONDS)
             said = fields.get("utterance") or ""
             confirms, asked_entry = None, None
+            proposed_go = False             # confirms is a read-back proposal his go-ahead confirmed
             if fields.get("kind") == "task.cancel.requested":
                 # Explicit authenticated-owner producer command, not words or a board actor.
                 try:
@@ -1176,7 +1213,7 @@ class Bridge:
                 if not self.holds() or self._project_command(fields, now, room, entry_id) is None:
                     return claimed               # not consumed: retried, by the next lease holder if it moved
                 continue
-            if self.readback and fields.get("kind") == READBACK_SPOKEN and fields.get("actor_id") == "chair":
+            if self.proposing() and fields.get("kind") == READBACK_SPOKEN and fields.get("actor_id") == "chair":
                 # The chair read the open proposal back into the call, verbatim, under this read-back id. Only the
                 # current id counts: a read-back of an older or changed proposal is not one of this.
                 proposal = self._proposal(room)
@@ -1200,7 +1237,7 @@ class Bridge:
                 # tombstone is compatible with Redis and expires like the original.
                 self.conn.set(PENDING_KEY % room, "null", ex=PENDING_SECONDS)
                 self.conn.set(ASKED_KEY % room, "null", ex=ASKED_SECONDS)
-                if self.readback:
+                if self.proposing():
                     proposal = self._proposal(room)
                     if proposal and _after(entry_id, proposal["entry"]):
                         self._close(room, proposal, proposal["agents"], "Cancelled", now)
@@ -1243,10 +1280,11 @@ class Bridge:
                     claimed.append(ask)
                 self.conn.set(CURSOR_KEY % room, entry_id, ex=TTL_SECONDS)
                 continue
-            if go_ahead(fields) and self.readback:
+            if go_ahead(fields) and (self.readback or (SCREEN and self._proposal(room))):
                 # READ-BACK: a go-ahead confirms only the room's open proposal, said at most READBACK_SECONDS before
                 # it, for the proposed voices it NAMES ("Codex, go ahead"), or for all of them when it names nobody
                 # and says to go (EXPLICIT_GO). A bare "yes please" may answer anything said on the call: nothing.
+                # Direct start with SCREEN: the only proposals are screen steps, and an open one takes the go-ahead.
                 agents = []
                 proposal = None if self.paused else self._proposal(room)
                 go_names = named_in(said)
@@ -1266,7 +1304,7 @@ class Bridge:
                 else:
                     agents = self._go_agents({"named": True, "agents": proposal["agents"]}, go_names)
                     if agents:
-                        confirms, asked_entry = proposal, entry_id
+                        confirms, asked_entry, proposed_go = proposal, entry_id, True
                         said = "%s -- then, to go ahead: %s" % (proposal["said"], said)
                         self._asked(room, proposal["entry"], said, now)
                         self._drop(room)
@@ -1378,8 +1416,8 @@ class Bridge:
                 if team:
                     by_name, agents = team, [team["agent"]]
             # R7b: a confirmed screen step is a new claim for Grok every time, never a revision of a living card.
-            screen_step = (SCREEN and bool(confirms) and SCREEN_AGENT in named_in(confirms["said"])
-                           and screen_ask(confirms["said"]))
+            screen_step = (SCREEN and proposed_go and SCREEN_AGENT in named_in(confirms["said"])
+                           and screen_bound(confirms["said"]))
             if screen_step:
                 if confirms.get("actor") in self.owners:
                     agents, by_name, fresh = [a for a in proposed if a == SCREEN_AGENT], None, True
@@ -1387,7 +1425,7 @@ class Bridge:
                     # Only a listed owner's step is ever claimed (Codex's HOLD on 921c35c6), however it was proposed.
                     self._close(room, confirms, proposed, NOT_OWNERS, now)
                     agents, proposed, by_name, fresh = [], [], None, True
-            if self.readback and confirms and [a for a in proposed if a not in agents]:
+            if proposed_go and [a for a in proposed if a not in agents]:
                 self._close(room, confirms, [a for a in proposed if a not in agents],
                             "Part of the team card" if fresh or (by_name and self._is_team(by_name))
                             else "Updating the card he named", now, retire=True)
@@ -1399,6 +1437,15 @@ class Bridge:
                     (by_name if by_name.get("agent") == agent else None) if by_name else
                     self._living(room, agent, fields.get("actor_id"), fields.get("session_epoch")))
                 source_entry = confirms["entry"] if confirms else entry_id
+                if SCREEN and agent == SCREEN_AGENT and not screen_step and screen_bound(said):
+                    # FAIL CLOSED (Codex's HOLD on 0a4c516f): what screen_bound holds reaches Grok only as a screen
+                    # step. Said to whoever held the floor, or to Grok beside other voices, it is refused for Grok,
+                    # visibly, in either mode; the other voices' share goes on.
+                    if proposed_go:
+                        self._close(room, confirms, [agent], NOT_PLAIN, now)      # its proposal card says so
+                    else:
+                        self._refuse(room, source_entry, [agent], NOT_PLAIN, now)
+                    continue
                 if living and self._bound(room, source_entry, living):
                     # His words update the agent's living card in place (no new ask, no new card). In read-back
                     # mode this runs only once his go-ahead confirmed the read-back (confirms), exactly where a new
@@ -1407,14 +1454,14 @@ class Bridge:
                     if self._route(living["ask"], source_entry, agent, {"entry": source_entry}):
                         self.log.info("call bridge: %s revision for %s routed to its living card", living["ask"],
                                       agent)
-                    if self.readback and confirms:
+                    if proposed_go:
                         self._close(room, confirms, [agent], "Updating its card", now, retire=True)
                     continue
                 if change_only(said) and not screen_step:
                     # "Shorter please" with no living card to change: nothing to revise, and a comparative
                     # alone never makes a new card.
                     self.log.info("call bridge: a change for %s in %s, but it has no living card", agent, room)
-                    if self.readback and confirms:
+                    if proposed_go:
                         self._close(room, confirms, [agent], "Not started, no card to change", now)
                     continue
                 ask = self._claim(room, confirms["entry"] if confirms else entry_id, agent, said, now,
@@ -1422,7 +1469,7 @@ class Bridge:
                                   screen=screen_kind(confirms["said"]) if screen_step else None)
                 if ask:
                     claimed.append(ask)
-                if self.readback and confirms:
+                if proposed_go:
                     # Claimed: the proposal card is retired. Held: it says so, and nothing was claimed.
                     self._close(room, confirms, [agent], "Not started, the claim was held", now)
             self.conn.set(CURSOR_KEY % room, entry_id, ex=TTL_SECONDS)
@@ -1430,7 +1477,7 @@ class Bridge:
             proposal = self._proposal(room)
             if proposal:
                 self._close(room, proposal, proposal["agents"], READ_BACK_OFF, now)
-        if self.readback and self.holds() and len(entries) < PAGE:
+        if self.proposing() and self.holds() and len(entries) < PAGE:
             # Every event so far is read: a proposal older than READBACK_SECONDS has had its chance.
             proposal = self._proposal(room)
             since = event_time(proposal["spoken"] or proposal["entry"]) if proposal else None
@@ -1439,7 +1486,7 @@ class Bridge:
                             if proposal["spoken"] else "Not started, the read-back was not heard", now)
         if self.holds():
             claimed.extend(self._refusals(room, now))
-        if self.readback and self.holds():
+        if self.proposing() and self.holds():
             # A proposed ask that is claimed by other means (an earlier claim): its proposal card goes.
             proposal = self._proposal(room)
             done = [a for a in proposal["agents"] if self._claimed(room, proposal["entry"], a)] if proposal else []
@@ -1737,9 +1784,9 @@ class Bridge:
                         # READ-BACK: a voice's "I can't" is a NON-EXECUTING disposition. It proposes that
                         # voice for his turn, and only his named go-ahead claims it.
                         said = self._said(room, str(asked["entry"]))
-                        if SCREEN and SCREEN_AGENT in named_in(said) and screen_ask(said):
+                        if screen_settled(said, agent):
                             # R7b: a screen step was settled when it was read (_screen); a voice's "I can't"
-                            # neither adds a voice to it nor proposes it again.
+                            # neither adds a voice to it nor proposes it again, nor proposes Grok for it plain.
                             self.conn.set(cursor_key, entry_id, ex=TTL_SECONDS)
                             continue
                         if said.strip():
@@ -1748,7 +1795,7 @@ class Bridge:
                         self.conn.set(cursor_key, entry_id, ex=TTL_SECONDS)
                         continue
                     legacy = str(asked.get("said") or "")
-                    if SCREEN and SCREEN_AGENT in named_in(legacy) and screen_ask(legacy):
+                    if screen_settled(legacy, agent):
                         self.conn.set(cursor_key, entry_id, ex=TTL_SECONDS)
                         continue                        # R7b: never claimed without the read-back
                     ask = self._claim(room, str(asked["entry"]), agent, legacy, now)
@@ -1960,6 +2007,18 @@ class Bridge:
 
     # R7b, SLOW MODE (SCREEN above). -------------------------------------------------------------------------------
 
+    def _screen_signal(self, room, last, now) -> None:
+        """SCREEN_SIGNAL_KEY "on" while this bridge proposes screen steps for a room said into within
+        SCREEN_LIVE_SECONDS (`last`: its newest entry): a listed owner, the read-back not paused, the lease held.
+        Paused or with no owner it is taken away at once; a quiet room's runs out by itself."""
+        said = event_time(last) if last else None
+        if said is None or (now - said).total_seconds() > SCREEN_LIVE_SECONDS or not self.holds():
+            return
+        if self.paused or not self.owners:
+            self.conn.delete(SCREEN_SIGNAL_KEY % room)
+            return
+        self.conn.set(SCREEN_SIGNAL_KEY % room, "on", ex=SCREEN_SIGNAL_SECONDS)
+
     def _drive_record(self, room):
         try:
             held = json.loads(_text(self.conn.get(DRIVE_KEY % room)) or "null")
@@ -1980,7 +2039,7 @@ class Bridge:
         """ "Greg, you can drive": a standing go for LOOK steps only, his alone (a listed owner), for this chair
         session, until "stop" or DRIVE_SECONDS. A turn older than the last go or stop (a replay) changes nothing."""
         actor, epoch = fields.get("actor_id"), fields.get("session_epoch")
-        if actor not in self.owners or not epoch or not self.readback or self.paused:
+        if actor not in self.owners or not epoch or self.paused:
             self.log.info("call bridge: a standing screen go in %s not taken (no listed owner, session or read-back)",
                           room)
             return None
@@ -2003,7 +2062,7 @@ class Bridge:
             self.log.info("call bridge: a screen step in %s from no listed owner; ignored", room)
             return None
         kind = screen_kind(said)
-        why = (NO_CREDENTIALS if kind == "refused" else NO_SCREEN_READBACK if not self.readback or self.paused
+        why = (NO_CREDENTIALS if kind == "refused" else NO_SCREEN_READBACK if self.paused
                else TOO_LONG if len(said) >= ASK_MAX_CHARS or len(said.split()) > ASK_MAX_WORDS else "")
         if why:
             self._refuse(room, entry_id, [SCREEN_AGENT], why, now)
@@ -2042,6 +2101,11 @@ class Bridge:
         ask = ask_id(room, entry_id, agent)
         if screen is not None and (screen not in ("look", "change", "own-go") or agent != SCREEN_AGENT):
             return None                  # a refused step, or a screen step for anyone but Grok, is never claimed
+        if SCREEN and screen is None and agent == SCREEN_AGENT and screen_bound(said):
+            # The last gate (Codex's HOLD on 0a4c516f): whatever path reached here, what screen_bound holds is never
+            # a plain claim for Grok. The callers that can say so on a card (Bridge._room) do; this one only holds.
+            self.log.info("call bridge: a plain claim for %s held, its words take the screen path", agent)
+            return None
         if self.conn.get(ROUTED_KEY % (entry_id, agent)):
             return None                  # this event went to the agent's living card; it is never a new claim
         def inbox(source_text):
