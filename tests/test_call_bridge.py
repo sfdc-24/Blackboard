@@ -293,7 +293,7 @@ class Claim(unittest.TestCase):
         self.assertRegex(ask, r"^call-[0-9a-f]{12}$")
         got = card(self.conn, "chatgpt-codex-desktop", ask)
         self.assertEqual(("claimed", 1, "2026-10-24T14:02:00Z"), (got["status"], got["version"], got["ts"]))
-        self.assertEqual("Waiting for a worker: Codex's work from the room", got["title"], "no worker is wired for codex")
+        self.assertEqual("Waiting for a worker: Cody's work from the room", got["title"], "no worker is wired for codex")
         self.assertIsNotNone(cp.clean_item("chatgpt-codex-desktop", ask, json.dumps(got)), "the publisher takes it")
         [(_, entry)] = self.conn.streams["fleet:inbox:chatgpt-codex-desktop"]
         self.assertEqual("call-bridge", entry["by"])
@@ -324,8 +324,8 @@ class Claim(unittest.TestCase):
         words = [w for w in re.findall(r"[A-Za-z][A-Za-z'-]+", said) if w.lower() not in ("codex", "the", "for", "first")]
         claimed = card(self.conn, "chatgpt-codex-desktop", ask)
         self.assertEqual("claimed in the room", claimed["activity"])
-        self.assertEqual("Claimed in the room at 10:02 ET. No worker picks up Codex's call asks yet; the ask waits in "
-                         "Codex's inbox, and Codex's own card replaces this one when it is taken.", claimed["body"])
+        self.assertEqual("Claimed in the room at 10:02 ET. No worker picks up Cody's call asks yet; the ask waits in "
+                         "Cody's inbox, and Cody's own card replaces this one when it is taken.", claimed["body"])
         later = NOW + datetime.timedelta(minutes=3)
         bridge(self.conn, clock=lambda: later).settle([row("chatgpt-codex-desktop",
                                                             "BCB|v=1|phase=RESULT|from=chatgpt-codex-desktop|answers=%s|text=ok" % ask)])
@@ -740,7 +740,7 @@ class InTheMakingAndLatency(unittest.TestCase):
 
     def test_fix1_an_agent_with_no_wired_worker_gets_an_honest_title(self):
         """FIX 1 (the owner's 8 PM call, 2026-11-02): two asks for grok sat "In the making" with nobody to take them."""
-        for agent, name in (("grok", "Grok"), ("gemini", "Gemini"), ("chatgpt-codex-desktop", "Codex")):
+        for agent, name in (("grok", "Greg"), ("gemini", "Gemini"), ("chatgpt-codex-desktop", "Cody")):
             got = cb.claimed_card(agent, NOW, environ={})
             self.assertEqual("Waiting for a worker: %s's work from the room" % name, got["title"])
             self.assertEqual(("claimed", "claimed in the room"), (got["status"], got["activity"]),
@@ -1627,7 +1627,7 @@ class ReadBack(unittest.TestCase):
         got = self.cards(self.CODEX)
         self.assertEqual([field], list(got))
         ask = field
-        self.assertEqual(("review", cb.PROPOSED, "Say: Codex, go ahead (asked 10:01 ET)"),
+        self.assertEqual(("review", cb.PROPOSED, "Say: Cody, go ahead (asked 10:01 ET)"),
                          (got[ask]["status"], got[ask]["activity"], got[ask]["title"]))
         self.assertIsNotNone(cp.clean_item(self.CODEX, ask, json.dumps(got[ask])), "the publisher takes it")
         self.assertEqual([], self.inbox(self.CODEX))
@@ -2769,6 +2769,29 @@ class LivingCardRouting(unittest.TestCase):
         turn(self.conn, "Grok, make it funnier.", seconds_ago=10)
         self.b().tick()
         self.assertEqual(life.MAX_AGE, self.conn.ttls[cb.REVISE_KEY % ask])
+
+
+class RenamedVoices(unittest.TestCase):
+    """The owner, 2026-11-04 ~19:15Z: Grok is now Greg and Codex is Cody. Either name claims for the same agent, and the
+    bridge's own cards say the new names. Synthetic sentences only."""
+
+    def setUp(self):
+        self.conn = FakeRedis()
+        open_window(self.conn)
+
+    def test_the_new_and_the_old_name_claim_for_the_same_agent(self):
+        for said, agent in (("Greg, write a joke about admins.", "grok"), ("Grok, write a joke about admins.", "grok"),
+                            ("Cody, draft a kickoff checklist.", "chatgpt-codex-desktop"),
+                            ("Codex, draft a kickoff checklist.", "chatgpt-codex-desktop")):
+            with self.subTest(said=said):
+                self.setUp()
+                turn(self.conn, said, seconds_ago=10)
+                [ask] = cb.Bridge(self.conn, LOG, lambda: True, clock=lambda: NOW).tick()
+                self.assertEqual(agent, life.get(self.conn, ask)["agent"])
+
+    def test_a_possessive_of_the_new_name_names_nobody(self):
+        self.assertEqual([], cb.named_in("I like Greg's logo."))
+        self.assertEqual(["grok", "chatgpt-codex-desktop"], cb.named_in("Greg and Cody, compare them."))
 
 
 class CardNameRouting(unittest.TestCase):

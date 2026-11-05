@@ -200,7 +200,9 @@ AGENT_OF = {"grok": "grok", "claude": "claude-code-cli", "codex": "chatgpt-codex
 # are claude and codex). The one inverse of AGENT_OF, checked whole at import.
 PERSONA_OF = {agent: persona for persona, agent in AGENT_OF.items()}
 assert len(PERSONA_OF) == len(AGENT_OF), "AGENT_OF must be one-to-one"
-NAME_OF = {"grok": "Grok", "claude-code-cli": "Claude", "chatgpt-codex-desktop": "Codex", "gemini": "Gemini"}
+# The owner, 2026-11-04 ~19:15Z: Grok is now called Greg and Codex is Cody (conference personas/cards.json). The tags and
+# persona ids are unchanged; the names are what cards say, and the old names still address the same voices.
+NAME_OF = {"grok": "Greg", "claude-code-cli": "Claude", "chatgpt-codex-desktop": "Cody", "gemini": "Gemini"}
 # The board tags each agent posts its answers under (the board's tags, scripts/agent_roster.json and the aliases).
 ANSWERS_FROM = {
     "grok": ("grok", "grok-bot"),
@@ -210,7 +212,7 @@ ANSWERS_FROM = {
 }
 # Each voice's name and the spellings the chair's addressing accepts for it (conference addressing.HEARD_AS).
 NAMES = {persona: re.compile(r"(?i)\b(?:%s)\b(?!['’]s\b)" % "|".join(spellings)) for persona, spellings in {
-    "grok": ("grok", "grock", "groq"), "claude": ("claude", "claud"), "codex": ("codex", "kodex"),
+    "grok": ("greg", "grok", "grock", "groq"), "claude": ("claude", "claud"), "codex": ("cody", "codex", "kodex"),
     "gemini": ("gemini", "jemini", "gemeni")}.items()}
 # The chair names an agent with one of these (addressing.py). "everyone", "room", "host" and "continuity" name nobody.
 NAMED = ("vocative", "mention", "view_request")
