@@ -92,6 +92,7 @@ import threading
 
 import canvas_publish
 import call_lifecycle
+import projects
 
 STREAM_MATCH = "v1:conf:*:events"
 CONF_ROOM = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -407,6 +408,14 @@ def ask_id(room: str, entry_id: str, agent: str) -> str:
     return "call-" + hashlib.sha256(("%s|%s|%s" % (room, entry_id, agent)).encode("utf-8")).hexdigest()[:12]
 
 
+OWNERS_ENV = "CALL_BRIDGE_OWNER_ACTORS"
+
+
+def _owners(raw: str) -> list:
+    """The owner identities in OWNERS_ENV: separated by commas, semicolons or spaces; blanks dropped."""
+    return [part for part in re.split(r"[,;\s]+", raw or "") if part]
+
+
 def asks_in(fields: dict) -> list:
     """The agents an event asks for work, or []: an owner turn naming them, with a task verb in his words."""
     if fields.get("kind") != "turn.started" or fields.get("actor_id") in ("", None, "chair"):
@@ -693,8 +702,13 @@ def _stream_order(entry) -> tuple:
 
 
 class Bridge:
-    def __init__(self, conn, log, holds, clock=None, canvas_room=CANVAS_ROOM, ring=None, bucket=None, readback=None):
+    def __init__(self, conn, log, holds, clock=None, canvas_room=CANVAS_ROOM, ring=None, bucket=None, readback=None,
+                 owners=None):
         self.conn, self.log, self.holds = conn, log, holds
+        # Who may switch the canvas's project by voice (Codex's HOLD on PR 467: a guest must not change what the
+        # public canvas shows). The chair stamps every turn with the gateway-verified owner identity (conference
+        # chair session.owner_id); those identities are listed in OWNERS_ENV. Unset or empty: nobody switches.
+        self.owners = frozenset(owners if owners is not None else _owners(os.environ.get(OWNERS_ENV, "")))
         self.readback = READBACK if readback is None else bool(readback)
         # Switched off: still the read-back path (never claiming at once), but nothing is proposed or confirmed.
         self.paused = self.readback and READBACK_OFF
@@ -1034,6 +1048,18 @@ class Bridge:
                         self._close(room, proposal, proposal["agents"], "Cancelled", now)
                 self.conn.set(CURSOR_KEY % room, entry_id, ex=TTL_SECONDS)
                 continue
+            if fields.get("kind") == "turn.started" and fields.get("actor_id") not in ("", None, "chair") \
+                    and said.strip():
+                # PROJECTS (R6a, conference docs/CARDS-ARCHITECTURE.md R6.2): "switch to the Acme project" makes an
+                # existing active project current, by whole name only. It is never a task ("let's work on project
+                # Acme" holds TASK's "work on"), so it claims nothing; with no project matching, the turn goes on.
+                target = (projects.switch_target(said, projects.read_projects(self.conn, self.canvas_room))
+                          if fields.get("actor_id") in self.owners else None)
+                if target:
+                    if projects.set_current(self.conn, self.canvas_room, target):
+                        self.log.info("call bridge: project %s is current in %s", target, self.canvas_room)
+                    self.conn.set(CURSOR_KEY % room, entry_id, ex=TTL_SECONDS)
+                    continue
             if go_ahead(fields) and self.readback:
                 # READ-BACK: a go-ahead confirms only the room's open proposal, said at most READBACK_SECONDS before
                 # it, for the proposed voices it NAMES ("Codex, go ahead"), or for all of them when it names nobody
@@ -1317,6 +1343,8 @@ class Bridge:
         self._keep(room, {"entry": entry_id, "said": said, "agents": joined, "actor": actor, "epoch": epoch})
         for agent in agents:
             field = proposal_id(room, entry_id, agent)
+            # R6a: a proposal card is shown under the project current when it was made (the same key its claim uses).
+            projects.stamp(self.conn, ask_id(room, entry_id, agent), self.canvas_room)
             self.conn.hset(partition % (self.canvas_room, agent), field, json.dumps(proposal_card(agent, asked, now)))
             if self.bucket:
                 self.open_if_shut(now, "%s/%s" % (agent, field))
@@ -1631,6 +1659,11 @@ class Bridge:
                     "conference_room": room, "canvas_room": self.canvas_room}
         ring = ({"agent": agent, "claimed_at": stamp(now), "room": self.canvas_room}
                 if self.ring is not None else None)
+        # R6a: the project current now is recorded BEFORE the claim (Codex's HOLD on c7da999: stamped after it, a
+        # failure in between left a delivered ask with no project). Every card of this ask - the bridge's own
+        # claimed, waiting and done cards and the agent's card - is shown under it (canvas_publish.project_of). A
+        # claim that is then refused leaves only this key, which expires with the ask's age.
+        projects.stamp(self.conn, ask, self.canvas_room)
         try:
             info = call_lifecycle.claim(self.conn, ask, room, entry_id, agent, self.canvas_room,
                                         now, claimed_card(agent, now), inbox, ring, asked_entry)

@@ -7,9 +7,12 @@ one per room, time-boxed, refused rather than doubled. No network: the bucket an
 """
 import datetime
 import fnmatch
+import hashlib
 import json
 import sys
+import logging
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
@@ -267,6 +270,222 @@ class Snapshot(unittest.TestCase):
         self.assertEqual(a, b)
         put(conn, "grok", "1", item(version=2))
         self.assertNotEqual(a, cp.content_digest(cp.snapshot(conn, "demo", NOW)))
+
+
+class ProjectsOnTheCanvas(unittest.TestCase):
+    """R6a (conference docs/CARDS-ARCHITECTURE.md R6.3): cards carry their project; the room file shows only the
+    current project's cards, and untagged cards only while no project is current. Synthetic only."""
+
+    def setUp(self):
+        self.conn = FakeRedis()
+        put(self.conn, "grok", "old", item(title="Before projects"))
+        put(self.conn, "grok", "a", item(title="Acme card", project="acme"))
+        put(self.conn, "gemini", "b", item(title="Beta card", project="beta"))
+
+    def make(self, pid, name, status="active"):
+        self.conn.hashes.setdefault("conf:projects:demo", {})[pid] = json.dumps({"name": name, "status": status})
+
+    def titles(self):
+        return [i["title"] for i in cp.snapshot(self.conn, "demo", NOW)["items"]]
+
+    def test_no_current_project_shows_only_untagged_cards_as_before(self):
+        self.assertEqual(["Before projects"], self.titles())
+        self.assertNotIn("project", cp.snapshot(self.conn, "demo", NOW))
+
+    def test_the_current_project_shows_only_its_cards_and_names_itself(self):
+        self.make("acme", "Acme")
+        self.conn.set("conf:project:demo:current", "acme")
+        doc = cp.snapshot(self.conn, "demo", NOW)
+        self.assertEqual(["Acme card"], [i["title"] for i in doc["items"]])
+        self.assertEqual({"id": "acme", "name": "Acme"}, doc["project"])
+        self.assertEqual("acme", doc["items"][0]["project"])
+
+    def test_an_archived_or_unknown_current_project_is_no_project(self):
+        self.make("acme", "Acme", status="archived")
+        self.conn.set("conf:project:demo:current", "acme")
+        self.assertEqual(["Before projects"], self.titles())
+        self.conn.set("conf:project:demo:current", "nope")
+        self.assertEqual(["Before projects"], self.titles())
+
+    def test_an_untagged_card_of_a_stamped_ask_follows_the_asks_project(self):
+        """The bridge's own cards (claimed, waiting, read-back proposal) carry no tag: their ask's stamp decides."""
+        self.make("acme", "Acme")
+        self.conn.set("conf:project:demo:current", "acme")
+        self.conn.set("gov:callbridge:project:call-0123456789ab", "acme")
+        self.assertEqual("acme", cp.project_of(self.conn, "readback-0123456789ab", {"title": "x"}))
+        self.assertEqual("acme", cp.project_of(self.conn, "call-0123456789ab", {"title": "x"}))
+        self.assertEqual("", cp.project_of(self.conn, "call-ffffffffffff", {"title": "x"}), "no stamp, no project")
+        self.assertEqual("beta", cp.project_of(self.conn, "call-0123456789ab", {"project": "beta"}), "a tag wins")
+        put(self.conn, "grok", "readback-0123456789ab", item(title="Proposal"))
+        self.assertIn("Proposal", self.titles())
+
+    def test_a_malformed_project_tag_drops_the_card(self):
+        self.assertIsNone(cp.clean_item("grok", "x", item(project="Bad Tag!")))
+        self.assertIsNone(cp.clean_item("grok", "x", item(project=7)))
+        self.assertEqual("acme", cp.clean_item("grok", "x", item(project="acme"))["project"])
+
+
+LOG = logging.getLogger("canvas-publish-test")
+
+
+class ProjectArchives(unittest.TestCase):
+    """R6a (CARDS-ARCHITECTURE R6.1): at the end of his call each active project's cards go to the PRIVATE fleet-state
+    bucket, one file per project, never to the public canvas bucket; only cards the canvas itself would show; and an
+    archive a failure interrupted is finished on a later round. Synthetic only."""
+
+    def setUp(self):
+        self.conn = CallRedis()
+        self.conn.store[cp.LEASE_KEY] = ME
+        room = cp.CALL_ROOM
+        put(self.conn, "grok", "a1", item(title="Acme one", project="acme"), room=room)
+        put(self.conn, "gemini", "a2", item(title="Acme two", project="acme"), room=room)
+        put(self.conn, "grok", "b1", item(title="Beta card", project="beta"), room=room)
+        put(self.conn, "grok", "old", item(title="Untagged"), room=room)
+        put(self.conn, "grok", "secret", item(title="Private", project="acme", public=False), room=room)
+        # Shape-valid, but a lifecycle card whose ask is not open: the canvas's fence hides it, so must the archive.
+        put(self.conn, "grok", "call-0123456789ab-work",
+            item(title="Fenced out", project="acme", ask="call-0123456789ab", source_revision="r"), room=room)
+        projects = {"acme": {"name": "Acme", "status": "active"}, "beta": {"name": "Beta", "status": "archived"},
+                    "empty": {"name": "Empty", "status": "active"}}
+        self.conn.hashes["conf:projects:%s" % room] = {k: json.dumps(v) for k, v in projects.items()}
+        self.sent = []
+        [(self.NAME, self.BYTES)] = cp.archive_docs(self.conn, room, NOW)
+
+    def pub(self, upload=None):
+        return cp.Publisher(self.conn, "sfdc24-canvas", upload or (lambda b, n, d, allow=None: self.sent.append((b, n))),
+                            LOG, clock=lambda: NOW, holds=lambda: self.conn.store.get(cp.LEASE_KEY) == ME,
+                            family=FAMILY)
+
+    def test_one_file_per_active_project_with_only_the_cards_the_canvas_would_show(self):
+        docs = cp.archive_docs(self.conn, cp.CALL_ROOM, NOW)
+        self.assertEqual([self.NAME], [name for name, _ in docs])
+        self.assertEqual("projects/acme/20261020T220000Z-%s.json" % hashlib.sha256(docs[0][1]).hexdigest()[:32],
+                         self.NAME, "the name ends in the bytes' own digest")
+        doc = json.loads(docs[0][1])
+        self.assertEqual("project-archive/1", doc["format"])
+        self.assertEqual({"id": "acme", "name": "Acme"}, doc["project"])
+        self.assertEqual(["Acme one", "Acme two"], sorted(i["title"] for i in doc["items"]))
+        for absent in ("Beta card", "Untagged", "Private", "Fenced out"):
+            self.assertNotIn(absent, docs[0][1].decode())
+
+    def owed(self):
+        return sorted(k for k in self.conn.store if k.startswith(cp.ARCHIVE_PENDING_KEY % cp.CALL_ROOM + ":"))
+
+    def test_the_end_of_his_call_writes_the_archive_to_the_private_bucket_and_clears_what_it_owed(self):
+        with mock.patch.object(cp, "keep_call_window", lambda *a: "closed"):
+            self.assertEqual("closed", self.pub().calls())
+        self.assertEqual([("sfdc24-fleet-state", self.NAME)], self.sent)
+        self.assertEqual([], self.owed())
+
+    def test_a_retry_sends_the_bytes_frozen_at_the_call_end_even_after_a_card_changes(self):
+        """Codex's HOLD on bacb41a: a failed upload, then a live revision; the retry must send the call's archive."""
+        bodies = []
+
+        def boom(*a, **k):
+            raise OSError("503")
+        with mock.patch.object(cp, "keep_call_window", lambda *a: "closed"):
+            self.pub(boom).calls()
+        self.assertEqual(1, len(self.owed()), "still owed after the failure")
+        put(self.conn, "grok", "a1", item(title="Acme one REVISED LATER", project="acme", version=2),
+            room=cp.CALL_ROOM)
+        del self.conn.hashes[cp.PARTITION % (cp.CALL_ROOM, "gemini")]          # and a card gone after the call
+        later = self.pub(lambda b, n, d, allow=None: bodies.append((b, n, d)))
+        with mock.patch.object(cp, "keep_call_window", lambda *a: "idle"):
+            later.calls()
+        self.assertEqual([("sfdc24-fleet-state", self.NAME)], [(b, n) for b, n, _ in bodies], "written once")
+        doc = json.loads(bodies[0][2])
+        self.assertEqual(["Acme one", "Acme two"], sorted(i["title"] for i in doc["items"]))
+        self.assertEqual([], self.owed())
+
+    def test_a_landed_upload_whose_record_was_lost_counts_as_written_on_retry(self):
+        """Codex's HOLD on 96cf37e: the object was created but the marker update failed; the create-only retry gets
+        412 and must clear the file instead of failing every round and blocking later files."""
+        created = set()
+
+        def create_only(bucket, name, data, allow=None):
+            if name in created:
+                raise urllib.error.HTTPError(name, 412, "Precondition Failed", None, None)
+            created.add(name)
+            self.sent.append((bucket, name))
+        pub = self.pub()
+        pub.archive_upload = create_only
+        pub.owe_archive(cp.CALL_ROOM, NOW)
+        pub.owe_archive(cp.CALL_ROOM, NOW + datetime.timedelta(hours=1))
+        real = cp._fenced
+        with mock.patch.object(cp, "_fenced", lambda *a, **k: None):     # every marker update is lost
+            pub.archive(cp.CALL_ROOM, NOW)
+        self.assertEqual(2, len(self.owed()), "both still owed: their records were lost")
+        with mock.patch.object(cp, "_fenced", real):
+            self.assertEqual(2, pub.archive(cp.CALL_ROOM, NOW))
+        self.assertEqual([], self.owed(), "cleared, nothing blocked")
+        self.assertEqual(2, len(self.sent), "each object created once")
+
+    def test_a_different_object_at_the_same_time_never_stands_in_for_the_archive(self):
+        """Codex's HOLD on 587a353: a 412 proved only that a name was taken. Another file for the same project and
+        second (different bytes) has a different name, so it neither blocks nor replaces this call's archive."""
+        bucket = {}
+
+        def create_only(b, name, data, allow=None):
+            if name in bucket:
+                raise urllib.error.HTTPError(name, 412, "Precondition Failed", None, None)
+            bucket[name] = data
+        other = "projects/acme/20261020T220000Z-%s.json" % hashlib.sha256(b"someone else's bytes").hexdigest()[:32]
+        bucket[other] = b"someone else's bytes"
+        pub = self.pub()
+        pub.archive_upload = create_only
+        pub.owe_archive(cp.CALL_ROOM, NOW)
+        self.assertEqual(1, pub.archive(cp.CALL_ROOM, NOW))
+        self.assertEqual(self.BYTES, bucket[self.NAME], "this call's own bytes are written under their own name")
+        self.assertEqual(b"someone else's bytes", bucket[other])
+        self.assertEqual([], self.owed())
+
+    def test_another_http_error_keeps_the_file_owed(self):
+        pub = self.pub()
+        pub.owe_archive(cp.CALL_ROOM, NOW)
+        pub.archive_upload = lambda *a, **k: (_ for _ in ()).throw(
+            urllib.error.HTTPError("x", 403, "Forbidden", None, None))
+        self.assertEqual(0, pub.archive(cp.CALL_ROOM, NOW))
+        self.assertEqual(1, len(self.owed()))
+
+    def test_the_real_archive_upload_is_create_only(self):
+        seen = []
+
+        class Resp:
+            status = 200
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+        cp.gcs_upload("sfdc24-fleet-state", "projects/acme/x.json", b"{}", lambda: "t",
+                      opener=lambda req, timeout=None: (seen.append(req.full_url), Resp())[1], if_absent=True)
+        cp.gcs_upload("sfdc24-canvas", "rooms/demo.json", b"{}", lambda: "t",
+                      opener=lambda req, timeout=None: (seen.append(req.full_url), Resp())[1])
+        self.assertIn("ifGenerationMatch=0", seen[0])
+        self.assertNotIn("ifGenerationMatch", seen[1], "the room file is still replaced each round")
+
+    def test_the_live_publisher_wires_create_only_for_archives_and_replace_for_the_room_file(self):
+        calls = []
+        room, archive = cp.uploaders("tok", send=lambda *a, **k: calls.append(k.get("if_absent", False)))
+        room("b", "n", b"d")
+        archive("b", "n", b"d")
+        self.assertEqual([False, True], calls)
+
+    def test_two_calls_owed_at_once_are_both_written(self):
+        self.pub(lambda *a, **k: (_ for _ in ()).throw(OSError("503"))).owe_archive(cp.CALL_ROOM, NOW)
+        self.pub().owe_archive(cp.CALL_ROOM, NOW + datetime.timedelta(hours=1))
+        self.assertEqual(2, len(self.owed()))
+        self.assertEqual(2, self.pub().archive(cp.CALL_ROOM, NOW))
+        second = cp.archive_docs(self.conn, cp.CALL_ROOM, NOW + datetime.timedelta(hours=1))[0][0]
+        self.assertEqual([self.NAME, second], [n for _, n in self.sent])
+
+    def test_nothing_owed_or_no_lease_writes_nothing(self):
+        with mock.patch.object(cp, "keep_call_window", lambda *a: "open"):
+            self.pub().calls()
+        self.assertEqual([], self.sent)
+        self.pub().owe_archive(cp.CALL_ROOM, NOW)
+        self.conn.store[cp.LEASE_KEY] = "someone-else"
+        self.assertEqual(0, self.pub().archive(cp.CALL_ROOM, NOW))
+        self.assertEqual([], self.sent)
 
 
 class Window(unittest.TestCase):

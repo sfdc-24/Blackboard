@@ -10,6 +10,7 @@ import datetime
 import fnmatch
 import hashlib
 import json
+import os
 import re
 import logging
 import threading
@@ -2659,6 +2660,109 @@ class LivingCardRouting(unittest.TestCase):
             self.assertFalse(cb.change_ask(said), said)
         self.assertTrue(cb.change_only("shorter please"))
         self.assertFalse(cb.change_only("make it shorter"), "a task word: the usual rules")
+
+    def make_project(self, pid, name, status="active"):
+        self.conn.hset("conf:projects:%s" % cb.CANVAS_ROOM, pid, json.dumps({"name": name, "status": status}))
+
+    def owner_bridge(self):
+        return cb.Bridge(self.conn, LOG, lambda: True, clock=lambda: NOW, owners=["own_fixture_owner"])
+
+    def test_a_project_switch_makes_it_current_and_claims_nothing(self):
+        """R6a: "let's work on project Acme" holds TASK's "work on"; it must switch, never claim a card."""
+        self.make_project("acme", "Acme")
+        turn(self.conn, "Grok, let's work on project Acme.", seconds_ago=10)
+        self.assertEqual([], self.owner_bridge().tick())
+        self.assertEqual("acme", cb._text(self.conn.get("conf:project:%s:current" % cb.CANVAS_ROOM)))
+
+    def test_only_a_listed_owner_switches_the_project(self):
+        """Codex's HOLD on PR 467: a guest's switch changes neither the selector nor the published snapshot."""
+        self.make_project("acme", "Acme")
+        turn(self.conn, "Switch to the Acme project.", actor="guest_fixture", seconds_ago=10)
+        self.owner_bridge().tick()
+        self.assertIsNone(self.conn.get("conf:project:%s:current" % cb.CANVAS_ROOM))
+        self.assertNotIn("project", cb.canvas_publish.snapshot(self.conn, cb.CANVAS_ROOM, NOW))
+
+    def test_with_no_owner_listed_nobody_switches(self):
+        self.make_project("acme", "Acme")
+        with mock.patch.dict(os.environ, {cb.OWNERS_ENV: ""}):
+            bridge = cb.Bridge(self.conn, LOG, lambda: True, clock=lambda: NOW)
+        turn(self.conn, "Switch to the Acme project.", seconds_ago=10)
+        bridge.tick()
+        self.assertIsNone(self.conn.get("conf:project:%s:current" % cb.CANVAS_ROOM))
+        with mock.patch.dict(os.environ, {cb.OWNERS_ENV: "someone, own_fixture_owner"}):
+            self.assertIn("own_fixture_owner", cb.Bridge(self.conn, LOG, lambda: True, clock=lambda: NOW).owners)
+
+    def test_no_matching_project_lets_the_turn_go_on_as_before(self):
+        turn(self.conn, "Grok, let's work on project Nova.", seconds_ago=10)
+        self.assertEqual(1, len(self.b().tick()), "no such project: an ordinary task turn")
+        self.assertIsNone(self.conn.get("conf:project:%s:current" % cb.CANVAS_ROOM))
+
+    def test_the_bridges_own_claimed_card_shows_under_the_current_project(self):
+        """Codex's HOLD on c7da999: the claimed card carries no tag and was hidden while a project was current."""
+        self.make_project("acme", "Acme")
+        self.conn.set("conf:project:%s:current" % cb.CANVAS_ROOM, "acme")
+        turn(self.conn, "Codex, draft a kickoff checklist.", seconds_ago=10)
+        [ask] = self.b().tick()
+        doc = cb.canvas_publish.snapshot(self.conn, cb.CANVAS_ROOM, NOW)
+        self.assertIn("chatgpt-codex-desktop/" + ask, [i["id"] for i in doc["items"]])
+
+    def test_a_stamp_that_fails_delivers_nothing_untagged(self):
+        """The project is recorded BEFORE the claim: if recording fails, no claim (and no inbox ask) is made."""
+        self.make_project("acme", "Acme")
+        self.conn.set("conf:project:%s:current" % cb.CANVAS_ROOM, "acme")
+        turn(self.conn, "Codex, draft a kickoff checklist.", seconds_ago=10)
+        with mock.patch.object(cb.projects, "stamp", side_effect=ConnectionError("redis")):
+            with self.assertRaises(ConnectionError):
+                self.b().tick()
+        self.assertEqual({}, dict(self.conn.hgetall(cb.call_lifecycle.OPEN_KEY) or {}), "nothing claimed")
+
+    def test_a_duplicate_claim_after_a_switch_keeps_the_asks_first_project(self):
+        """Codex's HOLD on d519e34: replaying an Acme ask after switching to Beta must not move it to Beta."""
+        self.make_project("acme", "Acme")
+        self.make_project("beta", "Beta")
+        self.conn.set("conf:project:%s:current" % cb.CANVAS_ROOM, "acme")
+        entry = turn(self.conn, "Codex, draft a kickoff checklist.", seconds_ago=10)
+        [ask] = self.b().tick()
+        self.conn.set("conf:project:%s:current" % cb.CANVAS_ROOM, "beta")
+        self.assertIsNone(self.b()._claim(ROOM, entry, "chatgpt-codex-desktop", "Codex, draft a kickoff checklist.", NOW),
+                          "the duplicate is refused")
+        self.assertEqual("acme", cb._text(self.conn.get("gov:callbridge:project:%s" % ask)))
+
+    def test_a_finished_card_stays_in_its_project_long_after_max_age(self):
+        """Codex's HOLD on 6b8750a: a DONE card stays visible past MAX_AGE; its project binding must too."""
+        self.make_project("acme", "Acme")
+        self.make_project("beta", "Beta")
+        self.conn.set("conf:project:%s:current" % cb.CANVAS_ROOM, "acme")
+        turn(self.conn, "Codex, draft a kickoff checklist.", seconds_ago=10)
+        [ask] = self.b().tick()
+        agent = "chatgpt-codex-desktop"
+        self.assertTrue(put_card(self.conn, agent, ask))
+        self.assertTrue(complete(self.conn, agent, ask))
+        self.assertNotIn("gov:callbridge:project:%s" % ask, {k: v for k, v in self.conn.ttls.items() if v},
+                         "the binding has no expiry")
+        later = NOW + datetime.timedelta(seconds=cb.call_lifecycle.MAX_AGE + 3600)
+        self.conn.set("conf:project:%s:current" % cb.CANVAS_ROOM, "beta")
+        self.assertNotIn(agent + "/" + ask + "-work",
+                         [i["id"] for i in cb.canvas_publish.snapshot(self.conn, cb.CANVAS_ROOM, later)["items"]])
+        self.conn.set("conf:project:%s:current" % cb.CANVAS_ROOM, "acme")
+        shown = [i["id"] for i in cb.canvas_publish.snapshot(self.conn, cb.CANVAS_ROOM, later)["items"]]
+        self.assertTrue(any(i.startswith(agent + "/" + ask) for i in shown), shown)
+
+    def test_a_negated_switch_switches_nothing(self):
+        self.make_project("acme", "Acme")
+        turn(self.conn, "Don't switch to the Acme project.", seconds_ago=10)
+        self.owner_bridge().tick()
+        self.assertIsNone(self.conn.get("conf:project:%s:current" % cb.CANVAS_ROOM))
+
+    def test_a_claim_carries_the_current_project_and_none_without_one(self):
+        turn(self.conn, "Grok, write a joke on a card.", seconds_ago=30)
+        [plain] = self.b().tick()
+        self.assertEqual("", cb._text(self.conn.get("gov:callbridge:project:%s" % plain)), "no project, recorded")
+        self.make_project("acme", "Acme")
+        self.conn.set("conf:project:%s:current" % cb.CANVAS_ROOM, "acme")
+        turn(self.conn, "Codex, draft a kickoff checklist.", seconds_ago=10)
+        [tagged] = self.b().tick()
+        self.assertEqual("acme", cb._text(self.conn.get("gov:callbridge:project:%s" % tagged)))
 
     def test_the_revision_list_expires_with_the_ask(self):
         ask, _ = self.living()

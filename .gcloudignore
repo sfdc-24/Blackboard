@@ -41,6 +41,7 @@
 !/scripts/canvas_publish.py
 !/scripts/call_bridge.py
 !/scripts/call_lifecycle.py
+!/scripts/projects.py
 !/scripts/redis_gov.py
 !/scripts/redis_acl.json
 !/scripts/git_requests.py

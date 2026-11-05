@@ -64,6 +64,7 @@ import re
 import secrets
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -166,6 +167,9 @@ def _whole(value) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
+_PROJECT = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")     # projects.PROJECT_ID
+
+
 def clean_item(agent: str, item_id: str, raw):
     """The published form of one stored item, or None when it must not be published.
 
@@ -218,6 +222,12 @@ def clean_item(agent: str, item_id: str, raw):
         out["activity"] = activity
     if name:
         out["name"] = name
+    project = item.get("project")
+    if project is not None:
+        # R6a: the project the card was made in (projects.PROJECT_ID). A malformed tag drops the item, like any field.
+        if not (isinstance(project, str) and _PROJECT.fullmatch(project)):
+            return None
+        out["project"] = project
     return out
 
 
@@ -327,9 +337,27 @@ def image_ok(url: str) -> bool:
             and (parts.hostname or "") in IMAGE_HOSTS and parts.port in (None, 443))
 
 
+_ASK_FIELD = re.compile(r"^(?:call-|readback-)([0-9a-f]{12})(?:-work)?$")
+
+
+def project_of(conn, item_id: str, published: dict) -> str:
+    """The project a published card belongs to: its own tag, else the stamp of the ask its field belongs to (Codex's
+    HOLD on c7da999: the bridge's claimed, waiting, done and read-back cards carry no tag, and were hidden whenever a
+    project was current). "" for none. Reads only; the card's bytes, and so its hash, are never touched."""
+    if published.get("project"):
+        return published["project"]
+    match = _ASK_FIELD.fullmatch(_text(item_id) or "")
+    if not match:
+        return ""
+    import projects  # local import: the chair vendors this module without projects.py
+    return projects.stamped(conn, "call-" + match.group(1))
+
+
 def snapshot(conn, room: str, generated, until=None, scope=None) -> dict:
     """The room file: every public item of every allowlisted agent, in a stable order. `scope` (a scoped
     window's list, scope_of): only the listed items and the cards bound to them (module docstring)."""
+    import projects  # local import: the chair vendors this module without projects.py
+    current = projects.current(conn, room)
     items = []
     for agent in AGENTS:
         stored = conn.hgetall(PARTITION % (room, agent)) or {}
@@ -340,9 +368,14 @@ def snapshot(conn, room: str, generated, until=None, scope=None) -> dict:
             published = clean_item(agent, item_id, raw)
             import call_lifecycle  # local import avoids publisher/lifecycle import cycle
             if (published and call_lifecycle.visible(conn, agent, item_id, raw, room=room, now=generated)
-                    and (scope is None or in_scope(scope, agent, item_id, raw))):
+                    and (scope is None or in_scope(scope, agent, item_id, raw))
+                    and project_of(conn, item_id, published) == (current[0] if current else "")):
+                # R6a (CARDS-ARCHITECTURE R6.3): only the current project's cards; untagged cards (made before
+                # projects, or with none current) only while no project is current.
                 items.append(published)
     doc = {"format": FORMAT, "v": 1, "room": room, "generated": stamp(generated), "items": items[:MAX_ITEMS]}
+    if current:
+        doc["project"] = {"id": current[0], "name": current[1]}
     if until is not None:
         doc["until"] = stamp(until)
     return doc
@@ -523,7 +556,8 @@ class Token:
         return self.value
 
 
-def gcs_upload(bucket: str, name: str, data: bytes, token, opener=urllib.request.urlopen, allow=None) -> int:
+def gcs_upload(bucket: str, name: str, data: bytes, token, opener=urllib.request.urlopen, allow=None,
+               if_absent: bool = False) -> int:
     """One multipart upload, so the object's Cache-Control is set in the same call as its bytes.
 
     `allow`, when given, is asked again after the body is built and before the request is sent. An upload
@@ -537,6 +571,8 @@ def gcs_upload(bucket: str, name: str, data: bytes, token, opener=urllib.request
         raise Aborted()
     url = ("https://storage.googleapis.com/upload/storage/v1/b/%s/o?uploadType=multipart"
            % urllib.parse.quote(bucket, safe=""))
+    if if_absent:
+        url += "&ifGenerationMatch=0"          # create only: an object already there answers 412, never overwritten
     req = urllib.request.Request(url, data=body, method="POST", headers={
         "Authorization": "Bearer " + token(), "Content-Type": "multipart/related; boundary=" + boundary})
     with opener(req, timeout=10) as resp:
@@ -659,6 +695,53 @@ def keep_call_window(conn, family: str, now, bucket: str, fence) -> str:
     return "idle"
 
 
+# PROJECT ARCHIVES (R6a, conference docs/CARDS-ARCHITECTURE.md R6.1, Gemini AGREE 2026-11-04 15:29Z): when his call
+# ends (keep_call_window closed the window it opened), each active project's cards in CALL_ROOM are written to the
+# PRIVATE fleet-state bucket, never to the public canvas bucket: one file per project per call. The cards are the
+# published form (clean_item), so nothing goes into an archive that the canvas would not have shown.
+ARCHIVE_BUCKET = "sfdc24-fleet-state"
+ARCHIVE_FORMAT = "project-archive/1"
+# A call's archive is owed until every file is written (Codex's HOLDs on d1bde3a and bacb41a: a transient failure right
+# after the window closed lost it, and a retry must not rebuild it from later state). At the call's end its files are
+# built once and kept, bytes and names, under ARCHIVE_PENDING_KEY:<end time>; every round of his calls writes what is
+# left, under the lease, until none is or the marker expires.
+ARCHIVE_PENDING_KEY = "gov:canvas:archive-pending:%s"
+ARCHIVE_PENDING_SECONDS = 24 * 60 * 60
+
+
+def archive_docs(conn, room: str, now, at=None) -> list:
+    """[(object name, bytes)]: one archive per active project of `room` that has cards, named for `at` (the call's
+    end; default `now`). Only cards the canvas itself would show: clean_item AND the lifecycle fence (Codex's HOLD on
+    d1bde3a: a shape-valid card the fence excludes must not reach a durable archive). Reads only."""
+    import projects  # local import: the chair vendors this module without projects.py
+    import call_lifecycle  # local import avoids publisher/lifecycle import cycle
+    at = at or now
+    found = {}
+    for agent in AGENTS:
+        stored = conn.hgetall(PARTITION % (room, agent)) or {}
+        for item_id in sorted(_text(k) for k in stored):
+            raw = stored.get(item_id)
+            if raw is None:
+                raw = stored.get(item_id.encode("utf-8"))
+            published = clean_item(agent, item_id, raw)
+            pid = project_of(conn, item_id, published) if published else ""
+            if pid and call_lifecycle.visible(conn, agent, item_id, raw, room=room, now=now):
+                found.setdefault(pid, []).append(dict(published, project=pid))
+    out = []
+    for pid, info in sorted(projects.read_projects(conn, room).items()):
+        if info["status"] != "active" or not found.get(pid):
+            continue
+        doc = {"format": ARCHIVE_FORMAT, "v": 1, "room": room, "project": {"id": pid, "name": info["name"]},
+               "archived_at": stamp(at), "items": found[pid][:MAX_ITEMS]}
+        data = json.dumps(doc, sort_keys=True).encode("utf-8")
+        # The name carries the bytes' own digest (Codex's HOLD on 587a353): a create-only 412 on this name then proves
+        # these exact bytes are already there, not merely that some file took the name.
+        name = "projects/%s/%s-%s.json" % (pid, at.astimezone(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ"),
+                                           hashlib.sha256(data).hexdigest()[:32])
+        out.append((name, data))
+    return out
+
+
 def _json_of(raw):
     try:
         value = json.loads(_text(raw)) if raw else None
@@ -717,8 +800,10 @@ class Publisher:
     upload must not commit after a stop, a deletion, a lost lease or an expiry, and a reopen or a privacy
     change must not publish the old bytes). The send asks again after it has been entered."""
 
-    def __init__(self, conn, bucket, upload, log, clock=None, holds=None, family=""):
+    def __init__(self, conn, bucket, upload, log, clock=None, holds=None, family="", archive_upload=None):
         self.conn, self.bucket, self.upload, self.log = conn, bucket, upload, log
+        # Archives are created only, never overwritten (ifGenerationMatch=0): see archive().
+        self.archive_upload = archive_upload or upload
         self.clock = clock or (lambda: datetime.datetime.now(datetime.timezone.utc))
         self.holds = holds
         self.last = {}          # room -> (digest, time of the last write)
@@ -747,7 +832,60 @@ class Publisher:
         if said in ("opened", "closed") or said != self.call_said:
             self.log.info("canvas %s: his call window %s", CALL_ROOM, said)
         self.call_said = said
+        if said == "closed":
+            self.owe_archive(CALL_ROOM, now)
+        self.archive(CALL_ROOM, now)
         return said
+
+    def owe_archive(self, room, now) -> bool:
+        """His call ended: build its archive NOW and keep those exact bytes owed until each file is written (Codex's
+        HOLD on bacb41a: a retry rebuilt from live Redis, so a card revised or expired after the call changed or
+        dropped it). One marker per call, keyed by its end time, so a later call never replaces an earlier one."""
+        try:
+            files = {name: data.decode("utf-8") for name, data in archive_docs(self.conn, room, now)}
+            if not files:
+                return False
+            key = ARCHIVE_PENDING_KEY % room + ":" + stamp(now)
+            value = json.dumps({"at": stamp(now), "files": files}, sort_keys=True)
+            return bool(_fenced(self.conn, self.may_govern, (key,), lambda pipe: (
+                [("set", key, value, ARCHIVE_PENDING_SECONDS, True)])))
+        except Exception as error:                                       # noqa: BLE001 - the TYPE only
+            self.log.warning("canvas %s: the owed archive could not be marked (%s)", room, type(error).__name__)
+            return False
+
+    def archive(self, room, now) -> int:
+        """Write the owed archives' frozen files, oldest call first, dropping each file from its marker as it lands and
+        the marker once it is empty. How many files this round wrote. Never raises: a failure is logged by type and
+        the rest stays owed for a later round, under the lease."""
+        written = 0
+        try:
+            prefix = ARCHIVE_PENDING_KEY % room + ":"
+            for key in sorted(_text(k) for k in self.conn.scan_iter(match=prefix + "*", count=100)):
+                owed = _json_of(self.conn.get(key))
+                files = dict(owed.get("files") or {}) if owed else {}
+                for name in sorted(files):
+                    if not self.may_govern():
+                        return written
+                    try:
+                        self.archive_upload(ARCHIVE_BUCKET, name, files[name].encode("utf-8"), self.may_govern)
+                        self.log.info("canvas %s: archived %s", room, name)
+                    except urllib.error.HTTPError as error:
+                        if error.code != 412:
+                            raise
+                        # Already there (Codex's HOLDs on 96cf37e and 587a353: an upload that landed but whose marker
+                        # update was lost). The name ends in the sha256 of these frozen bytes, so the object holding
+                        # it IS this file: it counts as written.
+                        self.log.info("canvas %s: %s was already archived", room, name)
+                    written += 1
+                    del files[name]
+                    value = json.dumps(dict(owed, files=files), sort_keys=True)
+                    _fenced(self.conn, self.may_govern, (key,), lambda pipe, v=value, k=key: (
+                        [("set", k, v, ARCHIVE_PENDING_SECONDS, False)] if files else [("delete", k)]))
+                if not files:
+                    _fenced(self.conn, self.may_govern, (key,), lambda pipe, k=key: [("delete", k)])
+        except Exception as error:                                       # noqa: BLE001 - the TYPE only
+            self.log.warning("canvas %s: a project archive was not written yet (%s)", room, type(error).__name__)
+        return written
 
     def may_write(self, room) -> bool:
         """The publisher is running, the lease is this worker's, and the room's window is open now."""
@@ -869,6 +1007,14 @@ class Publisher:
             self.stop.wait(interval)
 
 
+def uploaders(token, send=None):
+    """(room file upload, archive upload) over one token: the room file is replaced each round; an archive is
+    created only, never overwritten (ifGenerationMatch=0)."""
+    send = send or gcs_upload
+    return (lambda b, n, d, allow=None: send(b, n, d, token, allow=allow),
+            lambda b, n, d, allow=None: send(b, n, d, token, allow=allow, if_absent=True))
+
+
 def start(conn, bucket, log, upload=None, holds=None, family=None):
     """The publisher on its own thread, or None when no bucket is configured.
 
@@ -880,12 +1026,13 @@ def start(conn, bucket, log, upload=None, holds=None, family=None):
     if not BUCKET.fullmatch(bucket or "") or holds is None:
         return None
     if upload is None:
-        token = Token()
-        upload = lambda b, n, d, allow=None: gcs_upload(b, n, d, token, allow=allow)  # noqa: E731
+        upload, archive_upload = uploaders(Token())
+    else:
+        archive_upload = upload
     if family is None:
         import os                                                        # noqa: PLC0415
         family = call_family(os.environ)
-    publisher = Publisher(conn, bucket, upload, log, holds=holds, family=family)
+    publisher = Publisher(conn, bucket, upload, log, holds=holds, family=family, archive_upload=archive_upload)
     thread = threading.Thread(target=publisher.run, name="canvas-publish", daemon=True)
     thread.start()
     publisher.thread = thread
