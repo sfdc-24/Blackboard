@@ -1031,20 +1031,17 @@ class Bridge:
                 # PROJECTS (R6b, conference docs/CARDS-ARCHITECTURE.md R6.2): the owner console creates, switches,
                 # archives and clears the canvas's project; a heard name never creates one. Only a listed owner's
                 # command is obeyed (the same gate as the R6a voice switch: a guest must not change what the public
-                # canvas shows), and only under the lease (Codex's HOLD on PR 470): read without it, the event is
-                # left unconsumed, like a final, so the next lease holder retries it instead of a former worker
-                # writing project state. The one compound write, the archive's owed marker, is fenced on the lease
-                # itself (canvas_publish._fenced); when it fails the event is left unconsumed too, so the archive
-                # is retried until it lands or the entry goes stale.
+                # canvas shows), and the project writes AND the cursor advance are ONE transaction fenced on
+                # gov:worker:lock (_fenced; Codex's second HOLD on PR 470: the lease can move between a holds()
+                # check and the writes). The lease moving mid-processing, or an archive whose files could not be
+                # owed, writes nothing and consumes nothing: the next round, or the next lease holder, retries the
+                # event until it is obeyed or goes stale.
                 if fields.get("actor_id") not in self.owners:
                     self.log.info("call bridge: a project command in %s from no listed owner; ignored", room)
                     self.conn.set(CURSOR_KEY % room, entry_id, ex=TTL_SECONDS)
                     continue
-                if not self.holds():
-                    return claimed               # not consumed: the next lease holder retries this event
-                if self._project_command(fields, now) is None:
-                    return claimed               # the archive was not owed: nothing changed; retried next round
-                self.conn.set(CURSOR_KEY % room, entry_id, ex=TTL_SECONDS)
+                if not self.holds() or self._project_command(fields, now, room, entry_id) is None:
+                    return claimed               # not consumed: retried, by the next lease holder if it moved
                 continue
             if self.readback and fields.get("kind") == READBACK_SPOKEN and fields.get("actor_id") == "chair":
                 # The chair read the open proposal back into the call, verbatim, under this read-back id. Only the
@@ -1079,9 +1076,24 @@ class Bridge:
                 target = (projects.switch_target(said, projects.read_projects(self.conn, self.canvas_room))
                           if fields.get("actor_id") in self.owners else None)
                 if target:
-                    if projects.set_current(self.conn, self.canvas_room, target):
+                    # The switch and the cursor advance are one transaction fenced on gov:worker:lock, like a
+                    # console command's (Codex's second HOLD on PR 470): the lease moving mid-write switches
+                    # nothing and consumes nothing, and the next lease holder retries the event.
+                    switched = {"done": False}
+
+                    def switch_plan(pipe, target=target, room=room, entry_id=entry_id, switched=switched):
+                        ops = [lambda p: p.set(CURSOR_KEY % room, entry_id, ex=TTL_SECONDS)]
+                        if projects.read_projects(pipe, self.canvas_room).get(target, {}).get("status") == "active":
+                            switched["done"] = True
+                            ops.append(lambda p, t=target: p.set(projects.CURRENT_KEY % self.canvas_room, t))
+                        return ops
+
+                    if self._fenced((projects.PROJECTS_KEY % self.canvas_room,
+                                     projects.CURRENT_KEY % self.canvas_room, CURSOR_KEY % room),
+                                    switch_plan) is None:
+                        return claimed           # not consumed: the next lease holder retries this event
+                    if switched["done"]:
                         self.log.info("call bridge: project %s is current in %s", target, self.canvas_room)
-                    self.conn.set(CURSOR_KEY % room, entry_id, ex=TTL_SECONDS)
                     continue
             if go_ahead(fields) and self.readback:
                 # READ-BACK: a go-ahead confirms only the room's open proposal, said at most READBACK_SECONDS before
@@ -1276,51 +1288,105 @@ class Bridge:
                 self._close(room, proposal, done, "Claimed", now)
         return claimed
 
-    def _project_command(self, fields: dict, now):
-        """One owner-console command on the canvas room's projects (R6b). Whether it changed anything; None for
-        an archive whose files could not be owed (nothing changed, and the caller must not consume the event).
+    def _fenced(self, keys, plan):
+        """Run `plan(pipe)`'s writes in one MULTI while gov:worker:lock, `keys` and holds() all hold (Codex's
+        second HOLD on PR 470: the lease can move between a holds() check and the writes, so the check, the
+        project writes and the cursor advance must be one transaction). WATCH first, then `plan` (reads only,
+        through the pipe; returns the writes as callables taking the pipe, or None to write nothing), then
+        holds(), then EXEC: a lease or key that moved after the WATCH fails the EXEC and nothing is written.
+        True when the writes landed; None when nothing was."""
+        pipe = self.conn.pipeline(transaction=True)
+        try:
+            pipe.watch(canvas_publish.LEASE_KEY, *keys)
+            ops = plan(pipe)
+            if ops is None or not self.holds():
+                return None
+            pipe.multi()
+            for op in ops:
+                op(pipe)
+            pipe.execute()
+            return True
+        except Exception as error:               # noqa: BLE001 - only a lost WATCH is a quiet no
+            if type(error).__name__ not in ("WatchError", "WatchConflict"):
+                raise
+            return None
+        finally:
+            pipe.reset()
+
+    def _project_command(self, fields: dict, now, room: str, entry_id: str):
+        """One owner-console command on the canvas room's projects (R6b), and the event's cursor advance, as ONE
+        transaction fenced on gov:worker:lock (_fenced). True when the event was consumed, obeyed or refused;
+        None when nothing was written at all (the lease moved mid-processing, or an archive's files could not be
+        owed): the caller leaves the event unconsumed and the next lease holder retries it.
 
         create   the id is slug(project_name), computed here (the console's own project_id is not consulted, so a
-                 mismatching one is simply ignored); refused for an invalid name or a taken id; the new project is
-                 made current.
-        switch   an existing ACTIVE project becomes current (projects.set_current: nothing else).
-        archive  an active project is retired and, if current, no project is current. Its cards are archived to the
-                 private bucket FIRST (R6.1): the call's end archives active projects only, so the archive is owed
-                 now, under the lease; if it cannot be owed the project stays active and the command is refused.
+                 mismatching one is simply ignored); refused for an invalid name or a taken id, in any status; the
+                 new project is made current.
+        switch   an existing ACTIVE project becomes current.
+        archive  an active project is retired and, if current, no project is current. Its cards are archived to
+                 the private bucket FIRST (R6.1): the call's end archives active projects only, so the archive is
+                 owed before the status flips, under its own fenced marker.
         clear    no project is current.
         The log says ids and outcomes only, never the name the owner typed."""
         action = fields.get("action") or ""
-        if action not in PROJECT_ACTIONS:
-            self.log.info("call bridge: an unknown project command in %s; ignored", self.canvas_room)
-            return False
         pid = fields.get("project_id") or ""
         if not projects.PROJECT_ID.fullmatch(pid):
             pid = ""
-        done = False
-        if action == "create":
-            made = projects.create(self.conn, self.canvas_room, fields.get("project_name") or "", now)
-            same = bool(made) and made == pid
-            pid = made or ""
-            done = bool(made) and projects.set_current(self.conn, self.canvas_room, made)
-            if made and not same:
-                self.log.info("call bridge: project %s created in %s under its own id, not the console's", made,
-                              self.canvas_room)
-        elif action == "switch":
-            done = bool(pid) and projects.set_current(self.conn, self.canvas_room, pid)
-        elif action == "archive":
-            info = projects.read_projects(self.conn, self.canvas_room).get(pid) if pid else None
-            if info and info["status"] == "active":
-                if canvas_publish.owe_project_archive(self.conn, self.canvas_room, pid, now, self.holds):
-                    done = projects.archive(self.conn, self.canvas_room, pid)
-                else:
-                    self.log.warning("call bridge: project %s stays active in %s: its archive could not be owed",
-                                     pid, self.canvas_room)
-                    return None                  # the caller leaves the event unconsumed: retried, never lost
-        elif action == "clear":
-            done = projects.clear_current(self.conn, self.canvas_room)
-        self.log.info("call bridge: project command %s %s in %s: %s", action, pid or "-", self.canvas_room,
-                      "done" if done else "refused")
-        return done
+        proj_key = projects.PROJECTS_KEY % self.canvas_room
+        cur_key = projects.CURRENT_KEY % self.canvas_room
+        if action == "archive" and pid:
+            held = projects.read_projects(self.conn, self.canvas_room).get(pid)
+            if held and held["status"] == "active" \
+                    and not canvas_publish.owe_project_archive(self.conn, self.canvas_room, pid, now, self.holds):
+                self.log.warning("call bridge: project %s stays active in %s: its archive could not be owed",
+                                 pid, self.canvas_room)
+                return None                      # unconsumed: retried, never lost
+        state = {"pid": pid, "done": False}
+
+        def plan(pipe):
+            ops = [lambda p: p.set(CURSOR_KEY % room, entry_id, ex=TTL_SECONDS)]
+            held = projects.read_projects(pipe, self.canvas_room)
+            if action == "create":
+                made = projects.new_entry(fields.get("project_name") or "", now)
+                if made:
+                    state["pid"] = made[0]
+                # The hash is WATCHed, so this read and the write are one step, as HSETNX is: an id the hash
+                # already holds, in ANY status (even a malformed entry), refuses the create; never a rename,
+                # never a revival.
+                if made and made[0] not in {_text(k) for k in (pipe.hgetall(proj_key) or {})}:
+                    state["done"] = True
+                    ops.append(lambda p, m=made: p.hset(proj_key, m[0], m[1]))
+                    ops.append(lambda p, m=made: p.set(cur_key, m[0]))
+            elif action == "switch":
+                if pid and held.get(pid, {}).get("status") == "active":
+                    state["done"] = True
+                    ops.append(lambda p: p.set(cur_key, pid))
+            elif action == "archive":
+                info = held.get(pid) if pid else None
+                if info and info["status"] == "active":
+                    state["done"] = True
+                    entry = json.dumps(dict(info, status="archived"), sort_keys=True)
+                    ops.append(lambda p, e=entry: p.hset(proj_key, pid, e))
+                    if _text(pipe.get(cur_key)) == pid:
+                        ops.append(lambda p: p.delete(cur_key))
+            elif action == "clear":
+                if _text(pipe.get(cur_key)):
+                    state["done"] = True
+                    ops.append(lambda p: p.delete(cur_key))
+            else:
+                self.log.info("call bridge: an unknown project command in %s; ignored", self.canvas_room)
+            return ops
+
+        if self._fenced((proj_key, cur_key, CURSOR_KEY % room), plan) is None:
+            return None
+        if action == "create" and state["done"] and fields.get("project_id") \
+                and fields.get("project_id") != state["pid"]:
+            self.log.info("call bridge: project %s created in %s under its own id, not the console's",
+                          state["pid"], self.canvas_room)
+        if action in PROJECT_ACTIONS:
+            self.log.info("call bridge: project command %s %s in %s: %s", action, state["pid"] or "-",
+                          self.canvas_room, "done" if state["done"] else "refused")
+        return True
 
     def _proposal(self, room):
         """The room's open proposal {entry, said, agents}, or None."""

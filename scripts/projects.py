@@ -137,6 +137,17 @@ def _iso(now) -> str:
     return now.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def new_entry(name: str, now):
+    """(id, stored json) for a console create: slug(name) and the hash entry create() writes ({"name", "status":
+    "active", "created": ISO UTC}, the shape read_projects() accepts). None for an invalid name or slug."""
+    if not isinstance(name, str) or not PROJECT_NAME.fullmatch(name):
+        return None
+    pid = slug(name)
+    if not PROJECT_ID.fullmatch(pid):
+        return None
+    return pid, json.dumps({"name": name, "status": "active", "created": _iso(now)}, sort_keys=True)
+
+
 def create(conn, room: str, name: str, now):
     """A new ACTIVE project from the owner console (R6.2: never from a heard name): its id, or None.
 
@@ -144,15 +155,10 @@ def create(conn, room: str, name: str, now):
     name outside PROJECT_NAME, a slug outside PROJECT_ID, or an id the room's hash already holds in ANY status (active,
     archived, or malformed): HSETNX takes the id or refuses it in one step, so a repeat or a race never renames or
     revives a project. The entry is the shape read_projects() accepts."""
-    if not isinstance(name, str) or not PROJECT_NAME.fullmatch(name):
+    made = new_entry(name, now)
+    if not made or not conn.hsetnx(PROJECTS_KEY % room, made[0], made[1]):
         return None
-    pid = slug(name)
-    if not PROJECT_ID.fullmatch(pid):
-        return None
-    entry = json.dumps({"name": name, "status": "active", "created": _iso(now)}, sort_keys=True)
-    if not conn.hsetnx(PROJECTS_KEY % room, pid, entry):
-        return None
-    return pid
+    return made[0]
 
 
 def archive(conn, room: str, pid: str) -> bool:

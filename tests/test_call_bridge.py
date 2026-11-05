@@ -2796,6 +2796,19 @@ def command(conn, action, actor="own_fixture_owner", seconds_ago=10, reason="", 
     return turn(conn, utterance, reason=reason, actor=actor, seconds_ago=seconds_ago, kind=cb.PROJECT_COMMAND, **fields)
 
 
+def moving_lease(conn):
+    """A holds() that answers yes while gov:worker:lock quietly moves to another worker: true at every check, but
+    the WATCHed key has changed by the EXEC, so a fenced transaction writes nothing."""
+    asked = []
+
+    def holds():
+        asked.append(1)
+        if len(asked) >= 2:                    # past tick()'s own gate: the lock moves under this worker's feet
+            conn.set(cp.LEASE_KEY, "another-worker-%d" % len(asked))
+        return True
+    return holds
+
+
 class ProjectCommands(unittest.TestCase):
     """R6b (CARDS-ARCHITECTURE R6.2): new projects come from the owner console only, as project.command entries the
     chair writes; the bridge obeys a listed owner's create, switch, archive and clear, and nothing else. Synthetic."""
@@ -2967,6 +2980,33 @@ class ProjectCommands(unittest.TestCase):
         self.assertIsNone(self.conn.get(cb.CURSOR_KEY % ROOM), "not consumed")
         self.b().tick()
         self.assertEqual("acme", self.current(), "the next lease holder obeys it")
+
+    def test_a_lease_that_moves_during_the_writes_changes_and_consumes_nothing(self):
+        """Codex's second HOLD on PR 470: holds() said yes, then the lock moved before the writes landed. The
+        project writes and the cursor advance are one transaction WATCHing gov:worker:lock, so the EXEC fails,
+        nothing is written, and the next holder processes the command, once."""
+        command(self.conn, "create", project_name="Acme", project_id="acme", seconds_ago=20)
+        former = cb.Bridge(self.conn, LOG, moving_lease(self.conn), clock=lambda: NOW,
+                           owners=["own_fixture_owner"])
+        self.assertEqual([], former.tick())
+        self.assertEqual({}, self.projects(), "nothing written by a worker whose lease moved")
+        self.assertIsNone(self.current())
+        self.assertIsNone(self.conn.get(cb.CURSOR_KEY % ROOM), "not consumed")
+        self.b().tick()
+        self.assertEqual(["acme"], list(self.projects()), "the next lease holder processes it, once")
+        self.assertEqual("acme", self.current())
+
+    def test_a_voice_switch_is_fenced_on_the_lease_too(self):
+        """The same race on the R6a path: the lock moves between the owner's words and the write."""
+        cb.projects.create(self.conn, cb.CANVAS_ROOM, "Acme", NOW)
+        turn(self.conn, "Switch to the Acme project.", seconds_ago=10)
+        former = cb.Bridge(self.conn, LOG, moving_lease(self.conn), clock=lambda: NOW,
+                           owners=["own_fixture_owner"])
+        self.assertEqual([], former.tick())
+        self.assertIsNone(self.current(), "nothing switched by a worker whose lease moved")
+        self.assertIsNone(self.conn.get(cb.CURSOR_KEY % ROOM), "not consumed")
+        self.b().tick()
+        self.assertEqual("acme", self.current(), "the next lease holder switches it")
 
     def test_a_switch_takes_his_revisions_off_another_projects_living_card(self):
         """Codex's HOLD on PR 470: living-card lookups were scoped by room, actor and session but not project, so
