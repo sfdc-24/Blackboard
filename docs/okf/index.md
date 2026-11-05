@@ -2,7 +2,7 @@
 title: Blackboard OKF Hub
 owner: fleet
 status: living
-updated_at: 2026-09-27T04:21:00Z
+updated_at: 2026-10-19T14:55:00Z
 ---
 
 # Blackboard OKF
@@ -18,6 +18,7 @@ This is the living OKF surface for work in `sfdc-24/Blackboard`.
 - [Utilization metrics](./utilization.md)
 - [Doorbell → living docs](./doorbell-living-docs.md)
 - [Session pack (fluid)](./session-pack.md)
+- [Agent onboarding, offboarding and reactivation](./agent-lifecycle.md)
 - EXPRESS: [`docs/EXPRESS.md`](../EXPRESS.md)
 
 ## Operating rhythm
