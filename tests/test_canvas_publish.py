@@ -371,9 +371,16 @@ class ProjectArchives(unittest.TestCase):
     def owed(self):
         return sorted(k for k in self.conn.store if k.startswith(cp.ARCHIVE_PENDING_KEY % cp.CALL_ROOM + ":"))
 
-    def test_the_end_of_his_call_writes_the_archive_to_the_private_bucket_and_clears_what_it_owed(self):
-        with mock.patch.object(cp, "keep_call_window", lambda *a: "closed"):
-            self.assertEqual("closed", self.pub().calls())
+    def hold_window(self):
+        """The call-rule's own window stands and his call is over: the next round must close it."""
+        self.conn.store[cp.window_key(cp.CALL_ROOM)] = json.dumps(
+            {"by": cp.CALL_BY, "gen": "feedfacefeedface", "room": cp.CALL_ROOM,
+             "until": cp.stamp(NOW + datetime.timedelta(minutes=5))}, sort_keys=True)
+
+    def test_the_end_of_his_call_owes_and_closes_in_one_step_then_writes_the_private_bucket(self):
+        self.hold_window()
+        self.assertEqual("closed", self.pub().calls())
+        self.assertIsNone(self.conn.store.get(cp.window_key(cp.CALL_ROOM)), "closed with the owe, in one step")
         self.assertEqual([("sfdc24-fleet-state", self.NAME)], self.sent)
         self.assertEqual([], self.owed())
 
@@ -383,19 +390,62 @@ class ProjectArchives(unittest.TestCase):
 
         def boom(*a, **k):
             raise OSError("503")
-        with mock.patch.object(cp, "keep_call_window", lambda *a: "closed"):
-            self.pub(boom).calls()
+        self.hold_window()
+        self.assertEqual("closed", self.pub(boom).calls(), "owed and closed; only the upload failed")
         self.assertEqual(1, len(self.owed()), "still owed after the failure")
         put(self.conn, "grok", "a1", item(title="Acme one REVISED LATER", project="acme", version=2),
             room=cp.CALL_ROOM)
         del self.conn.hashes[cp.PARTITION % (cp.CALL_ROOM, "gemini")]          # and a card gone after the call
         later = self.pub(lambda b, n, d, allow=None: bodies.append((b, n, d)))
-        with mock.patch.object(cp, "keep_call_window", lambda *a: "idle"):
-            later.calls()
+        self.assertEqual("idle", later.calls())
         self.assertEqual([("sfdc24-fleet-state", self.NAME)], [(b, n) for b, n, _ in bodies], "written once")
         doc = json.loads(bodies[0][2])
         self.assertEqual(["Acme one", "Acme two"], sorted(i["title"] for i in doc["items"]))
         self.assertEqual([], self.owed())
+
+    def test_a_close_that_cannot_owe_keeps_the_window_and_the_next_round_closes_once(self):
+        """Codex's HOLD on PR 470: the window was deleted before the owe, so a failed owe left no retry trigger
+        and the call's private archive could be lost. The owe and the close are one fenced transaction now: a
+        failure keeps the window, the next round retries, and the archive lands once."""
+        self.hold_window()
+        with mock.patch.object(cp, "_fenced", lambda *a, **k: None):           # nothing lands this round
+            self.assertEqual("idle", self.pub().calls())
+        self.assertIsNotNone(self.conn.store.get(cp.window_key(cp.CALL_ROOM)), "the window stays: a retry trigger")
+        self.assertEqual([], self.owed(), "and nothing was owed without the close")
+        self.assertEqual([], self.sent)
+        self.assertEqual("closed", self.pub().calls())
+        self.assertIsNone(self.conn.store.get(cp.window_key(cp.CALL_ROOM)))
+        self.assertEqual([("sfdc24-fleet-state", self.NAME)], self.sent, "the archive landed, once")
+        self.assertEqual([], self.owed())
+        self.assertEqual("idle", self.pub().calls())
+        self.assertEqual(1, len(self.sent), "and never twice")
+
+    def test_an_archive_that_cannot_be_built_keeps_the_window_too(self):
+        self.hold_window()
+        with mock.patch.object(cp, "archive_docs", side_effect=OSError("redis")):
+            self.assertEqual("idle", self.pub().calls())
+        self.assertIsNotNone(self.conn.store.get(cp.window_key(cp.CALL_ROOM)))
+        self.assertEqual([], self.owed())
+
+    def test_the_owe_and_the_close_land_together_or_not_at_all(self):
+        """The lease moves at the EXEC: neither the marker nor the delete is written; the retry does both."""
+        self.hold_window()
+        self.conn.race = lambda: self.conn.store.__setitem__(cp.LEASE_KEY, "someone-else")
+        self.assertEqual("idle", self.pub().calls())
+        self.assertIsNotNone(self.conn.store.get(cp.window_key(cp.CALL_ROOM)), "not closed")
+        self.assertEqual([], self.owed(), "and not owed either: together or not at all")
+        self.conn.store[cp.LEASE_KEY] = ME
+        self.assertEqual("closed", self.pub().calls())
+        self.assertEqual([("sfdc24-fleet-state", self.NAME)], self.sent)
+
+    def test_a_call_with_no_cards_closes_without_owing(self):
+        for agent in cp.AGENTS:
+            self.conn.hashes.pop(cp.PARTITION % (cp.CALL_ROOM, agent), None)
+        self.hold_window()
+        self.assertEqual("closed", self.pub().calls())
+        self.assertIsNone(self.conn.store.get(cp.window_key(cp.CALL_ROOM)))
+        self.assertEqual([], self.owed())
+        self.assertEqual([], self.sent)
 
     def test_a_landed_upload_whose_record_was_lost_counts_as_written_on_retry(self):
         """Codex's HOLD on 96cf37e: the object was created but the marker update failed; the create-only retry gets
@@ -479,13 +529,49 @@ class ProjectArchives(unittest.TestCase):
         self.assertEqual([self.NAME, second], [n for _, n in self.sent])
 
     def test_nothing_owed_or_no_lease_writes_nothing(self):
-        with mock.patch.object(cp, "keep_call_window", lambda *a: "open"):
+        with mock.patch.object(cp, "keep_call_window", lambda *a, **k: "open"):
             self.pub().calls()
         self.assertEqual([], self.sent)
         self.pub().owe_archive(cp.CALL_ROOM, NOW)
         self.conn.store[cp.LEASE_KEY] = "someone-else"
         self.assertEqual(0, self.pub().archive(cp.CALL_ROOM, NOW))
         self.assertEqual([], self.sent)
+
+    def test_one_projects_archive_alone(self):
+        self.assertEqual([self.NAME], [n for n, _ in cp.archive_docs(self.conn, cp.CALL_ROOM, NOW, only="acme")])
+        self.assertEqual([], cp.archive_docs(self.conn, cp.CALL_ROOM, NOW, only="empty"), "no cards")
+        self.assertEqual([], cp.archive_docs(self.conn, cp.CALL_ROOM, NOW, only="beta"), "archived already")
+
+    def test_a_project_archived_from_the_console_is_owed_now_and_written_like_a_calls(self):
+        """R6b under R6.1: the call's end archives active projects only, so the console's archive owes it first."""
+        holds = lambda: self.conn.store.get(cp.LEASE_KEY) == ME                                   # noqa: E731
+        self.assertTrue(cp.owe_project_archive(self.conn, cp.CALL_ROOM, "acme", NOW, holds))
+        [key] = self.owed()
+        self.assertEqual(cp.ARCHIVE_PENDING_KEY % cp.CALL_ROOM + ":" + cp.stamp(NOW) + "-acme", key)
+        self.assertEqual({self.NAME: self.BYTES.decode("utf-8")}, json.loads(self.conn.store[key])["files"])
+        self.assertEqual(cp.ARCHIVE_PENDING_SECONDS, self.conn.ttls[key])
+        self.assertEqual(1, self.pub().archive(cp.CALL_ROOM, NOW))
+        self.assertEqual([("sfdc24-fleet-state", self.NAME)], self.sent)
+        self.assertEqual([], self.owed())
+
+    def test_a_publisher_with_no_call_family_still_writes_owed_archives(self):
+        """Codex's HOLD on PR 470: the drain ran only under a call family, so a project archived from the console
+        (owed by the bridge, not by a call's end) would never have reached the private bucket without one."""
+        holds = lambda: self.conn.store.get(cp.LEASE_KEY) == ME                                   # noqa: E731
+        self.assertTrue(cp.owe_project_archive(self.conn, cp.CALL_ROOM, "acme", NOW, holds))
+        pub = cp.Publisher(self.conn, "sfdc24-canvas", lambda b, n, d, allow=None: self.sent.append((b, n)), LOG,
+                           clock=lambda: NOW, holds=holds)                      # no family: his calls are not read
+        self.assertEqual("", pub.calls())
+        self.assertEqual([("sfdc24-fleet-state", self.NAME)], self.sent)
+        self.assertEqual([], self.owed())
+
+    def test_a_project_with_no_cards_owes_nothing_and_no_lease_owes_nothing(self):
+        holds = lambda: self.conn.store.get(cp.LEASE_KEY) == ME                                   # noqa: E731
+        self.assertTrue(cp.owe_project_archive(self.conn, cp.CALL_ROOM, "empty", NOW, holds), "nothing to archive")
+        self.assertEqual([], self.owed())
+        self.conn.store[cp.LEASE_KEY] = "someone-else"
+        self.assertFalse(cp.owe_project_archive(self.conn, cp.CALL_ROOM, "acme", NOW, holds))
+        self.assertEqual([], self.owed())
 
 
 class Window(unittest.TestCase):

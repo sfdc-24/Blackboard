@@ -5,6 +5,10 @@ R6a in conference docs/CARDS-ARCHITECTURE.md (Gemini's R6 decisions, 2026-11-04)
   R6.2  voice only SWITCHES among a small list of existing, active projects with distinct names; new projects come
         from the owner console (R6b, after the gateway is unpinned), never from a heard name.
   R6.3  the bridge stamps the current project on every claim; cards carry it; the canvas shows the current project.
+R6b: the owner console creates, switches, archives and clears projects through a `project.command` entry on the
+  chair's event stream (call_bridge.py reads it, from a listed owner only): create(), set_current(), archive(),
+  clear_current() below. A project's id is slug(name), computed here from the name the console sent; an id already
+  taken, in any status, refuses the create (never a rename, never a revival).
 
 Keys (one room each):
   conf:projects:<room>          hash  id -> {"name", "status": "active"|"archived", "created"}
@@ -15,6 +19,7 @@ Everything read here is validated and fails closed: an unreadable or malformed e
 """
 from __future__ import annotations
 
+import datetime
 import json
 import re
 
@@ -123,3 +128,51 @@ def set_current(conn, room: str, pid: str) -> bool:
         return False
     conn.set(CURRENT_KEY % room, pid)
     return True
+
+
+def _iso(now) -> str:
+    """`now` as ISO UTC to the second ("2026-11-04T15:29:00Z"); a naive datetime is taken as UTC."""
+    if now.tzinfo is not None:
+        now = now.astimezone(datetime.timezone.utc)
+    return now.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def new_entry(name: str, now):
+    """(id, stored json) for a console create: slug(name) and the hash entry create() writes ({"name", "status":
+    "active", "created": ISO UTC}, the shape read_projects() accepts). None for an invalid name or slug."""
+    if not isinstance(name, str) or not PROJECT_NAME.fullmatch(name):
+        return None
+    pid = slug(name)
+    if not PROJECT_ID.fullmatch(pid):
+        return None
+    return pid, json.dumps({"name": name, "status": "active", "created": _iso(now)}, sort_keys=True)
+
+
+def create(conn, room: str, name: str, now):
+    """A new ACTIVE project from the owner console (R6.2: never from a heard name): its id, or None.
+
+    The id is slug(name), computed here; whatever id the console sent along is not consulted. Nothing is written for a
+    name outside PROJECT_NAME, a slug outside PROJECT_ID, or an id the room's hash already holds in ANY status (active,
+    archived, or malformed): HSETNX takes the id or refuses it in one step, so a repeat or a race never renames or
+    revives a project. The entry is the shape read_projects() accepts."""
+    made = new_entry(name, now)
+    if not made or not conn.hsetnx(PROJECTS_KEY % room, made[0], made[1]):
+        return None
+    return made[0]
+
+
+def archive(conn, room: str, pid: str) -> bool:
+    """Retire an active project: status "archived", and if it was current, no project is current (the canvas goes back
+    to its untagged cards). False (nothing changed) for an unknown, malformed or already archived project."""
+    info = read_projects(conn, room).get(pid)
+    if not info or info["status"] != "active":
+        return False
+    conn.hset(PROJECTS_KEY % room, pid, json.dumps(dict(info, status="archived"), sort_keys=True))
+    if _text(conn.get(CURRENT_KEY % room)) == pid:
+        conn.delete(CURRENT_KEY % room)
+    return True
+
+
+def clear_current(conn, room: str) -> bool:
+    """No project is current (every untagged card shows again). True when one was set."""
+    return bool(conn.delete(CURRENT_KEY % room))

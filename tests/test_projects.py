@@ -4,6 +4,7 @@ What matters (conference docs/CARDS-ARCHITECTURE.md R6.1-R6.3): malformed state 
 active project can be current; voice switches only among a small list of distinct active names, by whole name, and
 never creates one. No network.
 """
+import datetime
 import json
 import os
 import sys
@@ -36,6 +37,18 @@ class FakeRedis:
 
     def hset(self, key, field, value):
         self.hashes.setdefault(key, {})[field] = value
+
+    def hsetnx(self, key, field, value):
+        if field in self.hashes.get(key, {}):
+            return 0
+        self.hashes.setdefault(key, {})[field] = value
+        return 1
+
+    def delete(self, key):
+        return 1 if self.kv.pop(key, None) is not None else 0
+
+
+NOW = datetime.datetime(2026, 11, 4, 15, 29, 0, tzinfo=datetime.timezone.utc)
 
 
 def add(conn, pid, name, status="active"):
@@ -148,6 +161,70 @@ class VoiceSwitch(unittest.TestCase):
 
     def test_voice_never_creates(self):
         self.assertIsNone(pj.switch_target("Switch to the Brand New project", {}))
+
+
+class Console(unittest.TestCase):
+    """R6b: the owner console's create, archive and clear on the store. Deterministic refusals, never a rename."""
+
+    def setUp(self):
+        self.conn = FakeRedis()
+
+    def test_create_writes_an_active_project_under_its_slug_in_the_shape_the_store_reads(self):
+        self.assertEqual("acme-rollout", pj.create(self.conn, ROOM, "Acme Rollout", NOW))
+        self.assertEqual({"acme-rollout": {"name": "Acme Rollout", "status": "active", "created": "2026-11-04T15:29:00Z"}},
+                         pj.read_projects(self.conn, ROOM))
+        self.assertIsNone(pj.current(self.conn, ROOM), "created, not yet current: the bridge switches to it")
+        self.assertTrue(pj.set_current(self.conn, ROOM, "acme-rollout"))
+
+    def test_created_is_iso_utc_whatever_zone_the_clock_is_in(self):
+        eastern = NOW.astimezone(datetime.timezone(datetime.timedelta(hours=-5)))
+        pj.create(self.conn, ROOM, "Acme", eastern)
+        self.assertEqual("2026-11-04T15:29:00Z", pj.read_projects(self.conn, ROOM)["acme"]["created"])
+
+    def test_a_taken_id_refuses_the_create_in_any_status(self):
+        add(self.conn, "acme", "Acme", status="archived")
+        self.assertIsNone(pj.create(self.conn, ROOM, "ACME", NOW), "the same slug, archived: not revived, not renamed")
+        self.assertEqual("archived", pj.read_projects(self.conn, ROOM)["acme"]["status"])
+        self.assertEqual("Acme", pj.read_projects(self.conn, ROOM)["acme"]["name"])
+        add(self.conn, "beta", "Beta")
+        self.assertIsNone(pj.create(self.conn, ROOM, "Beta", NOW), "active: a duplicate")
+        self.conn.hset(pj.PROJECTS_KEY % ROOM, "gamma", "not json")
+        self.assertIsNone(pj.create(self.conn, ROOM, "Gamma", NOW), "a malformed entry still owns its id")
+        self.assertEqual("not json", self.conn.hgetall(pj.PROJECTS_KEY % ROOM)["gamma"], "and is left as it was")
+
+    def test_an_invalid_name_writes_nothing(self):
+        for bad in ("", " ", "<script>", "x" * 41, "-dash first", "tab\there", "two|parts", None, 7):
+            self.assertIsNone(pj.create(self.conn, ROOM, bad, NOW), repr(bad))
+        self.assertEqual({}, self.conn.hashes)
+
+    def test_archive_retires_an_active_project_and_clears_it_when_current(self):
+        add(self.conn, "acme", "Acme")
+        add(self.conn, "beta", "Beta")
+        pj.set_current(self.conn, ROOM, "acme")
+        self.assertTrue(pj.archive(self.conn, ROOM, "acme"))
+        self.assertEqual("archived", pj.read_projects(self.conn, ROOM)["acme"]["status"])
+        self.assertIsNone(self.conn.get(pj.CURRENT_KEY % ROOM), "it was current: now no project is")
+        self.assertIsNone(pj.current(self.conn, ROOM))
+        self.assertFalse(pj.set_current(self.conn, ROOM, "acme"), "an archived project cannot come back")
+        pj.set_current(self.conn, ROOM, "beta")
+        self.assertFalse(pj.archive(self.conn, ROOM, "acme"), "already archived")
+        self.assertFalse(pj.archive(self.conn, ROOM, "nope"), "unknown")
+        self.assertFalse(pj.archive(self.conn, ROOM, "Bad Id"), "malformed")
+        self.assertEqual("beta", self.conn.get(pj.CURRENT_KEY % ROOM), "another project's archive leaves current alone")
+
+    def test_archive_keeps_the_name_and_created_fields(self):
+        add(self.conn, "acme", "Acme")
+        pj.archive(self.conn, ROOM, "acme")
+        self.assertEqual({"name": "Acme", "status": "archived", "created": "2026-11-04"},
+                         pj.read_projects(self.conn, ROOM)["acme"])
+
+    def test_clear_current_says_whether_one_was_set(self):
+        self.assertFalse(pj.clear_current(self.conn, ROOM), "none set: a no-op")
+        add(self.conn, "acme", "Acme")
+        pj.set_current(self.conn, ROOM, "acme")
+        self.assertTrue(pj.clear_current(self.conn, ROOM))
+        self.assertIsNone(self.conn.get(pj.CURRENT_KEY % ROOM))
+        self.assertEqual("active", pj.read_projects(self.conn, ROOM)["acme"]["status"], "the project itself stays")
 
 
 if __name__ == "__main__":

@@ -643,13 +643,18 @@ def live_call(conn, family: str, now) -> str:
     return best[1]
 
 
-def keep_call_window(conn, family: str, now, bucket: str, fence) -> str:
+def keep_call_window(conn, family: str, now, bucket: str, fence, closing=None) -> str:
     """One round: "opened", "open", "closed", "stopped" or "idle". Raises only what Redis raises.
 
     `fence()` says this worker may still write governance state: the publisher is not stopped and the lease
     is provably its own. Every write below is made in MULTI with gov:worker:lock WATCHed after fence() said
     yes, so a lease that moves before EXEC writes nothing (Aya on 0fde974: a lease lost during the scan, and
-    a stopped publisher, still opened the window)."""
+    a stopped publisher, still opened the window).
+
+    `closing(now)`, when given, performs the close itself and says whether it is done (Publisher.close_call:
+    the call's archive is owed and the window deleted as ONE transaction; Codex's HOLD on PR 470: the window
+    was deleted before the owe, so a failed owe left no retry trigger). Not done: the window is kept, and the
+    next round re-sees it and retries."""
     live = live_call(conn, family, now)
     seen = conn.get(CALL_STOP_KEY)
     stop = _json_of(seen)
@@ -691,6 +696,8 @@ def keep_call_window(conn, family: str, now, bucket: str, fence) -> str:
             return "idle"                    # not ours to write now: no lease, stopped, raced or a stop landed
         return "opened" if done and done[0] else "open"
     if held is not None:                     # closed only if it is still the one this rule opened
+        if closing is not None:
+            return "closed" if closing(now) else "idle"
         return "closed" if _drop_ours(conn, fence) else "idle"
     return "idle"
 
@@ -704,15 +711,18 @@ ARCHIVE_FORMAT = "project-archive/1"
 # A call's archive is owed until every file is written (Codex's HOLDs on d1bde3a and bacb41a: a transient failure right
 # after the window closed lost it, and a retry must not rebuild it from later state). At the call's end its files are
 # built once and kept, bytes and names, under ARCHIVE_PENDING_KEY:<end time>; every round of his calls writes what is
-# left, under the lease, until none is or the marker expires.
+# left, under the lease, until none is or the marker expires. The owe and the window's delete are ONE fenced
+# transaction (Publisher.close_call; Codex's HOLD on PR 470): a close whose marker did not land keeps the window, so
+# the next round retries it, and the archive is never owed twice for one close.
 ARCHIVE_PENDING_KEY = "gov:canvas:archive-pending:%s"
 ARCHIVE_PENDING_SECONDS = 24 * 60 * 60
 
 
-def archive_docs(conn, room: str, now, at=None) -> list:
+def archive_docs(conn, room: str, now, at=None, only=None) -> list:
     """[(object name, bytes)]: one archive per active project of `room` that has cards, named for `at` (the call's
     end; default `now`). Only cards the canvas itself would show: clean_item AND the lifecycle fence (Codex's HOLD on
-    d1bde3a: a shape-valid card the fence excludes must not reach a durable archive). Reads only."""
+    d1bde3a: a shape-valid card the fence excludes must not reach a durable archive). `only`: that one project's
+    archive alone (R6b, a project archived from the console). Reads only."""
     import projects  # local import: the chair vendors this module without projects.py
     import call_lifecycle  # local import avoids publisher/lifecycle import cycle
     at = at or now
@@ -729,7 +739,7 @@ def archive_docs(conn, room: str, now, at=None) -> list:
                 found.setdefault(pid, []).append(dict(published, project=pid))
     out = []
     for pid, info in sorted(projects.read_projects(conn, room).items()):
-        if info["status"] != "active" or not found.get(pid):
+        if info["status"] != "active" or not found.get(pid) or (only is not None and pid != only):
             continue
         doc = {"format": ARCHIVE_FORMAT, "v": 1, "room": room, "project": {"id": pid, "name": info["name"]},
                "archived_at": stamp(at), "items": found[pid][:MAX_ITEMS]}
@@ -740,6 +750,21 @@ def archive_docs(conn, room: str, now, at=None) -> list:
                                            hashlib.sha256(data).hexdigest()[:32])
         out.append((name, data))
     return out
+
+
+def owe_project_archive(conn, room: str, pid: str, now, fence) -> bool:
+    """R6b: the owner archives a project from the console, while his call may still be on. The call's end archives only
+    ACTIVE projects (archive_docs), so this project's archive is built NOW, while it is still active, and owed under its
+    own marker (ARCHIVE_PENDING_KEY:<time>-<id>; Publisher.archive() writes every marker's files on a later round, under
+    the lease, like a call's). True when its files are owed, or when it has no cards to archive; False when the marker
+    could not be written (the lease is not this worker's): the caller must then leave the project active, so its cards
+    are still archived when his call ends."""
+    files = {name: data.decode("utf-8") for name, data in archive_docs(conn, room, now, only=pid)}
+    if not files:
+        return True
+    key = ARCHIVE_PENDING_KEY % room + ":" + stamp(now) + "-" + pid
+    value = json.dumps({"at": stamp(now), "files": files}, sort_keys=True)
+    return bool(_fenced(conn, fence, (key,), lambda pipe: [("set", key, value, ARCHIVE_PENDING_SECONDS, True)]))
 
 
 def _json_of(raw):
@@ -819,28 +844,65 @@ class Publisher:
     def calls(self) -> str:
         """His calls' round, every CALL_SCAN_SECONDS, only while this worker provably holds the lease."""
         now = self.clock()
-        if not self.family or (self.call_at and (now - self.call_at).total_seconds() < CALL_SCAN_SECONDS):
+        if self.call_at and (now - self.call_at).total_seconds() < CALL_SCAN_SECONDS:
             return ""
         self.call_at = now
+        if not self.family:
+            # No call to read, but a project archived from the owner console (R6b) owes its files with or without
+            # one (Codex's HOLD on PR 470: this drain ran only under a family, so those archives never landed).
+            self.archive(CALL_ROOM, now)
+            return ""
         try:
             if self.holds is None or not self.holds():
                 return ""
-            said = keep_call_window(self.conn, self.family, now, self.bucket, self.may_govern)
+            said = keep_call_window(self.conn, self.family, now, self.bucket, self.may_govern,
+                                    closing=lambda at: self.close_call(CALL_ROOM, at))
         except Exception as error:                                       # noqa: BLE001 - the TYPE only
             self.log.warning("canvas %s: his calls could not be read (%s)", CALL_ROOM, type(error).__name__)
             return ""
         if said in ("opened", "closed") or said != self.call_said:
             self.log.info("canvas %s: his call window %s", CALL_ROOM, said)
         self.call_said = said
-        if said == "closed":
-            self.owe_archive(CALL_ROOM, now)
         self.archive(CALL_ROOM, now)
         return said
 
+    def close_call(self, room, now) -> bool:
+        """His call is over: freeze its archive, owe it, and delete the window, as ONE fenced transaction (Codex's
+        HOLD on PR 470: the window was deleted before the owe, so a failed owe left no retry trigger and the call's
+        private archive could be lost). The owed marker and the window delete land together or not at all: a failed
+        EXEC keeps the window, so the next round re-sees it and retries the whole close, and the marker is written
+        only by the transaction that closes, so a retry can never owe twice. Only a window this rule opened
+        (by == CALL_BY, read again under the WATCH) is ever closed; False closed nothing. A call with no cards owes
+        no marker and simply closes."""
+        key = window_key(room)
+        try:
+            files = {name: data.decode("utf-8") for name, data in archive_docs(self.conn, room, now)}
+        except Exception as error:                                       # noqa: BLE001 - the TYPE only
+            self.log.warning("canvas %s: the closing call's archive could not be built (%s)", room,
+                             type(error).__name__)
+            return False
+        marker = ARCHIVE_PENDING_KEY % room + ":" + stamp(now)
+        value = json.dumps({"at": stamp(now), "files": files}, sort_keys=True)
+
+        def plan(pipe):
+            if (_json_of(pipe.get(key)) or {}).get("by") != CALL_BY:
+                return None                  # someone else's window, or gone: not ours to close
+            ops = [("delete", key)]
+            if files:
+                ops.insert(0, ("set", marker, value, ARCHIVE_PENDING_SECONDS, True))
+            return ops
+
+        done = bool(_fenced(self.conn, self.may_govern, (key, marker), plan))
+        if not done and (_json_of(self.conn.get(key)) or {}).get("by") == CALL_BY:
+            self.log.warning("canvas %s: his call's close is not done yet: the archive is not owed", room)
+        return done
+
     def owe_archive(self, room, now) -> bool:
-        """His call ended: build its archive NOW and keep those exact bytes owed until each file is written (Codex's
-        HOLD on bacb41a: a retry rebuilt from live Redis, so a card revised or expired after the call changed or
-        dropped it). One marker per call, keyed by its end time, so a later call never replaces an earlier one."""
+        """Build `room`'s archive NOW and keep those exact bytes owed until each file is written (Codex's HOLD on
+        bacb41a: a retry rebuilt from live Redis, so a card revised or expired after the call changed or dropped
+        it). One marker per call, keyed by its end time, so a later call never replaces an earlier one. The live
+        close owes through close_call(), atomically with the window's delete; this is the marker-writing
+        primitive itself."""
         try:
             files = {name: data.decode("utf-8") for name, data in archive_docs(self.conn, room, now)}
             if not files:
