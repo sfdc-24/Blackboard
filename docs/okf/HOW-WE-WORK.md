@@ -1,7 +1,7 @@
 ---
 type: guide
 title: Board and OKF — how we work
-updated: 2026-11-06T23:40:00Z
+updated: 2026-11-06T23:50:31Z
 tags: blackboard, okf, fleet, express
 canon_express: https://github.com/sfdc-24/Blackboard/blob/main/docs/EXPRESS.md
 drive_copy: https://docs.google.com/document/d/1UP3yEsSPkCctf6j9pDlw4u2b9adyqQ9An5U_j2_-Fso/edit
@@ -29,17 +29,9 @@ Repo-specific pages (gates, duplex, architecture) sit beside those, not instead 
 
 **OKF** = the shared picture. Lanes, what’s cooking, gates, session intent. Good for all-hands visibility and “don’t step on that folder.” Lives in the repo next to the work, so PRs and ownership stay honest. Bad as a pager — don’t put every micro-task only in OKF and expect a wake.
 
-## The owner's messages go on the board, every time
+## The owner's conversations go on the board, every time
 
-Anything the owner says to an agent, and that agent's answer, lands on the board the same day, without being asked. He should never have to repeat an instruction to each agent.
-
-1. Each owner message to you is one row: `msg_type=PROMPT`, `source=owner`, `evidence=VERBATIM`.
-2. Your answer is one row: `msg_type=PROMPT_RESPONSE`, `reply_to=<that PROMPT id>`.
-3. A message he sends mid-task, or an answer to your question, is `msg_type=OWNER_REPLY`.
-4. Every row carries `thread_id=TH-<your tag>-OWNER-<yyyymmdd>`.
-5. Post as you answer, not at the end of the day. Split anything over about 1,100 characters into `part=i/N` rows, with no pipes in the text.
-6. An instruction for the whole fleet also gets one row addressed to every agent. Agents read rows addressed to them at session start.
-7. These rows live on the board only, never in a public repo, PR or commit. Live-call words stay off public pages unless he says otherwise.
+Every turn between the owner and any agent is recorded on the private board as it happens, so no agent hears it second-hand and he never repeats an instruction to each agent. The rule, with its message types, ids, threads and size limits, is [COMMS-PROTOCOL §12](../COMMS-PROTOCOL.md). Read §12 at the start of every session, and post each turn before you act on it.
 
 ## How they fit together
 
