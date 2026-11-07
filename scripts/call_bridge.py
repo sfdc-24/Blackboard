@@ -388,13 +388,17 @@ REFUSAL = re.compile(
 # to start a Grokbot turn exists yet, so a screen step is an ordinary claim for grok whose inbox entry carries the
 # hard limits, and its card comes when Grokbot wakes. Switched by CALL_BRIDGE_SCREEN=on; off (the default), nothing
 # here runs and "click" is not a task word, as before.
-#   look     scroll, hover, go to, open, switch to, expand: runs on his standing go for this chair session ("Greg,
-#            you can drive"), else a read-back and his go, like any ask.
-#   change   click, type, select, fill in: a read-back and his go for every step, never the standing go.
-#   own-go   delete, deploy, activate, send, submit, purchase, permission changes: the same, and Grokbot is told this
-#            step is irreversible and needs this go, no other.
+#   look     scroll, hover, go to, open, switch to, expand: claimed at once, no read-back.
+#   change   click, type, select, fill in, and activate, submit, purchase, permission changes: claimed at once, no
+#            read-back, with or without a standing go.
+#   own-go   send, delete (remove, wipe, erase, discard), deploy, merge: a read-back and his spoken go for every step, and
+#            Grokbot is told this step is irreversible and needs this go, no other.
 #   refused  anything asking for a password, token, code or sign-in: never proposed, never rung. He signs in himself.
-# "stop" or "enough" drops the open proposal, revokes the standing go and puts a STOP in grok's inbox.
+# ONLY FOUR WORDS WAIT FOR HIS YES (the rule since 2026-11-07): send, delete, deploy and merge. Until
+# then every change and many more verbs waited for the read-back. Every other guard stands: a listed owner only, the
+# length limit, refused while paused, and the host allowlist and hard limits in each inbox entry.
+# "Greg, you can drive" still records a standing go (DRIVE_KEY); a look needs none now, so it only marks the look's
+# inbox entry. "stop" or "enough" drops the open proposal, revokes the standing go and puts a STOP in grok's inbox.
 # Screen text is never an instruction: commands come only from his turns, read here.
 SCREEN = os.environ.get("CALL_BRIDGE_SCREEN", "off").strip().lower() == "on"
 SCREEN_AGENT = "grok"
@@ -408,12 +412,12 @@ DRIVE_KEY = "gov:callbridge:drive:%s"          # the room's standing look-only g
 DRIVE_SECONDS = 60 * 60
 SCREEN_STOP_KEY = "gov:callbridge:screenstop:%s:%s"    # <room>, <entry>: a STOP is written once per turn
 NO_CREDENTIALS = "Not started: no agent types a password, token or code. Please sign in yourself"
-NO_SCREEN_READBACK = "Not started: screen steps need the read-back"
+NO_SCREEN_READBACK = "Not started: screen steps are paused"
 NOT_OWNERS = "Not started: screen steps are the owner's"
-NOT_PLAIN = "Not started: a screen step goes to Greg by name alone, then the read-back and your go"
+NOT_PLAIN = "Not started: a screen step goes to Greg by name alone"
 # DIRECT START KEEPS THE READ-BACK FOR THE SCREEN (Codex's HOLD on 0a4c516f: READBACK is False in production and
 # serve_requests passes no override, so every screen step was refused). With SCREEN on, the read-back machinery runs
-# for screen steps alone (Bridge.proposing); every other ask still claims at once. CALL_BRIDGE_READBACK=off still
+# for own-go screen steps alone (Bridge.proposing); every other ask still claims at once. CALL_BRIDGE_READBACK=off still
 # pauses it, and then a screen step is refused (NO_SCREEN_READBACK): fail closed.
 # THE CHAIR'S PROMISE FOLLOWS THE BRIDGE (Codex's HOLD on conference 37dc359b): while this bridge proposes screen
 # steps for a room (SCREEN on, a listed owner, not paused), it keeps SCREEN_SIGNAL_KEY "on" for that room, for
@@ -439,11 +443,17 @@ CREDENTIAL = re.compile(
     r"(?i)\b(?:pass(?:word|code|phrase|key)s?|pin\s+(?:codes?|numbers?)|tokens?|mfa|2fa|two[\s-]?factor|one[\s-]?time|"
     r"otp|(?:verification|security|auth(?:entication|enticator)?|sms|login|sign[\s-]?in)\s+codes?|api\s+keys?|"
     r"secrets?|credentials?|sign[\s-]?in|sign\s+(?:me\s+)?in|log[\s-]?in|log\s+(?:me\s+)?in)\b")
+# The four that wait for his spoken go (since 2026-11-07): send, delete, deploy, merge. Remove, wipe, erase and
+# discard are a delete (as the Grokbot adapter's DELETE has it, conference tools/binder/adapters/grokbot/rules.py).
 OWN_GO = re.compile(
-    r"(?i)\b(?:delet(?:e|ing)|remov(?:e|ing)|deploy(?:ing)?|activat(?:e|ing)|deactivat(?:e|ing)|send(?:ing)?|"
-    r"submit(?:ting)?|purchas(?:e|ing)|buy(?:ing)?|pay(?:ing)?|check\s*out|permissions?|profiles?|roles?|sharing|"
-    r"grant(?:ing)?|revok(?:e|ing)|assign(?:ing)?|publish(?:ing)?|install(?:ing)?|uninstall(?:ing)?|reset(?:ting)?|"
-    r"erase|discard|mass)\b")
+    r"(?i)\b(?:send(?:s|ing)?|sent|delet(?:e[sd]?|ing)|remov(?:e[sd]?|ing)|wip(?:e[sd]?|ing)|eras(?:e[sd]?|ing)|"
+    r"discard(?:s|ed|ing)?|deploy(?:s|ed|ing)?|merg(?:e[sd]?|ing))\b")
+# No spoken go since 2026-11-07, yet said to Grok these still take the screen path and its hard limits (screen_bound),
+# never a plain claim: "Greg, activate the FlexCard" is a change step, claimed at once.
+WEIGHTY = re.compile(
+    r"(?i)\b(?:activat(?:e|ing)|deactivat(?:e|ing)|submit(?:ting)?|purchas(?:e|ing)|buy(?:ing)?|pay(?:ing)?|"
+    r"check\s*out|permissions?|profiles?|roles?|sharing|grant(?:ing)?|revok(?:e|ing)|assign(?:ing)?|"
+    r"publish(?:ing)?|install(?:ing)?|uninstall(?:ing)?|reset(?:ting)?|mass)\b")
 # What only looks: navigation, never a click, a keystroke or a choice.
 _LOOK = re.compile(r"(?i)\b(?:scroll(?:s|ed|ing)?|hover|mouse\s+over|go\s+(?:to|back)|navigate|open|"
                    r"switch\s+to|expand|collapse)\b")
@@ -465,10 +475,12 @@ def screen_ask(said: str) -> bool:
 
 def screen_bound(said: str) -> bool:
     """FAIL CLOSED (Codex's HOLD on 0a4c516f): what Grok is asked takes the screen path (the read-back, the refusal,
-    the hard limits) when it is a screen step, or names a credential, or an irreversible verb, even with no screen
-    word in it: "Greg, delete that record", "Greg, put the password in". Never a plain claim."""
+    the hard limits) when it is a screen step, or names a credential, an irreversible verb or a weighty one, even with
+    no screen word in it: "Greg, delete that record", "Greg, put the password in", "Greg, activate it". Never a plain
+    claim."""
     said = said or ""
-    return screen_ask(said) or bool(CREDENTIAL.search(said)) or bool(OWN_GO.search(said))
+    return (screen_ask(said) or bool(CREDENTIAL.search(said)) or bool(OWN_GO.search(said))
+            or bool(WEIGHTY.search(said)))
 
 
 def screen_settled(said: str, agent: str) -> bool:
@@ -527,7 +539,8 @@ def screen_stop(fields: dict) -> bool:
 
 def screen_inbox_text(ask: str, said: str, kind: str, now, standing: str = "") -> str:
     """A screen step's inbox entry: the step and the hard limits, every time (Grokbot acts on this entry alone)."""
-    why = ("on his standing look-only go (turn %s)" % standing) if standing else "after the read-back and his go-ahead"
+    why = ("on his standing look-only go (turn %s)" % standing if standing
+           else "after the read-back and his go-ahead" if kind == "own-go" else "at his word, no read-back needed")
     step = {"look": "LOOK ONLY: navigate or scroll; never click a control, type or choose anything.",
             "change": "ONE CHANGING STEP: do exactly this step and nothing past it.",
             "own-go": ("ONE IRREVERSIBLE STEP: his go is for this step alone. If the screen then asks you to confirm "
@@ -2052,8 +2065,8 @@ class Bridge:
         return None
 
     def _screen(self, room, entry_id, fields, said, now):
-        """One screen step he asked Grok for: refused, claimed on his standing go (look only), or proposed for the
-        read-back and his go-ahead. Returns the ask claimed, or None."""
+        """One screen step he asked Grok for: refused, claimed at once (a look or a change, the rule since
+        2026-11-07), or proposed for the read-back and his go-ahead (own-go). Returns the ask claimed, or None."""
         actor, epoch = fields.get("actor_id"), fields.get("session_epoch")
         self._asked(room, entry_id, said, now, actor, epoch)        # a voice's "I can't" answers this turn only
         if actor not in self.owners:
@@ -2067,13 +2080,14 @@ class Bridge:
         if why:
             self._refuse(room, entry_id, [SCREEN_AGENT], why, now)
             return None
-        standing = self._driving(room, actor, epoch, entry_id) if kind == "look" else ""
-        if standing:
+        if kind in ("look", "change"):
+            # No read-back, with or without his standing go; it marks a look's inbox entry, nothing more.
+            standing = self._driving(room, actor, epoch, entry_id) if kind == "look" else ""
             ask = self._claim(room, entry_id, SCREEN_AGENT, said, now, screen=kind, standing=standing)
             if ask:
-                self.log.info("call bridge: %s screen look for grok on the standing go %s", ask, standing)
+                self.log.info("call bridge: %s screen %s for grok, claimed at once", ask, kind)
             return ask
-        self._propose(room, entry_id, [SCREEN_AGENT], said, now, actor, epoch)
+        self._propose(room, entry_id, [SCREEN_AGENT], said, now, actor, epoch)       # own-go: send, delete, ...
         return None
 
     def _screen_stop(self, room, entry_id, fields, now) -> None:
