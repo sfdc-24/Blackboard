@@ -42,7 +42,7 @@ class Classifier(unittest.TestCase):
             "Greg, scroll down and select the second row": "change",
             "Greg, delete that record.": "own-go",
             "Greg, click Deploy.": "own-go",
-            # The owner, 2026-11-07: a spoken yes only for send, delete, deploy and merge.
+            # Since 2026-11-07: a spoken yes only for send, delete, deploy and merge.
             "Greg, send the email.": "own-go",
             "Greg, merge the PR.": "own-go",
             "Greg, deploy it.": "own-go",
