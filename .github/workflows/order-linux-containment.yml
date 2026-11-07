@@ -29,7 +29,11 @@ on:
       # either - which is the more serious half.
       - 'tests/test_order_unit_containment.ps1'
       - 'packaging/systemd/blackboard-order.service'
+  # Main only. pull_request already runs this job on the branch. An unscoped
+  # push ran it a second time for the same commit 23604ae5 (runs 34824057267
+  # and 34824060492, about 70s of runner each).
   push:
+    branches: [main]
     paths:
       - '.github/workflows/order-linux-containment.yml'
       - 'scripts/order_supervisor.ps1'
@@ -44,6 +48,14 @@ on:
       # either - which is the more serious half.
       - 'tests/test_order_unit_containment.ps1'
       - 'packaging/systemd/blackboard-order.service'
+
+# A newer commit on the same pull request cancels this workflow's older run.
+# Group: workflow name, event, and pull request number (GitHub's id, not a
+# branch name). Any other event uses a unique run id, so push, schedule,
+# dispatch, and deploy are neither queued nor cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
