@@ -139,7 +139,7 @@ There are four levels. No lower level is ever reported as a higher one:
 
 ## 7 · Shipping
 
-- **Exact-head reviews.** Codex PASS on the exact head is required on every PR that ships (conference `docs/RELEASES.md`). A Cursor GO is not a gate on any PR (owner, 2026-11-07), and a chair deploy needs no separate owner go: it follows the same guard.
+- **Exact-head reviews.** Codex PASS on the exact head is required on every PR that ships (conference `docs/RELEASES.md`). A Cursor GO is not a gate on any PR, and a chair deploy needs no separate owner go: it follows the same guard.
 - **A moved head restarts every review.** Freeze the head while a review is in flight. Read every Codex verdict on the PR, under all three of its tags, before re-asking.
 - **Never promote over a Codex hold.** Before any traffic move or flag, grep the board for a hold on that feature.
 - **Name the rollback before promoting.** After promoting, read back traffic, health and served bytes.
