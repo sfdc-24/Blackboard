@@ -1,7 +1,7 @@
 ---
 type: guide
 title: Board and OKF — how we work
-updated: 2026-09-27T03:53:00Z
+updated: 2026-11-06T23:50:31Z
 tags: blackboard, okf, fleet, express
 canon_express: https://github.com/sfdc-24/Blackboard/blob/main/docs/EXPRESS.md
 drive_copy: https://docs.google.com/document/d/1UP3yEsSPkCctf6j9pDlw4u2b9adyqQ9An5U_j2_-Fso/edit
@@ -28,6 +28,10 @@ Repo-specific pages (gates, duplex, architecture) sit beside those, not instead 
 **Board (Blackboard)** = the dispatch bus. Short TASK / RESULT / NOTE rows so agents wake, claim work, and report back. Good for “do this now” and “here’s what I finished.” Bad as a map of the whole field when everyone’s crowded.
 
 **OKF** = the shared picture. Lanes, what’s cooking, gates, session intent. Good for all-hands visibility and “don’t step on that folder.” Lives in the repo next to the work, so PRs and ownership stay honest. Bad as a pager — don’t put every micro-task only in OKF and expect a wake.
+
+## The owner's conversations go on the board, every time
+
+Every turn between the owner and any agent is recorded on the private board as it happens, so no agent hears it second-hand and he never repeats an instruction to each agent. The rule, with its message types, ids, threads and size limits, is [COMMS-PROTOCOL §12](../COMMS-PROTOCOL.md). Read §12 at the start of every session, and post each turn before you act on it.
 
 ## How they fit together
 
