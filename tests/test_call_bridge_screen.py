@@ -1,7 +1,7 @@
 """R7b slow mode: he says it on the call, Grokbot clicks it (scripts/call_bridge.py, SCREEN).
 
 Pins the classifier, the three routes (refused; a look or a change claimed at once; send, delete, deploy and merge
-read back and waiting for his go, the owner's rule of 2026-11-07), "stop", and that a screen step is Grok's alone. Synthetic sentences only; the fixtures are test_call_bridge's. No network.
+read back and waiting for his go, the rule since 2026-11-07), "stop", and that a screen step is Grok's alone. Synthetic sentences only; the fixtures are test_call_bridge's. No network.
 Run: python tests/test_call_bridge_screen.py
 """
 import importlib.util
@@ -144,7 +144,7 @@ class ScreenSteps(unittest.TestCase):
         self.assertEqual([], self.inbox())
 
     def test_a_changing_click_is_claimed_at_once(self):
-        """The owner, 2026-11-07: a click or a change needs no read-back and no go, standing or spoken."""
+        """Since 2026-11-07: a click or a change needs no read-back and no go, standing or spoken."""
         entry = turn(self.conn, "Greg, click New on the Integration Procedures tab.", seconds_ago=60)
         ask = cb.ask_id(ROOM, entry, "grok")
         self.assertEqual([ask], self.b().tick())
@@ -189,7 +189,7 @@ class ScreenSteps(unittest.TestCase):
             self.assertIsNone(self.conn.get(cb.PROPOSAL_KEY % ROOM), readback)
 
     def test_purchase_activate_and_permissions_are_claimed_at_once(self):
-        """No longer a spoken yes (the owner, 2026-11-07), and still the screen path with its hard limits."""
+        """No longer a spoken yes (since 2026-11-07), and still the screen path with its hard limits."""
         for said in ("Greg, click Activate on the FlexCard.", "Greg, click Purchase on the checkout page.",
                      "Greg, open the profile page and change the permissions", "Greg, activate it.",
                      "Greg, grant the permission set", "Greg, submit the form"):
