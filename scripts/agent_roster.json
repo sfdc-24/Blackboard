@@ -269,7 +269,7 @@
           "in_vpc": false,
           "redis_read": false,
           "redis_write": false,
-          "why": "The laptop is not in the VPC. Unlike the gemini waker, this instance HAS a shell and reads the repo, so it can ground its designs in code. Design only: no commits, deploys or merges. A separate tag from gemini because the fleet is one writer per tag (sheet L-82).",
+          "why": "The laptop is not in the VPC. Unlike the gemini waker, this instance HAS a shell and reads the repo, so it can ground its designs in code. As the architect it may lead a build and change code (owner, 2026-11-07); merges and deploys still go through the release guard. A separate tag from gemini because the fleet is one writer per tag (sheet L-82).",
           "wake": "NONE automatic. The owner starts a Roo Code task in VS Code. Its rules live in C:/Users/salam/.roo/rules. It answers only what the owner hands it or rows addressed to=gemini-vscode; rows to=gemini stay with the cloud waker."
         },
         {
