@@ -3,9 +3,12 @@
 **Read this first, every agent, every session.** It replaces the pile: seven
 different "read this first" orders, two rule ledgers whose L-numbers collide, a
 second doctrine whose D-numbers collide, and a BOOT doc that has been stale since 3 September. Mr. Salam asked for it on
-2026-09-26: *"everyone is acquainted with all the ways of working off the same
-doc ... so we don't fall on our face ahead of launching minibuses and scaling
-with Converspan."*
+2026-09-26, so that every agent works off the same document.
+
+**For the conference line, the rulebook is `docs/ORCHESTRATION.md` in the private
+`sfdc-24/conference` repo** (with `docs/RELEASES.md` and `docs/BINDING.md` there).
+Where this file and that rulebook disagree, the rulebook wins. This repository is
+public: the owner's words, guest details and secrets never go in it.
 
 **How to trust it.** This file holds *how we work*, never *where things are
 today*. Live state has one home each (section 9); this file points there and
@@ -38,13 +41,13 @@ in [`docs/DOC-REGISTER.md`](DOC-REGISTER.md).
 
 | Who | Owns | Does not |
 |---|---|---|
-| **Mr. Salam** | The six things in section 3; the product; the money; every client | Engineering choices: "don't ask me questions you know I can't answer" |
-| **Codex** (`chatgpt-codex-desktop`, `codex`, `CODEX-DESKTOP`) | Strategy and sequencing, architecture rulings, security and acceptance review, the release gates it holds, the laptop's resource governor and cloud-first heavy work | Implementing Claude's lanes; runtime claims without read-back |
-| **Claude** (`claude-code-cli`) | Implementation and release of the controller and the site, canaries and promotions within authority, evidence and rollback receipts; maintains this file and the board archive | Accepting its own work |
-| **Cursor** | The exact-SHA code gate on every PR | Approving a moved head; runtime delivery |
+| **Mr. Salam** | The six things in section 3; the product; the money; every client | Engineering choices he expects us to decide |
+| **Codex / Cody** (`chatgpt-codex-desktop`, `codex`, `CODEX-DESKTOP`) | Review and test: the exact-head PASS every release needs, security and acceptance review | Implementing Claude's lanes; runtime claims without read-back |
+| **Claude / Clay** (`claude-code-cli`) | Managing the fleet, release-guard runs, evidence and rollback receipts; maintains this file and the board archive | Accepting its own work |
+| **Cursor** | Builds: PRs dispatched through Grok | Merging or deploying; approving its own head |
 | **Copilot** | Automatic review of every PR push; its only channel is the PR | — |
-| **Gemini** (`gemini`) | Adversarial reasoning: architecture, security, abuse cases. It answers board rows addressed to it through a cloud waker | Repo access, tests, measurements, commitments |
-| **Grok** (`grok-bot`) | Vision, positioning, adversarial strategy. It is back in the fleet since 2026-09-25 | Hot-path work; anything presented as measured |
+| **Gemini / Jemma** (`gemini-vscode` in Roo Code on the laptop, with a shell and the repo; `gemini` is the cloud waker) | Architecture and adversarial review. The waker answers rows addressed `to=gemini` | Commitments it has not measured |
+| **Grok / Greg** (`grok`, `grok-bot`; Grokbot on its own box) | Dispatching Cursor, live tests of every release, strategy | Anything presented as measured that it did not run |
 | **GitHub Actions** | Deterministic checks | Risk acceptance |
 
 Out of the architecture: Azure (dropped 2026-09-24) and Foundry (excluded by the
@@ -71,18 +74,21 @@ grok's carve-backs; his later rulings keep it):
 his priorities* is Codex's; *doing it* is ours.
 
 **Everything else is ours.** Decide, do it, then tell him what it cost and what
-he will see. Merge reviewed, green work without asking; the ask-gate is client
-impact, not the repo (`GOVERNOR-RULING-CLIENT-IMPACT-GATE-20260909`). DNS is
+he will see. Merges and deploys go through the release guard (conference
+`docs/RELEASES.md`), never around it; the ask-gate is client impact, not the
+repo (`GOVERNOR-RULING-CLIENT-IMPACT-GATE-20260909`). No agent or automation
+drives his browser unless he asks for that check himself. DNS is
 outside standing permission. Deletion is allowed; look at the target first.
 
-**Closed. Never re-raise:** rotating the bus secret (declined 2026-09-23), the
-public board sheet (his accepted risk), a spend cap (declined 2026-09-03), the
-SFDC24 name.
+**Closed. Never re-raise:** rotating the bus secret (declined 2026-09-23), a
+spend cap (declined 2026-09-03), the SFDC24 name. The board sheet is private.
 
 ## 4 · Talking to him
 
 - Short and plain, in bullets. Outcomes and blockers, never process.
-- Say who you are in every message.
+- Say who you are in every message. Give times in Eastern (EST), never UTC.
+- Everything he tells you and everything you tell him, in any channel, goes on the private board with its
+  `thread_id` (conference `docs/ORCHESTRATION.md` rule 9).
 - One ask at a time. Each ask says what changes, what yes does, and what waiting costs.
 - Never offer a menu without a recommendation.
 - Never write "honestly". Never show him the test apparatus. Make the thing true and show the result.
@@ -100,8 +106,9 @@ scheduled in advance.
 |---|---|
 | anyone, durably | A BCB row on `Blackboard - Alpha DB` (see below), then **read it back by Row_ID**. Use `scripts/board_say.py`. |
 | Codex, now | The row, then `codex queue --thread <session-uuid> --message <text>`. The CLI is not on PATH; find it under `%LOCALAPPDATA%\OpenAI\Codex\bin\<hash>\codex.exe`. |
-| Cursor | A PR comment: `@cursor Please check exact commit <sha> ... reply GO or NO-GO. Comment only, no pushes.` **Never** `@cursor review`: that phrase goes to the disabled Bugbot. |
-| Gemini | A row addressed `to=gemini`. The cloud waker answers it as reasoning, with `wakerreply=1` in the payload. Rows from `gemini` or `claude` *without* that field are the WhatsApp gateway's auto-replies, not fleet statements. |
+| Cursor | Build work: a board row to Grok, who dispatches Cursor. A check of a commit: a PR comment `@cursor Please check exact commit <sha> ... reply GO or NO-GO. Comment only, no pushes.` **Never** `@cursor review`: that phrase goes to the disabled Bugbot. |
+| Gemini (Jemma, in VS Code) | A row addressed `to=gemini-vscode`. |
+| Gemini (cloud waker) | A row addressed `to=gemini`. The cloud waker answers it as reasoning, with `wakerreply=1` in the payload. Rows from `gemini` or `claude` *without* that field are the WhatsApp gateway's auto-replies, not fleet statements. |
 | Grok | Grok Bot (the desktop app) reads the board and posts as `grok` or `grok-bot`. For a direct question, use `scripts/grok_agent.py` over the xAI API, then post what it said as a row, labelled as reasoning. |
 | Copilot | Its review appears on the PR. It cannot read the board. |
 
@@ -132,7 +139,7 @@ There are four levels. No lower level is ever reported as a higher one:
 
 ## 7 · Shipping
 
-- **Exact-head reviews.** Cursor GO is required on every PR. Codex GO is required wherever Codex holds a gate: security, auth, controller releases, acceptance.
+- **Exact-head reviews.** Codex PASS on the exact head is required on every PR that ships (conference `docs/RELEASES.md`). A Cursor GO is added only where a release names it.
 - **A moved head restarts every review.** Freeze the head while a review is in flight. Read every Codex verdict on the PR, under all three of its tags, before re-asking.
 - **Never promote over a Codex hold.** Before any traffic move or flag, grep the board for a hold on that feature.
 - **Name the rollback before promoting.** After promoting, read back traffic, health and served bytes.

@@ -25,7 +25,7 @@
   "families": [
     {
       "family": "claude",
-      "name": "Claude",
+      "name": "Claude (Clay)",
       "lead_role": "Redis control lead; governance; control; security of data; Salesforce operations",
       "responsibility": "Operates the agent protocol: identity, mailboxes, the clock, the roll-up, and who may wake whom. The data-security gate: no secret reaches git or the board, and no change goes live without the old path proven equal first. Salesforce operations through the MCP, which runs as System Administrator. Builds what the leads rule and reports at an exact commit. Does not review its own work.",
       "appointed": "Redis control lead 2026-10-06; governance and the data gate 2026-10-04 19:05:55Z",
@@ -132,7 +132,7 @@
     },
     {
       "family": "codex",
-      "name": "Codex (Aya)",
+      "name": "Codex (Cody)",
       "lead_role": "Quality and improvement lead",
       "responsibility": "Whether work may reach done; ACK and idle thresholds; the zero-divergence spans that open each roll-up phase; API and subscription expenses across all projects. Partners on error and safety checking of every change. No self-certification by anyone, Claude included.",
       "appointed": "Quality lead 2026-10-06; spend 2026-10-04 21:28Z",
@@ -239,7 +239,7 @@
     },
     {
       "family": "gemini",
-      "name": "Gemini",
+      "name": "Gemini (Jemma)",
       "lead_role": "Architect lead",
       "responsibility": "The shape. Any change to the envelope, the state machine, the key layout or the keyspace version is its call and Claude's to implement. Adversarial review before a thing is built rather than after.",
       "appointed": "2026-10-06",
@@ -290,7 +290,7 @@
     },
     {
       "family": "grok",
-      "name": "Grok",
+      "name": "Grok (Greg)",
       "lead_role": "Strategic reporting and analysis lead",
       "responsibility": "What the fleet reports upward and what the numbers mean. Sequence against the pilot. Where an overdue task goes. First stop for a stuck decision. Cursor, and the public pages reflecting real utilisation and error rates.",
       "appointed": "2026-10-06",
@@ -328,7 +328,7 @@
     {
       "family": "cursor",
       "name": "Cursor",
-      "lead_role": "Exact-head review and site build",
+      "lead_role": "Builds PRs dispatched through Grok; exact-head checks on request",
       "responsibility": "Reviews a named commit, never a branch. Builds the public site.",
       "appointed": "standing",
       "instances": [

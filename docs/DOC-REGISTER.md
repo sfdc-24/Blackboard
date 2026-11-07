@@ -21,6 +21,24 @@ carries a status banner is shifted down by two lines.
 - Nothing is deleted.
 - Drive documents are never renamed. The bus finds documents by exact title, so a rename silently breaks every writer.
 
+## 0 · Update 2026-11-06: where the rules live now
+
+The fleet's rules for the conference line moved to the private `sfdc-24/conference` repo. Its statuses:
+
+| Document | Status | Notes |
+|---|---|---|
+| conference `docs/ORCHESTRATION.md` | CANON | The rulebook: receipts, FREE/BLOCKED, everything on the board, the floor, browser and automations, privacy. Every agent's local rules restate it and point here. |
+| conference `docs/RELEASES.md` | CANON | The release guard, one lock, manifests. |
+| conference `docs/BINDING.md` | CANON | How each voice is bound to its real instance (binders, the door, floor holding). |
+| conference `docs/CAMERA-R8.md` | CANON | pi1 is an optional add-on. |
+| conference `docs/GUESTS.md` | CANON | Guest codes and the binder door's deploy. |
+| conference `README.md` | STALE until fixed | Provider-backed personas and Cursor as review-only are superseded. |
+| conference `docs/CONF-LINE-ARCHITECTURE.md` | HISTORICAL in part | The 2026-09-26 POC contract. |
+| conference `docs/okf/HOW-WE-WORK.md` | SUPERSEDED for rules | Board-vs-OKF split kept as reference. |
+| `docs/EXPRESS.md` (this repo) | CANON for Blackboard mechanics | Points to the conference rulebook for fleet rules. |
+| `docs/COMMS-PROTOCOL.md` §12 | CANON for row fields | The PROMPT / PROMPT_RESPONSE / OWNER_REPLY field rules. |
+| Drive "SFDC24 OWNER TRIGGER" (2026-10-10) and "UPDATE 2026-10-16"; Drive "Fleet Protocol - Drive-intake task filter" | HISTORICAL | The Lou phone agent and drive-intake era. Their "Redis board is live, the Sheet is a frozen mirror" line no longer holds. |
+
 ## 1 · Blackboard repo (`docs/` unless noted)
 
 | Document | Status | Notes |
