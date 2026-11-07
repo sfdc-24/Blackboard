@@ -17,6 +17,14 @@ on:
       - "tests/test_watch_harness.ps1"
       - ".github/workflows/beat1-prototype-tests.yml"
 
+# A newer commit on the same pull request cancels this workflow's older run.
+# Group: workflow name, event, and pull request number (GitHub's id, not a
+# branch name). Any other event uses a unique run id, so push, schedule,
+# dispatch, and deploy are neither queued nor cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
