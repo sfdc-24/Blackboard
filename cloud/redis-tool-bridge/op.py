@@ -37,6 +37,9 @@ THE TWO LAYERS THAT CAN FAIL ON THEIR OWN, AND THEIR STATUSES
                                  committed. The error TYPE only
         409 replay               the chair sent a request id it already sent; nothing was written
                                  and the hour was not charged
+        429 busy                 MAX_WAITS xwaits are already held on this instance (CAPACITY, below);
+                                 nothing was executed, and "retry_after" says how many seconds to
+                                 wait before asking again
         200                      redis_gov's result, as it returned it
 
     "EXECUTED": FALSE IS A PROMISE, AND ITS ABSENCE IS NOT ONE (Aya on 919fd52)
@@ -134,6 +137,16 @@ THE BODY
     "replay", "executed": false. The claim is forgotten when the quota was not touched or redis_gov refused the
     write, so that id can be sent again; a 200 and an outcome-unknown keep it.
 
+    CAPACITY (Gemini, GEMINI-ARCH-REDIS-DOORBELL-20261108T1645Z: PASS on the condition that held waits can never
+    starve the chair). An xwait holds its request for the whole wait, and the service runs one instance. So at
+    most MAX_WAITS xwaits are held at once on it (a BoundedSemaphore, taken without blocking after every other
+    refusal and before the connection, and given back in a finally whatever the wait does). The next one is not
+    queued behind them: it is a 429 "busy" at once, "executed": false, and scripts/bridge_client.py raises Busy,
+    which scripts/redis_doorbell.py sleeps on and asks again; it is not a refusal and not a reason to use the
+    board. deploy.sh serves 32 requests at once (main.py's ThreadingHTTPServer, a thread a request, and a
+    connection of the request's own from connect()), so with every wait slot held 24 remain for everything else,
+    the chair's ops among them. No other op touches the semaphore.
+
     WHAT THIS DOES NOT DO, AND MUST BE SAID WHEREVER THE PILOT IS APPROVED: THE BRIDGE TRUSTS THE CHAIR'S
     IDENTITY. It does not see the owner's confirmation and does not enforce it; the chair does. Whoever
     holds the chair's identity can make these writes with no confirmation at all. What bounds that is the
@@ -149,6 +162,7 @@ import html
 import json
 import os
 import re
+import threading
 import time
 import urllib.parse
 
@@ -166,6 +180,11 @@ PURPOSES = (FLEET, CHAIR, PROBE, DOORBELL)
 # THE DOORBELL: a caller's own lane (redis_gov.WAIT_LANE), and the two ops it runs there.
 DOORBELL_LANE = "fleet:inbox:"
 DOORBELL_OPS = ("xwait", "xrange")
+# CAPACITY: the ops that hold their request for a wait (redis_gov.OPS_WAIT, restated and held equal by a test),
+# how many may be held at once on this instance, and how long a caller turned away is told to wait.
+WAITS = ("xwait",)
+MAX_WAITS = 8
+WAIT_RETRY_SECONDS = 5
 CHAIR_OPS = ("get", "set")
 CHAIR_WRITES_PER_HOUR = 20              # in Redis for 3,600s from the first count, and in memory for the last hour
 MAX_PERSONAS = 4                        # as the chair's own cast
@@ -196,6 +215,8 @@ _CANVAS_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 clock = time.time                       # the door's clock; a test puts its own here
 _SPENT = collections.deque()            # when this instance's chair writes were made, oldest first
 _CANVAS_SPENT = collections.deque()     # when this instance's chair canvas posts were made, oldest first
+_WAITING = threading.BoundedSemaphore(MAX_WAITS)   # the held xwaits (CAPACITY); nothing else takes it
+_TAKING = threading.Lock()              # take() reads and appends in one step: requests run on threads
 
 
 def _lines(path=None) -> dict:
@@ -283,13 +304,15 @@ def days(now: float) -> tuple:
 
 def take(now: float, spent, ceiling: int = CHAIR_WRITES_PER_HOUR) -> bool:
     """May the chair make one more write in this hour? `spent` holds the times of the ones made. THIS HALF IS
-    PER INSTANCE AND IN MEMORY, and forgotten when the instance stops; redis_gov.hourly is the half that is not."""
-    while spent and now - spent[0] >= 3600.0:
-        spent.popleft()
-    if len(spent) >= ceiling:
-        return False
-    spent.append(now)
-    return True
+    PER INSTANCE AND IN MEMORY, and forgotten when the instance stops; redis_gov.hourly is the half that is not.
+    Under a lock: main.py serves each request on its own thread, and two chair writes must not both see room."""
+    with _TAKING:
+        while spent and now - spent[0] >= 3600.0:
+            spent.popleft()
+        if len(spent) >= ceiling:
+            return False
+        spent.append(now)
+        return True
 
 
 
@@ -408,13 +431,14 @@ def parse(raw: bytes) -> tuple:
 
 
 def handle(caller: str, raw: bytes, connect, log, callers=None, gov=None, acl=None, purposes=None,
-           personas=None, rooms=None, now=None, spent=None, canvas_spent=None) -> tuple:
+           personas=None, rooms=None, now=None, spent=None, canvas_spent=None, waits=None) -> tuple:
     """(status, body) for one /op request from an ALREADY VERIFIED caller.
 
     caller   the email main.verify_caller returned: verified, and on BRIDGE_CALLERS.
     connect  main.connect; called only after the request has parsed, so a malformed body costs no
              connection.
     log      a callable taking one line. No value, no key content and no body ever goes to it.
+    waits    the semaphore that bounds held xwaits (CAPACITY); _WAITING unless a test gives its own.
     """
     email = str(caller or "").strip().lower()
     purpose = (load_purposes() if purposes is None else purposes).get(email, FLEET)
@@ -473,6 +497,27 @@ def handle(caller: str, raw: bytes, connect, log, callers=None, gov=None, acl=No
             log("op by %s as %s: not a doorbell op (%s)" % (caller, who, why))
             return 403, {"error": "refused", "reason": why, "executed": False, "audit": "not recorded",
                          "caller": caller, "principal": who}
+    if op in WAITS:
+        # CAPACITY. After every refusal above, so a wait that would be refused anyway holds no slot; before the
+        # connection, so a caller turned away cost Redis nothing and "executed": false is true. Never blocking:
+        # a wait queued behind eight others would hold a request slot while it queued.
+        gate = _WAITING if waits is None else waits
+        if not gate.acquire(blocking=False):
+            log("op by %s as %s: %s busy (%d waits already held)" % (caller, who, op, MAX_WAITS))
+            return 429, {"error": "busy", "executed": False, "retry_after": WAIT_RETRY_SECONDS}
+        try:
+            return _governed(caller, who, purpose, request, op, author, asked, canvas, connect, log, gov, acl,
+                             now, spent, canvas_spent)
+        finally:
+            gate.release()
+    return _governed(caller, who, purpose, request, op, author, asked, canvas, connect, log, gov, acl,
+                     now, spent, canvas_spent)
+
+
+def _governed(caller, who, purpose, request, op, author, asked, canvas, connect, log, gov, acl, now, spent,
+              canvas_spent) -> tuple:
+    """handle()'s second half: the connection, the chair's hour, and the one governed call. Every refusal that
+    needs no connection is behind it already."""
     stated = {name: value for name, value in (("author", author), ("request", asked)) if value}
     if gov is None:
         import redis_gov as gov

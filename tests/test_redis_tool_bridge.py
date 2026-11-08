@@ -1032,9 +1032,11 @@ class TheOpEndpoint(unittest.TestCase):
                         "the stop is set before the deploy, so no IAM line can follow a failed one")
 
     def test_the_deploy_runs_one_instance_which_is_what_makes_the_hourly_ceiling_one_ceiling(self):
-        """take() counts in the instance's memory. Two instances would be two ceilings."""
-        self.assertEqual(1, DEPLOY.count("  --min-instances=0 --max-instances=1 --concurrency=4 \\"))
+        """take() counts in the instance's memory. Two instances would be two ceilings. 32 requests at once
+        (CAPACITY): at 4, four held waits left nothing for the chair."""
+        self.assertEqual(1, DEPLOY.count("  --min-instances=0 --max-instances=1 --concurrency=32 \\"))
         self.assertNotIn("--max-instances=2", DEPLOY)
+        self.assertNotIn("--concurrency=4 ", DEPLOY)
 
     def test_a_line_says_a_principal_and_what_the_caller_is_for_or_it_maps_nobody(self):
         import json
@@ -1766,6 +1768,215 @@ class TheOpEndpoint(unittest.TestCase):
     def test_the_deploy_script_still_refuses_to_be_run(self):
         """D1 is not given. Until it is, the script keeps its own warning."""
         self.assertIn("DO NOT RUN THIS YET", DEPLOY)
+
+
+class HeldWaitsCannotStarveTheChair(unittest.TestCase):
+    """CAPACITY (Gemini, GEMINI-ARCH-REDIS-DOORBELL-20261108T1645Z: PASS on this condition). An xwait holds its
+    request for its whole wait. At most MAX_WAITS are held at once; the next is a 429 "busy" at once and is never
+    queued; a slot comes back however the wait ends; and no other op touches the limit, so the chair is served
+    while every wait slot is held. No network: the threaded test listens on 127.0.0.1 only."""
+
+    GROK = "fleet-grok@sfdc24.iam.gserviceaccount.com"
+    LANE = "fleet:inbox:grok"
+    WAIT = {"op": "xwait", "key": "fleet:inbox:grok", "after": "1-0", "expect": "grok"}
+
+    def setUp(self):
+        import threading
+        self.threading = threading
+        self.release = threading.Event()
+        self.addCleanup(self.release.set)           # a failed test must not leave threads holding slots
+
+    def free_slots(self):
+        """How many slots the real semaphore has free, by taking them all without blocking and giving them back."""
+        taken = 0
+        while bridge_op._WAITING.acquire(blocking=False):
+            taken += 1
+        for _ in range(taken):
+            bridge_op._WAITING.release()
+        return taken
+
+    def holding_gov(self, inside):
+        """A governor whose xwait blocks until self.release is set, and counts who is inside."""
+        test = self
+
+        class Gov:
+            Refused = redis_gov.Refused
+
+            @staticmethod
+            def load_acl():
+                return {}
+
+            @staticmethod
+            def execute(conn, acl, who, via, op, key, **kw):
+                if op == "xwait":
+                    inside.append(who)
+                    test.release.wait(10)
+                return {"ok": True, "op": op, "key": key, "entries": 0, "value": [], "last": kw.get("after", "")}
+        return Gov
+
+    def door(self, body, gov, connected=None):
+        log = []
+        code, out = bridge_op.handle(
+            self.GROK, __import__("json").dumps(body).encode("utf-8"),
+            lambda: connected.append(1) if connected is not None else object(), log.append,
+            callers={self.GROK: "grok"}, purposes={self.GROK: bridge_op.DOORBELL}, gov=gov, acl={})
+        return code, out, log
+
+    def test_the_limit_is_eight_held_waits_and_the_ops_are_redis_gov_s(self):
+        self.assertEqual(8, bridge_op.MAX_WAITS)
+        self.assertEqual(tuple(redis_gov.OPS_WAIT), bridge_op.WAITS)
+        self.assertIsInstance(bridge_op._WAITING, type(self.threading.BoundedSemaphore(1)))
+        self.assertEqual(bridge_op.MAX_WAITS, self.free_slots())
+
+    def test_eight_waits_are_admitted_and_the_ninth_is_busy_at_once_and_reaches_nothing(self):
+        import time
+        inside, results = [], []
+        gov = self.holding_gov(inside)
+        threads = [self.threading.Thread(target=lambda: results.append(self.door(self.WAIT, gov)[:2]))
+                   for _ in range(bridge_op.MAX_WAITS)]
+        for thread in threads:
+            thread.start()
+        deadline = time.time() + 5
+        while len(inside) < bridge_op.MAX_WAITS and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(bridge_op.MAX_WAITS, len(inside), "eight waits are held at once")
+        connected = []
+        started = time.time()
+        code, out, log = self.door(self.WAIT, gov, connected)
+        self.assertLess(time.time() - started, 1.0, "the ninth is answered at once, not queued")
+        self.assertEqual((429, {"error": "busy", "executed": False, "retry_after": bridge_op.WAIT_RETRY_SECONDS}),
+                         (code, out))
+        self.assertEqual([], connected, "a wait turned away never connects")
+        self.assertEqual(bridge_op.MAX_WAITS, len(inside), "and never reaches the governor")
+        self.assertIn("busy", log[-1])
+        self.release.set()
+        for thread in threads:
+            thread.join(5)
+        self.assertEqual([200] * bridge_op.MAX_WAITS, [code for code, _ in results])
+        self.assertEqual(bridge_op.MAX_WAITS, self.free_slots(), "every slot came back")
+
+    def test_a_slot_comes_back_when_a_wait_ends_whether_it_answers_raises_or_cannot_connect(self):
+        class Raising:
+            Refused = redis_gov.Refused
+
+            @staticmethod
+            def load_acl():
+                return {}
+
+            @staticmethod
+            def execute(*a, **k):
+                raise RuntimeError("the wait blew up")
+
+        for _ in range(bridge_op.MAX_WAITS * 2):
+            with self.assertRaises(RuntimeError):
+                self.door(self.WAIT, Raising)
+        self.assertEqual(bridge_op.MAX_WAITS, self.free_slots(), "a wait that raised gave its slot back")
+
+        def unreachable():
+            raise ConnectionError("no route")
+
+        for _ in range(bridge_op.MAX_WAITS * 2):
+            code, out = bridge_op.handle(self.GROK, __import__("json").dumps(self.WAIT).encode("utf-8"),
+                                         unreachable, lambda line: None, callers={self.GROK: "grok"},
+                                         purposes={self.GROK: bridge_op.DOORBELL}, gov=Raising, acl={})
+            self.assertEqual((503, "redis unreachable"), (code, out["error"]))
+        self.assertEqual(bridge_op.MAX_WAITS, self.free_slots(), "a wait that could not connect gave its slot back")
+        inside = []
+        self.release.set()
+        for _ in range(bridge_op.MAX_WAITS * 2):
+            self.assertEqual(200, self.door(self.WAIT, self.holding_gov(inside))[0])
+        self.assertEqual(bridge_op.MAX_WAITS, self.free_slots(), "a wait that answered gave its slot back")
+
+    def test_a_refused_wait_holds_no_slot_and_no_other_op_touches_the_limit(self):
+        held = []
+        while bridge_op._WAITING.acquire(blocking=False):
+            held.append(1)
+        try:
+            self.assertEqual(bridge_op.MAX_WAITS, len(held))
+            gov = self.holding_gov([])
+            code, out, _ = self.door(dict(self.WAIT, key="fleet:inbox:gemini"), gov)
+            self.assertEqual((403, "refused"), (code, out["error"]), "the door's refusal comes first, not busy")
+            code, out, _ = self.door({"op": "xrange", "key": self.LANE, "count": 1, "expect": "grok"}, gov)
+            self.assertEqual(200, code, "the doorbell's xrange is not a wait")
+            for op, purpose in (("get", bridge_op.FLEET), ("xadd", bridge_op.FLEET)):
+                code, out = bridge_op.handle(
+                    "agent@x", __import__("json").dumps({"op": op, "key": "fleet:x"}).encode("utf-8"),
+                    object, lambda line: None, callers={"agent@x": "claude-code-cli"},
+                    purposes={"agent@x": purpose}, gov=gov, acl={})
+                self.assertEqual(200, code, "%s does not wait on the limit" % op)
+        finally:
+            for _ in held:
+                bridge_op._WAITING.release()
+
+    def test_the_chair_is_served_on_the_threaded_server_while_eight_waits_are_held(self):
+        """The real ThreadingHTTPServer and handler, the real op.handle, redis_gov and committed callers.json, and a
+        Redis whose XREAD blocks until released."""
+        import datetime
+        import http.client
+        import json
+        import time
+        from http.server import ThreadingHTTPServer
+        from test_redis_xwait import WaitingRedis
+        test = self
+        blocked = []
+
+        class BlockingRedis(WaitingRedis):
+            def xread(self, streams, count=None, block=None):
+                blocked.append(block)
+                test.release.wait(10)
+                return super().xread(streams, count=count, block=block)
+
+        saved = bridge.verify_caller, bridge.connect, bridge_op.clock
+        admitted = {self.GROK, CHAIR}
+        bridge.verify_caller = lambda token, aud, permitted: (token, None) if token in admitted else (None, "unauthenticated")
+        bridge.connect = BlockingRedis                # a connection of the request's own, as connect() makes
+        bridge_op.clock = time.time
+
+        def restore():
+            bridge.verify_caller, bridge.connect, bridge_op.clock = saved
+        self.addCleanup(restore)
+        server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+        server.daemon_threads = True
+        serving = self.threading.Thread(target=server.serve_forever, daemon=True)
+        serving.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        port = server.server_address[1]
+
+        def post(who, body, timeout=15):
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+            try:
+                raw = json.dumps(body).encode("utf-8")
+                conn.request("POST", "/op", body=raw, headers={"Authorization": "Bearer " + who,
+                                                               "Content-Type": "application/json"})
+                answer = conn.getresponse()
+                return answer.status, json.loads(answer.read().decode("utf-8"))
+            finally:
+                conn.close()
+
+        waits = []
+        threads = [self.threading.Thread(target=lambda: waits.append(post(self.GROK, self.WAIT)))
+                   for _ in range(bridge_op.MAX_WAITS)]
+        for thread in threads:
+            thread.start()
+        deadline = time.time() + 5
+        while len(blocked) < bridge_op.MAX_WAITS and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(bridge_op.MAX_WAITS, len(blocked), "eight waits are held inside XREAD")
+        started = time.time()
+        code, out = post(self.GROK, self.WAIT, timeout=3)
+        self.assertEqual((429, "busy", False), (code, out["error"], out["executed"]))
+        day = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d")
+        code, out = post(CHAIR, {"op": "get", "key": "conf:persona:%s:claude" % day, "author": "claude",
+                                 "request": "cap-1", "expect": "conference-chair"}, timeout=3)
+        self.assertEqual((200, True, "conference-chair"), (code, out["ok"], out["principal"]), out)
+        self.assertLess(time.time() - started, 3.0, "the chair was not queued behind the waits")
+        self.assertEqual(bridge_op.MAX_WAITS, len(blocked), "the chair's get did not wait")
+        self.release.set()
+        for thread in threads:
+            thread.join(10)
+        self.assertEqual([200] * bridge_op.MAX_WAITS, [code for code, _ in waits])
+        self.assertEqual(bridge_op.MAX_WAITS, self.free_slots())
 
 
 if __name__ == "__main__":

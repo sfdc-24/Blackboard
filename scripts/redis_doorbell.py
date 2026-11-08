@@ -19,11 +19,17 @@ It needs the bridge for this agent (REDIS_BRIDGE=on, REDIS_BRIDGE_URL, REDIS_BRI
 scripts/bridge_client.py). Without it, it says so and exits 3, and the board doorbell is the fallback.
 Exit codes: 0 entries printed, 2 refused or denied, 3 the bridge is not usable here, 4 the cursor file
 exists but is unreadable (fix or remove it by hand; it is never overwritten).
+
+A 429 busy (the bridge already holds as many waits as it lets one instance hold) is none of these: the
+doorbell sleeps the seconds the bridge named, plus a little jitter so a crowd does not return together,
+and waits again. It is not a refusal and not a reason to use the board doorbell.
 """
 import argparse
 import json
 import os
+import random
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -80,7 +86,8 @@ def write_cursor(path, value):
     os.replace(temp, path)
 
 
-def ring(me, attempt=bridge_client.attempt, out=None, cursor_file=None, peek=False, rounds=None):
+def ring(me, attempt=bridge_client.attempt, out=None, cursor_file=None, peek=False, rounds=None,
+         sleep=time.sleep):
     """Wait until an entry lands in fleet:inbox:<me>; print each as one JSON line. Returns an exit code."""
     out = out or sys.stdout
     path = cursor_file or cursor_path(me)
@@ -105,6 +112,12 @@ def ring(me, attempt=bridge_client.attempt, out=None, cursor_file=None, peek=Fal
         done += 1
         try:
             result = attempt("xwait", LANE + me, me=me, after=after, count=10)
+        except bridge_client.Busy as busy:
+            # CAPACITY: no room for a wait just now. Back off and wait again; never the board.
+            pause = busy.retry_after + random.uniform(0, 1)
+            print("redis doorbell: the bridge is busy; waiting again in %.0f s" % pause, file=sys.stderr)
+            sleep(pause)
+            continue
         except (bridge_client.Refused, bridge_client.Denied) as why:
             print("redis doorbell refused: %s" % why, file=sys.stderr)
             return 2

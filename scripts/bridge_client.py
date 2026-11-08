@@ -44,6 +44,11 @@ FIVE OUTCOMES, AND WHAT EACH ONE PERMITS (Aya's review of a125337, blockers 1 an
                   mismatch). TERMINAL. Never retried on the board route, read or write.
     Refused       403 "refused": redis_gov's own access rules said no. TERMINAL. The board route
                   runs the same rules and would refuse it again.
+    Busy          429 on an xwait, or a 429 "busy": the bridge already holds as many waits as it lets
+                  one instance hold (op.py, CAPACITY), or the platform had no room. Nothing ran.
+                  -> NOT the board route and NOT a failure: the caller waits .retry_after seconds
+                  and asks again. The breaker is left as it was, and a write's journal line closes
+                  as not executed.
     Unknown       anything else once a request was sent: a timeout, a dropped connection, a 5xx
                   without "executed": false, a 200 that is not the answer. For a READ the board
                   route may be used (asking twice changes nothing). For a WRITE it is TERMINAL:
@@ -115,6 +120,8 @@ OPEN_SECONDS = 900
 HTTP_TIMEOUT = 20
 WAIT_HTTP_TIMEOUT = 40     # an xwait holds the request for up to 25 s at the bridge
 MINT_TIMEOUT = 60
+BUSY_RETRY_SECONDS = 5     # how long to wait after a 429 busy that named no time (op.py WAIT_RETRY_SECONDS)
+BUSY_RETRY_MAX = 60        # and never longer than this, whatever the answer said
 # redis_gov.OPS_READ, restated: asking one of these twice changes nothing a caller owns.
 READS = ("get", "hgetall", "xrange", "xwait")   # xwait blocks on the caller's own lane; it is a read
 # redis_gov.PREVIEW_CHARS and redis_gov.preview(), restated and held equal by a test: how a read shows
@@ -179,6 +186,22 @@ class Refused(Exception):
     def __init__(self, reason: str, audit: str = ""):
         super().__init__("refused by the access rules")
         self.reason, self.audit = reason, audit
+
+
+class Busy(Exception):
+    """The bridge, or the platform in front of it, had no room for this wait. Nothing ran. Transient: wait
+    .retry_after seconds (BUSY_RETRY_SECONDS when the answer named none, bounded to 1..BUSY_RETRY_MAX) and
+    ask again. Never a reason to use the board route and never counted against the bridge."""
+
+    def __init__(self, retry_after=None):
+        super().__init__("HTTP 429 busy")
+        try:
+            seconds = float(retry_after)
+        except (TypeError, ValueError):
+            seconds = BUSY_RETRY_SECONDS
+        if seconds != seconds:                    # NaN
+            seconds = BUSY_RETRY_SECONDS
+        self.retry_after = min(max(seconds, 1.0), BUSY_RETRY_MAX)
 
 
 def status_label(status) -> str:
@@ -309,6 +332,9 @@ def call(url: str, token: str, request: dict, opener=None) -> dict:
         if status == 403 and answer.get("error") == "refused":
             raise Refused(clean_reason(answer.get("reason")),
                           "ok" if answer.get("audit") == "ok" else "not confirmed") from None
+        if status == 429 and (request.get("op") == "xwait" or answer.get("error") == "busy"):
+            # CAPACITY: a wait with no room. Nothing ran; ask again later, and never by the board.
+            raise Busy(answer.get("retry_after")) from None
         if status == 403 and answer.get("error") == "principal mismatch":
             raise Denied("HTTP 403 principal mismatch") from None
         if status in (401, 403):
@@ -523,6 +549,8 @@ def attempt(op: str, key: str, *, me: str, value=None, count=None, after=None, e
     nothing ran, or a READ's outcome is unknown. Everything but "off" is said first.
     Raises Refused, Denied or (for a write only) Unknown: all terminal. The caller must not send
     the operation again by any route.
+    Raises Busy when the bridge had no room for a wait: transient. The caller waits .retry_after
+    seconds and asks the bridge again; it does not use the board route.
 
     announce(text) is called at most once per trip of the breaker, at the moment it opens, with
     closed words only.
@@ -573,6 +601,11 @@ def attempt(op: str, key: str, *, me: str, value=None, count=None, after=None, e
             # may already have happened under that name: unknown, and never sent again.
             raise Unknown("answered as another principal") if write else Denied(
                 "answered as another principal")
+    except Busy:
+        # The bridge answered and ran nothing. Not a failure (the breaker is left as it was), not a reason
+        # to use the board, and a write's line closes as not executed.
+        _close(intent, "NOT_EXECUTED", now, journal_path, say)
+        raise
     except (Refused, Denied) as why:
         _record(state_path, {"failures": 0, "open_until": 0.0}, say, only_if=state)  # it answered
         _close(intent, "REFUSED" if isinstance(why, Refused) else "DENIED", now, journal_path, say)
