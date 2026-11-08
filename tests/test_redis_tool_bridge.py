@@ -910,10 +910,12 @@ class TheOpEndpoint(unittest.TestCase):
         # THE PILOT, pinned whole: the chair for one persona, Aya's account for the probe and no more, and
         # (the owner, 2026-11-08) claude-code-cli as the first fleet agent on /op, acting as itself.
         # Another caller, a second persona or another fleet agent fails HERE, in the PR that proposes it.
+        # Grok is the second fleet agent (the owner, 2026-11-08), as itself, for its Redis doorbell.
         cli = "fleet-claude-code-cli@sfdc24.iam.gserviceaccount.com"
-        self.assertEqual({AYA: bridge_op.PROBE, CHAIR: bridge_op.CHAIR, cli: bridge_op.FLEET}, purposes,
-                         "every line says what it is for")
-        self.assertEqual({CHAIR: "conference-chair", cli: "claude-code-cli"}, callers,
+        grok = "fleet-grok@sfdc24.iam.gserviceaccount.com"
+        self.assertEqual({AYA: bridge_op.PROBE, CHAIR: bridge_op.CHAIR, cli: bridge_op.FLEET, grok: bridge_op.FLEET},
+                         purposes, "every line says what it is for")
+        self.assertEqual({CHAIR: "conference-chair", cli: "claude-code-cli", grok: "grok"}, callers,
                          "an account admitted for the probe acts as nobody; the fleet agent acts as itself")
         self.assertEqual({CHAIR: ("claude",)}, bridge_op.load_personas())
         self.assertEqual({CHAIR: ("workshop",)}, bridge_op.load_rooms(), "the owner named one room")
@@ -1007,7 +1009,8 @@ class TheOpEndpoint(unittest.TestCase):
         words = shlex.split(rendered)
         self.assertEqual(1, len(words), "the environment flag is one shell word: %r" % words[:3])
         self.assertTrue(words[0].startswith("--set-env-vars=^;^REDIS_HOST=10.0.0.1;"))
-        self.assertTrue(words[0].endswith("fleet-claude-code-cli@sfdc24.iam.gserviceaccount.com"))
+        self.assertTrue(words[0].endswith("fleet-claude-code-cli@sfdc24.iam.gserviceaccount.com,"
+                                          "fleet-grok@sfdc24.iam.gserviceaccount.com"))
         self.assertIn("echo 'set -euo pipefail'", DEPLOY, "the generated script stops at its first failure")
         self.assertIn("deploy_cmds | bash -euo pipefail -s", DEPLOY)
         self.assertLess(DEPLOY.index("echo 'set -euo pipefail'"), DEPLOY.index("gcloud run deploy ${SERVICE}"),

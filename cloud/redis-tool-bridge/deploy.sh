@@ -22,8 +22,8 @@ IMAGE="us-central1-docker.pkg.dev/${PROJECT}/cloud-run-source-deploy/${SERVICE}:
 
 # WHO MAY CALL IT. Named service accounts, never allUsers and never allAuthenticatedUsers.
 # aya-runtime and conference-chair were read back from the running service's IAM policy on
-# 2026-11-08 (00003-j9j); fleet-claude-code-cli is the owner's 2026-11-08 addition.
-INVOKERS=("serviceAccount:aya-runtime@${PROJECT}.iam.gserviceaccount.com" "serviceAccount:conference-chair@${PROJECT}.iam.gserviceaccount.com" "serviceAccount:fleet-claude-code-cli@${PROJECT}.iam.gserviceaccount.com")
+# 2026-11-08 (00003-j9j); fleet-claude-code-cli and fleet-grok are the owner's 2026-11-08 additions.
+INVOKERS=("serviceAccount:aya-runtime@${PROJECT}.iam.gserviceaccount.com" "serviceAccount:conference-chair@${PROJECT}.iam.gserviceaccount.com" "serviceAccount:fleet-claude-code-cli@${PROJECT}.iam.gserviceaccount.com" "serviceAccount:fleet-grok@${PROJECT}.iam.gserviceaccount.com")
 
 usage() {
   cat <<'TXT'
@@ -117,7 +117,7 @@ gcloud run deploy ${SERVICE} \\
   --min-instances=0 --max-instances=1 --concurrency=4 \\
   --network=default --subnet=default --vpc-egress=private-ranges-only \\
   --set-secrets=/secrets/auth/redis-auth=REDIS_AUTH_STRING:2,/secrets/ca/redis-ca.pem=REDIS_CA_CERT:1 \\
-  '--set-env-vars=^;^REDIS_HOST=${REDIS_HOST};REDIS_PORT=${REDIS_PORT:-6378};REDIS_AUTH_FILE=/secrets/auth/redis-auth;REDIS_CA_CERT_PATH=/secrets/ca/redis-ca.pem;BRIDGE_AUDIENCE=${url};BRIDGE_CALLERS=aya-runtime@${PROJECT}.iam.gserviceaccount.com,conference-chair@${PROJECT}.iam.gserviceaccount.com,fleet-claude-code-cli@${PROJECT}.iam.gserviceaccount.com'
+  '--set-env-vars=^;^REDIS_HOST=${REDIS_HOST};REDIS_PORT=${REDIS_PORT:-6378};REDIS_AUTH_FILE=/secrets/auth/redis-auth;REDIS_CA_CERT_PATH=/secrets/ca/redis-ca.pem;BRIDGE_AUDIENCE=${url};BRIDGE_CALLERS=aya-runtime@${PROJECT}.iam.gserviceaccount.com,conference-chair@${PROJECT}.iam.gserviceaccount.com,fleet-claude-code-cli@${PROJECT}.iam.gserviceaccount.com,fleet-grok@${PROJECT}.iam.gserviceaccount.com'
 CMD
   # --no-allow-unauthenticated is the platform half of defect 3. The application allowlist
   # (BRIDGE_CALLERS) is the half this repository can review. Both, independently.

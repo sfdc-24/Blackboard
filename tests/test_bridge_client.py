@@ -974,7 +974,8 @@ class TheRealBoundary(Harness, unittest.TestCase):
         conn = FakeRedis()
         # Since the owner's 2026-11-08 go, claude-code-cli is the one fleet agent on /op, by its own account.
         self.assertEqual({"conference-chair@sfdc24.iam.gserviceaccount.com": "conference-chair",
-                          "fleet-claude-code-cli@sfdc24.iam.gserviceaccount.com": "claude-code-cli"},
+                          "fleet-claude-code-cli@sfdc24.iam.gserviceaccount.com": "claude-code-cli",
+                          "fleet-grok@sfdc24.iam.gserviceaccount.com": "grok"},
                          bc.load_callers())
         for me, account in ((AYA, AYA_SA), (ME, SA)):
             out, said = self.attempt(BridgeSim(conn, principal="file", account=account), me=me, account=account,
