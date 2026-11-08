@@ -378,10 +378,43 @@ def cmd_post(args):
     return append_and_verify(rid, row, fitted, spill)
 
 
-def append_and_verify(rid, row, fitted=None, spill=None):
+PAYLOAD_COLUMN = 5   # Row_ID, Timestamp, Source_Tag, Target_Surface, Action_Type, Payload, ...
+
+
+def _payload_of(row):
+    return str(row[PAYLOAD_COLUMN]) if isinstance(row, (list, tuple)) and len(row) > PAYLOAD_COLUMN else None
+
+
+def _matching(hits, row):
+    """True when every board row under this id carries exactly this row's payload."""
+    wanted = _payload_of(row)
+    return wanted is not None and all(str(h.get("Payload", "")) == wanted for h in hits)
+
+
+def append_and_verify(rid, row, fitted=None, spill=None, reuse_check=False):
     """Append one row, commit its spill if it has one, and prove it landed by reading it back.
-    0 only on a verified row. The one append path for post and request, so they cannot drift."""
+    0 only on a verified row. The one append path for post and request, so they cannot drift.
+
+    With ``reuse_check`` (requests, whose ids are stable by design; Codex on #478) a row is VERIFIED
+    only when every row under its id carries exactly its payload, so a retry that carried a different
+    operation under the same id is never reported as posted. The board is also read FIRST: the same
+    payload already there is that retry, verified without a second append; a different payload under
+    the id is refused and nothing is appended. A post keeps its own unique id and is unchanged."""
     fitted = fitted or {}
+    if reuse_check:
+        before = read_board(quiet=True)
+        if before is None:
+            print("  COULD NOT CHECK the id before appending; not appended. Do NOT retry blindly.")
+            return 1
+        _, existing = rows_frame(before)
+        hits = [r for r in existing if str(r.get("Row_ID", "")) == rid]
+        if hits and _matching(hits, row):
+            print("  VERIFIED on the board: Row_ID=%s Source_Tag=%s Target_Surface=%s (already there; not appended again)"
+                  % (rid, hits[-1].get("Source_Tag"), hits[-1].get("Target_Surface")))
+            return 0
+        if hits:
+            print("  REFUSED: Row_ID=%s is already on the board with a different payload; nothing appended" % rid)
+            return 2
     # tries=1 is not a tuning choice. The v1 bus does not dedup, and a
     # googleusercontent 404 on the redirect hop can be raised client-side AFTER
     # the row has landed - that replayed a row onto the live board once already.
@@ -418,6 +451,9 @@ def append_and_verify(rid, row, fitted=None, spill=None):
         return 1
     _, recs = rows_frame(data)
     hit = [r for r in recs if str(r.get("Row_ID", "")) == rid]
+    if hit and reuse_check and not _matching(hit, row):
+        print("  NOT VERIFIED: Row_ID=%s is on the board, but a row under it holds a different payload" % rid)
+        return 1
     if hit:
         print("  VERIFIED on the board: Row_ID=%s Source_Tag=%s Target_Surface=%s"
               % (rid, hit[-1].get("Source_Tag"), hit[-1].get("Target_Surface")))
@@ -511,7 +547,7 @@ def cmd_request(args):
         print("  refused before posting: %s" % why)
         return 2
     print("  request %s: %s %s" % (rid, args.op, args.key))
-    return append_and_verify(rid, row)
+    return append_and_verify(rid, row, reuse_check=True)
 
 
 def cmd_archive(args):
