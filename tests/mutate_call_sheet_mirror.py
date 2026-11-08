@@ -133,9 +133,16 @@ MUTANTS = [
     ),
     (
         "command-counts-as-other",
-        "    row_class = kind if kind in (\"command\", \"other\") else \"CALL\"",
-        "    row_class = \"other\"  # MUTANT: command is recorded as other",
-        "a class=command turn is written class=other and loses verb and target_chars",
+        "    extra = [(\"turn_class\", kind)]",
+        "    extra = [(\"turn_class\", \"other\")]  # MUTANT: command is recorded as other",
+        "a turn_class=command turn is written turn_class=other",
+        "test_a_turn_without_text_records_the_class_and_withheld",
+    ),
+    (
+        "read-the-old-class-field",
+        "    kind = (fields.get(\"turn_class\") or \"\").strip()",
+        "    kind = (fields.get(\"class\") or \"\").strip()  # MUTANT: the old field name",
+        "turn_class is taken from class=, which the chair no longer sends",
         "test_a_turn_without_text_records_the_class_and_withheld",
     ),
     (

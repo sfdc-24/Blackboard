@@ -611,6 +611,32 @@ def _turn_body(fields):
     return _cell(fields.get("text")).strip()
 
 
+def _turn_kind(fields):
+    """The chair's turn_class. The old class= field is not this, and is not copied."""
+    kind = (fields.get("turn_class") or "").strip()
+    return kind if kind in ("command", "other") else ""
+
+
+def _class_fields(fields):
+    """turn_class plus the counts that belong to it. command: verb and target_chars. other: chars."""
+    kind = _turn_kind(fields)
+    if not kind:
+        return []
+    extra = [("turn_class", kind)]
+    if kind == "command":
+        verb = _cell(fields.get("verb")).strip()
+        count = _count(fields.get("target_chars"))
+        if verb:
+            extra.append(("verb", verb))
+        if count:
+            extra.append(("target_chars", count))
+    else:
+        count = _count(fields.get("chars"))
+        if count:
+            extra.append(("chars", count))
+    return extra
+
+
 def _turn_spec(call_id, fields):
     turn_key = _token(fields.get("turn_key"), limit=120)
     tag = (fields.get("to") or "").strip()
@@ -629,32 +655,29 @@ def _turn_spec(call_id, fields):
     if cut:
         digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
         pairs += [("truncated", "1"), ("chars", str(len(text))), ("sha256", digest)]
+    pairs = _with_class(pairs, fields)
     return _sheet_spec(rid, tag, "ASK", _bcb(pairs), "CALL_TURN %s %d" % (turn_key, len(shown)))
 
 
-def _withheld_turn(call_id, fields, rid, tag, epoch, turn_key):
-    """No text on the entry: record the class and the counts, and do not invent the words.
+def _with_class(pairs, fields):
+    """Append turn_class and its counts. A chars= already on the row (a truncated text) stays."""
+    have = {key for key, _ in pairs}
+    for key, value in _class_fields(fields):
+        if key not in have:
+            pairs.append((key, value))
+    return pairs
 
-    class= is written once. command or other replaces CALL, because a second class= key would
-    disagree with the first. verb, target_chars and chars are the chair's own fields."""
-    kind = (fields.get("class") or "").strip()
-    row_class = kind if kind in ("command", "other") else "CALL"
-    pairs = [("v", "1"), ("id", rid), ("phase", "ASK"), ("class", row_class),
+
+def _withheld_turn(call_id, fields, rid, tag, epoch, turn_key):
+    """No text on the entry: record turn_class and the counts, and do not invent the words.
+
+    class=CALL stays the envelope class. turn_class is the chair's own field."""
+    pairs = [("v", "1"), ("id", rid), ("phase", "ASK"), ("class", "CALL"),
              ("from", SHEET_FROM), ("to", tag), ("msg_type", "CALL_TURN"),
              ("call_id", call_id), ("epoch", epoch), ("turn_key", turn_key),
              ("said_at", fields.get("said_at")), ("withheld", "1")]
-    if kind == "command":
-        verb = _cell(fields.get("verb")).strip()
-        count = _count(fields.get("target_chars"))
-        if verb:
-            pairs.append(("verb", verb))
-        if count:
-            pairs.append(("target_chars", count))
-    elif kind == "other":
-        count = _count(fields.get("chars"))
-        if count:
-            pairs.append(("chars", count))
-    return _sheet_spec(rid, tag, "ASK", _bcb(pairs), "CALL_TURN %s withheld" % turn_key)
+    return _sheet_spec(rid, tag, "ASK", _bcb(_with_class(pairs, fields)),
+                       "CALL_TURN %s withheld" % turn_key)
 
 
 def _live_calls(conn):

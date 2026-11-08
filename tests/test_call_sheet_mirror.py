@@ -258,8 +258,8 @@ class CallTurns(unittest.TestCase):
         self.assertEqual([], [key for op, key in conn.writes if str(key).startswith("fleet:voice-say:")])
 
     def test_a_turn_without_text_records_the_class_and_withheld(self):
-        """class=other carries chars, class=command carries verb and target_chars. No text key,
-        and a words field on the entry is not the row."""
+        """turn_class=other carries chars, turn_class=command carries verb and target_chars.
+        The envelope class stays CALL. The old class= field and a words field are not the row."""
         conn, board = FakeRedis(), Board()
         said = "2026-11-08T12:55:00Z"
         conn.hashes[sr.CALL_KEY % LIVE] = {
@@ -268,31 +268,42 @@ class CallTurns(unittest.TestCase):
             "state": "ended", "epoch": "7", "started_at": said, "ended_at": said, "reason": "hangup"}
         conn.add(sr.TURNS_KEY % LIVE, "5000-0", {
             "turn_key": "t-other", "to": "grok", "epoch": "7", "said_at": said,
-            "class": "other", "chars": "40", "words": "swordfish-secret"})
+            "turn_class": "other", "class": "not-this", "chars": "40", "words": "swordfish-secret"})
         conn.add(sr.TURNS_KEY % LIVE, "5000-1", {
             "turn_key": "t-cmd", "to": "gemini", "epoch": "7", "said_at": said,
-            "class": "command", "verb": "status", "target_chars": "12", "words": "secretphrase"})
+            "turn_class": "command", "class": "not-this", "verb": "status", "target_chars": "12",
+            "words": "secretphrase"})
+        conn.add(sr.TURNS_KEY % LIVE, "5000-2", {
+            "turn_key": "t-said", "to": "grok", "epoch": "7", "said_at": said, "text": "hello",
+            "turn_class": "command", "class": "not-this", "verb": "status", "target_chars": "4"})
         conn.add(sr.TURNS_KEY % ENDED, "5000-0", {
             "turn_key": "t-dead", "to": "grok", "epoch": "7", "said_at": said,
-            "class": "other", "chars": "9", "words": "gone-words"})
+            "turn_class": "other", "chars": "9", "words": "gone-words"})
         _mirror(conn, board)
         by_id = {spec["row_id"]: spec for spec in board.appends}
-        self.assertEqual(["CALLTURN-t-other", "CALLTURN-t-cmd"], list(by_id))
+        self.assertEqual(["CALLTURN-t-other", "CALLTURN-t-cmd", "CALLTURN-t-said"], list(by_id))
         other = (
-            "BCB|v=1|id=CALLTURN-t-other|phase=ASK|class=other|from=conference-chair|to=grok|"
-            "msg_type=CALL_TURN|call_id=%s|epoch=7|turn_key=t-other|said_at=%s|withheld=1|chars=40"
-            % (LIVE, said))
+            "BCB|v=1|id=CALLTURN-t-other|phase=ASK|class=CALL|from=conference-chair|to=grok|"
+            "msg_type=CALL_TURN|call_id=%s|epoch=7|turn_key=t-other|said_at=%s|withheld=1|"
+            "turn_class=other|chars=40" % (LIVE, said))
         command = (
-            "BCB|v=1|id=CALLTURN-t-cmd|phase=ASK|class=command|from=conference-chair|to=gemini|"
+            "BCB|v=1|id=CALLTURN-t-cmd|phase=ASK|class=CALL|from=conference-chair|to=gemini|"
             "msg_type=CALL_TURN|call_id=%s|epoch=7|turn_key=t-cmd|said_at=%s|withheld=1|"
-            "verb=status|target_chars=12" % (LIVE, said))
+            "turn_class=command|verb=status|target_chars=12" % (LIVE, said))
+        said_row = (
+            "BCB|v=1|id=CALLTURN-t-said|phase=ASK|class=CALL|from=conference-chair|to=grok|"
+            "msg_type=CALL_TURN|call_id=%s|epoch=7|turn_key=t-said|said_at=%s|text=hello|"
+            "turn_class=command|verb=status|target_chars=4" % (LIVE, said))
         self.assertEqual(other, by_id["CALLTURN-t-other"]["payload"])
         self.assertEqual(command, by_id["CALLTURN-t-cmd"]["payload"])
-        joined = other + command
-        self.assertNotIn("text=", joined)
+        self.assertEqual(said_row, by_id["CALLTURN-t-said"]["payload"])
+        joined = other + command + said_row
+        self.assertNotIn("not-this", joined)
         self.assertNotIn("swordfish", joined)
         self.assertNotIn("secretphrase", joined)
         self.assertNotIn("gone-words", joined)
+        self.assertNotIn("|text=", other)
+        self.assertNotIn("|text=", command)
         for spec in by_id.values():
             self.assertEqual([], board_row.problems(spec["payload"]))
             self.assertEqual([], signature.check(spec["source_tag"], spec["payload"]))
