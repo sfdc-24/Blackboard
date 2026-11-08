@@ -33,7 +33,8 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 LEDGER = Path.home() / ".claude" / "estimates.json"
-ME = os.environ.get("ESTIMATE_BY", "claude-code-cli")
+# No default: a default once posted Codex's estimate under claude-code-cli (2026-11-08). The author must name itself.
+ME = os.environ.get("ESTIMATE_BY", "").strip()
 try:
     from zoneinfo import ZoneInfo
     TORONTO = ZoneInfo("America/Toronto")
@@ -161,6 +162,8 @@ def main():
     r.add_argument("--minutes", type=int, required=True, help="minutes from now"); r.add_argument("--reason", required=True)
     s.add_parser("report")
     args = p.parse_args()
+    if args.cmd != "report" and not ME:
+        sys.exit("set ESTIMATE_BY to your instance tag (e.g. ESTIMATE_BY=codex); nothing was posted")
     {"start": cmd_start, "done": cmd_done, "reestimate": cmd_reestimate, "report": cmd_report}[args.cmd](args)
 
 
