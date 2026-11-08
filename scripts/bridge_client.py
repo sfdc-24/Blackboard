@@ -113,9 +113,10 @@ IMPERSONATE_ENV = "REDIS_BRIDGE_IMPERSONATE"
 TRIP_AFTER = 3
 OPEN_SECONDS = 900
 HTTP_TIMEOUT = 20
+WAIT_HTTP_TIMEOUT = 40     # an xwait holds the request for up to 25 s at the bridge
 MINT_TIMEOUT = 60
 # redis_gov.OPS_READ, restated: asking one of these twice changes nothing a caller owns.
-READS = ("get", "hgetall", "xrange")
+READS = ("get", "hgetall", "xrange", "xwait")   # xwait blocks on the caller's own lane; it is a read
 # redis_gov.PREVIEW_CHARS and redis_gov.preview(), restated and held equal by a test: how a read shows
 # a stored value. The journal hashes this form so a reconciliation can match what it reads.
 PREVIEW_CHARS = 200
@@ -294,7 +295,8 @@ def call(url: str, token: str, request: dict, opener=None) -> dict:
     req.add_header("Content-Type", "application/json")
     opener = opener or urllib.request.build_opener(_NoRedirect)
     try:
-        with opener.open(req, timeout=HTTP_TIMEOUT) as response:
+        timeout = WAIT_HTTP_TIMEOUT if request.get("op") == "xwait" else HTTP_TIMEOUT
+        with opener.open(req, timeout=timeout) as response:
             status, raw = response.status, response.read(1 << 20)
     except urllib.error.HTTPError as error:
         status = error.code
