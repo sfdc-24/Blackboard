@@ -27,6 +27,8 @@ import argparse
 import datetime
 import json
 import os
+import re
+import secrets
 import subprocess
 import sys
 import tempfile
@@ -39,8 +41,10 @@ LEDGER = Path(os.environ.get("ESTIMATE_LEDGER") or (Path.home() / ".claude" / "e
 ME = os.environ.get("ESTIMATE_BY", "").strip()
 # ESTIMATE_BY is the INSTANCE (a scripts/agent_roster.json id; the append guard refuses anything else). Two sessions of
 # one instance (two claude-code-cli terminals) tell their rows apart with ESTIMATE_SESSION, e.g. b76 or vscode: it is
-# posted as session= and goes into the row id, so two sessions posting in the same second never share an id.
+# posted as session= and goes into the row id whole (never cut), so two sessions never share an id. Every row id also
+# ends in a random suffix, so even two blank-session writers posting in the same second cannot collide.
 SESSION = os.environ.get("ESTIMATE_SESSION", "").strip()
+SAFE_SESSION = re.compile(r"^[a-z0-9][a-z0-9-]{0,23}$")
 try:
     from zoneinfo import ZoneInfo
     TORONTO = ZoneInfo("America/Toronto")
@@ -77,8 +81,8 @@ def clean(s):
 
 
 def post(kind, fields):
-    who = ME.upper().replace("-", "")[:12] + (("-" + SESSION.upper().replace("-", "")[:8]) if SESSION else "")
-    rid = "%s-%s-%s" % (who, kind.replace("_", "-"), now().strftime("%Y%m%dT%H%M%SZ"))
+    who = ME.upper() + (("-" + SESSION.upper()) if SESSION else "")
+    rid = "%s-%s-%s-%s" % (who, kind.replace("_", "-"), now().strftime("%Y%m%dT%H%M%SZ"), secrets.token_hex(2).upper())
     if SESSION:
         fields = list(fields[:3]) + [("session", SESSION)] + list(fields[3:])   # near the front, where a reader looks
     parts = ["BCB", "v=1", "id=" + rid, "phase=RESULT", "class=STATUS", "from=" + ME, "to=all",
@@ -106,12 +110,13 @@ def post(kind, fields):
 def cmd_start(a):
     t0 = now()
     due = t0 + datetime.timedelta(minutes=a.minutes)
-    d = load()
+    if not post("ESTIMATE", [("task", a.task), ("parent", a.parent or "-"), ("by", ME), ("started", iso(t0)),
+                             ("est_minutes", a.minutes), ("est_done", iso(due)), ("est_done_et", et(due)),
+                             ("what", a.what)]):
+        sys.exit("the ESTIMATE row did not read back; the ledger is unchanged, so this task is NOT recorded")
+    d = load()                                   # the ledger records only what the board holds
     d[a.task] = {"started": iso(t0), "est_minutes": a.minutes, "what": a.what, "by": ME, "parent": a.parent}
     save(d)
-    post("ESTIMATE", [("task", a.task), ("parent", a.parent or "-"), ("by", ME), ("started", iso(t0)),
-                      ("est_minutes", a.minutes), ("est_done", iso(due)), ("est_done_et", et(due)),
-                      ("what", a.what)])
 
 
 def cmd_reestimate(a):
@@ -122,11 +127,13 @@ def cmd_reestimate(a):
         sys.exit("no estimate for task %r on this machine" % a.task)
     t = now()
     due = t + datetime.timedelta(minutes=a.minutes)
+    n = len(e.get("reestimates", [])) + 1
+    if not post("ESTIMATE", [("task", a.task), ("by", ME), ("reestimate", n),
+                             ("started", e["started"]), ("new_est_done", iso(due)), ("new_est_done_et", et(due)),
+                             ("reason", a.reason)]):
+        sys.exit("the re-estimate row did not read back; the ledger is unchanged")
     e.setdefault("reestimates", []).append({"at": iso(t), "new_done": iso(due), "reason": a.reason})
     save(d)
-    post("ESTIMATE", [("task", a.task), ("by", ME), ("reestimate", len(e["reestimates"])),
-                      ("started", e["started"]), ("new_est_done", iso(due)), ("new_est_done_et", et(due)),
-                      ("reason", a.reason)])
 
 
 def cmd_done(a):
@@ -140,15 +147,17 @@ def cmd_done(a):
     est = e["est_minutes"]
     promised = t0 + datetime.timedelta(minutes=est)            # the FIRST estimate's promised delivery time
     delta = round((t1 - promised).total_seconds() / 60)        # + late, - early
-    e.update(done=iso(t1), actual_minutes=actual, note=a.note)
-    save(d)
-    post("ESTIMATE_DONE", [("task", a.task), ("parent", e.get("parent") or "-"), ("by", ME), ("started", e["started"]),
+    ok = post("ESTIMATE_DONE", [("task", a.task), ("parent", e.get("parent") or "-"), ("by", ME), ("started", e["started"]),
                            ("promised", iso(promised)), ("promised_et", et(promised)),
                            ("delivered", iso(t1)), ("delivered_et", et(t1)),
                            ("delta_minutes", ("+%d" % delta) if delta > 0 else str(delta)),
                            ("est_minutes", est), ("actual_minutes", actual),
                            ("ratio", "%.2f" % (actual / est if est else 0)),
                            ("reestimates", len(e.get("reestimates", []))), ("note", a.note or "")])
+    if not ok:
+        sys.exit("the ESTIMATE_DONE row did not read back; the task stays open in the ledger, run done again")
+    e.update(done=iso(t1), actual_minutes=actual, note=a.note)
+    save(d)
 
 
 def cmd_report(_a):
@@ -181,6 +190,9 @@ def main():
     args = p.parse_args()
     if args.cmd != "report" and not ME:
         sys.exit("set ESTIMATE_BY to your instance tag (e.g. ESTIMATE_BY=codex); nothing was posted")
+    if args.cmd != "report" and SESSION and not SAFE_SESSION.match(SESSION):
+        sys.exit("ESTIMATE_SESSION must be 1-24 of a-z 0-9 - (lower case, starting with a letter or digit); "
+                 "nothing was posted")
     ids = roster_ids()
     if args.cmd != "report" and ids is not None and ME not in ids:
         sys.exit("ESTIMATE_BY=%s is not an instance in scripts/agent_roster.json, so the board would refuse it. Use the "
