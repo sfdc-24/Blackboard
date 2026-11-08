@@ -655,6 +655,21 @@ class RedisRequests(unittest.TestCase):
         req, _ = aw.redis_request("REDIS-OP|op=xrange|key=conf:side:20261011|count=5")
         self.assertEqual(("xrange", "5"), (req["op"], req["count"]))
 
+    def test_every_post_request_call_names_the_ask_it_answers(self):
+        """The stable request id is only stable if the caller passes the ask being answered. Without
+        `answers`, request_id() hashes the empty string and every request from this agent would share
+        one id, which the worker's gov:req marker then refuses. main() is the caller."""
+        import ast
+        tree = ast.parse(open(aw.__file__, encoding="utf-8").read())
+        calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                 and getattr(node.func, "id", None) == "post_request"]
+        self.assertTrue(calls, "main() no longer posts a request")
+        for call in calls:
+            self.assertIn("answers", [kw.arg for kw in call.keywords],
+                          "a post_request call at line %d does not say which ask it answers" % call.lineno)
+        self.assertNotEqual(aw.request_id("gemini", "A-1"), aw.request_id("gemini", "A-2"))
+        self.assertEqual(aw.request_id("gemini", "A-1"), aw.request_id("gemini", "A-1"))
+
     def test_post_request_goes_through_fleet_agent_request_and_trusts_only_the_read_back(self):
         calls = []
 
