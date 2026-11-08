@@ -126,10 +126,19 @@ class TheImageLayout(unittest.TestCase):
         cls.tmp = tempfile.TemporaryDirectory()
         cls.app = Path(cls.tmp.name)
         cls.copied = copied_paths()
+        # The destination name, not the source basename. inbox-wake/main.py is copied as
+        # inbox_wake_main.py so it does not replace this image's entrypoint, which is also main.py.
         for rel in cls.copied:
             src = ROOT / rel
-            if src.is_file():
-                shutil.copy2(src, cls.app / src.name)
+            if not src.is_file():
+                continue
+            dest = src.name
+            for line in DOCKERFILE.read_text(encoding="utf-8").splitlines():
+                parts = line.split()
+                if len(parts) >= 3 and parts[0] == "COPY" and parts[1] == rel:
+                    dest = Path(parts[2]).name
+                    break
+            shutil.copy2(src, cls.app / dest)
 
     @classmethod
     def tearDownClass(cls):
@@ -153,6 +162,13 @@ class TheImageLayout(unittest.TestCase):
         job that cannot start, and the job spec is not in this repository to check against."""
         for entry in ("serve_requests.py", "main.py", "probe.py", "keyspace_view.py"):
             self.assertTrue((self.app / entry).is_file(), "%s is not copied into the image" % entry)
+        # inbox-wake/main.py is copied as inbox_wake_main.py. The same basename would replace this
+        # job's entrypoint, and `import main` would still succeed.
+        entry = (self.app / "main.py").read_text(encoding="utf-8")
+        self.assertIn("bus_reconcile", entry)
+        self.assertNotIn("INBOX_WAKE_ENABLED", entry)
+        wake = (self.app / "inbox_wake_main.py").read_text(encoding="utf-8")
+        self.assertIn("INBOX_WAKE_ENABLED", wake)
 
     def test_the_roster_travels_with_the_code_that_reads_it(self):
         """append.py refuses every row when the roster is absent - deliberately, a guard that cannot

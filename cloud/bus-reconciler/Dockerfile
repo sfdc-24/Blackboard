@@ -65,6 +65,9 @@ COPY scripts/append.py /app/append.py
 # warned about, reappearing inside the container. The roster it reads is already copied below.
 COPY scripts/signature.py /app/signature.py
 COPY cloud/bus-reconciler/serve_requests.py /app/serve_requests.py
+# Inbox-wake's alias table, for BOARD_TO_REDIS (default off). Read as text, not imported, and not
+# named main.py: that name is this image's entrypoint. The flag off never opens the file.
+COPY cloud/inbox-wake/main.py /app/inbox_wake_main.py
 # The roster: the file is the ORIGINAL, Redis gets a copy. Both travel so the seeder can verify
 # the copy against the original from inside the VPC, which is the only place either is reachable.
 COPY scripts/agent_roster.json /app/agent_roster.json

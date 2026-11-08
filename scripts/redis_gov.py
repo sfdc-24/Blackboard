@@ -83,6 +83,9 @@ from pathlib import Path
 ACL_FILE = Path(__file__).resolve().parent / "redis_acl.json"
 AUDIT_STREAM = "gov:audit"
 AUDIT_MAXLEN = 200000
+# A governed xadd trims its stream to about this many entries (MAXLEN ~). The bus-requests board
+# mirror reuses it for fleet:inbox:<agent>, so a lane it writes is held to the same cap.
+STREAM_MAXLEN = 10000
 
 PROTECTED = ("v1:bus:", "v1:agent:", "v1:conf:", "v1:synth:", "probe:", "gov:")
 FORWARD_ONLY = ("fleet:cursor:",)
@@ -1573,7 +1576,7 @@ def _write(conn, acl, who, raw_tag, via, op, key, field, value, now, stated=None
             if ttl:
                 pipe.expire(key, ttl)
         else:                                                                   # xadd
-            pipe.xadd(key, {"text": value, "by": who, "at": stamp(now)}, maxlen=10000,
+            pipe.xadd(key, {"text": value, "by": who, "at": stamp(now)}, maxlen=STREAM_MAXLEN,
                       approximate=True)
             if ttl:
                 pipe.expire(key, ttl)
