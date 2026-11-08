@@ -907,10 +907,14 @@ class TheOpEndpoint(unittest.TestCase):
         acl = redis_gov.load_acl()
         callers, purposes = bridge_op.load_callers(), bridge_op.load_purposes()
         self.assertTrue(callers, "callers.json maps nobody, so /op would refuse everyone")
-        # THE PILOT, pinned whole: one caller of /op, one persona, and Aya's account for the probe and no more.
-        # A second caller, a second persona or a fleet agent on /op fails HERE, in the PR that proposes it.
-        self.assertEqual({AYA: bridge_op.PROBE, CHAIR: bridge_op.CHAIR}, purposes, "every line says what it is for")
-        self.assertEqual({CHAIR: "conference-chair"}, callers, "an account admitted for the probe acts as nobody")
+        # THE PILOT, pinned whole: the chair for one persona, Aya's account for the probe and no more, and
+        # (the owner, 2026-11-08) claude-code-cli as the first fleet agent on /op, acting as itself.
+        # Another caller, a second persona or another fleet agent fails HERE, in the PR that proposes it.
+        cli = "fleet-claude-code-cli@sfdc24.iam.gserviceaccount.com"
+        self.assertEqual({AYA: bridge_op.PROBE, CHAIR: bridge_op.CHAIR, cli: bridge_op.FLEET}, purposes,
+                         "every line says what it is for")
+        self.assertEqual({CHAIR: "conference-chair", cli: "claude-code-cli"}, callers,
+                         "an account admitted for the probe acts as nobody; the fleet agent acts as itself")
         self.assertEqual({CHAIR: ("claude",)}, bridge_op.load_personas())
         self.assertEqual({CHAIR: ("workshop",)}, bridge_op.load_rooms(), "the owner named one room")
         self.assertEqual(1, bridge_op.MAX_ROOMS)
@@ -951,10 +955,63 @@ class TheOpEndpoint(unittest.TestCase):
 
     def test_every_caller_the_deploy_admits_has_a_line_that_says_what_it_is_for(self):
         import re
-        admitted = re.search(r"BRIDGE_CALLERS=([^\s\\]+)", DEPLOY).group(1)
+        admitted = re.search(r"BRIDGE_CALLERS=([^\s\\']+)", DEPLOY).group(1)
         for email in admitted.replace("${PROJECT}", "sfdc24").split(","):
             self.assertIn(email.strip().lower(), bridge_op.load_purposes(),
                           "deploy.sh admits %s but callers.json has no line for it" % email)
+
+    def test_an_operator_value_that_could_leave_its_quotes_is_refused_before_any_command(self):
+        """Codex on #477 R2 (CODEX-RESULT-BB477R2-20261108T0200Z): REDIS_HOST went unescaped into a single-quoted
+        word of a script piped to bash, so an apostrophe in it would run in the deploy shell."""
+        import shutil
+        import subprocess
+        bash = shutil.which("bash")
+        if bash is None:
+            self.skipTest("no bash here")
+        script = ('eval "$(sed -n \'/^valid_host()/,/^}/p; /^valid_port()/,/^}/p; /^deploy_cmds()/,/^}/p\' "$1")"; '
+                  'PROJECT=sfdc24; REGION=us-central1; SERVICE=redis-tool-bridge; RUNTIME_SA=sa; IMAGE=img; '
+                  'INVOKERS=(m); gcloud(){ echo https://x.invalid; }; deploy_cmds')
+        path = str(ROOT / "cloud" / "redis-tool-bridge" / "deploy.sh")
+
+        def plan(host, port="6378"):
+            env = dict(os.environ, REDIS_HOST=host, REDIS_PORT=port)
+            return subprocess.run([bash, "-c", script, "plan", path], capture_output=True, text=True, env=env)
+
+        for host, port in (("10.1.2.3", "6378"), ("0.0.0.0", "1"), ("255.255.255.255", "65535"),
+                           ("redis.internal", "6379"), ("a-b.c-d.example", "6378"), ("x", "6378"),
+                           ("10.1.2.3.example", "6378")):
+            with self.subTest(good=host, port=port):
+                good = plan(host, port)
+                self.assertEqual(0, good.returncode, good.stderr)
+                self.assertIn("gcloud run deploy", good.stdout)
+        for host, port in (("10.0.0.1'; touch /tmp/pwned; echo '", "6378"), ("a b", "6378"), ("$(id)", "6378"),
+                           ("-x", "6378"), ("10.0.0.1", "63'78"), ("10.0.0.1", "6378;id"),
+                           # Codex on #477 R3: malformed DNS labels and addresses
+                           ("a..b.example", "6378"), ("-bad.example", "6378"), ("bad-.example", "6378"),
+                           (".example", "6378"), ("example.", "6378"), ("a" * 64 + ".example", "6378"),
+                           ("a." * 127 + "ab", "6378"), ("256.1.1.1", "6378"), ("10.0.0", "6378"),
+                           ("10.0.0.1.2", "6378"), ("010.0.0.1", "6378"), ("10.0.0.1", "0"),
+                           ("10.0.0.1", "65536"), ("10.0.0.1", "06378"), ("ex*mple", "6378")):
+            with self.subTest(bad=host[:40], port=port):
+                bad = plan(host, port)
+                self.assertNotEqual(0, bad.returncode)
+                self.assertNotIn("gcloud run deploy", bad.stdout, "no command is generated")
+
+    def test_the_generated_deploy_passes_the_environment_as_ONE_argument_and_stops_at_a_failure(self):
+        """Codex on #477 (CODEX-RESULT-PR477-20261108T0135Z): the ^;^ list was written unquoted into a script
+        piped to bash, so its semicolons ended the gcloud command and the IAM bindings after it ran anyway."""
+        import shlex
+        line = next(l for l in DEPLOY.splitlines() if "--set-env-vars=" in l)
+        rendered = line.replace("${REDIS_PORT:-6378}", "6378").replace("${PROJECT}", "sfdc24")
+        rendered = rendered.replace("${REDIS_HOST}", "10.0.0.1").replace("${url}", "https://x.invalid")
+        words = shlex.split(rendered)
+        self.assertEqual(1, len(words), "the environment flag is one shell word: %r" % words[:3])
+        self.assertTrue(words[0].startswith("--set-env-vars=^;^REDIS_HOST=10.0.0.1;"))
+        self.assertTrue(words[0].endswith("fleet-claude-code-cli@sfdc24.iam.gserviceaccount.com"))
+        self.assertIn("echo 'set -euo pipefail'", DEPLOY, "the generated script stops at its first failure")
+        self.assertIn("deploy_cmds | bash -euo pipefail -s", DEPLOY)
+        self.assertLess(DEPLOY.index("echo 'set -euo pipefail'"), DEPLOY.index("gcloud run deploy ${SERVICE}"),
+                        "the stop is set before the deploy, so no IAM line can follow a failed one")
 
     def test_the_deploy_runs_one_instance_which_is_what_makes_the_hourly_ceiling_one_ceiling(self):
         """take() counts in the instance's memory. Two instances would be two ceilings."""
