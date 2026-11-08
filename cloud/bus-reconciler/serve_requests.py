@@ -16,15 +16,19 @@ So: one spec per temp file, append.py's own main() for each, and its exit code i
 
 WHAT IT CANNOT DO. It holds the board credential, so it CAN append - and the compare path never
 writes to the board at all, which is deliberate: a compare run must not be able to alter what it is
-comparing. The rows it writes here are its own receipts and results, under its own Row_IDs, and the
-only Redis key it touches is one the server names in its own namespace.
+comparing. The rows it writes here are its own receipts and results, under its own Row_IDs. The
+Redis it writes is the worker lock under gov:, plus — only when CALL_SHEET_MIRROR is exactly on —
+the call-sheet cursors, a stale end, and the replying agent's own voice lane. That step is off
+by default and is not a deploy.
 """
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
 import logging
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -405,7 +409,375 @@ def one_pass(conn, env, execution, with_git=True, quiet=False, renew=None, settl
                           refused=len(out["refused"]), capped=out["capped"], acl=out.get("acl", ""))
     # A refusal is a correct outcome and an error inside the probe is a reported one, so neither
     # fails the execution. Only being unable to reach Redis at all does, above.
+    # THE CALL SHEET. One step on the rows this pass already read. Off unless CALL_SHEET_MIRROR is
+    # exactly on, and a failure here is logged inside the step and does not fail the pass.
+    try:
+        mirror_call_sheet(conn, rows, now, env, renew)
+    except Exception as error:                                       # noqa: BLE001
+        log.warning("call sheet mirror failed id=- size=0 (%s)", type(error).__name__)
     return out
+
+
+# --- call sheet mirror ---------------------------------------------------------------------------
+# The conference chair stays Redis-only. This worker already holds the board and Redis, so when
+# CALL_SHEET_MIRROR is exactly "on" each pass copies call events and turns onto the sheet and a
+# sheet reply back onto that agent's voice lane. Off (the default, and every other value) it
+# does nothing. No deploy rides with this step: the flag is the switch.
+#
+# fleet_agent.append_and_verify has no reuse_check on main (its signature is rid, row, fitted,
+# spill). The same rule is applied here: read the Row_ID back, and append only when it is absent.
+# The cursor moves only after that read-back, so a crash re-reads the entry and the fixed id
+# stops a second row.
+
+CALL_ID_RE = re.compile(r"^conf-[0-9a-f]{16}-[0-9a-f]{8}$")
+CALL_TAGS = frozenset({"grok", "claude-code-cli", "chatgpt-codex-desktop", "gemini"})
+CALLS_KEY = "conf:calls"
+CALL_KEY = "conf:call:%s"
+TURNS_KEY = "conf:callturns:%s"
+CALLS_CURSOR = "gov:mirror:calls:cursor"
+TURNS_CURSOR = "gov:mirror:turns:%s:cursor"
+REPLIES_SEEN = "gov:mirror:replies:seen"
+REPLIES_TTL_SECONDS = 86400
+VOICE_KEY = "fleet:voice-say:%s:%s:%s"
+STALE_AFTER = datetime.timedelta(minutes=50)
+REPLY_FRESH = datetime.timedelta(seconds=120)
+TURN_TEXT_MAX = 1000
+MIRROR_PAGE = 100
+SHEET_FROM = "conference-chair"
+
+
+def call_sheet_on():
+    """The flag is exactly the string on. Empty, ON, true and 1 are all off."""
+    return os.environ.get("CALL_SHEET_MIRROR", "").strip() == "on"
+
+
+def _mirror_log(ident, size, why):
+    """Id and size only. `why` is a type name or a fixed token, never the words of a turn or a reply."""
+    log.warning("call sheet mirror: %s size=%d (%s)", ident, int(size), why)
+
+
+def _entry_size(fields):
+    return sum(len(str(v).encode("utf-8")) for v in (fields or {}).values())
+
+
+def _as_map(raw):
+    out = {}
+    for key, value in (raw or {}).items():
+        name = _text(key)
+        if isinstance(value, bytes):
+            out[str(name)] = value.decode("utf-8", "replace")
+        elif value is None:
+            out[str(name)] = ""
+        else:
+            out[str(name)] = str(_text(value)) if not isinstance(value, str) else value
+    return out
+
+
+def _cell(value):
+    """One BCB value: a pipe would start a new key, so it becomes a slash."""
+    text = "" if value is None else str(value)
+    text = text.replace("|", "/").replace("\r", " ").replace("\n", " ").replace("\t", " ")
+    return "".join(ch if ch >= " " else " " for ch in text)
+
+
+def _bcb(pairs):
+    return "|".join(["BCB"] + ["%s=%s" % (key, _cell(value)) for key, value in pairs])
+
+
+def _field(payload, key):
+    match = re.search(r"(?:^|\|)" + re.escape(key) + r"=([^|]*)", str(payload or ""))
+    return match.group(1).strip() if match else ""
+
+
+def _parse_time(text):
+    text = (text or "").strip()
+    if not text:
+        return None
+    try:
+        when = datetime.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=datetime.timezone.utc)
+    return when.astimezone(datetime.timezone.utc)
+
+
+def _stamp(moment):
+    return moment.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _token(value, limit=64):
+    text = (value or "").strip()
+    if not text or len(text) > limit or any(ch in text for ch in ":| \t\r\n"):
+        return ""
+    return text
+
+
+def _after(conn, key, cursor):
+    """Stream entries strictly after `cursor`, oldest first. No cursor reads from the start."""
+    if cursor:
+        found = conn.xrange(key, min="(" + cursor, max="+", count=MIRROR_PAGE)
+    else:
+        found = conn.xrange(key, min="-", max="+", count=MIRROR_PAGE)
+    return [(_text(entry_id), _as_map(raw)) for entry_id, raw in found or ()]
+
+
+def _cursor(conn, key):
+    raw = conn.get(key)
+    return _text(raw) if raw else ""
+
+
+def _row_present(env, rid):
+    """True when this exact Row_ID is already on the board. A read that fails raises, so the
+    cursor stays and the entry is tried again."""
+    from bus import read_rows                                            # noqa: PLC0415
+
+    found = read_rows(env, match=rid)
+    rows = found.get("rows") if isinstance(found, dict) else (found or [])
+    return any(row and row[0] == rid for row in rows)
+
+
+def _append_row(env, renew, spec):
+    guarded(appender(env), renew)(spec)
+
+
+def _land(conn, cursor_key, entry_id, spec, append, present):
+    """Append unless this Row_ID is already on the board, then move the cursor only once the row
+    reads back. False leaves the cursor where it was."""
+    rid = spec["row_id"]
+    try:
+        if not present(rid):
+            append(spec)
+        if not present(rid):
+            _mirror_log(rid, len(spec.get("payload") or ""), "unread")
+            return False
+    except (Exception, SystemExit) as error:
+        _mirror_log(rid, len(spec.get("payload") or ""), type(error).__name__)
+        return False
+    conn.set(cursor_key, entry_id)
+    return True
+
+
+def _sheet_spec(rid, to, action, payload, gist):
+    return {"row_id": rid, "source_tag": SHEET_FROM, "target_surface": to, "action_type": action,
+            "category": "DONE" if action == "RESULT" else "OPEN", "project_tag": "CALL",
+            "gist": _cell(gist)[:180], "payload": payload}
+
+
+def _event_spec(fields):
+    """The sheet row for one conf:calls entry, or None when the entry is not a call we can record."""
+    call_id = (fields.get("call_id") or "").strip()
+    event = (fields.get("event") or "").strip()
+    epoch = _token(fields.get("epoch"))
+    if not CALL_ID_RE.fullmatch(call_id) or event not in ("start", "end") or not epoch:
+        return None
+    at = _cell(fields.get("at"))
+    if event == "start":
+        rid = "CALLSTART-" + call_id
+        payload = _bcb([("v", "1"), ("id", rid), ("phase", "RESULT"), ("class", "CALL"),
+                        ("from", SHEET_FROM), ("to", "ALL"), ("msg_type", "CALL_START"),
+                        ("call_id", call_id), ("epoch", epoch), ("started_at", at)])
+        return _sheet_spec(rid, "ALL", "RESULT", payload, "CALL_START " + call_id)
+    rid = "CALLEND-" + call_id
+    payload = _bcb([("v", "1"), ("id", rid), ("phase", "RESULT"), ("class", "CALL"),
+                    ("from", SHEET_FROM), ("to", "ALL"), ("msg_type", "CALL_END"),
+                    ("call_id", call_id), ("epoch", epoch), ("ended_at", at),
+                    ("reason", fields.get("reason"))])
+    return _sheet_spec(rid, "ALL", "RESULT", payload, "CALL_END " + call_id)
+
+
+def _mirror_events(conn, append, present):
+    cursor = _cursor(conn, CALLS_CURSOR)
+    for entry_id, fields in _after(conn, CALLS_KEY, cursor):
+        try:
+            spec = _event_spec(fields)
+            if spec is None:
+                _mirror_log(entry_id, _entry_size(fields), "skip")
+                conn.set(CALLS_CURSOR, entry_id)
+                continue
+            if not _land(conn, CALLS_CURSOR, entry_id, spec, append, present):
+                return
+        except (Exception, SystemExit) as error:
+            _mirror_log(entry_id, _entry_size(fields), type(error).__name__)
+            return
+
+
+def _turn_spec(call_id, fields):
+    turn_key = _token(fields.get("turn_key"), limit=120)
+    tag = (fields.get("to") or "").strip()
+    epoch = _token(fields.get("epoch"))
+    if not turn_key or tag not in CALL_TAGS or not epoch:
+        return None
+    text, cut = _turn_text(fields.get("text"))
+    rid = "CALLTURN-" + turn_key
+    pairs = [("v", "1"), ("id", rid), ("phase", "ASK"), ("class", "CALL"),
+             ("from", SHEET_FROM), ("to", tag), ("msg_type", "CALL_TURN"),
+             ("call_id", call_id), ("epoch", epoch), ("turn_key", turn_key),
+             ("said_at", fields.get("said_at")), ("text", text)]
+    if cut:
+        full = _cell(fields.get("text"))
+        digest = hashlib.sha256(full.encode("utf-8")).hexdigest()
+        pairs += [("truncated", "1"), ("chars", str(len(full))), ("sha256", digest)]
+    return _sheet_spec(rid, tag, "ASK", _bcb(pairs), "CALL_TURN %s %d" % (turn_key, len(text)))
+
+
+def _turn_text(value):
+    text = _cell(value)
+    if len(text) <= TURN_TEXT_MAX:
+        return text, False
+    return text[:TURN_TEXT_MAX], True
+
+
+def _live_calls(conn):
+    found = []
+    for key in conn.scan_iter(match="conf:call:*", count=500):
+        name = str(_text(key) or "")
+        if not name.startswith("conf:call:"):
+            continue
+        call_id = name[len("conf:call:"):]
+        if not CALL_ID_RE.fullmatch(call_id):
+            continue
+        fields = _as_map(conn.hgetall(name))
+        if fields.get("state") == "live":
+            found.append((call_id, fields))
+    return found
+
+
+def _mirror_turns(conn, append, present):
+    for call_id, _fields in _live_calls(conn):
+        cursor_key = TURNS_CURSOR % call_id
+        cursor = _cursor(conn, cursor_key)
+        try:
+            entries = _after(conn, TURNS_KEY % call_id, cursor)
+        except (Exception, SystemExit) as error:
+            _mirror_log(call_id, 0, type(error).__name__)
+            continue
+        for entry_id, fields in entries:
+            try:
+                spec = _turn_spec(call_id, fields)
+                if spec is None:
+                    _mirror_log(entry_id, _entry_size(fields), "turn")
+                    conn.set(cursor_key, entry_id)
+                    continue
+                if not _land(conn, cursor_key, entry_id, spec, append, present):
+                    break
+            except (Exception, SystemExit) as error:
+                _mirror_log(entry_id, _entry_size(fields), type(error).__name__)
+                break
+
+
+def _sweep_stale(conn, now):
+    """A call still live more than 50 minutes after started_at is closed here: an end on the stream
+    first (so the next pass can record CALL_END), then the hash. Stream first, because a hash that
+    says ended with no stream entry would never become a sheet row."""
+    for call_id, fields in _live_calls(conn):
+        try:
+            started = _parse_time(fields.get("started_at"))
+            if started is None or now - started <= STALE_AFTER:
+                continue
+            epoch = _token(fields.get("epoch"))
+            if not epoch:
+                _mirror_log(call_id, _entry_size(fields), "epoch")
+                continue
+            at = _stamp(now)
+            conn.xadd(CALLS_KEY, {"event": "end", "call_id": call_id, "epoch": epoch,
+                                  "at": at, "reason": "stale"})
+            conn.hset(CALL_KEY % call_id, mapping={"state": "ended", "ended_at": at, "reason": "stale"})
+        except (Exception, SystemExit) as error:
+            _mirror_log(call_id, _entry_size(fields), type(error).__name__)
+
+
+def _reply_rows(rows):
+    for cells in rows or ():
+        if not isinstance(cells, list) or len(cells) < 6:
+            continue
+        payload = cells[5] if isinstance(cells[5], str) else str(cells[5] or "")
+        if _field(payload, "msg_type") == "CALL_REPLY" and _field(payload, "spoken") == "sheet":
+            yield cells, payload
+
+
+def _turn_targets(conn, call_id, turn_key):
+    """Every `to` on conf:callturns:<call_id> for this turn_key. Empty when the turn is not there."""
+    targets = []
+    entries = conn.xrange(TURNS_KEY % call_id, min="-", max="+", count=MIRROR_PAGE) or ()
+    for _entry_id, raw in entries:
+        fields = _as_map(raw)
+        if fields.get("turn_key") == turn_key:
+            targets.append((fields.get("to") or "").strip())
+    return targets
+
+
+def _reply_ok(conn, cells, payload, now):
+    """The four gates: from equals the source tag and the turn's to, the call is live, the epoch
+    matches, and the row is at most 120 s old."""
+    frm = _field(payload, "from")
+    source = str(cells[2] or "").strip()
+    if frm not in CALL_TAGS or frm != source:
+        return False
+    call_id = (_field(payload, "call_id") or "").strip()
+    if not CALL_ID_RE.fullmatch(call_id):
+        return False
+    call = _as_map(conn.hgetall(CALL_KEY % call_id))
+    if call.get("state") != "live":
+        return False
+    if _field(payload, "epoch") != (call.get("epoch") or "").strip():
+        return False
+    when = _parse_time(str(cells[1] or ""))
+    if when is None or now - when < datetime.timedelta(0) or now - when > REPLY_FRESH:
+        return False
+    turn_key = _field(payload, "turn_key")
+    targets = _turn_targets(conn, call_id, turn_key)
+    if not targets or any(target != frm for target in targets):
+        return False
+    return True
+
+
+def _mirror_replies(conn, rows, now):
+    for cells, payload in _reply_rows(rows):
+        rid = str(cells[0] or "").strip()
+        try:
+            if not rid or conn.sismember(REPLIES_SEEN, rid):
+                continue
+            if not _reply_ok(conn, cells, payload, now):
+                continue
+            tag = _field(payload, "from")
+            call_id = _field(payload, "call_id")
+            epoch = _token(_field(payload, "epoch"))
+            if not epoch:
+                _mirror_log(rid, len(payload), "epoch")
+                continue
+            say = _cell(_field(payload, "say"))
+            conn.xadd(VOICE_KEY % (tag, call_id, epoch),
+                      {"by": tag, "text": say, "at": _stamp(now)})
+            conn.sadd(REPLIES_SEEN, rid)
+            conn.expire(REPLIES_SEEN, REPLIES_TTL_SECONDS)
+        except (Exception, SystemExit) as error:
+            _mirror_log(rid or "-", len(payload), type(error).__name__)
+
+
+def mirror_call_sheet(conn, rows, now, env, renew=None, append=None, present=None):
+    """One pass of the call sheet. Flag off: return before any Redis or board call.
+
+    `append` and `present` are the production write and read-back unless a test supplies its own.
+    Each of the four parts is isolated: one failure is logged by id and size and the others run.
+    """
+    if not call_sheet_on():
+        return
+    if renew is not None and renew() is not True:
+        _mirror_log("-", 0, "lock")
+        return
+    write = append or (lambda spec: _append_row(env, renew, spec))
+    seen = present or (lambda rid: _row_present(env, rid))
+    for step in (
+        lambda: _mirror_events(conn, write, seen),
+        lambda: _mirror_turns(conn, write, seen),
+        lambda: _sweep_stale(conn, now),
+        lambda: _mirror_replies(conn, rows, now),
+    ):
+        try:
+            step()
+        except (Exception, SystemExit) as error:
+            _mirror_log("-", 0, type(error).__name__)
 
 
 if __name__ == "__main__":
