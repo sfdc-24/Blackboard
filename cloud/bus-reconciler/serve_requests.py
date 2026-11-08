@@ -413,15 +413,19 @@ _SAFE = {
     "msg_type": re.compile(r"[A-Z][A-Z0-9_]{0,31}"),
     "class": re.compile(r"[A-Z][A-Z0-9_]{0,31}"),
 }
-# KEYS[1] the mark, KEYS[2] the lane. ARGV[1] the ttl, ARGV[2..] the entry's field/value pairs.
-# 0: already copied. 1: added. An error reply: nothing is left behind, the mark is gone too.
+# KEYS[1] the mark, KEYS[2] the lane. ARGV[1] the mark's ttl, ARGV[2] the lane's MAXLEN, ARGV[3] the
+# lane's ttl, ARGV[4..] the entry's field/value pairs. 0: already copied. 1: added. An error reply:
+# nothing is left behind, the mark is gone too. The lane is written as a governed xadd writes it
+# (redis_gov.execute): MAXLEN ~ redis_gov.STREAM_MAXLEN, then EXPIRE to the access list's ttl for the
+# key, which also refreshes the ttl of a lane that already existed.
 MIRROR_LUA = """
 if not redis.call('SET', KEYS[1], '1', 'NX', 'EX', ARGV[1]) then return 0 end
-local added = redis.pcall('XADD', KEYS[2], '*', unpack(ARGV, 2))
+local added = redis.pcall('XADD', KEYS[2], 'MAXLEN', '~', ARGV[2], '*', unpack(ARGV, 4))
 if type(added) == 'table' and added.err then
   redis.call('DEL', KEYS[1])
   return added
 end
+redis.call('EXPIRE', KEYS[2], ARGV[3])
 return 1
 """
 
@@ -549,10 +553,14 @@ def mirror_addressed(conn, rows) -> int:
         fields = mirror_fields(source, row_id, _row_cell(row, 1), _payload(row))
         pairs = [item for pair in fields.items() for item in pair]
         for agent in agents:
+            mark, lane = "fleet:wake:mirrored:%s:%s" % (row_id, agent), "fleet:inbox:%s" % agent
+            mark_ttl, lane_ttl = redis_gov.ttl_for(acl, mark), redis_gov.ttl_for(acl, lane)
+            if not mark_ttl or not lane_ttl:
+                continue
             try:
                 # One script: the NX mark and the XADD, or neither. 0 is a row already copied.
-                if conn.eval(MIRROR_LUA, 2, "fleet:wake:mirrored:%s:%s" % (row_id, agent),
-                             "fleet:inbox:%s" % agent, int(ttl), *pairs):
+                if conn.eval(MIRROR_LUA, 2, mark, lane, int(mark_ttl), int(redis_gov.STREAM_MAXLEN),
+                             int(lane_ttl), *pairs):
                     added += 1
             except Exception as error:                                   # noqa: BLE001
                 # The type only. This agent's copy is retried by the next pass; the others go on.

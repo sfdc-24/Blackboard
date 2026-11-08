@@ -5,7 +5,8 @@ The NX on fleet:wake:mirrored must be what stops a re-read from adding a second 
 The entry is metadata only: no preview, no text field, and each copied id or tag must fully match
 its safe pattern, or payload words reach a lane every principal can read. The script's DEL on a
 failed XADD, and its pcall around the XADD, must be what lets the next pass deliver a copy that
-failed. The per-agent catch must be what lets one agent's failure leave the others delivered. A
+failed. The script's MAXLEN and EXPIRE must be what holds a lane to the governed cap and the
+fleet ttl. The per-agent catch must be what lets one agent's failure leave the others delivered. A
 mutant that leaves the suite green is an untested claim. The Lua mutants are run by the test's
 fake, which executes the script text it is given and refuses any line it does not know.
 
@@ -88,10 +89,26 @@ MUTANTS = [
     (
         "the-xadd-is-not-protected",
         "cloud/bus-reconciler/serve_requests.py",
-        "local added = redis.pcall('XADD', KEYS[2], '*', unpack(ARGV, 2))",
-        "local added = redis.call('XADD', KEYS[2], '*', unpack(ARGV, 2))",
+        "local added = redis.pcall('XADD', KEYS[2], 'MAXLEN', '~', ARGV[2], '*', unpack(ARGV, 4))",
+        "local added = redis.call('XADD', KEYS[2], 'MAXLEN', '~', ARGV[2], '*', unpack(ARGV, 4))",
         "a failing XADD aborts the script before the DEL, so the mark outlives the lost entry",
         "test_a_failed_copy_is_retried_and_delivered_once",
+    ),
+    (
+        "the-lane-never-expires",
+        "cloud/bus-reconciler/serve_requests.py",
+        "redis.call('EXPIRE', KEYS[2], ARGV[3])\n",
+        "",
+        "a lane outlives the fleet ttl, and an old lane keeps whatever expiry it had",
+        "test_a_copy_gives_the_lane_the_fleet_ttl_and_refreshes_an_old_one",
+    ),
+    (
+        "the-lane-is-never-trimmed",
+        "cloud/bus-reconciler/serve_requests.py",
+        "redis.pcall('XADD', KEYS[2], 'MAXLEN', '~', ARGV[2], '*', unpack(ARGV, 4))",
+        "redis.pcall('XADD', KEYS[2], '*', unpack(ARGV, 4))",
+        "a lane grows without bound: no MAXLEN, unlike a governed xadd",
+        "test_the_lane_is_trimmed_at_the_governed_cap",
     ),
     (
         "one-agents-failure-ends-the-copy",

@@ -34,7 +34,8 @@ _LUA_RETURN = re.compile(r"^return (\w+)$")
 
 
 class FakeRedis:
-    """SET NX/EX, XADD and DEL, and the worker-lock eval the live loop needs. No network.
+    """SET NX/EX, XADD (with MAXLEN), EXPIRE and DEL, and the worker-lock eval the live loop needs.
+    No network.
 
     Any other script is RUN, line by line, by a small interpreter that knows only the statements
     the mirror script uses and refuses any other line. So the fake does what the script text says:
@@ -47,7 +48,7 @@ class FakeRedis:
 
     def __init__(self):
         self.data, self.streams, self.expires, self.calls = {}, {}, {}, []
-        self.fail_xadd = {}
+        self.fail_xadd, self.trims = {}, []
 
     def set(self, key, value, nx=False, ex=None):
         self.calls.append(("set", key, value, nx, ex))
@@ -66,13 +67,26 @@ class FakeRedis:
         self.expires.pop(key, None)
         return 1 if self.data.pop(key, None) is not None else 0
 
-    def xadd(self, key, fields, **kwargs):
+    def xadd(self, key, fields, maxlen=None, approximate=False):
+        """Appends, then trims to the newest `maxlen` entries. A real `~` trim may keep a few more;
+        the cap asked for is recorded in `trims`, which is what a test checks."""
         self.calls.append(("xadd", key, dict(fields)))
         if self.fail_xadd.get(key):
             self.fail_xadd[key] -= 1
             raise RuntimeError("%s %s" % (key, WORDS))
-        self.streams.setdefault(key, []).append(dict(fields))
-        return "%d-0" % len(self.streams[key])
+        self.trims.append((key, maxlen, approximate))
+        stream = self.streams.setdefault(key, [])
+        stream.append(dict(fields))
+        if maxlen is not None:
+            del stream[:max(0, len(stream) - int(maxlen))]
+        return "%d-0" % len(stream)
+
+    def expire(self, key, seconds):
+        self.calls.append(("expire", key, int(seconds)))
+        if key not in self.data and key not in self.streams:
+            return 0
+        self.expires[key] = int(seconds)
+        return 1
 
     def eval(self, script, numkeys, *args):
         keys, argv = list(args[:numkeys]), [str(a) for a in args[numkeys:]]
@@ -121,10 +135,22 @@ class FakeRedis:
             ex = int(rest[2 + opts.index("EX") + 1]) if "EX" in opts else None
             return self.set(key, value, nx="NX" in opts, ex=ex)
         if name == "XADD":
-            key, ident, pairs = rest[0], rest[1], rest[2:]
+            key, rest = rest[0], rest[1:]
+            maxlen, approximate = None, False
+            if rest and rest[0].upper() == "MAXLEN":
+                approximate = rest[1] == "~"
+                if rest[1] in ("~", "="):
+                    rest = rest[1:]
+                maxlen, rest = int(rest[1]), rest[2:]
+            ident, pairs = rest[0], rest[1:]
             if ident != "*" or len(pairs) % 2:
-                raise AssertionError("fake XADD takes '*' and field/value pairs")
-            return self.xadd(key, dict(zip(pairs[0::2], pairs[1::2])))
+                raise AssertionError("fake XADD takes [MAXLEN [~] n] '*' and field/value pairs")
+            return self.xadd(key, dict(zip(pairs[0::2], pairs[1::2])), maxlen=maxlen,
+                             approximate=approximate)
+        if name == "EXPIRE":
+            if len(rest) != 2:
+                raise AssertionError("fake EXPIRE takes a key and seconds")
+            return self.expire(rest[0], rest[1])
         if name == "DEL":
             return self.delete(rest[0])
         raise AssertionError("fake has no %s" % name)
@@ -308,6 +334,42 @@ class BoardToRedis(unittest.TestCase):
         self.assertEqual(1, len(self.conn.inbox("grok")))
         self.assertEqual(1, len(self.conn.inbox("cursor")))
         self.assertEqual(2, len([c for c in self.conn.calls if c[0] == "xadd"]))
+
+    def test_a_copy_gives_the_lane_the_fleet_ttl_and_refreshes_an_old_one(self):
+        """As a governed xadd does: EXPIRE the lane to the access list's ttl for that key. A lane
+        that already existed with a shorter ttl gets the full one back. The mark keeps its own EX."""
+        acl = redis_gov.load_acl()
+        lane_ttl = redis_gov.ttl_for(acl, "fleet:inbox:grok")
+        self.assertTrue(lane_ttl)
+        self.conn.streams["fleet:inbox:grok"] = [{"row_id": "OLD"}]
+        self.conn.expires["fleet:inbox:grok"] = 5
+        self.assertEqual(2, self.mirror([row("ROW-1", "grok; cursor", "please look")]))
+        for agent in ("grok", "cursor"):
+            self.assertEqual(lane_ttl, self.conn.expires["fleet:inbox:%s" % agent], agent)
+            mark = "fleet:wake:mirrored:ROW-1:%s" % agent
+            self.assertEqual(redis_gov.ttl_for(acl, mark), self.conn.expires[mark], agent)
+        self.assertEqual(["OLD", "ROW-1"], [e["row_id"] for e in self.conn.inbox("grok")])
+
+    def test_the_lane_is_trimmed_at_the_governed_cap(self):
+        """MAXLEN ~ redis_gov.STREAM_MAXLEN, the cap a governed xadd applies, read from redis_gov."""
+        self.mirror([row("ROW-1", "grok", "please look")])
+        self.assertEqual([("fleet:inbox:grok", redis_gov.STREAM_MAXLEN, True)], self.conn.trims)
+        conn = FakeRedis()
+        with mock.patch.object(sr.redis_gov, "STREAM_MAXLEN", 3):
+            sr.mirror_addressed(conn, [row("ROW-%d" % i, "grok", "ping") for i in range(5)])
+        self.assertEqual(["ROW-2", "ROW-3", "ROW-4"], [e["row_id"] for e in conn.inbox("grok")])
+        self.assertEqual({3}, {cap for _, cap, _ in conn.trims})
+
+    def test_the_largest_entry_fits_the_governed_value_cap(self):
+        """Every field at its pattern's longest still fits what a governed write may store there."""
+        acl = redis_gov.load_acl()
+        payload = "|".join(["BCB", "phase=" + "P" * 32, "thread_id=TH-" + "9" * 64,
+                            "msg_type=" + "M" * 32, "class=" + "C" * 32])
+        self.mirror([row("R" * 128, "grok", payload, source="s" * 64, ts="2" * 40)])
+        entry = self.conn.inbox("grok")[0]
+        self.assertEqual({"by", "row_id", "at", "phase", "thread_id", "msg_type", "class"}, set(entry))
+        size = sum(len(k.encode("utf-8")) + len(v.encode("utf-8")) for k, v in entry.items())
+        self.assertLessEqual(size, redis_gov.value_cap(acl, "fleet:inbox:grok"))
 
     def test_the_mark_and_the_entry_are_one_script(self):
         """No SET or XADD from Python: both travel in one EVAL, so a lost reply or a dead process
