@@ -42,7 +42,8 @@ ME = os.environ.get("ESTIMATE_BY", "").strip()
 # ESTIMATE_BY is the INSTANCE (a scripts/agent_roster.json id; the append guard refuses anything else). Two sessions of
 # one instance (two claude-code-cli terminals) tell their rows apart with ESTIMATE_SESSION, e.g. b76 or vscode: it is
 # posted as session= and goes into the row id whole (never cut), so two sessions never share an id. Every row id also
-# ends in a random suffix, so even two blank-session writers posting in the same second cannot collide.
+# ends in a 128-bit random nonce, so even two blank-session writers posting in the same second do not collide
+# (Codex, 2026-11-08: 16 bits was too few for an append-only board).
 SESSION = os.environ.get("ESTIMATE_SESSION", "").strip()
 SAFE_SESSION = re.compile(r"^[a-z0-9][a-z0-9-]{0,23}$")
 try:
@@ -54,6 +55,10 @@ except Exception:                                            # noqa: BLE001 - no
 
 def now():
     return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+
+
+def nonce():
+    return secrets.token_hex(16).upper()                       # 128 bits
 
 
 def iso(t):
@@ -82,7 +87,7 @@ def clean(s):
 
 def post(kind, fields):
     who = ME.upper() + (("-" + SESSION.upper()) if SESSION else "")
-    rid = "%s-%s-%s-%s" % (who, kind.replace("_", "-"), now().strftime("%Y%m%dT%H%M%SZ"), secrets.token_hex(2).upper())
+    rid = "%s-%s-%s-%s" % (who, kind.replace("_", "-"), now().strftime("%Y%m%dT%H%M%SZ"), nonce())
     if SESSION:
         fields = list(fields[:3]) + [("session", SESSION)] + list(fields[3:])   # near the front, where a reader looks
     parts = ["BCB", "v=1", "id=" + rid, "phase=RESULT", "class=STATUS", "from=" + ME, "to=all",

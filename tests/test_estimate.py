@@ -81,14 +81,23 @@ class Estimate(unittest.TestCase):
         self.assertIn("id=CLAUDE-CODE-CLI-VSCODE-SECOND-ESTIMATE-", fake.payloads[0])
         self.assertIn("|session=vscode-second|", fake.payloads[0])
 
-    def test_two_rows_in_the_same_second_with_no_session_get_different_ids(self):
+    def test_two_rows_in_the_same_second_with_no_session_differ_only_by_the_nonce(self):
+        # Deterministic: the clock and the nonce are both fixed, so the ids are known exactly.
         fake = FakeAppend()
         fixed = estimate.now()
-        with mock.patch.object(estimate, "now", lambda: fixed):
+        stamp = fixed.strftime("%Y%m%dT%H%M%SZ")
+        nonces = iter(["A" * 32, "B" * 32])
+        with mock.patch.object(estimate, "now", lambda: fixed), mock.patch.object(estimate, "nonce", lambda: next(nonces)):
             self.start(fake, "a")
             self.start(fake, "b")
         ids = [p.split("|")[2] for p in fake.payloads]
-        self.assertEqual(2, len(set(ids)), ids)
+        self.assertEqual(["id=CLAUDE-CODE-CLI-ESTIMATE-%s-%s" % (stamp, c * 32) for c in "AB"], ids)
+
+    def test_the_nonce_is_128_bits_of_hex(self):
+        values = {estimate.nonce() for _ in range(3)}
+        for v in values:
+            self.assertRegex(v, r"^[0-9A-F]{32}$")
+        self.assertEqual(3, len(values))   # chance of a repeat among 3 draws of 128 bits is about 2^-126
 
     def test_an_unsafe_session_is_refused_before_posting(self):
         fake = FakeAppend()
