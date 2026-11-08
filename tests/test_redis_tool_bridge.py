@@ -968,21 +968,31 @@ class TheOpEndpoint(unittest.TestCase):
         bash = shutil.which("bash")
         if bash is None:
             self.skipTest("no bash here")
-        script = ('eval "$(sed -n \'/^deploy_cmds()/,/^}/p\' "$1")"; PROJECT=sfdc24; REGION=us-central1; '
-                  'SERVICE=redis-tool-bridge; RUNTIME_SA=sa; IMAGE=img; INVOKERS=(m); '
-                  'gcloud(){ echo https://x.invalid; }; deploy_cmds')
+        script = ('eval "$(sed -n \'/^valid_host()/,/^}/p; /^valid_port()/,/^}/p; /^deploy_cmds()/,/^}/p\' "$1")"; '
+                  'PROJECT=sfdc24; REGION=us-central1; SERVICE=redis-tool-bridge; RUNTIME_SA=sa; IMAGE=img; '
+                  'INVOKERS=(m); gcloud(){ echo https://x.invalid; }; deploy_cmds')
         path = str(ROOT / "cloud" / "redis-tool-bridge" / "deploy.sh")
 
         def plan(host, port="6378"):
             env = dict(os.environ, REDIS_HOST=host, REDIS_PORT=port)
             return subprocess.run([bash, "-c", script, "plan", path], capture_output=True, text=True, env=env)
 
-        good = plan("10.1.2.3")
-        self.assertEqual(0, good.returncode, good.stderr)
-        self.assertIn("gcloud run deploy", good.stdout)
+        for host, port in (("10.1.2.3", "6378"), ("0.0.0.0", "1"), ("255.255.255.255", "65535"),
+                           ("redis.internal", "6379"), ("a-b.c-d.example", "6378"), ("x", "6378"),
+                           ("10.1.2.3.example", "6378")):
+            with self.subTest(good=host, port=port):
+                good = plan(host, port)
+                self.assertEqual(0, good.returncode, good.stderr)
+                self.assertIn("gcloud run deploy", good.stdout)
         for host, port in (("10.0.0.1'; touch /tmp/pwned; echo '", "6378"), ("a b", "6378"), ("$(id)", "6378"),
-                           ("-x", "6378"), ("10.0.0.1", "63'78"), ("10.0.0.1", "6378;id")):
-            with self.subTest(host=host, port=port):
+                           ("-x", "6378"), ("10.0.0.1", "63'78"), ("10.0.0.1", "6378;id"),
+                           # Codex on #477 R3: malformed DNS labels and addresses
+                           ("a..b.example", "6378"), ("-bad.example", "6378"), ("bad-.example", "6378"),
+                           (".example", "6378"), ("example.", "6378"), ("a" * 64 + ".example", "6378"),
+                           ("a." * 127 + "ab", "6378"), ("256.1.1.1", "6378"), ("10.0.0", "6378"),
+                           ("10.0.0.1.2", "6378"), ("010.0.0.1", "6378"), ("10.0.0.1", "0"),
+                           ("10.0.0.1", "65536"), ("10.0.0.1", "06378"), ("ex*mple", "6378")):
+            with self.subTest(bad=host[:40], port=port):
                 bad = plan(host, port)
                 self.assertNotEqual(0, bad.returncode)
                 self.assertNotIn("gcloud run deploy", bad.stdout, "no command is generated")

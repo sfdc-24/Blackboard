@@ -45,6 +45,35 @@ build() {
   echo "ran. 'bus-reconciler:v1' is shared by eight jobs and rebuilding it re-pointed all of them."
 }
 
+# A host is a dotted IPv4 address (four numbers 0-255) or a DNS name: 1 to 253 characters, labels of
+# 1 to 63 letters, digits or dashes that neither start nor end with a dash, and no empty label.
+valid_host() {
+  local host="$1" label count=0 numeric=0
+  [[ "${host}" =~ ^[A-Za-z0-9.-]{1,253}$ ]] || return 1
+  [[ "${host}" != .* && "${host}" != *. && "${host}" != *..* ]] || return 1
+  local -a labels
+  IFS=. read -r -a labels <<< "${host}"
+  for label in "${labels[@]}"; do
+    [[ "${label}" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]] || return 1
+    count=$((count + 1))
+    if [[ "${label}" =~ ^[0-9]+$ ]]; then
+      numeric=$((numeric + 1))
+    fi
+  done
+  if [ "${numeric}" -eq "${count}" ]; then
+    # All numbers: it is an IPv4 address or nothing.
+    [ "${count}" -eq 4 ] || return 1
+    for label in "${labels[@]}"; do
+      [[ "${label}" =~ ^(0|[1-9][0-9]{0,2})$ ]] && [ "${label}" -le 255 ] || return 1
+    done
+  fi
+  return 0
+}
+
+valid_port() {
+  [[ "$1" =~ ^[1-9][0-9]{0,4}$ ]] && [ "$1" -le 65535 ]
+}
+
 deploy_cmds() {
   # BRIDGE_AUDIENCE must be the service's own https URL. Chicken-and-egg on a FIRST deploy: the URL
   # is not known until the service exists. It is known here, because the service already exists, and
@@ -57,15 +86,14 @@ deploy_cmds() {
     echo "refusing: set REDIS_HOST in the environment (the instance's private address)" >&2
     return 1
   fi
-  # THE OPERATOR'S VALUES ARE CHECKED BEFORE THEY ARE WRITTEN INTO A SCRIPT (Codex on #477, R2): they go
-  # inside a single-quoted word that bash then runs, so a quote in them would end the word. A host is
-  # letters, digits, dots and dashes (an IPv4 address or a DNS name) and a port is digits; nothing else.
-  if ! [[ "${REDIS_HOST}" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$ ]]; then
+  # THE OPERATOR'S VALUES ARE CHECKED BEFORE THEY ARE WRITTEN INTO A SCRIPT (Codex on #477, R2 and R3):
+  # they go inside a single-quoted word that bash then runs, so a quote in them would end the word.
+  if ! valid_host "${REDIS_HOST}"; then
     echo "refusing: REDIS_HOST must be an IPv4 address or a DNS name" >&2
     return 1
   fi
-  if ! [[ "${REDIS_PORT:-6378}" =~ ^[0-9]{1,5}$ ]]; then
-    echo "refusing: REDIS_PORT must be a number" >&2
+  if ! valid_port "${REDIS_PORT:-6378}"; then
+    echo "refusing: REDIS_PORT must be a number from 1 to 65535" >&2
     return 1
   fi
   local url
