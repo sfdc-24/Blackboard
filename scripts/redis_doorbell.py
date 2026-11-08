@@ -12,7 +12,8 @@ on (sfdc-24/Blackboard#480); the call bridge already writes there.
 
 Run it in the background, the same way as claude_cli_inbox.py --wait: it exits with the new entries,
 and the caller restarts it. The cursor (REDIS_DOORBELL_CURSOR, default ~/.redis-doorbell-<me>) moves
-only after the entries are printed, so an entry is never skipped. A first run starts from now.
+only after the entries are printed, so an entry is never skipped. A first run starts at the lane's own
+newest entry id, read from Redis, so nothing added after that is missed.
 
 It needs the bridge for this agent (REDIS_BRIDGE=on, REDIS_BRIDGE_URL, REDIS_BRIDGE_IMPERSONATE; see
 scripts/bridge_client.py). Without it, it says so and exits 3, and the board doorbell is the fallback.
@@ -22,7 +23,6 @@ import argparse
 import json
 import os
 import sys
-import time
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -35,15 +35,24 @@ def cursor_path(me):
     return Path(os.environ.get("REDIS_DOORBELL_CURSOR") or (Path.home() / (".redis-doorbell-" + me)))
 
 
-def read_cursor(path, now=None):
-    """The last entry id printed, or an id for now when there is none yet (a first run starts from now)."""
+def read_cursor(path):
+    """The last entry id printed, or None on a first run."""
     try:
         text = Path(path).read_text(encoding="utf-8").strip()
     except OSError:
-        text = ""
-    if text and bridge_client_stream_id(text):
-        return text
-    return "%d-0" % int((time.time() if now is None else now) * 1000)
+        return None
+    return text if text and bridge_client_stream_id(text) else None
+
+
+def lane_position(me, attempt):
+    """A first run starts at the lane's own newest id, read from Redis, never from this computer's clock:
+    an entry added in the same millisecond as a clock-made id would be skipped by XREAD's exclusive start
+    (Codex on sfdc-24/Blackboard#482). An empty lane starts at 0-0. None when the bridge is not usable."""
+    result = attempt("xrange", LANE + me, me=me, count=1)
+    if result is None:
+        return None
+    newest = [entry for entry in (result.get("value") or []) if isinstance(entry, dict)]
+    return str(newest[-1].get("id")) if newest and newest[-1].get("id") else "0-0"
 
 
 def bridge_client_stream_id(text):
@@ -58,11 +67,22 @@ def write_cursor(path, value):
     os.replace(temp, path)
 
 
-def ring(me, attempt=bridge_client.attempt, out=None, cursor_file=None, peek=False, rounds=None, now=None):
+def ring(me, attempt=bridge_client.attempt, out=None, cursor_file=None, peek=False, rounds=None):
     """Wait until an entry lands in fleet:inbox:<me>; print each as one JSON line. Returns an exit code."""
     out = out or sys.stdout
     path = cursor_file or cursor_path(me)
-    after = read_cursor(path, now)
+    after = read_cursor(path)
+    if after is None:
+        try:
+            after = lane_position(me, attempt)
+        except (bridge_client.Refused, bridge_client.Denied) as why:
+            print("redis doorbell refused: %s" % why, file=sys.stderr)
+            return 2
+        if after is None:
+            print("redis doorbell: the bridge is not usable here; use the board doorbell", file=sys.stderr)
+            return 3
+        if not peek:
+            write_cursor(path, after)
     done = 0
     while rounds is None or done < rounds:
         done += 1

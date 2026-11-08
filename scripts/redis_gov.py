@@ -493,6 +493,8 @@ def execute(conn, acl: dict, raw_tag: str, via: str, op: str, key: str, field: s
                 raise Refused("xwait is for the bridge only; the board route never blocks")
             if not after:
                 raise Refused("xwait needs after=, the last entry id this caller has seen")
+            if wait_ms() is None:
+                raise Refused("this connection's socket timeout is too short for a wait")
         value = decode_value(raw_value, enc, acl, key) if op in ("set", "hset", "xadd") else None
         if op == "hset" and not field:
             raise Refused("hset needs field=")
@@ -645,22 +647,31 @@ def entry_view(entry_id, fields) -> dict:
     return view
 
 
-def wait_ms(connect_seconds=None) -> int:
-    """How long one xwait may block: 25 s, and always 2 s under the connection's socket timeout, so a
-    quiet lane ends as an empty answer and never as a client timeout (redis_dual.CONNECT_SECONDS)."""
+WAIT_MIN_MS = 1000
+WAIT_MARGIN_MS = 2000
+
+
+def wait_ms(connect_seconds=None):
+    """How long one xwait may block, or None when this connection cannot wait safely.
+
+    25 s at most, and always WAIT_MARGIN_MS under the connection's socket timeout
+    (redis_dual.CONNECT_SECONDS), so a quiet lane ends as an empty answer, never as a socket timeout.
+    A socket timeout too short to leave WAIT_MIN_MS of wait under that margin is None: the op is refused,
+    it never blocks as long as the socket waits (Codex on sfdc-24/Blackboard#482)."""
     if connect_seconds is None:
         try:
             import redis_dual
             connect_seconds = redis_dual.CONNECT_SECONDS
-        except Exception:                   # noqa: BLE001 - no settings module: the shortest safe wait
+        except Exception:                   # noqa: BLE001 - no settings module: today's default
             connect_seconds = 10.0
-    return int(max(1000, min(25000, (float(connect_seconds) - 2.0) * 1000)))
+    block = min(25000, int(float(connect_seconds) * 1000) - WAIT_MARGIN_MS)
+    return block if block >= WAIT_MIN_MS else None
 
 
 def _read(conn, acl, who, raw_tag, via, op, key, count, now, after="", stated=None) -> dict:
     if op == "xwait":
         n = max(1, min(int(count or WAIT_MAX_COUNT), WAIT_MAX_COUNT))
-        found = conn.xread({key: after}, count=n, block=wait_ms()) or []
+        found = conn.xread({key: after}, count=n, block=wait_ms()) or []   # never None: checked above
         entries = [entry for _name, batch in found for entry in batch][:n]
         out = {"ok": True, "op": op, "key": key, "entries": len(entries), "after": after,
                "last": str(entries[-1][0]) if entries else after,

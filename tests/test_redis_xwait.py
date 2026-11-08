@@ -94,11 +94,31 @@ class TheGovernedOp(unittest.TestCase):
         self.assertEqual(10, got["entries"])
         self.assertEqual("10-0", got["last"])
 
-    def test_the_wait_stays_under_the_connections_socket_timeout(self):
+    def test_the_wait_stays_strictly_under_the_connections_socket_timeout(self):
+        # Codex on sfdc-24/Blackboard#482: a 1 s socket timeout gave a 1 s block, which times out.
         self.assertEqual(8000, gov.wait_ms(10))
         self.assertEqual(25000, gov.wait_ms(30))
         self.assertEqual(25000, gov.wait_ms(300))
-        self.assertEqual(1000, gov.wait_ms(1))
+        self.assertEqual(1000, gov.wait_ms(3))
+        for seconds in (2.9, 2, 1, 0.5, 0):
+            with self.subTest(seconds=seconds):
+                self.assertIsNone(gov.wait_ms(seconds))
+        for seconds in (3, 4.5, 10, 26, 27, 30):
+            with self.subTest(seconds=seconds):
+                self.assertLessEqual(gov.wait_ms(seconds), seconds * 1000 - gov.WAIT_MARGIN_MS)
+
+    def test_a_connection_too_short_to_wait_refuses_and_never_blocks(self):
+        import redis_dual
+        conn = WaitingRedis()
+        saved = redis_dual.CONNECT_SECONDS
+        redis_dual.CONNECT_SECONDS = 1.0
+        try:
+            got = wait(conn)
+        finally:
+            redis_dual.CONNECT_SECONDS = saved
+        self.assertFalse(got["ok"])
+        self.assertIn("too short", got["refused"])
+        self.assertEqual([], conn.blocks)
 
     def test_after_on_another_op_is_still_refused(self):
         conn = WaitingRedis()
@@ -153,8 +173,55 @@ class TheDoorbell(unittest.TestCase):
                             attempt=lambda *a, **k: {"value": [{"id": "7-0", "fields": {}}], "last": "7-0"})
         self.assertEqual("6-0", self.cursor.read_text(encoding="utf-8"))
 
-    def test_a_first_run_starts_from_now_not_from_the_lanes_beginning(self):
-        self.assertEqual("1700000000000-0", redis_doorbell.read_cursor(self.cursor, now=1_700_000_000))
+    def governed(self, conn):
+        def attempt(op, key, *, me, after=None, count=None):
+            return gov.execute(conn, ACL, me, BRIDGE, op, key, after=after or "", count=count or 10)
+        return attempt
+
+    def test_a_first_run_starts_at_the_lanes_own_newest_entry_and_misses_nothing_after_it(self):
+        # Codex on sfdc-24/Blackboard#482: a clock-made "<ms>-0" start skips an entry added in that same
+        # millisecond (XREAD's start is exclusive). The start is the lane's own newest id, read from Redis.
+        conn = WaitingRedis()
+        for text in ("old-1", "old-2"):
+            conn.xadd("fleet:inbox:claude-code-cli", {"by": "grok", "text": text})
+        governed = self.governed(conn)
+
+        def attempt(op, key, **kw):
+            result = governed(op, key, **kw)
+            if op == "xrange":                           # the race: an entry lands right after the start is read
+                conn.xadd("fleet:inbox:claude-code-cli", {"by": "grok", "text": "same-moment"})
+            return result
+
+        import time as clock
+        real = clock.time
+        clock.time = lambda: (_ for _ in ()).throw(AssertionError("the start must not come from the clock"))
+        try:
+            out = io.StringIO()
+            code = redis_doorbell.ring("claude-code-cli", attempt=attempt, out=out, cursor_file=self.cursor,
+                                       rounds=2)
+        finally:
+            clock.time = real
+        self.assertEqual(0, code)
+        self.assertEqual(["same-moment"], [json.loads(line)["text"] for line in out.getvalue().splitlines()])
+        self.assertEqual("3-0", self.cursor.read_text(encoding="utf-8"))
+
+    def test_a_first_run_that_saw_nothing_keeps_its_start_so_the_next_run_misses_nothing(self):
+        conn = WaitingRedis()
+        conn.xadd("fleet:inbox:claude-code-cli", {"by": "grok", "text": "before"})
+        attempt = self.governed(conn)
+        quiet = redis_doorbell.ring("claude-code-cli", attempt=attempt, out=io.StringIO(),
+                                    cursor_file=self.cursor, rounds=1)
+        self.assertEqual(0, quiet)
+        self.assertEqual("1-0", self.cursor.read_text(encoding="utf-8"), "the start is kept")
+        conn.xadd("fleet:inbox:claude-code-cli", {"by": "grok", "text": "between runs"})
+        out = io.StringIO()
+        redis_doorbell.ring("claude-code-cli", attempt=attempt, out=out, cursor_file=self.cursor, rounds=1)
+        self.assertEqual(["between runs"], [json.loads(line)["text"] for line in out.getvalue().splitlines()])
+
+    def test_a_first_run_on_an_empty_lane_starts_at_the_beginning(self):
+        conn = WaitingRedis()
+        self.assertEqual("0-0", redis_doorbell.lane_position("claude-code-cli", self.governed(conn)))
+        self.assertIsNone(redis_doorbell.lane_position("claude-code-cli", lambda *a, **k: None))
 
     def test_no_bridge_says_so_and_a_refusal_stops(self):
         self.assertEqual(3, redis_doorbell.ring("claude-code-cli", out=io.StringIO(), cursor_file=self.cursor,
