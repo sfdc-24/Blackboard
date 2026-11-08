@@ -866,8 +866,13 @@ redis.call('EXPIRE', KEYS[1], ARGV[4])
 redis.call('XADD', KEYS[2], 'MAXLEN', '~', ARGV[5], '*', 'event', 'end', 'call_id', ARGV[1], 'epoch', ARGV[2], 'at', ARGV[3], 'reason', ARGV[6])
 return 1
 """
-SHEET_FROM = "conference-chair"   # who the call record is from
-SHEET_SOURCE = "bus-reconciler"  # who posts it; the gateway stamps sender=verified for this tag
+SHEET_FROM = "conference-chair"   # who the call record is about: carried as claimed_author, never as from=
+SHEET_SOURCE = "bus-reconciler"  # who posts it, and its from=: the gateway stamps sender=verified for this tag
+# THE GATEWAY READS from= (gas-bus senderCheck_): column C must equal the payload's from=, with no relayer exception,
+# or the row is stamped sender=mismatch and is never verified. Until 2026-11-08 the mirror wrote from=conference-chair
+# under source bus-reconciler, so every row it wrote read back as a conflict, the cursor never moved, and the box
+# (which counts only verified rows) never saw a turn. A row this mirror wrote that way carries exactly this stamp.
+LEGACY_STAMP = "sender=mismatch;claimed=bus-reconciler;from=conference-chair"
 
 
 def call_sheet_on():
@@ -909,9 +914,9 @@ def _bcb(pairs):
 
 
 def _carry(pairs):
-    """The worker posts the chair's record. relayer= is the source tag, so the signature is legal
-    and the gateway can stamp sender=verified for bus-reconciler. These fields stay off the
-    msg_type|call_id pair the box reader matches."""
+    """The worker posts the chair's record as itself: from= is the source tag (the gateway's rule), and the
+    chair it speaks for rides as claimed_author. These fields stay off the msg_type|call_id pair the box
+    reader matches."""
     return list(pairs) + [("relayer", SHEET_SOURCE), ("claimed_author", SHEET_FROM)]
 
 
@@ -1015,9 +1020,16 @@ def _reuse_status(found, payload):
     if len(hits) != 1:
         return "conflict"
     got, source, stamp = _hit_parts(hits[0])
+    if source == SHEET_SOURCE and stamp == LEGACY_STAMP and got == _legacy(payload):
+        return "legacy"
     if got != payload or source != SHEET_SOURCE or stamp != VERIFIED_STAMP:
         return "conflict"
     return "done"
+
+
+def _legacy(payload):
+    """This payload as the mirror wrote it before the from= fix: the same row with from=conference-chair."""
+    return payload.replace("|from=%s|" % SHEET_SOURCE, "|from=%s|" % SHEET_FROM, 1)
 
 
 def _append_row(env, renew, spec):
@@ -1034,6 +1046,13 @@ def _land(conn, cursor_key, entry_id, spec, append, present, renew):
         if status == "conflict":
             _mirror_log(rid, len(payload), "conflict")
             return False
+        if status == "legacy":
+            # One row this mirror wrote before the from= fix, exact but for from=: it stays as it is (never
+            # re-posted, never counted as verified), and the cursor moves past it so later events land.
+            _mirror_log(rid, len(payload), "legacy")
+            _owned(renew)
+            conn.set(cursor_key, entry_id)
+            return True
         if status == "absent":
             append(spec)
             status = _reuse_status(present(rid), payload)
@@ -1068,12 +1087,12 @@ def _event_spec(fields):
     if event == "start":
         rid = "CALLSTART-" + call_id
         payload = _bcb(_carry([("v", "1"), ("id", rid), ("phase", "RESULT"), ("class", "CALL"),
-                               ("from", SHEET_FROM), ("to", "ALL"), ("msg_type", "CALL_START"),
+                               ("from", SHEET_SOURCE), ("to", "ALL"), ("msg_type", "CALL_START"),
                                ("call_id", call_id), ("epoch", epoch), ("started_at", at)]))
         return _sheet_spec(rid, "ALL", "RESULT", payload, "CALL_START " + call_id)
     rid = "CALLEND-" + call_id
     payload = _bcb(_carry([("v", "1"), ("id", rid), ("phase", "RESULT"), ("class", "CALL"),
-                           ("from", SHEET_FROM), ("to", "ALL"), ("msg_type", "CALL_END"),
+                           ("from", SHEET_SOURCE), ("to", "ALL"), ("msg_type", "CALL_END"),
                            ("call_id", call_id), ("epoch", epoch), ("ended_at", at),
                            ("reason", fields.get("reason"))]))
     return _sheet_spec(rid, "ALL", "RESULT", payload, "CALL_END " + call_id)
@@ -1167,7 +1186,7 @@ def _with_class(pairs, fields):
 def _turn_head(rid, tag, call_id):
     """msg_type=CALL_TURN is immediately followed by call_id=. The box reader matches that substring."""
     return [("v", "1"), ("id", rid), ("phase", "ASK"), ("class", "CALL"),
-            ("from", SHEET_FROM), ("to", tag), ("msg_type", "CALL_TURN"),
+            ("from", SHEET_SOURCE), ("to", tag), ("msg_type", "CALL_TURN"),
             ("call_id", call_id)]
 
 

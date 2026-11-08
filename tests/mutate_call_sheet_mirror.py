@@ -213,12 +213,47 @@ MUTANTS = [
     ),
     (
         "split-the-box-substring",
-        "            (\"from\", SHEET_FROM), (\"to\", tag), (\"msg_type\", \"CALL_TURN\"),\n"
+        "            (\"from\", SHEET_SOURCE), (\"to\", tag), (\"msg_type\", \"CALL_TURN\"),\n"
         "            (\"call_id\", call_id)]",
-        "            (\"from\", SHEET_FROM), (\"to\", tag), (\"msg_type\", \"CALL_TURN\"),\n"
+        "            (\"from\", SHEET_SOURCE), (\"to\", tag), (\"msg_type\", \"CALL_TURN\"),\n"
         "            (\"epoch\", \"0\"), (\"call_id\", call_id)]  # MUTANT: call_id is not next",
         "msg_type=CALL_TURN is no longer immediately followed by call_id=",
         "test_the_box_reads_a_bus_reconciler_row_at_its_turn_substring",
+    ),
+    (
+        "turn-from-the-chair",
+        "            (\"from\", SHEET_SOURCE), (\"to\", tag), (\"msg_type\", \"CALL_TURN\"),",
+        "            (\"from\", SHEET_FROM), (\"to\", tag), (\"msg_type\", \"CALL_TURN\"),",
+        "a turn row says from=conference-chair under source bus-reconciler: the gateway stamps it mismatch",
+        "test_the_box_reads_a_bus_reconciler_row_at_its_turn_substring",
+    ),
+    (
+        "start-from-the-chair",
+        "(\"from\", SHEET_SOURCE), (\"to\", \"ALL\"), (\"msg_type\", \"CALL_START\"),",
+        "(\"from\", SHEET_FROM), (\"to\", \"ALL\"), (\"msg_type\", \"CALL_START\"),",
+        "a start row says from=conference-chair: never verified, the cursor never moves",
+        "test_every_row_the_mirror_writes_is_one_the_gateway_verifies",
+    ),
+    (
+        "legacy-any-payload",
+        "    if source == SHEET_SOURCE and stamp == LEGACY_STAMP and got == _legacy(payload):",
+        "    if source == SHEET_SOURCE and stamp == LEGACY_STAMP:",
+        "any payload under the legacy stamp moves the cursor",
+        "test_a_legacy_stamp_on_any_other_payload_is_still_a_conflict",
+    ),
+    (
+        "legacy-any-source",
+        "    if source == SHEET_SOURCE and stamp == LEGACY_STAMP and got == _legacy(payload):",
+        "    if stamp == LEGACY_STAMP and got == _legacy(payload):",
+        "a legacy-stamped row from another source moves the cursor",
+        "test_a_legacy_stamp_from_another_source_is_still_a_conflict",
+    ),
+    (
+        "legacy-is-reposted",
+        "            _mirror_log(rid, len(payload), \"legacy\")\n            _owned(renew)\n            conn.set(cursor_key, entry_id)\n            return True",
+        "            _mirror_log(rid, len(payload), \"legacy\")\n            return False",
+        "a legacy row blocks the cursor forever",
+        "test_a_legacy_row_from_before_the_fix_is_passed_not_reposted",
     ),
     (
         "flag-always-on",
