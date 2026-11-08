@@ -10,7 +10,8 @@ learn which tasks take how long and how far each agent's estimates are off.
     python scripts/estimate.py done  --task one-speaker-fix [--note "2 Codex rounds"]
     python scripts/estimate.py report                    # this machine's estimate vs actual so far
 
-Every agent, every task and subtask (owner, 2026-11-08). Set ESTIMATE_BY to your instance tag.
+Every agent, every task and subtask (owner, 2026-11-08). Set ESTIMATE_BY to your instance tag (a roster id). A second
+session of the same instance sets ESTIMATE_SESSION (posted as session=) and its own ESTIMATE_LEDGER.
 Rows (thread TH-ESTIMATES):
     msg_type=ESTIMATE       task, parent, by, started (UTC), est_minutes, est_done (UTC and Toronto), what
     msg_type=ESTIMATE       (reestimate=N) task, by, started, new_est_done, reason
@@ -36,6 +37,10 @@ REPO = Path(__file__).resolve().parent.parent
 LEDGER = Path(os.environ.get("ESTIMATE_LEDGER") or (Path.home() / ".claude" / "estimates.json"))
 # No default: a default once posted Codex's estimate under claude-code-cli (2026-11-08). The author must name itself.
 ME = os.environ.get("ESTIMATE_BY", "").strip()
+# ESTIMATE_BY is the INSTANCE (a scripts/agent_roster.json id; the append guard refuses anything else). Two sessions of
+# one instance (two claude-code-cli terminals) tell their rows apart with ESTIMATE_SESSION, e.g. b76 or vscode: it is
+# posted as session= and goes into the row id, so two sessions posting in the same second never share an id.
+SESSION = os.environ.get("ESTIMATE_SESSION", "").strip()
 try:
     from zoneinfo import ZoneInfo
     TORONTO = ZoneInfo("America/Toronto")
@@ -72,7 +77,10 @@ def clean(s):
 
 
 def post(kind, fields):
-    rid = "%s-%s-%s" % (ME.upper().replace("-", "")[:12], kind.replace("_", "-"), now().strftime("%Y%m%dT%H%M%SZ"))
+    who = ME.upper().replace("-", "")[:12] + (("-" + SESSION.upper().replace("-", "")[:8]) if SESSION else "")
+    rid = "%s-%s-%s" % (who, kind.replace("_", "-"), now().strftime("%Y%m%dT%H%M%SZ"))
+    if SESSION:
+        fields = list(fields[:3]) + [("session", SESSION)] + list(fields[3:])   # near the front, where a reader looks
     parts = ["BCB", "v=1", "id=" + rid, "phase=RESULT", "class=STATUS", "from=" + ME, "to=all",
              "msg_type=" + kind, "thread_id=TH-ESTIMATES"] + ["%s=%s" % (k, clean(v)) for k, v in fields]
     payload = "|".join(parts)
@@ -152,6 +160,14 @@ def cmd_report(_a):
             print("%-28s est %4d  open since %s" % (task, e["est_minutes"], e["started"]))
 
 
+def roster_ids():
+    try:
+        d = json.loads((REPO / "scripts" / "agent_roster.json").read_text(encoding="utf-8"))
+        return {i["id"] for f in d.get("families", []) for i in f.get("instances", [])}
+    except (OSError, ValueError, KeyError, TypeError):
+        return None                                          # no roster here: append.py's own guard decides
+
+
 def main():
     p = argparse.ArgumentParser()
     s = p.add_subparsers(dest="cmd", required=True)
@@ -165,6 +181,11 @@ def main():
     args = p.parse_args()
     if args.cmd != "report" and not ME:
         sys.exit("set ESTIMATE_BY to your instance tag (e.g. ESTIMATE_BY=codex); nothing was posted")
+    ids = roster_ids()
+    if args.cmd != "report" and ids is not None and ME not in ids:
+        sys.exit("ESTIMATE_BY=%s is not an instance in scripts/agent_roster.json, so the board would refuse it. Use the "
+                 "instance tag and name the session with ESTIMATE_SESSION (e.g. ESTIMATE_BY=claude-code-cli "
+                 "ESTIMATE_SESSION=b76); nothing was posted" % ME)
     {"start": cmd_start, "done": cmd_done, "reestimate": cmd_reestimate, "report": cmd_report}[args.cmd](args)
 
 
