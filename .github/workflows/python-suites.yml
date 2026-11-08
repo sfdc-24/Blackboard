@@ -125,6 +125,11 @@ on:
       - "tests/test_redis_dual.py"
       - "scripts/bus_reconcile.py"
       - "tests/test_bus_reconcile.py"
+      - "scripts/redis_daily_audit.py"
+      - "tests/test_redis_daily_audit.py"
+      - "tests/mutate_redis_daily_audit.py"
+      - "cloud/bus-reconciler/deploy.sh"
+      - ".gcloudignore"
       - "scripts/bus_request.py"
       - "tests/test_bus_request.py"
       - "scripts/redis_gov.py"
@@ -254,6 +259,11 @@ on:
       - "tests/test_redis_dual.py"
       - "scripts/bus_reconcile.py"
       - "tests/test_bus_reconcile.py"
+      - "scripts/redis_daily_audit.py"
+      - "tests/test_redis_daily_audit.py"
+      - "tests/mutate_redis_daily_audit.py"
+      - "cloud/bus-reconciler/deploy.sh"
+      - ".gcloudignore"
       - "scripts/bus_request.py"
       - "tests/test_bus_request.py"
       - "scripts/redis_gov.py"
@@ -1216,6 +1226,23 @@ jobs:
           if [ -f tests/test_bus_reconcile.py ]; then
             python_bin="$(command -v python3)"
             sudo unshare -n -- "$python_bin" -B -m unittest tests.test_bus_reconcile -v
+          else
+            echo "not on this branch; skipping"
+          fi
+
+      # One UTC day of every fleet inbox lane, copied onto the board. Flag off unless the value is
+      # exactly on. An unreachable or empty Redis is UNKNOWN, never a completed audit of zero.
+      # The dedupe and the call-text withhold are deleted on purpose; each mutant must fail.
+      - name: "redis daily audit: one row per entry, call text withheld, empty is UNKNOWN (no network)"
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_redis_daily_audit.py ]; then
+            python_bin="$(command -v python3)"
+            sudo unshare -n -- "$python_bin" -B -m unittest tests.test_redis_daily_audit -v
+            sudo unshare -n -- "$python_bin" -B tests/mutate_redis_daily_audit.py
+          elif [ -f scripts/redis_daily_audit.py ]; then
+            echo "::error::scripts/redis_daily_audit.py is on this branch but its suite is not"
+            exit 1
           else
             echo "not on this branch; skipping"
           fi

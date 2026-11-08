@@ -28,6 +28,9 @@ COPY scripts/redis_dual.py /app/redis_dual.py
 # stops the dual-run with no redeploy.
 COPY scripts/redis_dual.settings.json /app/redis_dual.settings.json
 COPY scripts/bus_reconcile.py /app/bus_reconcile.py
+# The daily copy of every fleet inbox lane onto the board. Same image as bus-requests, which can
+# already reach redis-central. Off unless REDIS_DAILY_AUDIT=on. The scheduler is not applied by deploy.
+COPY scripts/redis_daily_audit.py /app/redis_daily_audit.py
 # append.py's one write rule (never trim a row silently) and the store a long row is kept in.
 COPY scripts/board_row.py /app/board_row.py
 COPY scripts/state_store.py /app/state_store.py

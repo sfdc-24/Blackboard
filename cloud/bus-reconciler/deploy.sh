@@ -23,6 +23,8 @@
 #   bash cloud/bus-reconciler/deploy.sh run      # execute it once and wait
 #   bash cloud/bus-reconciler/deploy.sh readback # what is actually deployed, printed
 #   bash cloud/bus-reconciler/deploy.sh off      # REDIS_DUAL_ENABLED=false, no redeploy of anything else
+#   bash cloud/bus-reconciler/deploy.sh audit-schedule
+#       NOT APPLIED. Prints the daily audit's 06:10 UTC scheduler command and does not create it.
 
 set -euo pipefail
 
@@ -139,6 +141,28 @@ off() {
   echo "enabled=false cannot be overridden back on from the environment."
 }
 
+# NOT APPLIED. The daily copy (scripts/redis_daily_audit.py) runs in this image, the one bus-requests
+# already uses, and only when REDIS_DAILY_AUDIT is exactly on. `deploy` does not create the job and
+# does not create the scheduler. This command prints what an operator would apply, and stops.
+audit_schedule() {
+  cat <<'EOF'
+NOT APPLIED: the daily Redis audit scheduler is documented here and is not created.
+Job redis-daily-audit, on the bus-requests image (this directory's image), command:
+  python -B redis_daily_audit.py
+Env includes REDIS_CONNECT=true and REDIS_DAILY_AUDIT=off
+REDIS_DAILY_AUDIT=off stays off: the job copies nothing until that value is exactly on.
+Scheduler redis-daily-audit-daily, once a day at 06:10 UTC:
+  gcloud scheduler jobs create http redis-daily-audit-daily \
+    --project sfdc24 --location us-central1 \
+    --schedule "10 6 * * *" --time-zone "Etc/UTC" \
+    --http-method POST \
+    --uri "https://run.googleapis.com/v2/projects/sfdc24/locations/us-central1/jobs/redis-daily-audit:run" \
+    --oauth-service-account-email "redis-daily-audit-ticker@sfdc24.iam.gserviceaccount.com" \
+    --oauth-token-scope "https://www.googleapis.com/auth/cloud-platform"
+EOF
+  return 2
+}
+
 case "${1:-}" in
   setup) setup ;;
   build) build ;;
@@ -146,5 +170,6 @@ case "${1:-}" in
   run) run_once ;;
   readback) readback ;;
   off) off ;;
+  audit-schedule) audit_schedule ;;
   *) sed -n '1,30p' "$0"; exit 2 ;;
 esac

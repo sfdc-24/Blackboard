@@ -37,6 +37,7 @@
 !/scripts/redis_dual.py
 !/scripts/redis_dual.settings.json
 !/scripts/bus_reconcile.py
+!/scripts/redis_daily_audit.py
 !/scripts/bus_request.py
 !/scripts/canvas_publish.py
 !/scripts/call_bridge.py
