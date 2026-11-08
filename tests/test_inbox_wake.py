@@ -600,6 +600,40 @@ class TheLanePath(unittest.TestCase):
         clock["t"] += 1
         self.assertEqual("duplicate", wake.sweep(d)[0]["status"], "and the new claim holds its own window")
 
+    def test_the_scan_claim_ttl_is_strictly_shorter_than_the_sweep_interval(self):
+        """Codex on c221f657: a TTL equal to the cron's cadence lets a retry slip a whole extra interval."""
+        import re
+        sweep = (REPO / ".github" / "workflows" / "inbox-wake-sweep.yml").read_text(encoding="utf-8")
+        crons = re.findall(r"cron:\s*'\*/(\d+) \* \* \* \*'", sweep)
+        self.assertEqual(1, len(crons), "one every-N-minutes schedule to read the cadence from")
+        self.assertEqual(int(crons[0]) * 60, wake.SWEEP_INTERVAL)
+        self.assertLess(wake.SCAN_CLAIM_TTL, wake.SWEEP_INTERVAL)
+        self.assertEqual(wake.SCAN_CLAIM_TTL + wake.SWEEP_INTERVAL, wake.RETRY_BOUND)
+
+    def test_a_stalled_start_is_retried_within_the_bound_at_every_phase_of_the_sweep(self):
+        """Sweeps on the cron's cadence, at many phases against the start: the retry is never before the
+        TTL and always by the first sweep after it, so within RETRY_BOUND."""
+        for phase in (1, 60, 300, 450, 600, wake.SCAN_CLAIM_TTL - 1, wake.SCAN_CLAIM_TTL,
+                      wake.SCAN_CLAIM_TTL + 1, 850, wake.SWEEP_INTERVAL - 1):
+            clock = {"t": 10000.0}
+            d, rec, lane = lane_deps()
+            d.seen = wake.MemorySeen(clock=lambda: clock["t"])
+            d.worker.stalled = True
+            lane.add()
+            self.assertEqual("woke", nudge(d)[1]["woke"][0]["status"])
+            retried = None
+            for tick in range(6):
+                clock["t"] = 10000.0 + phase + tick * wake.SWEEP_INTERVAL
+                if wake.sweep(d)[0]["status"] == "woke":
+                    retried = clock["t"] - 10000.0
+                    break
+            self.assertIsNotNone(retried, phase)
+            self.assertGreaterEqual(retried, wake.SCAN_CLAIM_TTL, phase)
+            self.assertLessEqual(retried, wake.RETRY_BOUND, phase)
+            self.assertLess(retried - wake.SCAN_CLAIM_TTL, wake.SWEEP_INTERVAL,
+                            "the first sweep after the TTL, never the one after that (phase %s)" % phase)
+            self.assertEqual(2, len(rec.jobs), phase)
+
     def test_progress_that_moves_is_a_new_key_and_an_immediate_start(self):
         clock = {"t": 5000.0}
         d, rec, lane = lane_deps(cap=1)
@@ -621,8 +655,8 @@ class TheLanePath(unittest.TestCase):
         self.assertEqual(int(number) * {"s": 1, "m": 60, "h": 3600}[unit], wake.WORKER_TASK_TIMEOUT)
         self.assertIn("--max-retries 0", script, "no retry inside the job lengthens a run")
         self.assertEqual(wake.WORKER_TASK_TIMEOUT + wake.SCAN_CLAIM_MARGIN, wake.SCAN_CLAIM_TTL)
-        self.assertGreater(wake.SCAN_CLAIM_MARGIN, 0)
-        self.assertLess(wake.SCAN_CLAIM_TTL, 3600, "well short of the 30-day seen ttl")
+        self.assertGreaterEqual(wake.SCAN_CLAIM_MARGIN, 60)
+        self.assertLessEqual(wake.SCAN_CLAIM_MARGIN, 120)
         client = FakeRedis()
         d, rec, lane = lane_deps()
         d.seen = wake.RedisSeen(client)

@@ -39,8 +39,10 @@ Redis and has just written the entry, so it sends the event:
 
 So delivery is **at least once**. A failed start moves nothing and is retried by the next nudge or sweep. A start the
 run API accepted, but whose execution died before the worker moved, is retried too: the `scan:` claim lasts only
-`SCAN_CLAIM_TTL`, which is the worker job's `--task-timeout` (10 min, `--max-retries 0`) plus 5 min. Within that window
-a running execution is never doubled. The wake cursor and the entry claims keep the 30-day fleet ttl. The worker's scan
+`SCAN_CLAIM_TTL`, which is the worker job's `--task-timeout` (10 min, `--max-retries 0`) plus 2 min, 720 s. That is
+strictly shorter than the sweep's 15-minute cadence. **The bound** (`RETRY_BOUND`) is that a stalled start is retried
+by the first nudge or sweep after `SCAN_CLAIM_TTL`: never before 720 s, and no later than 720 + 900 = 1620 s after the
+start, whatever the phase against the cron. Within the TTL a running execution is never doubled. The wake cursor and the entry claims keep the 30-day fleet ttl. The worker's scan
 state is only read. The flag off changes nothing: a nudge answers `lane_off` and reads nothing,
 the sweep is the per-entry sweep it was, and no cursor is written.
 

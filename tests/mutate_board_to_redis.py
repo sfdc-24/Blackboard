@@ -356,6 +356,15 @@ MUTANTS = [
         "test_the_scan_claim_ttl_is_the_worker_job_timeout_plus_a_margin",
         "tests.test_inbox_wake",
     ),
+    (
+        "the-ttl-equals-the-sweep-interval",
+        "cloud/inbox-wake/main.py",
+        "SCAN_CLAIM_MARGIN = 120\n",
+        "SCAN_CLAIM_MARGIN = 300\n",
+        "a start just after a tick keeps its claim at the first sweep after the TTL: the retry slips a cadence",
+        "test_the_scan_claim_ttl_is_strictly_shorter_than_the_sweep_interval",
+        "tests.test_inbox_wake",
+    ),
 ]
 
 
