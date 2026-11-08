@@ -106,10 +106,34 @@ MUTANTS = [
     ),
     (
         "a-transient-failure-exits",
-        "        except Transient as why:\n            back_off(why, why.rate_limited)\n            continue",
+        "        except Transient as why:\n            back_off(why, why.rate_limited, why.retry_after)\n"
+        "            continue",
         "        except Transient as why:\n            return 3  # MUTANT: give up",
         "one dropped wait stops the ring until someone restarts it",
         "test_transient_failures_double_and_are_capped",
+    ),
+    (
+        "busy-is-an-empty-pass",
+        "                raise Transient(\"HTTP 429 busy\", rate_limited=True,\n"
+        "                                retry_after=getattr(why, \"retry_after\", None)) from None",
+        "                return {\"ok\": True, \"value\": [], \"principal\": kwargs.get(\"me\")}"
+        "  # MUTANT: busy looks like a quiet lane",
+        "a 429 busy is a quiet lane: the ring asks again after the 2 s floor, not after its 30 s backoff",
+        "test_a_busy_wait_backs_off_by_the_rings_policy_not_the_doorbells",
+    ),
+    (
+        "busy-not-intercepted",
+        "            if busy is not None and isinstance(why, busy):",
+        "            if False:  # MUTANT: Busy reaches the doorbell, which sleeps its own 5 s",
+        "the doorbell's short busy sleep stands in for the ring's 429 policy",
+        "test_a_busy_wait_backs_off_by_the_rings_policy_not_the_doorbells",
+    ),
+    (
+        "busy-retry-after-ignored",
+        "            back_off(why, why.rate_limited, why.retry_after)\n",
+        "            back_off(why, why.rate_limited)  # MUTANT: the bridge's retry_after is dropped\n",
+        "a bridge that asks for 90 s is asked again after 30",
+        "test_a_busy_wait_that_names_a_longer_retry_after_waits_that_long",
     ),
     (
         "summary-carries-the-text",

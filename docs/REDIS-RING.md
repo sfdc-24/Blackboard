@@ -22,10 +22,10 @@ sfdc-24/Blackboard#490), as metadata only: `by`, `row_id`, `at`, `phase`, `threa
 | codex | `chatgpt-codex-desktop` | the laptop with the Codex desktop app | `codex queue --thread <uuid> --message <summary> --resume` (`fleet_ring.codex_template`; codex.exe is resolved on every ring) | `powershell -File scripts\install_redis_ring.ps1 -Agent codex -WakeArgs '--codex-thread','<uuid>' -BridgeUrl <url> -Impersonate fleet-codex@<project>.iam.gserviceaccount.com` |
 | grok | `grok` | Grok's Linux box | `-- /workspace/fleet-ring/grok_ring.sh {file}`: POSTs the summary to its Grok Bot webhook. The key is in that process's env, never in a file in this repo | XFCE autostart entry running `scripts/redis_ring_autostart.sh grok -- /workspace/fleet-ring/grok_ring.sh {file}` |
 | gemini | `gemini` | Gemini's computer | one JSON file in `~/.gemini/binder/inbox/` (`ANTIGRAVITY_DROP_ROOT` moves the root; `--drop DIR` overrides), written to a temp name in that folder and renamed into place | `python scripts/redis_ring.py --agent gemini --bridge-url <url> --impersonate fleet-gemini@<project>.iam.gserviceaccount.com`, or the Windows installer with `-Agent gemini`, or the autostart script with `gemini` |
-| cursor | — | cloud | none from Redis. Reached by GitHub (`@cursor` on a PR) and by Grok dispatch; `cloud/inbox-wake` has no route for it | **missing:** any wake from `fleet:inbox:cursor` |
-| claude-api | — | cloud | `cloud/inbox-wake` runs the `claude-api-worker` Cloud Run job on a GitHub event or the 15-minute sweep; the job reads `fleet:inbox:claude-api` | **missing:** a trigger on the lane itself; an `XADD` does not start the job |
+| cursor | — | cloud | relayed to grok | covered by the follow-up PR (cloud): cursor relayed to grok |
+| claude-api | — | cloud | `cloud/inbox-wake` runs the `claude-api-worker` Cloud Run job, which reads `fleet:inbox:claude-api` | covered by the follow-up PR (cloud): claude-api via inbox-wake |
 
-No cloud service is built for the last two rows. A Redis-event trigger for a cloud agent is its own reviewed design.
+No cloud service is built in this PR for the last two rows; a separate PR covers them.
 
 ### Gemini's drop file
 
@@ -58,7 +58,8 @@ The cursor is the ring's own (`~/.redis-ring-<principal>-cursor`, `REDIS_RING_DI
 
 | What happens | What the ring does |
 |---|---|
-| 429, timeout, dropped connection, 5xx, open breaker, token mint failure | waits and tries again: 5 s doubling to 300 s; a 429 starts at 30 s |
+| 429, timeout, dropped connection, 5xx, open breaker, token mint failure | waits and tries again: 5 s doubling to 300 s; a 429 starts at 30 s (or the bridge's `retry_after`, if longer) |
+| 429 busy on an xwait (`bridge_client.Busy`, sfdc-24/Blackboard#489) | the same 30 s policy. Busy is caught at the attempt boundary, before `redis_doorbell.ring` can turn it into its own 5 s sleep and an empty pass; works with and without #489 |
 | 401 or 403 (`Denied`), a governed refusal (`Refused`) | exits 2 with one line. **No board fallback** |
 | bridge env missing or malformed, or the account is not bound to this agent in `callers.json` | exits 3 before any request. **No board fallback** |
 | cursor file unreadable | exits 4; the file is left as it is |

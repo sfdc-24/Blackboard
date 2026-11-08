@@ -80,6 +80,15 @@ class FakeBridge:
         return [c for c in self.calls if c[0] == "xwait"]
 
 
+class FakeBusy(Exception):
+    """bridge_client.Busy as sfdc-24/Blackboard#489 has it: a 429 on an xwait, with the bridge's retry_after. Patched
+    in as bridge_client.Busy, so the suite proves the same path before #489 lands and after."""
+
+    def __init__(self, retry_after=5.0):
+        super().__init__("HTTP 429 busy")
+        self.retry_after = retry_after
+
+
 class Wake:
     def __init__(self, *results):
         self.results = list(results)
@@ -209,6 +218,43 @@ class FailuresBackOff(Harness):
         self.assertEqual(rr.BACKOFF_START * 2, self.clock.slept[1])
         self.assertEqual(rr.BACKOFF_MAX, max(self.clock.slept))
         self.assertTrue(all(s >= rr.BACKOFF_START for s in self.clock.slept))
+
+    def test_a_busy_wait_backs_off_by_the_rings_policy_not_the_doorbells(self):
+        self.cursor.write_text("1-0", encoding="utf-8")
+        bridge, wake = FakeBridge(FakeBusy(5), FakeBusy(5), answer(entry(1), after="1-0")), Wake()
+        with mock.patch.object(rr.bridge_client, "Busy", FakeBusy, create=True):
+            self.assertEqual(0, self.run_ring(bridge, wake, rounds=3))
+        self.assertEqual([rr.RATE_LIMIT_START, rr.RATE_LIMIT_START * 2], self.clock.slept,
+                         "busy is the ring's 30 s doubling backoff, never the doorbell's 5 s or an empty pass")
+        self.assertEqual(1, len(wake.calls))
+        self.assertEqual(entry(1)["id"], self.cursor_at())
+        self.assertTrue(any(line.startswith("RATE LIMITED") for line in self.lines), self.lines)
+
+    def test_a_busy_wait_that_names_a_longer_retry_after_waits_that_long(self):
+        self.cursor.write_text("1-0", encoding="utf-8")
+        bridge = FakeBridge(FakeBusy(90))
+        with mock.patch.object(rr.bridge_client, "Busy", FakeBusy, create=True):
+            self.run_ring(bridge, Wake(), rounds=1)
+        self.assertEqual([90], self.clock.slept)
+
+    def test_a_busy_first_run_backs_off_and_primes_after(self):
+        calls = []
+
+        def attempt(op, key, **kwargs):
+            calls.append(op)
+            if len(calls) == 1:
+                raise FakeBusy(5)
+            return {"ok": True, "value": [{"id": "7-0"}]}
+        with mock.patch.object(rr.bridge_client, "Busy", FakeBusy, create=True):
+            self.run_ring(attempt, Wake(), rounds=2)
+        self.assertEqual([rr.RATE_LIMIT_START], self.clock.slept)
+        self.assertEqual("7-0", self.cursor_at())
+
+    def test_without_a_busy_class_other_errors_pass_through_untouched(self):
+        self.cursor.write_text("1-0", encoding="utf-8")
+        bridge = FakeBridge(bridge_client.Denied("HTTP 401 unauthenticated"))
+        with mock.patch.object(rr, "busy_class", return_value=None):
+            self.assertEqual(rr.EXIT_DENIED, self.run_ring(bridge, Wake(), rounds=3))
 
     def test_a_raised_transient_problem_backs_off_too(self):
         self.cursor.write_text("1-0", encoding="utf-8")

@@ -23,8 +23,8 @@ THE WAKE TABLE (docs/REDIS-RING.md holds the same table, with the start command 
                                               webhook; the key is in that process's env, never in this repo)
     gemini            gemini                  a JSON file in ~/.gemini/binder/inbox/ (ANTIGRAVITY_DROP_ROOT moves the
                                               root), written to a temp name in that folder and renamed into place
-    cursor            -                       cloud; no machine to run this on. Reached by cloud/inbox-wake and the
-    claude-api        -                       Grok dispatch path today. MISSING: a Redis-event trigger in the cloud.
+    cursor            -                       cloud; no machine to run this on. Covered by the follow-up PR (cloud):
+    claude-api        -                       claude-api via inbox-wake, cursor relayed to grok.
 
 WHAT ONE PASS DOES
   1. A first run (no cursor file) starts at the lane's own newest entry id (redis_doorbell.lane_position): nothing
@@ -37,8 +37,10 @@ WHAT ONE PASS DOES
      a backoff; the agent may be woken twice for one entry (at least once), never zero times.
 
 FAILURES
-  A 429, a timeout, a dropped connection, a 5xx or an open breaker: wait and try again, BACKOFF_START doubling to
-  BACKOFF_MAX (a 429 starts at RATE_LIMIT_START). Never a tight loop.
+  A 429 (bridge_client.Busy once #489 is in, an Unknown read before it), a timeout, a dropped connection, a 5xx or
+  an open breaker: wait and try again, BACKOFF_START doubling to BACKOFF_MAX (a 429 starts at RATE_LIMIT_START, or
+  the bridge's retry_after if that is longer). Busy is caught at the attempt boundary (governed), so the
+  doorbell's own short busy sleep never stands in for this policy. Never a tight loop.
   A 401 or 403 (Denied), a governed refusal (Refused), or the bridge env missing or not bound to this agent: exit
   non-zero with one clear line. There is NO board fallback: the board doorbell is a separate program, and a denied
   agent quietly moving to a weaker route is the downgrade bridge_client.py exists to refuse.
@@ -81,9 +83,10 @@ EXIT_DENIED, EXIT_NO_BRIDGE, EXIT_CURSOR, EXIT_NO_ID = 2, 3, 4, 5
 class Transient(Exception):
     """The bridge gave no answer this time (attempt returned None): retry after a backoff."""
 
-    def __init__(self, detail: str, rate_limited: bool = False):
+    def __init__(self, detail: str, rate_limited: bool = False, retry_after=None):
         super().__init__(detail)
         self.rate_limited = rate_limited
+        self.retry_after = retry_after
 
 
 def state_dir() -> Path:
@@ -127,9 +130,21 @@ def preflight(principal: str, environ=None, callers=None):
     return None
 
 
+def busy_class():
+    """bridge_client.Busy (a 429 on an xwait: no room for a wait just now) where this bridge_client has it
+    (sfdc-24/Blackboard#489), else None. Before it, a 429 is an Unknown read and attempt() returns None."""
+    return getattr(bridge_client, "Busy", None)
+
+
 def governed(attempt, log):
-    """bridge_client.attempt, with its None ("use the board route") turned into Transient: this loop never takes the
-    board route, it waits and asks the bridge again. Refused and Denied pass through untouched."""
+    """bridge_client.attempt, as the doorbell's wait sees it, with two answers turned into Transient:
+    - None ("use the board route"): this loop never takes the board route, it waits and asks the bridge again;
+    - Busy, raised HERE, at the attempt boundary, before redis_doorbell.ring can catch it. The doorbell's own answer
+      to Busy is to sleep the bridge's retry_after (about 5 s) and, with rounds=1, return an empty pass, which looks
+      like a quiet lane and would bypass this loop's 429 policy. Raised as Transient(rate_limited) it reaches run(),
+      which backs off from RATE_LIMIT_START doubling to BACKOFF_MAX (Codex HOLD on #491).
+    Refused and Denied pass through untouched. redis_doorbell.py itself is not changed, so #489's version of it
+    merges as it is."""
     def call(op, key, **kwargs):
         heard = []
 
@@ -138,7 +153,14 @@ def governed(attempt, log):
             heard.append(line)
             log("bridge: " + line)
 
-        result = attempt(op, key, say=note, **kwargs)
+        busy = busy_class()
+        try:
+            result = attempt(op, key, say=note, **kwargs)
+        except Exception as why:  # noqa: BLE001 - only Busy is turned; everything else is raised as it was
+            if busy is not None and isinstance(why, busy):
+                raise Transient("HTTP 429 busy", rate_limited=True,
+                                retry_after=getattr(why, "retry_after", None)) from None
+            raise
         if result is None:
             text = " ".join(heard)
             raise Transient(text[-200:] or "no answer", rate_limited="429" in text)
@@ -266,7 +288,7 @@ def run(agent: str, principal: str, wake, *, attempt=bridge_client.attempt, log=
             log("redis ring: DENIED or REFUSED (%s). No board fallback; exiting." % why)
             return EXIT_DENIED
         except Transient as why:
-            back_off(why, why.rate_limited)
+            back_off(why, why.rate_limited, why.retry_after)
             continue
         except (bridge_client.BridgeProblem, OSError, ValueError) as why:
             # NotSent / NotExecuted / Unknown, or a rate-limit class a newer bridge_client may raise: all transient.
