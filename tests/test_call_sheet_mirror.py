@@ -1,7 +1,7 @@
-"""The call-sheet mirror: Redis call events and turns become sheet rows, and a sheet reply
-returns to that agent's voice lane. Offline. Redis and the board are fakes.
+"""The call-sheet mirror: Redis call events and live turns become sheet rows. Offline.
 
-CALL_SHEET_MIRROR is exactly "on". Anything else does nothing, and this file never deploys.
+The sheet is a projection. A missing turn text is withheld, not reconstructed, and nothing
+here writes a voice lane. CALL_SHEET_MIRROR is exactly "on". Anything else does nothing.
 """
 import datetime
 import hashlib
@@ -141,35 +141,11 @@ def _run_pass(conn, board, rows=None):
         return sr.one_pass(conn, {}, "bus-requests-test", with_git=False, quiet=True, renew=lambda: True)
 
 
-def _mirror(conn, rows, board=None):
+def _mirror(conn, board=None):
     board = board or Board()
     with mock.patch.dict(sr.os.environ, {"CALL_SHEET_MIRROR": "on"}):
-        sr.mirror_call_sheet(conn, rows, NOW, {}, append=board.append, present=board.present)
+        sr.mirror_call_sheet(conn, NOW, {}, append=board.append, present=board.present)
     return board
-
-
-def _arm(conn, call_id=LIVE, state="live", epoch="3", to="grok", turn_key="t-001", started=None):
-    """A call hash and one turn already behind the turns cursor, so this pass does not re-post it."""
-    if started is None:
-        started = _stamp(NOW - datetime.timedelta(minutes=1))
-    conn.hashes[sr.CALL_KEY % call_id] = {
-        "state": state, "epoch": epoch, "started_at": started, "ended_at": "", "reason": ""}
-    conn.add(sr.TURNS_KEY % call_id, "3000-0", {
-        "turn_key": turn_key, "to": to, "epoch": epoch, "said_at": started, "text": "hello"})
-    conn.strings[sr.TURNS_CURSOR % call_id] = "3000-0"
-
-
-def _reply(frm="grok", source="grok", epoch="3", age=10, call_id=LIVE, turn_key="t-001", say="heard",
-           spoken="sheet", msg="CALL_REPLY", rid="REPLY-1"):
-    when = _stamp(NOW - datetime.timedelta(seconds=age))
-    payload = "|".join(["BCB", "v=1", "id=%s" % rid, "from=%s" % frm, "msg_type=%s" % msg,
-                        "spoken=%s" % spoken, "call_id=%s" % call_id, "epoch=%s" % epoch,
-                        "turn_key=%s" % turn_key, "say=%s" % say])
-    return [rid, when, source, frm, "RESULT", payload, "OPEN", "CALL", "", ""]
-
-
-def _voice_adds(conn):
-    return [key for op, key in conn.writes if op == "xadd" and str(key).startswith("fleet:voice-say:")]
 
 
 class CallEvents(unittest.TestCase):
@@ -254,7 +230,7 @@ class CallTurns(unittest.TestCase):
         conn.add(sr.TURNS_KEY % ENDED, "4000-0", {
             "turn_key": "t-ended", "to": "grok", "epoch": "7", "said_at": said, "text": "gone"})
         with self.assertLogs("bus-requests", level="WARNING") as caught:
-            _mirror(conn, [], board)
+            _mirror(conn, board)
         logged = "\n".join(caught.output)
         self.assertNotIn("nope", logged)
         self.assertNotIn("gone", logged)
@@ -276,9 +252,51 @@ class CallTurns(unittest.TestCase):
         self.assertNotIn("nope", " ".join(spec["payload"] for spec in board.appends))
 
         marked = len(board.present_calls)
-        _mirror(conn, [], board)
+        _mirror(conn, board)
         self.assertEqual(marked, len(board.present_calls))
         self.assertEqual(1, len(board.appends))
+        self.assertEqual([], [key for op, key in conn.writes if str(key).startswith("fleet:voice-say:")])
+
+    def test_a_turn_without_text_records_the_class_and_withheld(self):
+        """class=other carries chars, class=command carries verb and target_chars. No text key,
+        and a words field on the entry is not the row."""
+        conn, board = FakeRedis(), Board()
+        said = "2026-11-08T12:55:00Z"
+        conn.hashes[sr.CALL_KEY % LIVE] = {
+            "state": "live", "epoch": "7", "started_at": said, "ended_at": "", "reason": ""}
+        conn.hashes[sr.CALL_KEY % ENDED] = {
+            "state": "ended", "epoch": "7", "started_at": said, "ended_at": said, "reason": "hangup"}
+        conn.add(sr.TURNS_KEY % LIVE, "5000-0", {
+            "turn_key": "t-other", "to": "grok", "epoch": "7", "said_at": said,
+            "class": "other", "chars": "40", "words": "swordfish-secret"})
+        conn.add(sr.TURNS_KEY % LIVE, "5000-1", {
+            "turn_key": "t-cmd", "to": "gemini", "epoch": "7", "said_at": said,
+            "class": "command", "verb": "status", "target_chars": "12", "words": "secretphrase"})
+        conn.add(sr.TURNS_KEY % ENDED, "5000-0", {
+            "turn_key": "t-dead", "to": "grok", "epoch": "7", "said_at": said,
+            "class": "other", "chars": "9", "words": "gone-words"})
+        _mirror(conn, board)
+        by_id = {spec["row_id"]: spec for spec in board.appends}
+        self.assertEqual(["CALLTURN-t-other", "CALLTURN-t-cmd"], list(by_id))
+        other = (
+            "BCB|v=1|id=CALLTURN-t-other|phase=ASK|class=other|from=conference-chair|to=grok|"
+            "msg_type=CALL_TURN|call_id=%s|epoch=7|turn_key=t-other|said_at=%s|withheld=1|chars=40"
+            % (LIVE, said))
+        command = (
+            "BCB|v=1|id=CALLTURN-t-cmd|phase=ASK|class=command|from=conference-chair|to=gemini|"
+            "msg_type=CALL_TURN|call_id=%s|epoch=7|turn_key=t-cmd|said_at=%s|withheld=1|"
+            "verb=status|target_chars=12" % (LIVE, said))
+        self.assertEqual(other, by_id["CALLTURN-t-other"]["payload"])
+        self.assertEqual(command, by_id["CALLTURN-t-cmd"]["payload"])
+        joined = other + command
+        self.assertNotIn("text=", joined)
+        self.assertNotIn("swordfish", joined)
+        self.assertNotIn("secretphrase", joined)
+        self.assertNotIn("gone-words", joined)
+        for spec in by_id.values():
+            self.assertEqual([], board_row.problems(spec["payload"]))
+            self.assertEqual([], signature.check(spec["source_tag"], spec["payload"]))
+        self.assertNotIn("CALLTURN-t-dead", by_id)
 
 
 class StaleSweep(unittest.TestCase):
@@ -290,7 +308,7 @@ class StaleSweep(unittest.TestCase):
             "state": "live", "epoch": "3", "started_at": exact_at, "ended_at": "", "reason": ""}
         conn.hashes[sr.CALL_KEY % OVER] = {
             "state": "live", "epoch": "4", "started_at": over_at, "ended_at": "", "reason": ""}
-        _mirror(conn, [])
+        _mirror(conn)
         exact = conn.hashes[sr.CALL_KEY % EXACT]
         over = conn.hashes[sr.CALL_KEY % OVER]
         self.assertEqual("live", exact["state"], "fifty minutes on the dot is not stale")
@@ -302,53 +320,6 @@ class StaleSweep(unittest.TestCase):
                          conn.streams.get(sr.CALLS_KEY))
         self.assertEqual([sr.CALLS_KEY, sr.CALL_KEY % OVER],
                          [key for op, key in conn.writes if op in ("xadd", "hset")])
-
-
-class SheetReplies(unittest.TestCase):
-    def _spoken(self, **kw):
-        conn = FakeRedis()
-        _arm(conn, to=kw.pop("to", "grok"), state=kw.pop("state", "live"), epoch=kw.pop("hash_epoch", "3"))
-        _mirror(conn, [_reply(**kw)])
-        return conn
-
-    def test_a_reply_reaches_its_own_voice_lane_when_every_condition_holds(self):
-        conn = FakeRedis()
-        _arm(conn)
-        decoy = _reply(rid="REPLY-VOICE", spoken="voice", say="not-this")
-        _mirror(conn, [_reply(say="heard"), decoy])
-        _mirror(conn, [_reply(say="heard"), decoy])
-        lane = sr.VOICE_KEY % ("grok", LIVE, "3")
-        self.assertEqual([lane], _voice_adds(conn))
-        _entry_id, fields = conn.streams[lane][0]
-        self.assertEqual({"by": "grok", "text": "heard", "at": _stamp(NOW)}, fields)
-        self.assertIn("REPLY-1", conn.sets[sr.REPLIES_SEEN])
-        self.assertNotIn("REPLY-VOICE", conn.sets.get(sr.REPLIES_SEEN, ()))
-        self.assertEqual(sr.REPLIES_TTL_SECONDS, conn.ttls[sr.REPLIES_SEEN])
-        self.assertEqual(86400, conn.ttls[sr.REPLIES_SEEN])
-        others = [key for key in conn.streams if key.startswith("fleet:voice-say:") and key != lane]
-        self.assertEqual([], others)
-
-    def test_a_reply_whose_from_disagrees_with_the_source_tag_is_not_spoken(self):
-        conn = self._spoken(frm="grok", source="gemini")
-        self.assertEqual([], _voice_adds(conn))
-
-    def test_a_reply_whose_from_disagrees_with_the_turn_is_not_spoken(self):
-        conn = self._spoken(frm="grok", source="grok", to="gemini")
-        self.assertEqual([], _voice_adds(conn))
-
-    def test_a_reply_on_an_ended_call_is_not_spoken(self):
-        conn = self._spoken(state="ended")
-        self.assertEqual([], _voice_adds(conn))
-
-    def test_a_reply_whose_epoch_disagrees_is_not_spoken(self):
-        conn = self._spoken(epoch="9", hash_epoch="3")
-        self.assertEqual([], _voice_adds(conn))
-
-    def test_a_reply_older_than_120_seconds_is_not_spoken(self):
-        fresh = self._spoken(age=120, rid="REPLY-120")
-        self.assertEqual([sr.VOICE_KEY % ("grok", LIVE, "3")], _voice_adds(fresh))
-        stale = self._spoken(age=121, rid="REPLY-121")
-        self.assertEqual([], _voice_adds(stale))
 
 
 class TheFlag(unittest.TestCase):
