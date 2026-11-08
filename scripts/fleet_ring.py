@@ -22,6 +22,8 @@ The summary names each row by metadata only (time, sender, row id, id-like chara
 agent reads the rows on the board under its own rules. One ring names at most BATCH rows (plus timestamp ties) and the
 bookmark moves only past those, so a backlog drains over the following ticks. Nothing new is reached: the bus pair the agent already holds, read only.
 No secret or thread id belongs in this file; they come from arguments and the scheduler.
+
+The event-driven ring, on the agent's Redis lane instead of the Sheet: scripts/redis_ring.py (docs/REDIS-RING.md).
 """
 from __future__ import annotations
 
@@ -118,6 +120,12 @@ def codex_exe() -> str:
     return found[-1]
 
 
+def codex_template(thread: str) -> list:
+    """The ring for the Codex desktop app: queue the summary on its session and resume it. Shared with
+    scripts/redis_ring.py, which resolves it again on every ring because codex.exe moves with updates."""
+    return [codex_exe(), "queue", "--thread", thread, "--message", "{message}", "--resume"]
+
+
 def ring_argv(template, message: str, file: str):
     return [part.replace("{message}", message).replace("{file}", file) for part in template]
 
@@ -198,7 +206,7 @@ def parse(argv):
         raise SystemExit(usage)
     thread = value("--codex-thread")
     if thread:
-        template = [codex_exe(), "queue", "--thread", thread, "--message", "{message}", "--resume"]
+        template = codex_template(thread)
     if not template:
         raise SystemExit(usage)
     if value("--min-gap"):

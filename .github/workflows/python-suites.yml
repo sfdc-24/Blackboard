@@ -157,6 +157,10 @@ on:
       - "tests/test_redis_archive.py"
       - "scripts/redis_inbox.py"
       - "tests/test_redis_inbox.py"
+      - "scripts/redis_ring.py"
+      - "scripts/redis_doorbell.py"
+      - "tests/test_redis_ring.py"
+      - "tests/mutate_redis_ring.py"
       - "scripts/bridge_client.py"
       - "tests/test_bridge_client.py"
       - "cloud/redis-tool-bridge/callers.json"
@@ -290,6 +294,10 @@ on:
       - "tests/test_redis_archive.py"
       - "scripts/redis_inbox.py"
       - "tests/test_redis_inbox.py"
+      - "scripts/redis_ring.py"
+      - "scripts/redis_doorbell.py"
+      - "tests/test_redis_ring.py"
+      - "tests/mutate_redis_ring.py"
       - "scripts/bridge_client.py"
       - "tests/test_bridge_client.py"
       - "cloud/redis-tool-bridge/callers.json"
@@ -1209,6 +1217,7 @@ jobs:
                       "test_wake_ack:scripts/wake_ack.py" \
                       "test_redis_archive:cloud/bus-reconciler/redis_archive.py" \
                       "test_redis_inbox:scripts/redis_inbox.py" \
+                      "test_redis_ring:scripts/redis_ring.py" \
                       "test_bridge_client:scripts/bridge_client.py"; do
             suite="${pair%%:*}"; code="${pair#*:}"
             if [ -f "tests/${suite}.py" ]; then
@@ -1220,6 +1229,22 @@ jobs:
               echo "tests/${suite}.py and ${code} are both absent on this branch; skipping"
             fi
           done
+
+      # The Redis ring (2026-11-08): the cursor moves only after the wake exits 0, a 401 or a missing
+      # bridge env exits with no board fallback, a 429 backs off. Each guard is broken on a copy and
+      # the test that claims it must fail. Offline: fake bridge, fake clock, empty network namespace.
+      - name: "redis ring: cursor-after-wake and no-fallback are load-bearing (mutation, no network)"
+        run: |
+          set -euo pipefail
+          if [ -f tests/mutate_redis_ring.py ]; then
+            python_bin="$(command -v python3)"
+            sudo unshare -n -- "$python_bin" -B tests/mutate_redis_ring.py
+          elif [ -f scripts/redis_ring.py ]; then
+            echo "::error::scripts/redis_ring.py is on this branch but tests/mutate_redis_ring.py is not"
+            exit 1
+          else
+            echo "not on this branch; skipping"
+          fi
 
       # Generation digest audit. Flag off, synthetic hashes only: no Redis, no network.
       # A stored string must not come back; missing, extra, changed, movement, partial
