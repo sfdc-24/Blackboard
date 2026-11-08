@@ -85,6 +85,13 @@ class FakeRedis:
             del stream[:max(0, len(stream) - int(maxlen))]
         return "%d-0" % len(stream)
 
+    def xrevrange(self, key, count=None):
+        """The newest entry first. Ids are the 1-based position xadd returned."""
+        stream = self.streams.get(key, [])
+        rows = [("%d-0" % (i + 1), dict(e)) for i, e in enumerate(stream)]
+        rows.reverse()
+        return rows[:count] if count else rows
+
     def expire(self, key, seconds):
         self.calls.append(("expire", key, int(seconds)))
         if key not in self.data and key not in self.streams:
@@ -854,9 +861,10 @@ class TheClaudeApiNudge(unittest.TestCase):
         def head(agent="claude-api"):
             return "%d-0" % len(conn.inbox(agent)) if conn.inbox(agent) else ""
 
-        def run_job(job):                           # the worker: it reads its lane to the head
+        def run_job(job):                           # the worker: it reads its lane to the head and says so
             jobs.append(job)
             worker["after"] = head()
+            conn.set("fleet:worker:inbox_scan:claude-api", json.dumps({"after": head(), "through": head()}))
         deps = wake.Deps(enabled=True, seen=wake.MemorySeen(), reader=reader, webhook_secret="shared",
                          agents=frozenset({"claude-api"}), redis_wake=True, cursor=wake.MemoryCursor(),
                          lane=lane, progress=lambda agent: (worker["after"], head(agent)),
@@ -871,6 +879,83 @@ class TheClaudeApiNudge(unittest.TestCase):
         sr.mirror_pass(conn, rows + [row("ROW-B", "claude-api", "pong")], nudger=nudger)
         self.assertEqual(["claude-api-worker"] * 2, jobs)
         self.assertEqual("2-0", deps.cursor.get("claude-api"))
+
+    def lagging_lane(self, after=""):
+        conn = FakeRedis()
+        for _ in range(3):
+            conn.xadd("fleet:inbox:claude-api", {"by": "grok", "row_id": "ROW-X"})
+        if after:
+            conn.set("fleet:worker:inbox_scan:claude-api", json.dumps({"after": after, "through": "3-0"}))
+        return conn
+
+    def test_the_lag_check_period_is_inbox_wake_s_scan_claim_ttl(self):
+        self.assertEqual(load_inbox_wake().SCAN_CLAIM_TTL, sr.LAG_CHECK_SECONDS)
+        self.assertEqual(load_inbox_wake().SCAN_KEY + "%s", sr.SCAN_STATE_KEY)
+
+    def test_worker_lags_reads_the_scan_state_against_the_head(self):
+        self.assertTrue(sr.worker_lags(self.lagging_lane(), "claude-api"))
+        self.assertTrue(sr.worker_lags(self.lagging_lane("2-0"), "claude-api"))
+        self.assertFalse(sr.worker_lags(self.lagging_lane("3-0"), "claude-api"))
+        self.assertFalse(sr.worker_lags(FakeRedis(), "claude-api"), "an empty lane does not lag")
+        conn = self.lagging_lane()
+        conn.set("fleet:worker:inbox_scan:claude-api", "not json")
+        self.assertTrue(sr.worker_lags(conn, "claude-api"))
+
+    def test_a_lagging_worker_is_nudged_by_the_live_loop_with_no_sweep_and_rate_limited(self):
+        """Codex on 790dc1a0: no GitHub schedule in the path. No mirror entry this pass, no sweep: the lag
+        check alone nudges, at most once per LAG_CHECK_SECONDS, and stops once the worker is at the head."""
+        nudger, sent, clock = self.nudger(["woke", "duplicate", "woke"])
+        conn = self.lagging_lane("1-0")
+        sr.mirror_pass(conn, [], nudger=nudger)
+        self.assertEqual(1, len(sent))
+        self.assertEqual({"by": "bus-reconciler", "lane": "claude-api"}, json.loads(sent[0][1]))
+        for step in (10, 100, sr.LAG_CHECK_SECONDS - 1):
+            clock.now = 1000.0 + step
+            sr.mirror_pass(conn, [], nudger=nudger)
+        self.assertEqual(1, len(sent), "rate-limited: one check per period")
+        clock.now = 1000.0 + sr.LAG_CHECK_SECONDS
+        sr.mirror_pass(conn, [], nudger=nudger)
+        self.assertEqual(2, len(sent))
+        conn.set("fleet:worker:inbox_scan:claude-api", json.dumps({"after": "3-0", "through": "3-0"}))
+        clock.now += sr.LAG_CHECK_SECONDS
+        sr.mirror_pass(conn, [], nudger=nudger)
+        self.assertEqual(2, len(sent), "a worker at the head is not nudged")
+
+    def test_a_stalled_start_is_retried_by_the_live_loop_alone(self):
+        """End to end with no sweep: a start the run API accepted and that never moved the worker is
+        started again after inbox-wake's claim lapses, by the live loop's lag check, and not before."""
+        wake = load_inbox_wake()
+        clock, conn, jobs = Clock(), FakeRedis(), []
+
+        def reader(agent):
+            return [{"id": "%d-0" % (i + 1), "stream_id": "%d-0" % (i + 1), "by": ""}
+                    for i, _e in enumerate(conn.inbox(agent))]
+
+        def lane(agent, start, count):
+            floor = wake._stream_key(start) or (0, -1)
+            return [e for e in reader(agent) if wake._stream_key(e["stream_id"]) >= floor][:count]
+
+        def head(agent="claude-api"):
+            return "%d-0" % len(conn.inbox(agent)) if conn.inbox(agent) else ""
+        deps = wake.Deps(enabled=True, seen=wake.MemorySeen(clock=clock), reader=reader, webhook_secret="shared",
+                         agents=frozenset({"claude-api"}), redis_wake=True, cursor=wake.MemoryCursor(),
+                         lane=lane, progress=lambda agent: wake.read_progress(conn, agent),
+                         wakers=wake.Wakers(run_job=jobs.append))   # accepted, and the worker never moves
+        nudger = sr.Nudger("https://inbox-wake.example/wake", "shared", clock=clock,
+                           post=lambda url, body, headers: wake.handle("POST", "/wake", headers, body, deps)[1])
+        sr.mirror_pass(conn, [row("ROW-A", "claude-api", "ping")], nudger=nudger)
+        start = clock.now
+        self.assertEqual(1, len(jobs))
+        retried = None
+        while clock.now < start + 3 * sr.LAG_CHECK_SECONDS:
+            clock.now += 10                         # a live pass every 10 s, no sweep at all
+            sr.mirror_pass(conn, [], nudger=nudger)
+            if len(jobs) == 2 and retried is None:
+                retried = clock.now - start
+        self.assertIsNotNone(retried)
+        self.assertGreaterEqual(retried, wake.SCAN_CLAIM_TTL)
+        self.assertLessEqual(retried, wake.SCAN_CLAIM_TTL + sr.LAG_CHECK_SECONDS)
+        self.assertLessEqual(len(jobs), 4, "one start per lapsed claim, never one per pass")
 
     def test_the_live_loop_nudges_only_with_the_flag_exactly_on(self):
         rows = [row("ROW-A", "claude-api", "ping", source="owner")]

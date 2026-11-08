@@ -608,11 +608,11 @@ class TheLanePath(unittest.TestCase):
         self.assertEqual(1, len(crons), "one every-N-minutes schedule to read the cadence from")
         self.assertEqual(int(crons[0]) * 60, wake.SWEEP_INTERVAL)
         self.assertLess(wake.SCAN_CLAIM_TTL, wake.SWEEP_INTERVAL)
-        self.assertEqual(wake.SCAN_CLAIM_TTL + wake.SWEEP_INTERVAL, wake.RETRY_BOUND)
+        self.assertEqual(wake.SCAN_CLAIM_TTL + wake.SWEEP_INTERVAL, wake.EXPECTED_RETRY_SECONDS)
 
-    def test_a_stalled_start_is_retried_within_the_bound_at_every_phase_of_the_sweep(self):
-        """Sweeps on the cron's cadence, at many phases against the start: the retry is never before the
-        TTL and always by the first sweep after it, so within RETRY_BOUND."""
+    def test_a_stalled_start_is_retried_on_time_at_every_phase_of_an_on_time_sweep(self):
+        """Sweeps on the cron's cadence, delivered on time, at many phases against the start: the retry is
+        never before the TTL and always by the first sweep after it, so within EXPECTED_RETRY_SECONDS."""
         for phase in (1, 60, 300, 450, 600, wake.SCAN_CLAIM_TTL - 1, wake.SCAN_CLAIM_TTL,
                       wake.SCAN_CLAIM_TTL + 1, 850, wake.SWEEP_INTERVAL - 1):
             clock = {"t": 10000.0}
@@ -629,10 +629,35 @@ class TheLanePath(unittest.TestCase):
                     break
             self.assertIsNotNone(retried, phase)
             self.assertGreaterEqual(retried, wake.SCAN_CLAIM_TTL, phase)
-            self.assertLessEqual(retried, wake.RETRY_BOUND, phase)
+            self.assertLessEqual(retried, wake.EXPECTED_RETRY_SECONDS, phase)
             self.assertLess(retried - wake.SCAN_CLAIM_TTL, wake.SWEEP_INTERVAL,
                             "the first sweep after the TTL, never the one after that (phase %s)" % phase)
             self.assertEqual(2, len(rec.jobs), phase)
+
+    def test_a_dropped_sweep_defers_the_retry_to_the_next_one(self):
+        clock = {"t": 10000.0}
+        d, rec, lane = lane_deps()
+        d.seen = wake.MemorySeen(clock=lambda: clock["t"])
+        d.worker.stalled = True
+        lane.add()
+        nudge(d)
+        clock["t"] += 2 * wake.SWEEP_INTERVAL + 1   # the first sweep after the TTL never came
+        self.assertEqual("woke", wake.sweep(d)[0]["status"])
+        self.assertEqual(2, len(rec.jobs))
+
+    def test_the_retry_is_described_as_expected_not_guaranteed(self):
+        """Codex on 790dc1a0: GitHub may delay or drop a scheduled run, so no text may promise a bound."""
+        source = (REPO / "cloud" / "inbox-wake" / "main.py").read_text(encoding="utf-8")
+        readme = (REPO / "cloud" / "inbox-wake" / "README.md").read_text(encoding="utf-8")
+        for name, text in (("main.py", source), ("README.md", readme)):
+            self.assertNotIn("RETRY_BOUND", text, name)
+            self.assertNotIn("guarantee", text.lower(), name)
+            self.assertNotIn("the bound", text.lower(), name)
+            self.assertNotIn("no later than", text.lower(), name)
+        self.assertFalse(hasattr(wake, "RETRY_BOUND"))
+        self.assertIn("not a hard bound", readme)
+        self.assertIn("delivered", source.lower())
+        self.assertIn("delay or drop", readme)
 
     def test_progress_that_moves_is_a_new_key_and_an_immediate_start(self):
         clock = {"t": 5000.0}

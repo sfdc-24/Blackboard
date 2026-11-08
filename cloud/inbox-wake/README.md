@@ -40,9 +40,13 @@ Redis and has just written the entry, so it sends the event:
 So delivery is **at least once**. A failed start moves nothing and is retried by the next nudge or sweep. A start the
 run API accepted, but whose execution died before the worker moved, is retried too: the `scan:` claim lasts only
 `SCAN_CLAIM_TTL`, which is the worker job's `--task-timeout` (10 min, `--max-retries 0`) plus 2 min, 720 s. That is
-strictly shorter than the sweep's 15-minute cadence. **The bound** (`RETRY_BOUND`) is that a stalled start is retried
-by the first nudge or sweep after `SCAN_CLAIM_TTL`: never before 720 s, and no later than 720 + 900 = 1620 s after the
-start, whatever the phase against the cron. Within the TTL a running execution is never doubled. The wake cursor and the entry claims keep the 30-day fleet ttl. The worker's scan
+strictly shorter than the sweep's 15-minute cadence. A stalled start is retried **no sooner than** 720 s after it, and
+then by the next nudge or the next *delivered* sweep. With GitHub's schedule on time that is within
+`EXPECTED_RETRY_SECONDS`, 720 + 900 = 1620 s, at any phase against the cron. GitHub can delay or drop a scheduled run
+under load, which defers the retry to the next sweep or nudge, so this is an expectation and not a hard bound. While
+bus-requests runs live, it removes the cron from that path: once per `SCAN_CLAIM_TTL` it reads the worker's scan
+state and the lane head, and nudges if the worker is behind (`Nudger.check_lag`). A nudge inside a live claim is
+answered `duplicate` and starts nothing. Within the TTL a running execution is never doubled. The wake cursor and the entry claims keep the 30-day fleet ttl. The worker's scan
 state is only read. The flag off changes nothing: a nudge answers `lane_off` and reads nothing,
 the sweep is the per-entry sweep it was, and no cursor is written.
 

@@ -231,7 +231,9 @@ flags close that gap. Each must be exactly `on`, and each does nothing unless `B
 - **`INBOX_WAKE_REDIS` (claude-api).** When an entry lands on `fleet:inbox:claude-api`, the live loop sends
   cloud/inbox-wake one signed `redis_lane` nudge, which carries no row text. inbox-wake starts `claude-api-worker`
   while the worker's own position is behind the lane's head, once per position; `cloud/inbox-wake/README.md` explains why this is a nudge and not a blocking
-  read there. The job also needs `INBOX_WAKE_URL` (the service's `/wake` URL), the `INBOX_WAKE_SECRET` secret as that
+  read there. Once per inbox-wake claim period (720 s), the live loop also reads the worker's scan state
+  and the lane head, and nudges when the worker is behind, so a stalled start does not wait on GitHub's
+  schedule, which can be late or dropped. The job also needs `INBOX_WAKE_URL` (the service's `/wake` URL), the `INBOX_WAKE_SECRET` secret as that
   variable, and `run.invoker` on inbox-wake for its identity. Without the URL or the secret it logs one error and
   sends nothing.
 - **`BOARD_TO_REDIS_RELAY_CURSOR` (cursor).** A row that names cursor (by name or alias; `ALL` and `fleet` are a

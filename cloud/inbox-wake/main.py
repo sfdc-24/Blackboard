@@ -40,15 +40,17 @@ SEEN_TTL = 2592000  # fleet: ttl in scripts/redis_acl.json; no new grant
 # for SEEN_TTL, or no nudge or sweep would start the worker at that position for 30 days. It lasts the
 # worker job's own --task-timeout (cloud/claude-api-worker/deploy.sh: 10m, --max-retries 0) plus a margin:
 # within it a running execution is not doubled, after it a worker still at that position gets a new start.
-# The TTL is STRICTLY shorter than the sweep's cadence (.github/workflows/inbox-wake-sweep.yml, */15), so
-# whatever the phase between a start and the cron, the first sweep after the TTL is at most one interval
-# later: a stalled start is retried by the first nudge or sweep after SCAN_CLAIM_TTL, so no later than
-# RETRY_BOUND (720 + 900 = 1620 s) after the start, and never before SCAN_CLAIM_TTL (Codex on c221f657).
+# The TTL is strictly shorter than the sweep's cadence (.github/workflows/inbox-wake-sweep.yml, */15). A
+# stalled start is retried no sooner than SCAN_CLAIM_TTL, then by the next nudge or the next DELIVERED
+# sweep. With the schedule on time that is within EXPECTED_RETRY_SECONDS (720 + 900 = 1620 s) at any phase;
+# GitHub may delay or drop a scheduled run under load, which defers the retry to the next sweep or nudge.
+# It is an expectation, not a hard limit. While bus-requests runs live, its lag check (serve_requests
+# Nudger.check_lag) nudges a lagging worker at most once per SCAN_CLAIM_TTL, with no cron in the path.
 WORKER_TASK_TIMEOUT = 600
 SCAN_CLAIM_MARGIN = 120
 SCAN_CLAIM_TTL = WORKER_TASK_TIMEOUT + SCAN_CLAIM_MARGIN
 SWEEP_INTERVAL = 900
-RETRY_BOUND = SCAN_CLAIM_TTL + SWEEP_INTERVAL
+EXPECTED_RETRY_SECONDS = SCAN_CLAIM_TTL + SWEEP_INTERVAL
 MAX_BODY = 65536
 ID_OK = re.compile(r"[A-Za-z0-9_.:-]{1,128}\Z")
 COMMENT_LINE = re.compile(r"(?m)^inbox\s+to=(\S+)\s+id=(\S+)\s+by=(\S+)\s+text=(.*)$")

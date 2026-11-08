@@ -651,18 +651,66 @@ def private_post(url, body, headers):  # pragma: no cover - the nudge's one sock
         return resp.read()
 
 
+# THE LAG CHECK (Codex on 790dc1a0). inbox-wake's 15-minute sweep is a GitHub schedule, which GitHub may
+# delay or drop. So while this loop runs, it also nudges when the claude-api worker's own position
+# (fleet:worker:inbox_scan:claude-api, which the worker writes) is behind its lane's head: two reads, at
+# most once per LAG_CHECK_SECONDS, which is inbox-wake's SCAN_CLAIM_TTL. A nudge inside inbox-wake's live
+# claim is answered duplicate and starts nothing, so the check cannot double a running worker.
+LAG_CHECK_SECONDS = 720
+SCAN_STATE_KEY = "fleet:worker:inbox_scan:%s"
+
+
+def _stream_order(value):
+    """A stream id as (ms, seq), or None."""
+    head, _, tail = str(value or "").partition("-")
+    if not head.isdigit() or (tail and not tail.isdigit()):
+        return None
+    return int(head), int(tail or 0)
+
+
+def worker_lags(conn, agent) -> bool:
+    """True when the worker's scan position is behind the newest entry of fleet:inbox:<agent>."""
+    raw = conn.get(SCAN_STATE_KEY % agent)
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", "replace")
+    try:
+        state = json.loads(raw) if raw else {}
+    except ValueError:
+        state = {}
+    after = _stream_order(state.get("after")) if isinstance(state, dict) else None
+    newest = conn.xrevrange("fleet:inbox:%s" % agent, count=1) or ()
+    head = newest[0][0] if newest else ""
+    if isinstance(head, bytes):
+        head = head.decode("utf-8", "replace")
+    head = _stream_order(head)
+    return head is not None and (after or (0, -1)) < head
+
+
 class Nudger:
-    """Collects the lanes the mirror wrote this pass (note) and nudges inbox-wake once for each (flush)."""
+    """Collects the lanes the mirror wrote this pass (note) and nudges inbox-wake once for each (flush).
+    check_lag adds a lane whose worker is behind, at most once per LAG_CHECK_SECONDS."""
 
     def __init__(self, url, secret, post=None, clock=None):
         self.url, self.secret = url, secret
         self.post = post or private_post
         self.clock = clock or time.monotonic
         self.pending, self.not_before = set(), 0.0
+        self.lag_next = 0.0
 
     def note(self, agent):
         if agent in NUDGE_AGENTS:
             self.pending.add(agent)
+
+    def check_lag(self, conn):
+        if self.clock() < self.lag_next:
+            return
+        self.lag_next = self.clock() + LAG_CHECK_SECONDS
+        for agent in sorted(NUDGE_AGENTS):
+            try:
+                if worker_lags(conn, agent):
+                    self.note(agent)
+            except Exception as error:                                   # noqa: BLE001
+                log.warning("worker lag check failed (%s)", type(error).__name__)
 
     def body_for(self, agent) -> bytes:
         return json.dumps({"by": "bus-reconciler", "lane": agent}, sort_keys=True).encode("utf-8")
@@ -712,6 +760,7 @@ def mirror_pass(conn, rows, relay=False, nudger=None) -> int:
     """The live loop's mirror: the copy (with the cursor relay when asked), then the nudge for what landed."""
     added = mirror_addressed(conn, rows, relay=relay, on_added=nudger.note if nudger is not None else None)
     if nudger is not None:
+        nudger.check_lag(conn)
         nudger.flush()
     return added
 

@@ -210,6 +210,22 @@ MUTANTS = [
         "a configured URL and secret nudge with the flag off",
         "test_only_exactly_on_and_configured_builds_a_nudger",
     ),
+    (
+        "the-live-loop-skips-the-lag-check",
+        "cloud/bus-reconciler/serve_requests.py",
+        "        nudger.check_lag(conn)\n",
+        "",
+        "a stalled worker waits for a GitHub schedule that may be late or dropped",
+        "test_a_lagging_worker_is_nudged_by_the_live_loop_with_no_sweep_and_rate_limited",
+    ),
+    (
+        "the-lag-check-is-not-rate-limited",
+        "cloud/bus-reconciler/serve_requests.py",
+        "        self.lag_next = self.clock() + LAG_CHECK_SECONDS\n",
+        "",
+        "two Redis reads and a nudge on every 10 s pass while the worker lags",
+        "test_a_lagging_worker_is_nudged_by_the_live_loop_with_no_sweep_and_rate_limited",
+    ),
     # THE LANE PATH IN INBOX-WAKE (INBOX_WAKE_REDIS): cursor after success, a burst once, signed, off is off.
     (
         "the-cursor-moves-before-the-start",
