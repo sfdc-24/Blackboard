@@ -2,8 +2,11 @@
 """Mutation checks for the board-to-Redis mirror. Each guard is removed on purpose.
 
 The NX on fleet:wake:mirrored must be what stops a re-read from adding a second inbox entry.
-The WITHHELD preview must be what keeps call-bridge text out of the lane. A mutant that leaves
-the suite green is an untested claim.
+The WITHHELD preview must be what keeps call-bridge text out of the lane. The script's DEL on a
+failed XADD, and its pcall around the XADD, must be what lets the next pass deliver a copy that
+failed. The per-agent catch must be what lets one agent's failure leave the others delivered. A
+mutant that leaves the suite green is an untested claim. The Lua mutants are run by the test's
+fake, which executes the script text it is given and refuses any line it does not know.
 
 scripts/ is copied per mutant and the edit is applied to the copy, so a bad replace cannot land
 on the real worker. An anchor that is not in the file is ANCHOR-MISS, not a pass.
@@ -26,8 +29,8 @@ MUTANTS = [
     (
         "nx-dedupe-is-a-plain-set",
         "cloud/bus-reconciler/serve_requests.py",
-        'if not conn.set("fleet:wake:mirrored:%s:%s" % (row_id, agent), "1", nx=True, ex=int(ttl)):',
-        'if not conn.set("fleet:wake:mirrored:%s:%s" % (row_id, agent), "1", nx=False, ex=int(ttl)):',
+        "if not redis.call('SET', KEYS[1], '1', 'NX', 'EX', ARGV[1]) then return 0 end",
+        "if not redis.call('SET', KEYS[1], '1', 'EX', ARGV[1]) then return 0 end",
         "a re-read of the same board row XADDs a second inbox entry for the same agent",
         "test_a_reread_adds_nothing",
     ),
@@ -38,6 +41,30 @@ MUTANTS = [
         '(payload or "")[:PREVIEW_CHARS]',
         "a row carrying call-bridge text puts the owner's words in the inbox preview",
         "test_call_bridge_text_is_withheld",
+    ),
+    (
+        "a-failed-xadd-keeps-its-mark",
+        "cloud/bus-reconciler/serve_requests.py",
+        "  redis.call('DEL', KEYS[1])\n",
+        "",
+        "the XADD fails, the mark stays, and every later pass skips that wake until the ttl ends",
+        "test_a_failed_copy_is_retried_and_delivered_once",
+    ),
+    (
+        "the-xadd-is-not-protected",
+        "cloud/bus-reconciler/serve_requests.py",
+        "local added = redis.pcall('XADD', KEYS[2], '*', unpack(ARGV, 2))",
+        "local added = redis.call('XADD', KEYS[2], '*', unpack(ARGV, 2))",
+        "a failing XADD aborts the script before the DEL, so the mark outlives the lost entry",
+        "test_a_failed_copy_is_retried_and_delivered_once",
+    ),
+    (
+        "one-agents-failure-ends-the-copy",
+        "cloud/bus-reconciler/serve_requests.py",
+        '                log.warning("board mirror copy failed (%s)", type(error).__name__)\n',
+        "                raise\n",
+        "grok's failed copy stops cursor's copy of the same row and every row after it",
+        "test_a_failure_for_one_agent_still_delivers_to_the_next",
     ),
 ]
 

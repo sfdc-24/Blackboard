@@ -382,10 +382,13 @@ def _loop_until(text):
 # stream entry on fleet:inbox:<agent>, so a lane reader (Q1, built separately) has something to
 # block on. Off, this block is not called and the pass does not touch those keys.
 #
-# EXACTLY ONCE per row and agent: SET NX fleet:wake:mirrored:<row_id>:<agent> with the fleet ttl,
-# and only then XADD. A re-read of the same window finds the mark and adds nothing. The mark is
-# written first on purpose: a retry must not deliver twice. A crash between the two loses that one
-# copy rather than duplicating it.
+# EXACTLY ONCE per row and agent, and no lost wake: MIRROR_LUA is one script on the server. It
+# sets fleet:wake:mirrored:<row_id>:<agent> NX with the fleet ttl, then XADDs; if the XADD errors
+# it deletes that mark before it returns the error. So a mark exists only beside its entry, and a
+# re-read finds the mark and adds nothing. A script that never ran (Redis unreachable) wrote
+# nothing, and the next pass copies the row. A reply lost after the script ran is a delivered copy
+# and a mark, and the next pass adds nothing. One agent's failure is logged as its exception type
+# and the copy goes on to the next agent and the next row.
 #
 # CALL WORDS NEVER TRAVEL. A row that carries the call bridge's text gets redis_gov.WITHHELD as its
 # preview. The words stay on the board; the lane gets the marker the public board already uses.
@@ -399,6 +402,17 @@ _EXPAND = frozenset({"all", "fleet"})
 _PHASE = re.compile(r"(?:^|\|)\s*phase=([^|]*)", re.I)
 _THREAD = re.compile(r"(?:^|\|)\s*thread_id=([^|]*)", re.I)
 _BY_CALL = re.compile(r"(?:^|\|)\s*by\s*=\s*call-bridge\b", re.I)
+# KEYS[1] the mark, KEYS[2] the lane. ARGV[1] the ttl, ARGV[2..] the entry's field/value pairs.
+# 0: already copied. 1: added. An error reply: nothing is left behind, the mark is gone too.
+MIRROR_LUA = """
+if not redis.call('SET', KEYS[1], '1', 'NX', 'EX', ARGV[1]) then return 0 end
+local added = redis.pcall('XADD', KEYS[2], '*', unpack(ARGV, 2))
+if type(added) == 'table' and added.err then
+  redis.call('DEL', KEYS[1])
+  return added
+end
+return 1
+"""
 
 
 def board_to_redis_on(environ=None) -> bool:
@@ -499,7 +513,8 @@ def mirror_addressed(conn, rows) -> int:
 
     The access list decides who a principal is and what the fleet ttl is. Inbox-wake aliases are
     merged on top of the access list's aliases. An unreadable list, or a fleet ttl that is not
-    set, copies nothing: there is no second ttl to invent. Does not log a key or a value."""
+    set, copies nothing: there is no second ttl to invent. Does not log a key or a value.
+    A failed copy for one agent is logged by exception type and does not stop the rest."""
     acl = redis_gov.load_acl()
     if not acl.get("readable"):
         return 0
@@ -519,12 +534,16 @@ def mirror_addressed(conn, rows) -> int:
         if not agents:
             continue
         fields = mirror_fields(source, row_id, _row_cell(row, 1), _payload(row))
+        pairs = [item for pair in fields.items() for item in pair]
         for agent in agents:
-            # NX first. A lost race, or a row this pass already copied, does not XADD.
-            if not conn.set("fleet:wake:mirrored:%s:%s" % (row_id, agent), "1", nx=True, ex=int(ttl)):
-                continue
-            conn.xadd("fleet:inbox:%s" % agent, fields)
-            added += 1
+            try:
+                # One script: the NX mark and the XADD, or neither. 0 is a row already copied.
+                if conn.eval(MIRROR_LUA, 2, "fleet:wake:mirrored:%s:%s" % (row_id, agent),
+                             "fleet:inbox:%s" % agent, int(ttl), *pairs):
+                    added += 1
+            except Exception as error:                                   # noqa: BLE001
+                # The type only. This agent's copy is retried by the next pass; the others go on.
+                log.warning("board mirror copy failed (%s)", type(error).__name__)
     return added
 
 

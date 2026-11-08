@@ -4,6 +4,7 @@ BOARD_TO_REDIS must be exactly "on". Anything else, the live loop does not take 
 writes nothing under fleet:inbox or fleet:wake:mirrored.
 """
 import datetime
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -24,11 +25,29 @@ def row(rid, target, payload, source="grok", ts="2026-11-08T03:00:00Z"):
     return [rid, ts, source, target, "ASK", payload, "", "", "", ""]
 
 
+_LUA_CALL = re.compile(r"^redis\.(call|pcall)\((.*)\)$")
+_LUA_ARG = re.compile(r"'[^']*'|KEYS\[\d+\]|ARGV\[\d+\]|unpack\(ARGV, \d+\)")
+_LUA_IF_NOT = re.compile(r"^if not (redis\.\w+\(.*\)) then return (\d+) end$")
+_LUA_LOCAL = re.compile(r"^local (\w+) = (redis\.\w+\(.*\))$")
+_LUA_IF_ERR = re.compile(r"^if type\((\w+)\) == 'table' and (\w+)\.err then$")
+_LUA_RETURN = re.compile(r"^return (\w+)$")
+
+
 class FakeRedis:
-    """SET NX/EX and XADD, and the worker-lock eval the live loop needs. No network."""
+    """SET NX/EX, XADD and DEL, and the worker-lock eval the live loop needs. No network.
+
+    Any other script is RUN, line by line, by a small interpreter that knows only the statements
+    the mirror script uses and refuses any other line. So the fake does what the script text says:
+    a script without NX, or without the DEL on a failed XADD, behaves that way here too. As on a
+    real server, redis.call raising aborts the script with its earlier writes kept, and redis.pcall
+    turns the error into a table. A script that returns that table raises the original exception
+    here (redis-py raises ResponseError), so a test can see what failed.
+
+    fail_xadd maps a stream key to how many XADDs on it raise before one succeeds."""
 
     def __init__(self):
         self.data, self.streams, self.expires, self.calls = {}, {}, {}, []
+        self.fail_xadd = {}
 
     def set(self, key, value, nx=False, ex=None):
         self.calls.append(("set", key, value, nx, ex))
@@ -36,30 +55,116 @@ class FakeRedis:
             return None
         self.data[key] = value
         if ex is not None:
-            self.expires[key] = ex
+            self.expires[key] = int(ex)
         return True
 
     def get(self, key):
         return self.data.get(key)
 
+    def delete(self, key):
+        self.calls.append(("del", key))
+        self.expires.pop(key, None)
+        return 1 if self.data.pop(key, None) is not None else 0
+
     def xadd(self, key, fields, **kwargs):
         self.calls.append(("xadd", key, dict(fields)))
+        if self.fail_xadd.get(key):
+            self.fail_xadd[key] -= 1
+            raise RuntimeError("%s %s" % (key, WORDS))
         self.streams.setdefault(key, []).append(dict(fields))
         return "%d-0" % len(self.streams[key])
 
-    def eval(self, script, numkeys, key, me, *args):
-        self.calls.append(("eval", key))
+    def eval(self, script, numkeys, *args):
+        keys, argv = list(args[:numkeys]), [str(a) for a in args[numkeys:]]
+        self.calls.append(("eval", keys[0]))
         if script == sr.RENEW_LUA:
-            if self.data.get(key) != me:
+            if self.data.get(keys[0]) != argv[0]:
                 return None
-            self.data[key] = me
+            self.data[keys[0]] = argv[0]
             return "OK"
         if script == sr.DROP_LUA:
-            if self.data.get(key) != me:
+            if self.data.get(keys[0]) != argv[0]:
                 return 0
-            self.data.pop(key, None)
+            self.data.pop(keys[0], None)
             return 1
-        raise AssertionError("unexpected script")
+        return self._run(script, keys, argv)
+
+    def _command(self, text, keys, argv):
+        found = _LUA_CALL.match(text)
+        if not found:
+            raise AssertionError("fake cannot run: %s" % text)
+        protected, raw = found.group(1) == "pcall", found.group(2)
+        tokens = _LUA_ARG.findall(raw)
+        if ", ".join(tokens) != raw:
+            raise AssertionError("fake cannot read the arguments: %s" % raw)
+        values = []
+        for token in tokens:
+            if token.startswith("'"):
+                values.append(token[1:-1])
+            elif token.startswith("KEYS["):
+                values.append(keys[int(token[5:-1]) - 1])
+            elif token.startswith("ARGV["):
+                values.append(argv[int(token[5:-1]) - 1])
+            else:
+                values.extend(argv[int(token[len("unpack(ARGV, "):-1]) - 1:])
+        try:
+            return self._redis(values)
+        except Exception as error:                                       # noqa: BLE001
+            if not protected:
+                raise
+            return {"err": str(error), "error": error}
+
+    def _redis(self, values):
+        name, rest = values[0].upper(), values[1:]
+        if name == "SET":
+            key, value, opts = rest[0], rest[1], [o.upper() for o in rest[2:]]
+            ex = int(rest[2 + opts.index("EX") + 1]) if "EX" in opts else None
+            return self.set(key, value, nx="NX" in opts, ex=ex)
+        if name == "XADD":
+            key, ident, pairs = rest[0], rest[1], rest[2:]
+            if ident != "*" or len(pairs) % 2:
+                raise AssertionError("fake XADD takes '*' and field/value pairs")
+            return self.xadd(key, dict(zip(pairs[0::2], pairs[1::2])))
+        if name == "DEL":
+            return self.delete(rest[0])
+        raise AssertionError("fake has no %s" % name)
+
+    def _run(self, script, keys, argv):
+        lines = [line.strip() for line in script.strip().splitlines() if line.strip()]
+        local, skipping, index = {}, False, 0
+        while index < len(lines):
+            line = lines[index]
+            index += 1
+            if skipping:
+                skipping = line != "end"
+                continue
+            if line == "end":
+                continue
+            found = _LUA_IF_NOT.match(line)
+            if found:
+                if self._command(found.group(1), keys, argv) in (None, False):
+                    return int(found.group(2))
+                continue
+            found = _LUA_LOCAL.match(line)
+            if found:
+                local[found.group(1)] = self._command(found.group(2), keys, argv)
+                continue
+            found = _LUA_IF_ERR.match(line)
+            if found and found.group(1) == found.group(2):
+                value = local.get(found.group(1))
+                skipping = not (isinstance(value, dict) and "err" in value)
+                continue
+            found = _LUA_RETURN.match(line)
+            if found:
+                name = found.group(1)
+                if name.isdigit():
+                    return int(name)
+                value = local[name]
+                if isinstance(value, dict) and "err" in value:
+                    raise value["error"]
+                return value
+            self._command(line, keys, argv)
+        return None
 
     def inbox(self, agent):
         return self.streams.get("fleet:inbox:%s" % agent, [])
@@ -166,6 +271,54 @@ class BoardToRedis(unittest.TestCase):
         self.assertEqual(1, len(self.conn.inbox("grok")))
         self.assertEqual(1, len(self.conn.inbox("cursor")))
         self.assertEqual(2, len([c for c in self.conn.calls if c[0] == "xadd"]))
+
+    def test_the_mark_and_the_entry_are_one_script(self):
+        """No SET or XADD from Python: both travel in one EVAL, so a lost reply or a dead process
+        between them cannot leave a mark without its entry."""
+        self.mirror([row("ROW-1", "grok", "please look")])
+        evals = [c for c in self.conn.calls if c[0] == "eval"]
+        self.assertEqual([("eval", "fleet:wake:mirrored:ROW-1:grok")], evals)
+        self.assertEqual("eval", self.conn.calls[0][0], "the SET is inside the script")
+
+    def test_a_failed_copy_is_retried_and_delivered_once(self):
+        """The XADD fails on the first pass. The mark goes with it, so the next pass delivers the
+        row once, and the pass after that adds nothing."""
+        self.conn.fail_xadd = {"fleet:inbox:grok": 1}
+        rows = [row("ROW-1", "grok", WORDS)]
+        mark = "fleet:wake:mirrored:ROW-1:grok"
+        with mock.patch.object(sr.log, "warning") as warning:
+            self.assertEqual(0, self.mirror(rows))
+        self.assertNotIn(mark, self.conn.data, "a failed XADD leaves no mark behind")
+        self.assertEqual([], self.conn.inbox("grok"))
+        text = " ".join(str(call) for call in warning.call_args_list)
+        self.assertIn("RuntimeError", text)
+        self.assertNotIn(WORDS, text)
+        self.assertNotIn("fleet:", text)
+        self.assertEqual(1, self.mirror(rows))
+        self.assertEqual(0, self.mirror(rows))
+        self.assertEqual(["ROW-1"], [e["row_id"] for e in self.conn.inbox("grok")])
+        self.assertEqual("1", self.conn.data[mark])
+        self.assertEqual(fleet_ttl(), self.conn.expires[mark])
+        self.assertEqual(2, len([c for c in self.conn.calls if c[0] == "xadd"]))
+
+    def test_a_failure_for_one_agent_still_delivers_to_the_next(self):
+        """grok's XADD fails. cursor still gets this row, the next row is still copied, and grok's
+        copy arrives on the next pass, once."""
+        self.conn.fail_xadd = {"fleet:inbox:grok": 1}
+        rows = [row("ROW-1", "grok; cursor", "please look"), row("ROW-2", "cursor", "next row")]
+        with mock.patch.object(sr.log, "warning") as warning:
+            self.assertEqual(2, self.mirror(rows))
+        self.assertEqual(["ROW-1", "ROW-2"], [e["row_id"] for e in self.conn.inbox("cursor")])
+        self.assertEqual([], self.conn.inbox("grok"))
+        self.assertNotIn("fleet:wake:mirrored:ROW-1:grok", self.conn.data)
+        text = " ".join(str(call) for call in warning.call_args_list)
+        self.assertEqual(1, len(warning.call_args_list))
+        self.assertIn("RuntimeError", text)
+        self.assertNotIn(WORDS, text)
+        self.assertNotIn("fleet:", text)
+        self.assertEqual(1, self.mirror(rows))
+        self.assertEqual(["ROW-1"], [e["row_id"] for e in self.conn.inbox("grok")])
+        self.assertEqual(2, len(self.conn.inbox("cursor")))
 
     def test_call_bridge_text_is_withheld(self):
         rows = [
@@ -395,6 +548,27 @@ class TheFlag(unittest.TestCase):
         self.assertEqual("1", conn.data["fleet:wake:mirrored:ROW-1:grok"])
         self.assertIn("ROW-GIT", [r[0] for r in handled[0]])
         self.assertEqual(["ROW-1"], [r[0] for r in handled[1]], "the second pass had no git read")
+
+
+class TheFake(unittest.TestCase):
+    """The mirror's tests trust the fake to run the script it is given. It must refuse what it
+    cannot run rather than skip it, and keep earlier writes when redis.call raises."""
+
+    def test_it_refuses_a_line_or_a_command_it_does_not_know(self):
+        for script in ("redis.call('HSET', KEYS[1], 'a', 'b')",
+                       "if redis.call('GET', KEYS[1]) then return 1 end",
+                       "redis.call('SET', KEYS[1], tostring(ARGV[1]))"):
+            with self.assertRaises(AssertionError, msg=script):
+                FakeRedis().eval(script, 1, "k", "v")
+
+    def test_a_raising_call_keeps_the_writes_before_it(self):
+        conn = FakeRedis()
+        conn.fail_xadd = {"lane": 1}
+        with self.assertRaises(RuntimeError):
+            conn.eval("redis.call('SET', KEYS[1], '1', 'NX', 'EX', ARGV[1])\n"
+                      "redis.call('XADD', KEYS[2], '*', 'a', 'b')\n", 2, "mark", "lane", 60)
+        self.assertEqual("1", conn.data["mark"])
+        self.assertEqual(60, conn.expires["mark"])
 
 
 if __name__ == "__main__":
