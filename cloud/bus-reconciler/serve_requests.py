@@ -20,9 +20,15 @@ comparing. The rows it writes here are its own receipts and results, under its o
 Redis it writes is the worker lock under gov:, plus — only when CALL_SHEET_MIRROR is exactly on —
 the call-sheet cursors and a stale end. The sheet is a projection of that record. It never
 speaks, and it never writes a voice lane. The step is off by default and is not a deploy.
+
+BOARD_TO_REDIS must be exactly "on" before a live pass also adds a metadata-only entry (no payload
+text) for an addressed board row to each named agent's fleet:inbox. Unset, empty, "off", "ON" and
+"true" leave that copy out, and the pass's Redis use is the lock and the heartbeat (plus the
+call-sheet keys above, when that flag is on).
 """
 from __future__ import annotations
 
+import ast
 import datetime
 import hashlib
 import json
@@ -33,12 +39,14 @@ import sys
 import tempfile
 import threading
 import time
+from pathlib import Path
 
 sys.path.insert(0, "/app")
 
 import bus_request                                                       # noqa: E402
 import bus_reconcile                                                     # noqa: E402
 import redis_dual                                                        # noqa: E402
+import redis_gov                                                         # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 log = logging.getLogger("bus-requests")
@@ -256,6 +264,9 @@ def live(conn, env, execution, me, until, interval, lock_ttl, settle=None) -> in
     stop = until                                     # already capped by LOOP_MAX_MINUTES, in main (live_deadline)
     log.info("live mode: every %ds, GitHub every %ds, until %s", interval, git_every, stop.strftime("%H:%M:%SZ"))
     last_git, passes = None, 0
+    # Exactly "on". Anything else leaves `mirror` unset, and the one_pass call below is the one it
+    # was: no mirror keyword, no inbox write.
+    mirror = (lambda rows, _conn=conn: mirror_addressed(_conn, rows)) if board_to_redis_on() else None
     while datetime.datetime.now(datetime.timezone.utc) < stop:
         held = keep_lock(conn, me, lock_ttl)
         if held is False:
@@ -269,9 +280,12 @@ def live(conn, env, execution, me, until, interval, lock_ttl, settle=None) -> in
         now = datetime.datetime.now(datetime.timezone.utc)
         with_git = last_git is None or (now - last_git).total_seconds() >= git_every
         try:
-            # `settle` only when the call bridge runs: without it a pass is called exactly as before.
+            # `settle` only when the call bridge runs, and `mirror` only when BOARD_TO_REDIS is exactly
+            # on. Without either, a pass is called exactly as before.
             one_pass(conn, env, execution, with_git=with_git, quiet=True,
-                     renew=lambda: keep_lock(conn, me, lock_ttl), **({"settle": settle} if settle else {}))
+                     renew=lambda: keep_lock(conn, me, lock_ttl),
+                     **({"settle": settle} if settle else {}),
+                     **({"mirror": mirror} if mirror else {}))
         except Exception as error:                                       # noqa: BLE001
             # One bad pass (a board flap, a lost reply) must not end the meeting's channel.
             log.warning("pass failed: %s", type(error).__name__)
@@ -364,11 +378,203 @@ def _loop_until(text):
     return when if when.tzinfo else when.replace(tzinfo=datetime.timezone.utc)
 
 
-def one_pass(conn, env, execution, with_git=True, quiet=False, renew=None, settle=None):
+# Q2 of the Redis doorbell. The live loop already reads the board every few seconds inside the VPC.
+# With BOARD_TO_REDIS exactly "on", each new row whose Target_Surface names an agent is also one
+# stream entry on fleet:inbox:<agent>, so a lane reader (Q1, built separately) has something to
+# block on. Off, this block is not called and the pass does not touch those keys.
+#
+# EXACTLY ONCE per row and agent, and no lost wake: MIRROR_LUA is one script on the server. It
+# sets fleet:wake:mirrored:<row_id>:<agent> NX with the fleet ttl, then XADDs; if the XADD errors
+# it deletes that mark before it returns the error. So a mark exists only beside its entry, and a
+# re-read finds the mark and adds nothing. A script that never ran (Redis unreachable) wrote
+# nothing, and the next pass copies the row. A reply lost after the script ran is a delivered copy
+# and a mark, and the next pass adds nothing. One agent's failure is logged as its exception type
+# and the copy goes on to the next agent and the next row.
+#
+# METADATA ONLY. No payload text reaches a lane: no preview, no free text, and so no call words
+# either. The fleet principals read every key, so a lane is not a confidentiality boundary. An
+# entry is by, row_id, at and phase, plus thread_id, msg_type and class when each matches a short
+# safe pattern; a value that does not match is dropped (a row id that does not match skips the
+# row). An agent woken by the entry reads the row itself on the board, under the board's rules.
+# Rows from bus-reconciler or redis-audit are not copied: those writers are this process and the
+# audit, and copying them would loop. Nothing here appends a board row, and a log line from this
+# path is an exception type, never a key and never a value.
+BOARD_TO_REDIS = "BOARD_TO_REDIS"
+LOOP_SOURCES = frozenset({"bus-reconciler", "redis-audit"})
+_EXPAND = frozenset({"all", "fleet"})
+_ENTRY_KEYS = ("phase", "thread_id", "msg_type", "class")
+# Each copied value must FULLY match its pattern. None of them can carry a sentence.
+_SAFE = {
+    "row_id": re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}"),
+    "by": re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@-]{0,63}"),
+    "at": re.compile(r"[0-9][0-9TZ:.+ -]{0,39}"),
+    "phase": re.compile(r"[A-Z][A-Z0-9_]{0,31}"),
+    "thread_id": re.compile(r"TH-[A-Z0-9-]{1,64}"),
+    "msg_type": re.compile(r"[A-Z][A-Z0-9_]{0,31}"),
+    "class": re.compile(r"[A-Z][A-Z0-9_]{0,31}"),
+}
+# KEYS[1] the mark, KEYS[2] the lane. ARGV[1] the mark's ttl, ARGV[2] the lane's MAXLEN, ARGV[3] the
+# lane's ttl, ARGV[4..] the entry's field/value pairs. 0: already copied. 1: added. An error reply:
+# nothing is left behind, the mark is gone too. The lane is written as a governed xadd writes it
+# (redis_gov.execute): MAXLEN ~ redis_gov.STREAM_MAXLEN, then EXPIRE to the access list's ttl for the
+# key, which also refreshes the ttl of a lane that already existed.
+MIRROR_LUA = """
+if not redis.call('SET', KEYS[1], '1', 'NX', 'EX', ARGV[1]) then return 0 end
+local added = redis.pcall('XADD', KEYS[2], 'MAXLEN', '~', ARGV[2], '*', unpack(ARGV, 4))
+if type(added) == 'table' and added.err then
+  redis.call('DEL', KEYS[1])
+  return added
+end
+redis.call('EXPIRE', KEYS[2], ARGV[3])
+return 1
+"""
+
+
+def board_to_redis_on(environ=None) -> bool:
+    """True only when BOARD_TO_REDIS is exactly "on". Unset, empty, and every other value are off."""
+    environ = os.environ if environ is None else environ
+    return environ.get(BOARD_TO_REDIS) == "on"
+
+
+def _row_cell(row, index) -> str:
+    """One board cell as stripped text. Not _cell: that name is the call-sheet mirror's BCB escaper."""
+    if not isinstance(row, (list, tuple)) or index >= len(row) or row[index] is None:
+        return ""
+    value = row[index]
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", "replace")
+    return str(value).strip()
+
+
+def _payload(row) -> str:
+    """The payload cell as text. Only its safe key=value fields are read; none of its text is copied."""
+    if not isinstance(row, (list, tuple)) or len(row) <= 5 or row[5] is None:
+        return ""
+    value = row[5]
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    return str(value)
+
+
+def inbox_wake_aliases() -> dict:
+    """The ALIASES dict in cloud/inbox-wake/main.py, when that file is on disk.
+
+    The checkout keeps it at cloud/inbox-wake/main.py, next to this directory. The image copies
+    that same file to /app/inbox_wake_main.py (not main.py: that name is this job's entrypoint).
+    Parsed, not imported: importing it would load the wake server into this process. Absent, the
+    access list's own aliases still apply."""
+    here = Path(__file__).resolve()
+    found = next((path for path in (
+        here.parent.parent / "inbox-wake" / "main.py",
+        here.parent / "inbox_wake_main.py",
+    ) if path.is_file()), None)
+    if found is None:
+        return {}
+    tree = ast.parse(found.read_text(encoding="utf-8"))
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+                isinstance(target, ast.Name) and target.id == "ALIASES" for target in node.targets):
+            value = ast.literal_eval(node.value)
+            return {str(key).strip().lower(): str(item).strip().lower() for key, item in value.items()}
+    return {}
+
+
+def addressed_agents(target, principals, aliases) -> list:
+    """Principals named by a Target_Surface. ALL and fleet mean every principal. One hop of alias,
+    then the name has to be a principal. Order is the address list, then principal order for an
+    expansion, and a name is kept once."""
+    known = set(principals)
+    out, seen = [], set()
+    for part in re.split(r"[,;]", str(target or "")):
+        token = part.strip().lower()
+        if not token:
+            continue
+        names = list(principals) if token in _EXPAND else (aliases.get(token, token),)
+        for name in names:
+            if name in known and name not in seen:
+                seen.add(name)
+                out.append(name)
+    return out
+
+
+def _safe(name, value) -> str:
+    """value when it fully matches the pattern for `name`, else ""."""
+    value = str(value or "").strip()
+    return value if _SAFE[name].fullmatch(value) else ""
+
+
+def _bcb_field(payload, key) -> str:
+    """The first `key=` field of a pipe-separated payload, unchecked. _safe decides if it travels."""
+    found = re.search(r"(?:^|\|)\s*" + re.escape(key) + r"=([^|]*)", payload or "", re.I)
+    return found.group(1) if found else ""
+
+
+def mirror_fields(source, row_id, at, payload) -> dict:
+    """The stream entry: metadata only, never payload text. by, row_id, at and phase are always
+    present ("" when absent or unsafe); thread_id, msg_type and class only when present and safe."""
+    fields = {
+        "by": _safe("by", source),
+        "row_id": _safe("row_id", row_id),
+        "at": _safe("at", at),
+        "phase": _safe("phase", _bcb_field(payload, "phase")),
+    }
+    for key in _ENTRY_KEYS[1:]:
+        value = _safe(key, _bcb_field(payload, key))
+        if value:
+            fields[key] = value
+    return fields
+
+
+def mirror_addressed(conn, rows) -> int:
+    """XADD one entry per named agent for each board row. Returns how many entries were added.
+
+    The access list decides who a principal is and what the fleet ttl is. Inbox-wake aliases are
+    merged on top of the access list's aliases. An unreadable list, or a fleet ttl that is not
+    set, copies nothing: there is no second ttl to invent. Does not log a key or a value.
+    A failed copy for one agent is logged by exception type and does not stop the rest."""
+    acl = redis_gov.load_acl()
+    if not acl.get("readable"):
+        return 0
+    ttl = redis_gov.ttl_for(acl, "fleet:")
+    if not ttl:
+        return 0
+    principals = list(acl["principals"])
+    aliases = {str(key).lower(): str(value).lower() for key, value in (acl.get("aliases") or {}).items()}
+    aliases.update(inbox_wake_aliases())
+    added = 0
+    for row in rows or []:
+        row_id = _row_cell(row, 0)
+        source = _row_cell(row, 2)
+        if not _safe("row_id", row_id) or source.lower() in LOOP_SOURCES:
+            continue
+        agents = addressed_agents(_row_cell(row, 3), principals, aliases)
+        if not agents:
+            continue
+        fields = mirror_fields(source, row_id, _row_cell(row, 1), _payload(row))
+        pairs = [item for pair in fields.items() for item in pair]
+        for agent in agents:
+            mark, lane = "fleet:wake:mirrored:%s:%s" % (row_id, agent), "fleet:inbox:%s" % agent
+            mark_ttl, lane_ttl = redis_gov.ttl_for(acl, mark), redis_gov.ttl_for(acl, lane)
+            if not mark_ttl or not lane_ttl:
+                continue
+            try:
+                # One script: the NX mark and the XADD, or neither. 0 is a row already copied.
+                if conn.eval(MIRROR_LUA, 2, mark, lane, int(mark_ttl), int(redis_gov.STREAM_MAXLEN),
+                             int(lane_ttl), *pairs):
+                    added += 1
+            except Exception as error:                                   # noqa: BLE001
+                # The type only. This agent's copy is retried by the next pass; the others go on.
+                log.warning("board mirror copy failed (%s)", type(error).__name__)
+    return added
+
+
+def one_pass(conn, env, execution, with_git=True, quiet=False, renew=None, settle=None, mirror=None):
     """Read the board (and GitHub), answer what is allowed, beat the heartbeat. One pass.
 
     `settle`, when given, is handed the board rows just read (the call bridge's done flips); its failure costs
-    those flips this pass and nothing else."""
+    those flips this pass and nothing else. `mirror`, when given, is handed those same board rows, before the
+    git channel is appended; the live loop passes it only when BOARD_TO_REDIS is exactly on. Its failure
+    costs the copy this pass and nothing else. Absent, this pass does not touch an inbox."""
     now = datetime.datetime.now(datetime.timezone.utc)
     bus_request.heartbeat(conn, "running", now=now, execution=execution)
     since = (now - datetime.timedelta(minutes=WINDOW_MINUTES)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -376,6 +582,12 @@ def one_pass(conn, env, execution, with_git=True, quiet=False, renew=None, settl
     # The board read can take minutes; the lock is renewed after it, and before each append below.
     if renew is not None and renew() is not True:
         raise LockLost("gov:worker:lock is not provably ours after the board read; this pass answers nothing")
+    if mirror is not None:
+        try:
+            mirror(rows)
+        except Exception as error:                                       # noqa: BLE001
+            # The type only. A key or any row text in this line would put the row, and his words, in the log.
+            log.warning("board mirror failed (%s)", type(error).__name__)
     if settle is not None:
         try:
             settle(rows)
