@@ -34,19 +34,36 @@ MUTANTS = [
     ),
     (
         "append-even-when-the-row-is-there",
-        "        if not present(rid):\n            append(spec)",
-        "        append(spec)  # MUTANT: a row already on the board is appended again",
+        "        if status == \"absent\":\n            append(spec)",
+        "        if True:  # MUTANT: append even when this payload is already on the board\n"
+        "            append(spec)",
         "clearing the cursor posts the same Row_ID a second time",
         "test_a_start_and_an_end_are_one_row_each_and_a_second_loop_is_quiet",
     ),
     (
         "cursor-moves-before-the-read-back",
-        "    rid = spec[\"row_id\"]\n    try:\n        if not present(rid):\n            append(spec)",
-        "    rid = spec[\"row_id\"]\n"
+        "    rid = spec[\"row_id\"]\n    payload = spec.get(\"payload\") or \"\"\n    try:\n"
+        "        status = _reuse_status(present(rid), payload)",
+        "    rid = spec[\"row_id\"]\n    payload = spec.get(\"payload\") or \"\"\n"
         "    conn.set(cursor_key, entry_id)  # MUTANT: cursor moves before the read-back\n"
-        "    try:\n        if not present(rid):\n            append(spec)",
+        "    try:\n        status = _reuse_status(present(rid), payload)",
         "a row that does not read back still advances the cursor, so the entry is never retried",
         "test_a_start_and_an_end_are_one_row_each_and_a_second_loop_is_quiet",
+    ),
+    (
+        "any-id-is-reuse",
+        "    if any(item != payload for item in payloads):\n        return \"conflict\"\n    return \"done\"",
+        "    return \"done\"  # MUTANT: any row with this id counts, whatever its payload",
+        "a different payload under the same id is treated as done and the cursor moves",
+        "test_the_same_id_with_a_different_payload_is_a_conflict",
+    ),
+    (
+        "matching-payload-is-not-reuse",
+        "    if any(item != payload for item in payloads):\n        return \"conflict\"\n    return \"done\"",
+        "    if any(item != payload for item in payloads):\n        return \"conflict\"\n"
+        "    return \"absent\"  # MUTANT: the same payload is not reuse",
+        "an id already on the board with this payload is appended again",
+        "test_the_same_id_and_payload_is_already_done",
     ),
     (
         "read-the-stream-from-the-start",
@@ -61,8 +78,8 @@ MUTANTS = [
     ),
     (
         "log-the-exception-words",
-        "        _mirror_log(rid, len(spec.get(\"payload\") or \"\"), type(error).__name__)",
-        "        _mirror_log(rid, len(spec.get(\"payload\") or \"\"), error)  # MUTANT: the words",
+        "        _mirror_log(rid, len(payload), type(error).__name__)",
+        "        _mirror_log(rid, len(payload), error)  # MUTANT: the words",
         "a failed append logs the text it was given",
         "test_a_failed_row_is_logged_by_id_and_size_not_by_its_words",
     ),

@@ -425,9 +425,9 @@ def one_pass(conn, env, execution, with_git=True, quiet=False, renew=None, settl
 # CALL_REPLY. Off (the default, and every other value) it does nothing. No deploy rides with it.
 #
 # fleet_agent.append_and_verify has no reuse_check on main (its signature is rid, row, fitted,
-# spill). The same rule is applied here: read the Row_ID back, and append only when it is absent.
-# The cursor moves only after that read-back, so a crash re-reads the entry and the fixed id
-# stops a second row.
+# spill). The same rule is applied here: the same Row_ID with the same payload is already done,
+# and the same id with a different payload is a conflict. The cursor moves only after the
+# matching row has been read back. A conflict is logged by id and the cursor stays.
 
 CALL_ID_RE = re.compile(r"^conf-[0-9a-f]{16}-[0-9a-f]{8}$")
 CALL_TAGS = frozenset({"grok", "claude-code-cli", "chatgpt-codex-desktop", "gemini"})
@@ -524,13 +524,32 @@ def _cursor(conn, key):
 
 
 def _row_present(env, rid):
-    """True when this exact Row_ID is already on the board. A read that fails raises, so the
-    cursor stays and the entry is tried again."""
+    """The payloads of every row with this exact Row_ID, or None when there is none.
+
+    A read that fails raises, so the cursor stays and the entry is tried again. match= is only a
+    hint: a row that quotes the id is not this id."""
     from bus import read_rows                                            # noqa: PLC0415
 
     found = read_rows(env, match=rid)
     rows = found.get("rows") if isinstance(found, dict) else (found or [])
-    return any(row and row[0] == rid for row in rows)
+    hits = [row for row in rows if row and row[0] == rid]
+    if not hits:
+        return None
+    return [str(row[5] if len(row) > 5 else "") for row in hits]
+
+
+def _reuse_status(found, payload):
+    """Same id and the same payload is done. The same id with a different payload is a conflict.
+    None means the id is not on the board. fleet_agent.append_and_verify has no reuse_check on
+    main, so this is that check."""
+    if found is None:
+        return "absent"
+    payloads = list(found) if isinstance(found, (list, tuple)) else [found]
+    if not payloads:
+        return "absent"
+    if any(item != payload for item in payloads):
+        return "conflict"
+    return "done"
 
 
 def _append_row(env, renew, spec):
@@ -538,17 +557,27 @@ def _append_row(env, renew, spec):
 
 
 def _land(conn, cursor_key, entry_id, spec, append, present):
-    """Append unless this Row_ID is already on the board, then move the cursor only once the row
-    reads back. False leaves the cursor where it was."""
+    """Append unless this Row_ID is already on the board with this payload. A different payload
+    under the same id is a conflict: log the id, do not append, do not move the cursor. The
+    cursor moves only after a matching row has been read back."""
     rid = spec["row_id"]
+    payload = spec.get("payload") or ""
     try:
-        if not present(rid):
+        status = _reuse_status(present(rid), payload)
+        if status == "conflict":
+            _mirror_log(rid, len(payload), "conflict")
+            return False
+        if status == "absent":
             append(spec)
-        if not present(rid):
-            _mirror_log(rid, len(spec.get("payload") or ""), "unread")
+            status = _reuse_status(present(rid), payload)
+            if status == "conflict":
+                _mirror_log(rid, len(payload), "conflict")
+                return False
+        if status != "done":
+            _mirror_log(rid, len(payload), "unread")
             return False
     except (Exception, SystemExit) as error:
-        _mirror_log(rid, len(spec.get("payload") or ""), type(error).__name__)
+        _mirror_log(rid, len(payload), type(error).__name__)
         return False
     conn.set(cursor_key, entry_id)
     return True

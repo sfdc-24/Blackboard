@@ -118,8 +118,11 @@ class Board:
         self.rows, self.appends, self.hidden, self.present_calls = {}, [], set(), []
 
     def present(self, rid):
+        """The stored payload, or None. Hidden means the read-back has not seen the row."""
         self.present_calls.append(rid)
-        return rid in self.rows and rid not in self.hidden
+        if rid not in self.rows or rid in self.hidden:
+            return None
+        return self.rows[rid].get("payload")
 
     def append(self, spec):
         self.appends.append(spec)
@@ -202,7 +205,7 @@ class CallEvents(unittest.TestCase):
                 mock.patch.object(sr.bus_reconcile, "board_rows", return_value=[]), \
                 mock.patch.object(sr.bus_request, "handle", return_value=dict(HANDLE)), \
                 mock.patch.object(sr, "_append_row", side_effect=explode), \
-                mock.patch.object(sr, "_row_present", side_effect=lambda env, rid: False), \
+                mock.patch.object(sr, "_row_present", side_effect=lambda env, rid: None), \
                 mock.patch.dict(sr.os.environ, {"CALL_SHEET_MIRROR": "on"}), \
                 self.assertLogs("bus-requests", level="WARNING") as caught:
             out = sr.one_pass(conn, {}, "bus-requests-test", with_git=False, quiet=True, renew=lambda: True)
@@ -212,6 +215,31 @@ class CallEvents(unittest.TestCase):
         self.assertIn("CALLEND-" + LIVE, text)
         self.assertIn("size=", text)
         self.assertIsNone(conn.strings.get(sr.CALLS_CURSOR))
+
+    def test_the_same_id_and_payload_is_already_done(self):
+        conn, board = FakeRedis(), Board()
+        fields = {"event": "start", "call_id": LIVE, "epoch": "7", "at": "2026-11-08T12:10:00Z", "reason": ""}
+        spec = sr._event_spec(fields)
+        board.rows[spec["row_id"]] = spec
+        conn.add(sr.CALLS_KEY, "1000-0", fields)
+        _mirror(conn, board)
+        self.assertEqual([], board.appends)
+        self.assertEqual("1000-0", conn.get(sr.CALLS_CURSOR))
+
+    def test_the_same_id_with_a_different_payload_is_a_conflict(self):
+        conn, board = FakeRedis(), Board()
+        fields = {"event": "start", "call_id": LIVE, "epoch": "7", "at": "2026-11-08T12:10:00Z", "reason": ""}
+        spec = sr._event_spec(fields)
+        board.rows[spec["row_id"]] = dict(spec, payload=spec["payload"] + "|note=swordfish-secret")
+        conn.add(sr.CALLS_KEY, "1000-0", fields)
+        with self.assertLogs("bus-requests", level="WARNING") as caught:
+            _mirror(conn, board)
+        text = "\n".join(caught.output)
+        self.assertEqual([], board.appends)
+        self.assertIsNone(conn.strings.get(sr.CALLS_CURSOR))
+        self.assertIn(spec["row_id"], text)
+        self.assertIn("conflict", text)
+        self.assertNotIn("swordfish", text)
 
 
 class CallTurns(unittest.TestCase):
