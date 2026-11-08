@@ -413,6 +413,8 @@ def one_pass(conn, env, execution, with_git=True, quiet=False, renew=None, settl
     # CALL_SHEET_MIRROR is exactly on. The board is not an input: a sheet row never starts an action.
     try:
         mirror_call_sheet(conn, now, env, renew)
+    except LockLost:
+        raise
     except Exception as error:                                       # noqa: BLE001
         log.warning("call sheet mirror failed id=- size=0 (%s)", type(error).__name__)
     return out
@@ -425,9 +427,10 @@ def one_pass(conn, env, execution, with_git=True, quiet=False, renew=None, settl
 # CALL_REPLY. Off (the default, and every other value) it does nothing. No deploy rides with it.
 #
 # fleet_agent.append_and_verify has no reuse_check on main (its signature is rid, row, fitted,
-# spill). The same rule is applied here: the same Row_ID with the same payload is already done,
-# and the same id with a different payload is a conflict. The cursor moves only after the
-# matching row has been read back. A conflict is logged by id and the cursor stays.
+# spill). Done means EXACTLY ONE row with this id, this payload, and the gateway's verified
+# bus-reconciler stamp. Two copies, a different payload, or another sender is a conflict: log
+# the id, do not append, do not move the cursor. A lost worker lease aborts the pass before
+# the next cursor write or Redis state change.
 
 CALL_ID_RE = re.compile(r"^conf-[0-9a-f]{16}-[0-9a-f]{8}$")
 CALL_TAGS = frozenset({"grok", "claude-code-cli", "chatgpt-codex-desktop", "gemini"})
@@ -437,8 +440,23 @@ TURNS_KEY = "conf:callturns:%s"
 CALLS_CURSOR = "gov:mirror:calls:cursor"
 TURNS_CURSOR = "gov:mirror:turns:%s:cursor"
 STALE_AFTER = datetime.timedelta(minutes=50)
+STALE_TTL = 7 * 24 * 3600
+CALLS_MAXLEN = 1000
 TURN_TEXT_MAX = 1000
 MIRROR_PAGE = 100
+# The stamp append.py requires on a read-back when this worker posts (scripts/append.py).
+VERIFIED_STAMP = "sender=verified;who=bus-reconciler@sfdc24.iam.gserviceaccount.com"
+# The chair's END_LUA (conference#373): one script, compare-and-set on the live hash and its
+# epoch, then the hash and the conf:calls end together. state must be live, so a second pass
+# cannot write a second end.
+STALE_END_LUA = """
+if redis.call('HGET', KEYS[1], 'state') ~= 'live' then return 0 end
+if redis.call('HGET', KEYS[1], 'epoch') ~= ARGV[2] then return 0 end
+redis.call('HSET', KEYS[1], 'state', 'ended', 'epoch', ARGV[2], 'ended_at', ARGV[3], 'reason', ARGV[6])
+redis.call('EXPIRE', KEYS[1], ARGV[4])
+redis.call('XADD', KEYS[2], 'MAXLEN', '~', ARGV[5], '*', 'event', 'end', 'call_id', ARGV[1], 'epoch', ARGV[2], 'at', ARGV[3], 'reason', ARGV[6])
+return 1
+"""
 SHEET_FROM = "conference-chair"   # who the call record is from
 SHEET_SOURCE = "bus-reconciler"  # who posts it; the gateway stamps sender=verified for this tag
 
@@ -531,31 +549,64 @@ def _cursor(conn, key):
     return _text(raw) if raw else ""
 
 
-def _row_present(env, rid):
-    """The payloads of every row with this exact Row_ID, or None when there is none.
+def _owned(renew):
+    """Raise LockLost unless this execution still holds the worker lease. No renew means the
+    caller is not under the lease (a test, or a pass that has no lock)."""
+    if renew is None:
+        return
+    if renew() is not True:
+        raise LockLost("gov:worker:lock is not ours")
 
-    A read that fails raises, so the cursor stays and the entry is tried again. match= is only a
-    hint: a row that quotes the id is not this id."""
+
+def _caught(ident, size, error):
+    """A lost lease leaves this pass. Anything else is logged by id and size, never by its words."""
+    if isinstance(error, LockLost):
+        raise error
+    _mirror_log(ident, size, type(error).__name__)
+
+
+def _row_present(env, rid):
+    """Every sheet row with this exact Row_ID, or None. A read that fails raises, so the cursor
+    stays. match= is only a hint: a row that quotes the id is not this id."""
     from bus import read_rows                                            # noqa: PLC0415
 
     found = read_rows(env, match=rid)
     rows = found.get("rows") if isinstance(found, dict) else (found or [])
     hits = [row for row in rows if row and row[0] == rid]
-    if not hits:
-        return None
-    return [str(row[5] if len(row) > 5 else "") for row in hits]
+    return hits or None
+
+
+def _as_hits(found):
+    """None, one hit, or several. A hit is a sheet row (a list of cells) or a dict with
+    payload, source_tag and sender."""
+    if not found:
+        return []
+    if isinstance(found, dict):
+        return [found]
+    if isinstance(found, (list, tuple)) and found and isinstance(found[0], (dict, list, tuple)):
+        return list(found)
+    return [found]
+
+
+def _hit_parts(hit):
+    if isinstance(hit, dict):
+        return (hit.get("payload") or "", hit.get("source_tag") or "", hit.get("sender") or "")
+    payload = str(hit[5] if len(hit) > 5 else "")
+    source = str(hit[2] if len(hit) > 2 else "")
+    stamp = str(hit[11] if len(hit) > 11 else "")
+    return payload, source, stamp
 
 
 def _reuse_status(found, payload):
-    """Same id and the same payload is done. The same id with a different payload is a conflict.
-    None means the id is not on the board. fleet_agent.append_and_verify has no reuse_check on
-    main, so this is that check."""
-    if found is None:
+    """Done only for exactly one row: this payload, source tag bus-reconciler, and the gateway's
+    verified stamp. Two copies, a different payload, or another sender is a conflict."""
+    hits = _as_hits(found)
+    if not hits:
         return "absent"
-    payloads = list(found) if isinstance(found, (list, tuple)) else [found]
-    if not payloads:
-        return "absent"
-    if any(item != payload for item in payloads):
+    if len(hits) != 1:
+        return "conflict"
+    got, source, stamp = _hit_parts(hits[0])
+    if got != payload or source != SHEET_SOURCE or stamp != VERIFIED_STAMP:
         return "conflict"
     return "done"
 
@@ -564,10 +615,9 @@ def _append_row(env, renew, spec):
     guarded(appender(env), renew)(spec)
 
 
-def _land(conn, cursor_key, entry_id, spec, append, present):
-    """Append unless this Row_ID is already on the board with this payload. A different payload
-    under the same id is a conflict: log the id, do not append, do not move the cursor. The
-    cursor moves only after a matching row has been read back."""
+def _land(conn, cursor_key, entry_id, spec, append, present, renew):
+    """Append unless this Row_ID is already done. A conflict is logged by id and the cursor
+    stays. The cursor moves only after one verified matching row has been read back."""
     rid = spec["row_id"]
     payload = spec.get("payload") or ""
     try:
@@ -584,10 +634,11 @@ def _land(conn, cursor_key, entry_id, spec, append, present):
         if status != "done":
             _mirror_log(rid, len(payload), "unread")
             return False
+        _owned(renew)
+        conn.set(cursor_key, entry_id)
     except (Exception, SystemExit) as error:
-        _mirror_log(rid, len(payload), type(error).__name__)
+        _caught(rid, len(payload), error)
         return False
-    conn.set(cursor_key, entry_id)
     return True
 
 
@@ -619,19 +670,20 @@ def _event_spec(fields):
     return _sheet_spec(rid, "ALL", "RESULT", payload, "CALL_END " + call_id)
 
 
-def _mirror_events(conn, append, present):
+def _mirror_events(conn, append, present, renew):
     cursor = _cursor(conn, CALLS_CURSOR)
     for entry_id, fields in _after(conn, CALLS_KEY, cursor):
         try:
             spec = _event_spec(fields)
             if spec is None:
                 _mirror_log(entry_id, _entry_size(fields), "skip")
+                _owned(renew)
                 conn.set(CALLS_CURSOR, entry_id)
                 continue
-            if not _land(conn, CALLS_CURSOR, entry_id, spec, append, present):
+            if not _land(conn, CALLS_CURSOR, entry_id, spec, append, present, renew):
                 return
         except (Exception, SystemExit) as error:
-            _mirror_log(entry_id, _entry_size(fields), type(error).__name__)
+            _caught(entry_id, _entry_size(fields), error)
             return
 
 
@@ -720,7 +772,8 @@ def _withheld_turn(call_id, fields, rid, tag, epoch, turn_key):
                        "CALL_TURN %s withheld" % turn_key)
 
 
-def _live_calls(conn):
+def _known_calls(conn):
+    """Every conf:call:<id> hash, live or ended."""
     found = []
     for key in conn.scan_iter(match="conf:call:*", count=500):
         name = str(_text(key) or "")
@@ -729,40 +782,43 @@ def _live_calls(conn):
         call_id = name[len("conf:call:"):]
         if not CALL_ID_RE.fullmatch(call_id):
             continue
-        fields = _as_map(conn.hgetall(name))
-        if fields.get("state") == "live":
-            found.append((call_id, fields))
+        found.append((call_id, _as_map(conn.hgetall(name))))
     return found
 
 
-def _mirror_turns(conn, append, present):
+def _live_calls(conn):
+    return [(call_id, fields) for call_id, fields in _known_calls(conn) if fields.get("state") == "live"]
+
+
+def _mirror_turns(conn, append, present, renew):
     for call_id, _fields in _live_calls(conn):
         cursor_key = TURNS_CURSOR % call_id
         cursor = _cursor(conn, cursor_key)
         try:
             entries = _after(conn, TURNS_KEY % call_id, cursor)
         except (Exception, SystemExit) as error:
-            _mirror_log(call_id, 0, type(error).__name__)
+            _caught(call_id, 0, error)
             continue
         for entry_id, fields in entries:
             try:
                 spec = _turn_spec(call_id, fields)
                 if spec is None:
                     _mirror_log(entry_id, _entry_size(fields), "turn")
+                    _owned(renew)
                     conn.set(cursor_key, entry_id)
                     continue
-                if not _land(conn, cursor_key, entry_id, spec, append, present):
+                if not _land(conn, cursor_key, entry_id, spec, append, present, renew):
                     break
             except (Exception, SystemExit) as error:
-                _mirror_log(entry_id, _entry_size(fields), type(error).__name__)
+                _caught(entry_id, _entry_size(fields), error)
                 break
 
 
-def _sweep_stale(conn, now):
-    """A call still live more than 50 minutes after started_at is closed here: an end on the stream
-    first (so the next pass can record CALL_END), then the hash. Stream first, because a hash that
-    says ended with no stream entry would never become a sheet row."""
-    for call_id, fields in _live_calls(conn):
+def _sweep_stale(conn, now, renew):
+    """A call more than 50 minutes after started_at is offered to one compare-and-set. The script
+    closes it only while it is still live in that epoch, so a second pass writes no second end.
+    The end event and state=ended land together, or neither does."""
+    for call_id, fields in _known_calls(conn):
         try:
             started = _parse_time(fields.get("started_at"))
             if started is None or now - started <= STALE_AFTER:
@@ -772,36 +828,34 @@ def _sweep_stale(conn, now):
                 _mirror_log(call_id, _entry_size(fields), "epoch")
                 continue
             at = _stamp(now)
-            conn.xadd(CALLS_KEY, {"event": "end", "call_id": call_id, "epoch": epoch,
-                                  "at": at, "reason": "stale"})
-            conn.hset(CALL_KEY % call_id, mapping={"state": "ended", "ended_at": at, "reason": "stale"})
+            _owned(renew)
+            conn.eval(STALE_END_LUA, 2, CALL_KEY % call_id, CALLS_KEY,
+                      call_id, epoch, at, int(STALE_TTL), int(CALLS_MAXLEN), "stale")
         except (Exception, SystemExit) as error:
-            _mirror_log(call_id, _entry_size(fields), type(error).__name__)
+            _caught(call_id, _entry_size(fields), error)
 
 
 def mirror_call_sheet(conn, now, env, renew=None, append=None, present=None):
     """One pass of the call sheet. Flag off: return before any Redis or board call.
 
     Events, live turns, then the stale sweep. The board is not read here. `append` and `present`
-    are the production write and read-back unless a test supplies its own. One part failing is
-    logged by id and size, and the others still run.
+    are the production write and read-back unless a test supplies its own. A lost lease aborts
+    the pass. Any other failure is logged by id and size, and the later parts still run.
     """
     if not call_sheet_on():
         return
-    if renew is not None and renew() is not True:
-        _mirror_log("-", 0, "lock")
-        return
+    _owned(renew)
     write = append or (lambda spec: _append_row(env, renew, spec))
     seen = present or (lambda rid: _row_present(env, rid))
     for step in (
-        lambda: _mirror_events(conn, write, seen),
-        lambda: _mirror_turns(conn, write, seen),
-        lambda: _sweep_stale(conn, now),
+        lambda: _mirror_events(conn, write, seen, renew),
+        lambda: _mirror_turns(conn, write, seen, renew),
+        lambda: _sweep_stale(conn, now, renew),
     ):
         try:
             step()
         except (Exception, SystemExit) as error:
-            _mirror_log("-", 0, type(error).__name__)
+            _caught("-", 0, error)
 
 
 if __name__ == "__main__":

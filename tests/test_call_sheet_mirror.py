@@ -76,6 +76,33 @@ class FakeRedis:
         """Plant an entry the chair already wrote, without counting it as this worker's write."""
         self.streams.setdefault(key, []).append((entry_id, dict(fields)))
 
+    def eval(self, script, numkeys, *args):
+        """The stale-end script: compare-and-set on state=live and the epoch, then hash and stream
+        together. A raised error applies nothing."""
+        self.ops.append(("eval", args[0] if args else ""))
+        self.writes.append(("eval", args[0] if args else ""))
+        if getattr(self, "eval_raises", None):
+            error = self.eval_raises
+            self.eval_raises = None
+            raise error
+        if "HSET" not in script or "XADD" not in script:
+            raise AssertionError("the end is not one script")
+        keys, argv = args[:numkeys], args[numkeys:]
+        call_key, calls_key = keys
+        call_id, epoch, at, ttl, _maxlen, reason = argv
+        current = dict(self.hashes.get(call_key, {}))
+        # Follow the script's compare-and-set. A mutant that drops "state is live" closes again.
+        if "state') ~= 'live'" in script and current.get("state") != "live":
+            return 0
+        if "epoch') ~=" in script and str(current.get("epoch")) != str(epoch):
+            return 0
+        current.update(state="ended", epoch=str(epoch), ended_at=at, reason=reason)
+        self.hashes[call_key] = current
+        self.ttls[call_key] = int(ttl)
+        self.xadd(calls_key, {"event": "end", "call_id": call_id, "epoch": str(epoch),
+                              "at": at, "reason": reason})
+        return 1
+
     def xrange(self, key, min="-", max="+", count=None):
         self.ops.append(("xrange", key))
         items = list(self.streams.get(key, []))
@@ -115,19 +142,27 @@ class FakeRedis:
 
 class Board:
     def __init__(self):
-        self.rows, self.appends, self.hidden, self.present_calls = {}, [], set(), []
+        self.rows, self.appends, self.hidden, self.present_calls, self.copies = {}, [], set(), [], {}
 
     def present(self, rid):
-        """The stored payload, or None. Hidden means the read-back has not seen the row."""
+        """The read-back hits for this id, or None. Hidden means the row was not seen.
+        A hit carries payload, source_tag and the gateway sender stamp."""
         self.present_calls.append(rid)
-        if rid not in self.rows or rid in self.hidden:
+        if rid in self.hidden:
             return None
-        return self.rows[rid].get("payload")
+        if rid in self.copies:
+            return list(self.copies[rid])
+        row = self.rows.get(rid)
+        if row is None:
+            return None
+        return [row]
 
     def append(self, spec):
         self.appends.append(spec)
         if spec["row_id"] not in self.hidden:
-            self.rows[spec["row_id"]] = spec
+            stored = dict(spec)
+            stored.setdefault("sender", sr.VERIFIED_STAMP)
+            self.rows[spec["row_id"]] = stored
 
 
 def _stamp(moment):
@@ -222,17 +257,47 @@ class CallEvents(unittest.TestCase):
         conn, board = FakeRedis(), Board()
         fields = {"event": "start", "call_id": LIVE, "epoch": "7", "at": "2026-11-08T12:10:00Z", "reason": ""}
         spec = sr._event_spec(fields)
-        board.rows[spec["row_id"]] = spec
+        board.rows[spec["row_id"]] = dict(spec, sender=sr.VERIFIED_STAMP)
         conn.add(sr.CALLS_KEY, "1000-0", fields)
         _mirror(conn, board)
         self.assertEqual([], board.appends)
         self.assertEqual("1000-0", conn.get(sr.CALLS_CURSOR))
 
+    def test_two_identical_copies_are_a_conflict(self):
+        conn, board = FakeRedis(), Board()
+        fields = {"event": "start", "call_id": LIVE, "epoch": "7", "at": "2026-11-08T12:10:00Z", "reason": ""}
+        spec = dict(sr._event_spec(fields), sender=sr.VERIFIED_STAMP)
+        board.copies[spec["row_id"]] = [spec, dict(spec)]
+        conn.add(sr.CALLS_KEY, "1000-0", fields)
+        with self.assertLogs("bus-requests", level="WARNING") as caught:
+            _mirror(conn, board)
+        text = "\n".join(caught.output)
+        self.assertEqual([], board.appends)
+        self.assertIsNone(conn.strings.get(sr.CALLS_CURSOR))
+        self.assertIn(spec["row_id"], text)
+        self.assertIn("conflict", text)
+
+    def test_a_copy_from_another_sender_is_a_conflict(self):
+        conn, board = FakeRedis(), Board()
+        fields = {"event": "start", "call_id": LIVE, "epoch": "7", "at": "2026-11-08T12:10:00Z", "reason": ""}
+        spec = sr._event_spec(fields)
+        board.rows[spec["row_id"]] = dict(spec, source_tag="grok",
+                                          sender="sender=verified;who=grok@sfdc24.iam.gserviceaccount.com")
+        conn.add(sr.CALLS_KEY, "1000-0", fields)
+        with self.assertLogs("bus-requests", level="WARNING") as caught:
+            _mirror(conn, board)
+        text = "\n".join(caught.output)
+        self.assertEqual([], board.appends)
+        self.assertIsNone(conn.strings.get(sr.CALLS_CURSOR))
+        self.assertIn(spec["row_id"], text)
+        self.assertNotIn("grok@sfdc24", text)
+
     def test_the_same_id_with_a_different_payload_is_a_conflict(self):
         conn, board = FakeRedis(), Board()
         fields = {"event": "start", "call_id": LIVE, "epoch": "7", "at": "2026-11-08T12:10:00Z", "reason": ""}
         spec = sr._event_spec(fields)
-        board.rows[spec["row_id"]] = dict(spec, payload=spec["payload"] + "|note=swordfish-secret")
+        board.rows[spec["row_id"]] = dict(spec, sender=sr.VERIFIED_STAMP,
+                                          payload=spec["payload"] + "|note=swordfish-secret")
         conn.add(sr.CALLS_KEY, "1000-0", fields)
         with self.assertLogs("bus-requests", level="WARNING") as caught:
             _mirror(conn, board)
@@ -383,8 +448,47 @@ class StaleSweep(unittest.TestCase):
         self.assertEqual([("2000-1", {"event": "end", "call_id": OVER, "epoch": "4",
                                       "at": _stamp(NOW), "reason": "stale"})],
                          conn.streams.get(sr.CALLS_KEY))
-        self.assertEqual([sr.CALLS_KEY, sr.CALL_KEY % OVER],
-                         [key for op, key in conn.writes if op in ("xadd", "hset")])
+        self.assertEqual([sr.CALLS_KEY], [key for op, key in conn.writes if op == "xadd"])
+
+    def test_a_stale_end_is_one_write_and_a_failed_script_writes_neither(self):
+        conn, board = FakeRedis(), Board()
+        over_at = _stamp(NOW - datetime.timedelta(minutes=50, seconds=1))
+        conn.hashes[sr.CALL_KEY % OVER] = {
+            "state": "live", "epoch": "4", "started_at": over_at, "ended_at": "", "reason": ""}
+        conn.eval_raises = RuntimeError("noscript")
+        _mirror(conn, board)
+        self.assertEqual("live", conn.hashes[sr.CALL_KEY % OVER]["state"])
+        self.assertIsNone(conn.streams.get(sr.CALLS_KEY))
+        self.assertEqual([], [spec for spec in board.appends if spec["row_id"].startswith("CALLEND")])
+        _mirror(conn, board)                                   # the script lands: one end
+        self.assertEqual("ended", conn.hashes[sr.CALL_KEY % OVER]["state"])
+        self.assertEqual(1, len(conn.streams[sr.CALLS_KEY]))
+        _mirror(conn, board)                                   # the end becomes one CALLEND row
+        ends = [spec for spec in board.appends if spec["row_id"] == "CALLEND-" + OVER]
+        self.assertEqual(1, len(ends))
+        _mirror(conn, board)                                   # a later pass does not end it again
+        self.assertEqual(1, len(conn.streams[sr.CALLS_KEY]))
+        self.assertEqual(1, len([spec for spec in board.appends if spec["row_id"] == "CALLEND-" + OVER]))
+
+    def test_losing_the_lease_mid_pass_writes_no_cursor_and_no_state(self):
+        conn, board = FakeRedis(), Board()
+        over_at = _stamp(NOW - datetime.timedelta(minutes=50, seconds=1))
+        conn.hashes[sr.CALL_KEY % OVER] = {
+            "state": "live", "epoch": "4", "started_at": over_at, "ended_at": "", "reason": ""}
+        conn.add(sr.CALLS_KEY, "1000-0", {
+            "event": "start", "call_id": LIVE, "epoch": "7", "at": "2026-11-08T12:10:00Z", "reason": ""})
+        calls = {"n": 0}
+
+        def renew():
+            calls["n"] += 1
+            return calls["n"] < 2                              # the pass starts; the next fence fails
+
+        with mock.patch.dict(sr.os.environ, {"CALL_SHEET_MIRROR": "on"}):
+            with self.assertRaises(sr.LockLost):
+                sr.mirror_call_sheet(conn, NOW, {}, renew=renew, append=board.append, present=board.present)
+        self.assertIsNone(conn.strings.get(sr.CALLS_CURSOR))
+        self.assertEqual("live", conn.hashes[sr.CALL_KEY % OVER]["state"])
+        self.assertEqual([], [key for op, key in conn.writes if op in ("xadd", "hset", "set", "eval")])
 
 
 class TheFlag(unittest.TestCase):

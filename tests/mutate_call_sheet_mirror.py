@@ -52,18 +52,60 @@ MUTANTS = [
     ),
     (
         "any-id-is-reuse",
-        "    if any(item != payload for item in payloads):\n        return \"conflict\"\n    return \"done\"",
-        "    return \"done\"  # MUTANT: any row with this id counts, whatever its payload",
+        "    if got != payload or source != SHEET_SOURCE or stamp != VERIFIED_STAMP:\n"
+        "        return \"conflict\"\n    return \"done\"",
+        "    return \"done\"  # MUTANT: any one row with this id counts",
         "a different payload under the same id is treated as done and the cursor moves",
         "test_the_same_id_with_a_different_payload_is_a_conflict",
     ),
     (
         "matching-payload-is-not-reuse",
-        "    if any(item != payload for item in payloads):\n        return \"conflict\"\n    return \"done\"",
-        "    if any(item != payload for item in payloads):\n        return \"conflict\"\n"
-        "    return \"absent\"  # MUTANT: the same payload is not reuse",
+        "    if got != payload or source != SHEET_SOURCE or stamp != VERIFIED_STAMP:\n"
+        "        return \"conflict\"\n    return \"done\"",
+        "    if got != payload or source != SHEET_SOURCE or stamp != VERIFIED_STAMP:\n"
+        "        return \"conflict\"\n    return \"absent\"  # MUTANT: the same payload is not reuse",
         "an id already on the board with this payload is appended again",
         "test_the_same_id_and_payload_is_already_done",
+    ),
+    (
+        "two-copies-count-as-one",
+        "    if len(hits) != 1:\n        return \"conflict\"",
+        "    if False:  # MUTANT: two copies of one id still count\n        return \"conflict\"",
+        "two identical rows with one id are treated as done",
+        "test_two_identical_copies_are_a_conflict",
+    ),
+    (
+        "another-sender-counts",
+        "    if got != payload or source != SHEET_SOURCE or stamp != VERIFIED_STAMP:",
+        "    if got != payload:  # MUTANT: another sender still counts",
+        "a row from another sender is treated as ours",
+        "test_a_copy_from_another_sender_is_a_conflict",
+    ),
+    (
+        "swallow-a-lost-lease",
+        "    if isinstance(error, LockLost):\n        raise error",
+        "    if False and isinstance(error, LockLost):  # MUTANT: lease loss is just a failed row\n"
+        "        raise error",
+        "losing the worker lease is swallowed and the pass keeps writing",
+        "test_losing_the_lease_mid_pass_writes_no_cursor_and_no_state",
+    ),
+    (
+        "stale-end-is-two-writes",
+        "            conn.eval(STALE_END_LUA, 2, CALL_KEY % call_id, CALLS_KEY,\n"
+        "                      call_id, epoch, at, int(STALE_TTL), int(CALLS_MAXLEN), \"stale\")",
+        "            conn.xadd(CALLS_KEY, {\"event\": \"end\", \"call_id\": call_id, \"epoch\": epoch,\n"
+        "                                 \"at\": at, \"reason\": \"stale\"})  # MUTANT: not one script\n"
+        "            conn.hset(CALL_KEY % call_id, mapping={\"state\": \"ended\", \"ended_at\": at,\n"
+        "                                                   \"reason\": \"stale\"})",
+        "the end event can land without the hash, or the hash without the event",
+        "test_a_stale_end_is_one_write_and_a_failed_script_writes_neither",
+    ),
+    (
+        "a-second-pass-ends-again",
+        "if redis.call('HGET', KEYS[1], 'state') ~= 'live' then return 0 end",
+        "if false then return 0 end  -- MUTANT: an ended call is ended again",
+        "a second pass writes another end, and a second CALLEND can conflict",
+        "test_a_stale_end_is_one_write_and_a_failed_script_writes_neither",
     ),
     (
         "read-the-stream-from-the-start",
@@ -78,15 +120,15 @@ MUTANTS = [
     ),
     (
         "log-the-exception-words",
-        "        _mirror_log(rid, len(payload), type(error).__name__)",
-        "        _mirror_log(rid, len(payload), error)  # MUTANT: the words",
+        "    _mirror_log(ident, size, type(error).__name__)",
+        "    _mirror_log(ident, size, error)  # MUTANT: the words",
         "a failed append logs the text it was given",
         "test_a_failed_row_is_logged_by_id_and_size_not_by_its_words",
     ),
     (
         "mirror-turns-of-ended-calls",
-        "        if fields.get(\"state\") == \"live\":",
-        "        if True:  # MUTANT: an ended call is mirrored too",
+        "    return [(call_id, fields) for call_id, fields in _known_calls(conn) if fields.get(\"state\") == \"live\"]",
+        "    return [(call_id, fields) for call_id, fields in _known_calls(conn) if True]  # MUTANT: ended too",
         "a turn of an ended call becomes a row",
         "test_a_turn_of_a_live_call_is_one_row_and_an_ended_call_is_none",
     ),
