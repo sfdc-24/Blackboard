@@ -196,7 +196,8 @@ class BoardToRedis(unittest.TestCase):
         return sr.mirror_addressed(self.conn, rows)
 
     def test_one_entry_per_named_agent(self):
-        payload = "BCB|v=1|id=ROW-1|phase=ASK|from=grok|to=cursor|thread_id=thread-9|text=please look"
+        payload = ("BCB|v=1|id=ROW-1|phase=ASK|class=TASK|from=grok|to=cursor|msg_type=REVIEW_ASK"
+                   "|thread_id=TH-Q2-9|text=please look")
         self.mirror([row("ROW-1", "grok; cursor", payload, source="Grok")])
         self.assertEqual(["grok", "cursor"], [k.split(":")[-1] for k in self.conn.streams])
         for agent in ("grok", "cursor"):
@@ -204,7 +205,7 @@ class BoardToRedis(unittest.TestCase):
             entry = self.conn.inbox(agent)[0]
             self.assertEqual({
                 "by": "Grok", "row_id": "ROW-1", "at": "2026-11-08T03:00:00Z",
-                "phase": "ASK", "thread_id": "thread-9", "preview": payload[:sr.PREVIEW_CHARS],
+                "phase": "ASK", "thread_id": "TH-Q2-9", "msg_type": "REVIEW_ASK", "class": "TASK",
             }, entry)
             mark = "fleet:wake:mirrored:ROW-1:%s" % agent
             self.assertEqual("1", self.conn.data[mark])
@@ -216,13 +217,49 @@ class BoardToRedis(unittest.TestCase):
         self.assertLess(self.conn.calls.index(sets[0]), self.conn.calls.index(adds[0]))
         self.assertLess(self.conn.calls.index(sets[1]), self.conn.calls.index(adds[1]))
 
-    def test_the_preview_is_the_payloads_first_300_characters(self):
-        payload = "x" * 300 + "TAIL"
-        self.mirror([row("ROW-LONG", "grok", payload)])
-        preview = self.conn.inbox("grok")[0]["preview"]
-        self.assertEqual(payload[:300], preview)
-        self.assertNotIn("TAIL", preview)
-        self.assertNotIn("thread_id", self.conn.inbox("grok")[0])
+    def test_no_payload_text_reaches_the_lane(self):
+        """Metadata only. The entry holds no word of the payload's text, and no 6-character run of
+        it, beyond the allowed fields' own values."""
+        secret = "FAKE-TOKEN-" + "Zq7Lx2Vb9Kd4Nw8Rt5Ym3Hc6"           # not a real credential format
+        private = "the guest's home address is on the second page of the contract"
+        payload = ("BCB|v=1|id=ROW-P|phase=ASK|from=grok|to=cursor|thread_id=TH-Q2-1"
+                   "|text=" + private + " token " + secret + " " + WORDS)
+        self.mirror([row("ROW-P", "grok", payload), row("ROW-RAW", "grok", private + " " + secret)])
+        entries = self.conn.inbox("grok")
+        self.assertEqual(["ROW-P", "ROW-RAW"], [e["row_id"] for e in entries])
+        allowed = {"by", "row_id", "at", "phase", "thread_id", "msg_type", "class"}
+        for entry in entries:
+            self.assertLessEqual(set(entry), allowed)
+            self.assertNotIn("preview", entry)
+        held = self.conn.dumped()
+        values = " ".join(v for e in entries for v in e.values())
+        for text in (secret, private, WORDS, "Zq7Lx2", "address", "contract"):
+            self.assertNotIn(text, held)
+        for source in (private + " token " + secret + " " + WORDS,):
+            runs = {source[i:i + 6] for i in range(len(source) - 5)}
+            self.assertEqual(set(), {run for run in runs if run in values})
+        self.assertEqual({"by": "grok", "row_id": "ROW-RAW", "at": "2026-11-08T03:00:00Z", "phase": ""},
+                         entries[1])
+
+    def test_unsafe_ids_and_fields_are_dropped(self):
+        """thread_id, msg_type and class travel only when each fully matches its short pattern.
+        by and at blank when unsafe. A row id that is not a safe id skips the row."""
+        cases = [
+            "thread_id=thread-9", "thread_id=TH-has space", "thread_id=TH-lower",
+            "thread_id=TH-" + "A" * 65, "thread_id=TH-", "thread_id=TH-OK\nmore",
+        ]
+        for i, field in enumerate(cases):
+            conn = FakeRedis()
+            payload = "BCB|v=1|phase=ask now|msg_type=call the owner|class=" + "C" * 33 + "|" + field
+            sr.mirror_addressed(conn, [row("ROW-%d" % i, "grok", payload,
+                                           source="grok said hi", ts="tomorrow morning")])
+            entry = conn.inbox("grok")[0]
+            self.assertEqual({"by": "", "row_id": "ROW-%d" % i, "at": "", "phase": ""}, entry, field)
+        conn = FakeRedis()
+        sr.mirror_addressed(conn, [row("ROW with words", "grok", "ping"),
+                                   row("ROW-" + "9" * 200, "grok", "ping")])
+        self.assertEqual({}, conn.streams)
+        self.assertEqual({}, conn.data)
 
     def test_all_and_fleet_expand_to_every_principal_once(self):
         self.mirror([row("ROW-ALL", "ALL", "hello fleet")])
@@ -320,24 +357,19 @@ class BoardToRedis(unittest.TestCase):
         self.assertEqual(["ROW-1"], [e["row_id"] for e in self.conn.inbox("grok")])
         self.assertEqual(2, len(self.conn.inbox("cursor")))
 
-    def test_call_bridge_text_is_withheld(self):
+    def test_call_bridge_rows_put_no_words_in_the_lane(self):
         rows = [
             row("ROW-ASK", "cursor", "CALL ASK call-1 from the owner: " + WORDS),
             row("ROW-BY", "cursor", "by=call-bridge|text=" + WORDS, source="grok"),
             row("ROW-SRC", "cursor", WORDS, source="call-bridge"),
             row("ROW-PLAIN", "grok", WORDS, source="grok"),
         ]
-        self.mirror(rows)
-        for rid in ("ROW-ASK", "ROW-BY", "ROW-SRC"):
-            found = [e for e in self.conn.inbox("cursor") if e["row_id"] == rid]
-            self.assertEqual([sr.redis_gov.WITHHELD], [e["preview"] for e in found], rid)
-        self.assertIn(WORDS, self.conn.inbox("grok")[0]["preview"])
+        self.assertEqual(4, self.mirror(rows))
+        self.assertEqual(["ROW-ASK", "ROW-BY", "ROW-SRC"], [e["row_id"] for e in self.conn.inbox("cursor")])
+        self.assertEqual(["ROW-PLAIN"], [e["row_id"] for e in self.conn.inbox("grok")])
         held = self.conn.dumped()
-        self.assertEqual(3, held.count(sr.redis_gov.WITHHELD))
-        self.assertNotIn("sample queue flow", "\n".join(
-            e["preview"] for e in self.conn.inbox("cursor")))
-        for entry in self.conn.inbox("cursor"):
-            self.assertNotIn(WORDS, " ".join(entry.values()))
+        for text in (WORDS, "sample queue flow", "CALL ASK", "from the owner", "Codex,"):
+            self.assertNotIn(text, held)
 
     def test_loop_rows_are_skipped(self):
         rows = [
@@ -542,7 +574,8 @@ class TheFlag(unittest.TestCase):
         git = [row("ROW-GIT", "cursor", "from git", source="cursor")]
         code, conn, handled = self.run_live(rows, "on", git)
         self.assertEqual(0, code)
-        self.assertEqual(["please look"], [e["preview"] for e in conn.inbox("grok")])
+        self.assertEqual(["ROW-1"], [e["row_id"] for e in conn.inbox("grok")])
+        self.assertNotIn("please look", conn.dumped())
         self.assertNotIn("fleet:inbox:cursor", conn.streams, "a git row is not a board row")
         self.assertEqual(1, len([c for c in conn.calls if c[0] == "xadd"]))
         self.assertEqual("1", conn.data["fleet:wake:mirrored:ROW-1:grok"])

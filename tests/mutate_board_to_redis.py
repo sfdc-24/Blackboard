@@ -2,7 +2,8 @@
 """Mutation checks for the board-to-Redis mirror. Each guard is removed on purpose.
 
 The NX on fleet:wake:mirrored must be what stops a re-read from adding a second inbox entry.
-The WITHHELD preview must be what keeps call-bridge text out of the lane. The script's DEL on a
+The entry is metadata only: no preview, no text field, and each copied id or tag must fully match
+its safe pattern, or payload words reach a lane every principal can read. The script's DEL on a
 failed XADD, and its pcall around the XADD, must be what lets the next pass deliver a copy that
 failed. The per-agent catch must be what lets one agent's failure leave the others delivered. A
 mutant that leaves the suite green is an untested claim. The Lua mutants are run by the test's
@@ -35,12 +36,46 @@ MUTANTS = [
         "test_a_reread_adds_nothing",
     ),
     (
-        "call-text-preview-is-the-raw-payload",
+        "a-preview-comes-back",
         "cloud/bus-reconciler/serve_requests.py",
-        'redis_gov.WITHHELD if call_bridge_text(source, payload) else (payload or "")[:PREVIEW_CHARS]',
-        '(payload or "")[:PREVIEW_CHARS]',
-        "a row carrying call-bridge text puts the owner's words in the inbox preview",
-        "test_call_bridge_text_is_withheld",
+        '        "phase": _safe("phase", _bcb_field(payload, "phase")),\n',
+        '        "phase": _safe("phase", _bcb_field(payload, "phase")),\n'
+        '        "preview": (payload or "")[:300],\n',
+        "the payload's first 300 characters, secrets and private words included, ride into the lane",
+        "test_no_payload_text_reaches_the_lane",
+    ),
+    (
+        "call-text-rides-in-a-field",
+        "cloud/bus-reconciler/serve_requests.py",
+        '        "phase": _safe("phase", _bcb_field(payload, "phase")),\n',
+        '        "phase": _safe("phase", _bcb_field(payload, "phase")),\n'
+        '        "text": _bcb_field(payload, "text") or (payload or "")[:120],\n',
+        "a call-bridge row's words reach the lane under another field name",
+        "test_call_bridge_rows_put_no_words_in_the_lane",
+    ),
+    (
+        "an-unsafe-thread-id-travels",
+        "cloud/bus-reconciler/serve_requests.py",
+        '"thread_id": re.compile(r"TH-[A-Z0-9-]{1,64}"),',
+        '"thread_id": re.compile(r".+", re.S),',
+        "any text written as thread_id=... reaches the lane",
+        "test_unsafe_ids_and_fields_are_dropped",
+    ),
+    (
+        "safe-is-a-prefix-match",
+        "cloud/bus-reconciler/serve_requests.py",
+        "return value if _SAFE[name].fullmatch(value) else \"\"",
+        "return value if _SAFE[name].match(value) else \"\"",
+        "a safe-looking prefix carries the words after it into the lane",
+        "test_unsafe_ids_and_fields_are_dropped",
+    ),
+    (
+        "an-unsafe-row-id-is-copied",
+        "cloud/bus-reconciler/serve_requests.py",
+        'if not _safe("row_id", row_id) or source.lower() in LOOP_SOURCES:',
+        "if not row_id or source.lower() in LOOP_SOURCES:",
+        "a row id made of words becomes a lane entry and a mark key",
+        "test_unsafe_ids_and_fields_are_dropped",
     ),
     (
         "a-failed-xadd-keeps-its-mark",

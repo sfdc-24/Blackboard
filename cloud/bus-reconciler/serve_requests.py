@@ -21,9 +21,10 @@ Redis it writes is the worker lock under gov:, plus — only when CALL_SHEET_MIR
 the call-sheet cursors and a stale end. The sheet is a projection of that record. It never
 speaks, and it never writes a voice lane. The step is off by default and is not a deploy.
 
-BOARD_TO_REDIS must be exactly "on" before a live pass also copies an addressed board row into
-each named agent's fleet:inbox. Unset, empty, "off", "ON" and "true" leave that copy out, and the
-pass's Redis use is the lock and the heartbeat (plus the call-sheet keys above, when that flag is on).
+BOARD_TO_REDIS must be exactly "on" before a live pass also adds a metadata-only entry (no payload
+text) for an addressed board row to each named agent's fleet:inbox. Unset, empty, "off", "ON" and
+"true" leave that copy out, and the pass's Redis use is the lock and the heartbeat (plus the
+call-sheet keys above, when that flag is on).
 """
 from __future__ import annotations
 
@@ -390,18 +391,28 @@ def _loop_until(text):
 # and a mark, and the next pass adds nothing. One agent's failure is logged as its exception type
 # and the copy goes on to the next agent and the next row.
 #
-# CALL WORDS NEVER TRAVEL. A row that carries the call bridge's text gets redis_gov.WITHHELD as its
-# preview. The words stay on the board; the lane gets the marker the public board already uses.
+# METADATA ONLY. No payload text reaches a lane: no preview, no free text, and so no call words
+# either. The fleet principals read every key, so a lane is not a confidentiality boundary. An
+# entry is by, row_id, at and phase, plus thread_id, msg_type and class when each matches a short
+# safe pattern; a value that does not match is dropped (a row id that does not match skips the
+# row). An agent woken by the entry reads the row itself on the board, under the board's rules.
 # Rows from bus-reconciler or redis-audit are not copied: those writers are this process and the
 # audit, and copying them would loop. Nothing here appends a board row, and a log line from this
 # path is an exception type, never a key and never a value.
 BOARD_TO_REDIS = "BOARD_TO_REDIS"
-PREVIEW_CHARS = 300
 LOOP_SOURCES = frozenset({"bus-reconciler", "redis-audit"})
 _EXPAND = frozenset({"all", "fleet"})
-_PHASE = re.compile(r"(?:^|\|)\s*phase=([^|]*)", re.I)
-_THREAD = re.compile(r"(?:^|\|)\s*thread_id=([^|]*)", re.I)
-_BY_CALL = re.compile(r"(?:^|\|)\s*by\s*=\s*call-bridge\b", re.I)
+_ENTRY_KEYS = ("phase", "thread_id", "msg_type", "class")
+# Each copied value must FULLY match its pattern. None of them can carry a sentence.
+_SAFE = {
+    "row_id": re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}"),
+    "by": re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@-]{0,63}"),
+    "at": re.compile(r"[0-9][0-9TZ:.+ -]{0,39}"),
+    "phase": re.compile(r"[A-Z][A-Z0-9_]{0,31}"),
+    "thread_id": re.compile(r"TH-[A-Z0-9-]{1,64}"),
+    "msg_type": re.compile(r"[A-Z][A-Z0-9_]{0,31}"),
+    "class": re.compile(r"[A-Z][A-Z0-9_]{0,31}"),
+}
 # KEYS[1] the mark, KEYS[2] the lane. ARGV[1] the ttl, ARGV[2..] the entry's field/value pairs.
 # 0: already copied. 1: added. An error reply: nothing is left behind, the mark is gone too.
 MIRROR_LUA = """
@@ -432,7 +443,7 @@ def _row_cell(row, index) -> str:
 
 
 def _payload(row) -> str:
-    """The payload cell as text, not stripped: the preview is its first PREVIEW_CHARS characters."""
+    """The payload cell as text. Only its safe key=value fields are read; none of its text is copied."""
     if not isinstance(row, (list, tuple)) or len(row) <= 5 or row[5] is None:
         return ""
     value = row[5]
@@ -482,29 +493,31 @@ def addressed_agents(target, principals, aliases) -> list:
     return out
 
 
-def call_bridge_text(source, payload) -> bool:
-    """A row whose words are the call bridge's: sent as call-bridge, quoting its CALL ASK line, or
-    carrying by=call-bridge. The preview of such a row is redis_gov.WITHHELD."""
-    if str(source or "").strip().lower() == redis_gov.CALL_BRIDGE_BY:
-        return True
-    text = payload or ""
-    return "CALL ASK" in text or _BY_CALL.search(text) is not None
+def _safe(name, value) -> str:
+    """value when it fully matches the pattern for `name`, else ""."""
+    value = str(value or "").strip()
+    return value if _SAFE[name].fullmatch(value) else ""
+
+
+def _bcb_field(payload, key) -> str:
+    """The first `key=` field of a pipe-separated payload, unchecked. _safe decides if it travels."""
+    found = re.search(r"(?:^|\|)\s*" + re.escape(key) + r"=([^|]*)", payload or "", re.I)
+    return found.group(1) if found else ""
 
 
 def mirror_fields(source, row_id, at, payload) -> dict:
-    """The stream entry. thread_id only when the payload has one. preview is the payload's first
-    300 characters, or WITHHELD when the row carries call-bridge text."""
-    phase = _PHASE.search(payload or "")
-    thread = _THREAD.search(payload or "")
+    """The stream entry: metadata only, never payload text. by, row_id, at and phase are always
+    present ("" when absent or unsafe); thread_id, msg_type and class only when present and safe."""
     fields = {
-        "by": source,
-        "row_id": row_id,
-        "at": at,
-        "phase": phase.group(1).strip() if phase else "",
-        "preview": redis_gov.WITHHELD if call_bridge_text(source, payload) else (payload or "")[:PREVIEW_CHARS],
+        "by": _safe("by", source),
+        "row_id": _safe("row_id", row_id),
+        "at": _safe("at", at),
+        "phase": _safe("phase", _bcb_field(payload, "phase")),
     }
-    if thread and thread.group(1).strip():
-        fields["thread_id"] = thread.group(1).strip()
+    for key in _ENTRY_KEYS[1:]:
+        value = _safe(key, _bcb_field(payload, key))
+        if value:
+            fields[key] = value
     return fields
 
 
@@ -528,7 +541,7 @@ def mirror_addressed(conn, rows) -> int:
     for row in rows or []:
         row_id = _row_cell(row, 0)
         source = _row_cell(row, 2)
-        if not row_id or source.lower() in LOOP_SOURCES:
+        if not _safe("row_id", row_id) or source.lower() in LOOP_SOURCES:
             continue
         agents = addressed_agents(_row_cell(row, 3), principals, aliases)
         if not agents:
@@ -565,7 +578,7 @@ def one_pass(conn, env, execution, with_git=True, quiet=False, renew=None, settl
         try:
             mirror(rows)
         except Exception as error:                                       # noqa: BLE001
-            # The type only. A key or a preview in this line would put the row, and his words, in the log.
+            # The type only. A key or any row text in this line would put the row, and his words, in the log.
             log.warning("board mirror failed (%s)", type(error).__name__)
     if settle is not None:
         try:
