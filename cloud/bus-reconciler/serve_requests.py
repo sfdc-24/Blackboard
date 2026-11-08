@@ -18,23 +18,31 @@ WHAT IT CANNOT DO. It holds the board credential, so it CAN append - and the com
 writes to the board at all, which is deliberate: a compare run must not be able to alter what it is
 comparing. The rows it writes here are its own receipts and results, under its own Row_IDs, and the
 only Redis key it touches is one the server names in its own namespace.
+
+BOARD_TO_REDIS must be exactly "on" before a live pass also copies an addressed board row into
+each named agent's fleet:inbox. Unset, empty, "off", "ON" and "true" leave that copy out, and the
+pass's Redis use is the lock and the heartbeat.
 """
 from __future__ import annotations
 
+import ast
 import datetime
 import json
 import logging
 import os
+import re
 import sys
 import tempfile
 import threading
 import time
+from pathlib import Path
 
 sys.path.insert(0, "/app")
 
 import bus_request                                                       # noqa: E402
 import bus_reconcile                                                     # noqa: E402
 import redis_dual                                                        # noqa: E402
+import redis_gov                                                         # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 log = logging.getLogger("bus-requests")
@@ -252,6 +260,9 @@ def live(conn, env, execution, me, until, interval, lock_ttl, settle=None) -> in
     stop = until                                     # already capped by LOOP_MAX_MINUTES, in main (live_deadline)
     log.info("live mode: every %ds, GitHub every %ds, until %s", interval, git_every, stop.strftime("%H:%M:%SZ"))
     last_git, passes = None, 0
+    # Exactly "on". Anything else leaves `mirror` unset, and the one_pass call below is the one it
+    # was: no mirror keyword, no inbox write.
+    mirror = (lambda rows, _conn=conn: mirror_addressed(_conn, rows)) if board_to_redis_on() else None
     while datetime.datetime.now(datetime.timezone.utc) < stop:
         held = keep_lock(conn, me, lock_ttl)
         if held is False:
@@ -265,9 +276,12 @@ def live(conn, env, execution, me, until, interval, lock_ttl, settle=None) -> in
         now = datetime.datetime.now(datetime.timezone.utc)
         with_git = last_git is None or (now - last_git).total_seconds() >= git_every
         try:
-            # `settle` only when the call bridge runs: without it a pass is called exactly as before.
+            # `settle` only when the call bridge runs, and `mirror` only when BOARD_TO_REDIS is exactly
+            # on. Without either, a pass is called exactly as before.
             one_pass(conn, env, execution, with_git=with_git, quiet=True,
-                     renew=lambda: keep_lock(conn, me, lock_ttl), **({"settle": settle} if settle else {}))
+                     renew=lambda: keep_lock(conn, me, lock_ttl),
+                     **({"settle": settle} if settle else {}),
+                     **({"mirror": mirror} if mirror else {}))
         except Exception as error:                                       # noqa: BLE001
             # One bad pass (a board flap, a lost reply) must not end the meeting's channel.
             log.warning("pass failed: %s", type(error).__name__)
@@ -360,11 +374,163 @@ def _loop_until(text):
     return when if when.tzinfo else when.replace(tzinfo=datetime.timezone.utc)
 
 
-def one_pass(conn, env, execution, with_git=True, quiet=False, renew=None, settle=None):
+# Q2 of the Redis doorbell. The live loop already reads the board every few seconds inside the VPC.
+# With BOARD_TO_REDIS exactly "on", each new row whose Target_Surface names an agent is also one
+# stream entry on fleet:inbox:<agent>, so a lane reader (Q1, built separately) has something to
+# block on. Off, this block is not called and the pass does not touch those keys.
+#
+# EXACTLY ONCE per row and agent: SET NX fleet:wake:mirrored:<row_id>:<agent> with the fleet ttl,
+# and only then XADD. A re-read of the same window finds the mark and adds nothing. The mark is
+# written first on purpose: a retry must not deliver twice. A crash between the two loses that one
+# copy rather than duplicating it.
+#
+# CALL WORDS NEVER TRAVEL. A row that carries the call bridge's text gets redis_gov.WITHHELD as its
+# preview. The words stay on the board; the lane gets the marker the public board already uses.
+# Rows from bus-reconciler or redis-audit are not copied: those writers are this process and the
+# audit, and copying them would loop. Nothing here appends a board row, and a log line from this
+# path is an exception type, never a key and never a value.
+BOARD_TO_REDIS = "BOARD_TO_REDIS"
+PREVIEW_CHARS = 300
+LOOP_SOURCES = frozenset({"bus-reconciler", "redis-audit"})
+_EXPAND = frozenset({"all", "fleet"})
+_PHASE = re.compile(r"(?:^|\|)\s*phase=([^|]*)", re.I)
+_THREAD = re.compile(r"(?:^|\|)\s*thread_id=([^|]*)", re.I)
+_BY_CALL = re.compile(r"(?:^|\|)\s*by\s*=\s*call-bridge\b", re.I)
+
+
+def board_to_redis_on(environ=None) -> bool:
+    """True only when BOARD_TO_REDIS is exactly "on". Unset, empty, and every other value are off."""
+    environ = os.environ if environ is None else environ
+    return environ.get(BOARD_TO_REDIS) == "on"
+
+
+def _cell(row, index) -> str:
+    if not isinstance(row, (list, tuple)) or index >= len(row) or row[index] is None:
+        return ""
+    value = row[index]
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", "replace")
+    return str(value).strip()
+
+
+def _payload(row) -> str:
+    """The payload cell as text, not stripped: the preview is its first PREVIEW_CHARS characters."""
+    if not isinstance(row, (list, tuple)) or len(row) <= 5 or row[5] is None:
+        return ""
+    value = row[5]
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    return str(value)
+
+
+def inbox_wake_aliases() -> dict:
+    """The ALIASES dict in cloud/inbox-wake/main.py, when that file is on disk.
+
+    The checkout keeps it at cloud/inbox-wake/main.py, next to this directory. The image copies
+    that same file to /app/inbox_wake_main.py (not main.py: that name is this job's entrypoint).
+    Parsed, not imported: importing it would load the wake server into this process. Absent, the
+    access list's own aliases still apply."""
+    here = Path(__file__).resolve()
+    found = next((path for path in (
+        here.parent.parent / "inbox-wake" / "main.py",
+        here.parent / "inbox_wake_main.py",
+    ) if path.is_file()), None)
+    if found is None:
+        return {}
+    tree = ast.parse(found.read_text(encoding="utf-8"))
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+                isinstance(target, ast.Name) and target.id == "ALIASES" for target in node.targets):
+            value = ast.literal_eval(node.value)
+            return {str(key).strip().lower(): str(item).strip().lower() for key, item in value.items()}
+    return {}
+
+
+def addressed_agents(target, principals, aliases) -> list:
+    """Principals named by a Target_Surface. ALL and fleet mean every principal. One hop of alias,
+    then the name has to be a principal. Order is the address list, then principal order for an
+    expansion, and a name is kept once."""
+    known = set(principals)
+    out, seen = [], set()
+    for part in re.split(r"[,;]", str(target or "")):
+        token = part.strip().lower()
+        if not token:
+            continue
+        names = list(principals) if token in _EXPAND else (aliases.get(token, token),)
+        for name in names:
+            if name in known and name not in seen:
+                seen.add(name)
+                out.append(name)
+    return out
+
+
+def call_bridge_text(source, payload) -> bool:
+    """A row whose words are the call bridge's: sent as call-bridge, quoting its CALL ASK line, or
+    carrying by=call-bridge. The preview of such a row is redis_gov.WITHHELD."""
+    if str(source or "").strip().lower() == redis_gov.CALL_BRIDGE_BY:
+        return True
+    text = payload or ""
+    return "CALL ASK" in text or _BY_CALL.search(text) is not None
+
+
+def mirror_fields(source, row_id, at, payload) -> dict:
+    """The stream entry. thread_id only when the payload has one. preview is the payload's first
+    300 characters, or WITHHELD when the row carries call-bridge text."""
+    phase = _PHASE.search(payload or "")
+    thread = _THREAD.search(payload or "")
+    fields = {
+        "by": source,
+        "row_id": row_id,
+        "at": at,
+        "phase": phase.group(1).strip() if phase else "",
+        "preview": redis_gov.WITHHELD if call_bridge_text(source, payload) else (payload or "")[:PREVIEW_CHARS],
+    }
+    if thread and thread.group(1).strip():
+        fields["thread_id"] = thread.group(1).strip()
+    return fields
+
+
+def mirror_addressed(conn, rows) -> int:
+    """XADD one entry per named agent for each board row. Returns how many entries were added.
+
+    The access list decides who a principal is and what the fleet ttl is. Inbox-wake aliases are
+    merged on top of the access list's aliases. An unreadable list, or a fleet ttl that is not
+    set, copies nothing: there is no second ttl to invent. Does not log a key or a value."""
+    acl = redis_gov.load_acl()
+    if not acl.get("readable"):
+        return 0
+    ttl = redis_gov.ttl_for(acl, "fleet:")
+    if not ttl:
+        return 0
+    principals = list(acl["principals"])
+    aliases = {str(key).lower(): str(value).lower() for key, value in (acl.get("aliases") or {}).items()}
+    aliases.update(inbox_wake_aliases())
+    added = 0
+    for row in rows or []:
+        row_id = _cell(row, 0)
+        source = _cell(row, 2)
+        if not row_id or source.lower() in LOOP_SOURCES:
+            continue
+        agents = addressed_agents(_cell(row, 3), principals, aliases)
+        if not agents:
+            continue
+        fields = mirror_fields(source, row_id, _cell(row, 1), _payload(row))
+        for agent in agents:
+            # NX first. A lost race, or a row this pass already copied, does not XADD.
+            if not conn.set("fleet:wake:mirrored:%s:%s" % (row_id, agent), "1", nx=True, ex=int(ttl)):
+                continue
+            conn.xadd("fleet:inbox:%s" % agent, fields)
+            added += 1
+    return added
+
+
+def one_pass(conn, env, execution, with_git=True, quiet=False, renew=None, settle=None, mirror=None):
     """Read the board (and GitHub), answer what is allowed, beat the heartbeat. One pass.
 
     `settle`, when given, is handed the board rows just read (the call bridge's done flips); its failure costs
-    those flips this pass and nothing else."""
+    those flips this pass and nothing else. `mirror`, when given, is handed those same board rows, before the
+    git channel is appended; the live loop passes it only when BOARD_TO_REDIS is exactly on. Its failure
+    costs the copy this pass and nothing else. Absent, this pass does not touch an inbox."""
     now = datetime.datetime.now(datetime.timezone.utc)
     bus_request.heartbeat(conn, "running", now=now, execution=execution)
     since = (now - datetime.timedelta(minutes=WINDOW_MINUTES)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -372,6 +538,12 @@ def one_pass(conn, env, execution, with_git=True, quiet=False, renew=None, settl
     # The board read can take minutes; the lock is renewed after it, and before each append below.
     if renew is not None and renew() is not True:
         raise LockLost("gov:worker:lock is not provably ours after the board read; this pass answers nothing")
+    if mirror is not None:
+        try:
+            mirror(rows)
+        except Exception as error:                                       # noqa: BLE001
+            # The type only. A key or a preview in this line would put the row, and his words, in the log.
+            log.warning("board mirror failed (%s)", type(error).__name__)
     if settle is not None:
         try:
             settle(rows)
