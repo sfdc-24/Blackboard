@@ -146,6 +146,147 @@ class TheClient(unittest.TestCase):
         self.assertEqual([("xwait", bridge_client.WAIT_HTTP_TIMEOUT), ("get", bridge_client.HTTP_TIMEOUT)], seen)
 
 
+class ABusyBridgeIsABackoffNotAFallback(unittest.TestCase):
+    """CAPACITY (Gemini, GEMINI-ARCH-REDIS-DOORBELL-20261108T1645Z): the bridge holds at most eight waits and answers
+    a ninth with a 429 "busy". The client must wait and ask again: not a refusal, not a breaker failure, and never
+    the board route."""
+
+    @staticmethod
+    def answering(status, body):
+        class Opener:
+            def open(self, req, timeout=None):
+                raw = json.dumps(body).encode("utf-8") if body is not None else b"<html>Rate exceeded</html>"
+                raise bridge_client.urllib.error.HTTPError(req.full_url, status, "", {}, io.BytesIO(raw))
+        return Opener()
+
+    def test_a_429_busy_or_any_429_on_a_wait_is_busy_with_a_bounded_retry(self):
+        busy = {"error": "busy", "executed": False, "retry_after": 5}
+        cases = ((busy, "xwait", 5.0),
+                 (None, "xwait", float(bridge_client.BUSY_RETRY_SECONDS)),      # the platform's own 429
+                 (dict(busy, retry_after=0), "xwait", 1.0),
+                 (dict(busy, retry_after=86400), "xwait", float(bridge_client.BUSY_RETRY_MAX)),
+                 (dict(busy, retry_after="soon"), "xwait", float(bridge_client.BUSY_RETRY_SECONDS)),
+                 (dict(busy, retry_after="nan"), "xwait", float(bridge_client.BUSY_RETRY_SECONDS)))
+        for body, op, seconds in cases:
+            with self.subTest(body=body):
+                with self.assertRaises(bridge_client.Busy) as raised:
+                    bridge_client.call("https://bridge.invalid", "tok", {"op": op, "key": "k"},
+                                       opener=self.answering(429, body))
+                self.assertEqual(seconds, raised.exception.retry_after)
+
+    def test_the_chair_s_quota_429_on_a_write_is_unchanged(self):
+        with self.assertRaises(bridge_client.Unknown):
+            bridge_client.call("https://bridge.invalid", "tok", {"op": "set", "key": "k"},
+                               opener=self.answering(429, {"error": "quota", "executed": False}))
+
+    def attempt(self, tmp, raised, write=False):
+        import os
+        said = []
+        environ = {"REDIS_BRIDGE": "on", "REDIS_BRIDGE_URL": "https://bridge.invalid",
+                   "REDIS_BRIDGE_IMPERSONATE": "fleet-grok@sfdc24.iam.gserviceaccount.com"}
+
+        def caller(url, token, request):
+            raise raised
+
+        with self.assertRaises(bridge_client.Busy):
+            bridge_client.attempt("xadd" if write else "xwait", "fleet:inbox:grok", me="grok",
+                                  value="v" if write else None, after=None if write else "1-0",
+                                  environ=environ, state_path=os.path.join(tmp, "s.json"),
+                                  journal_path=os.path.join(tmp, "j.jsonl"),
+                                  callers={"fleet-grok@sfdc24.iam.gserviceaccount.com": "grok"},
+                                  say=said.append, minter=lambda url, sa: "tok", caller=caller,
+                                  announce=lambda line: said.append("ANNOUNCED " + line))
+        return said
+
+    def test_attempt_raises_busy_and_neither_falls_back_nor_counts_it_against_the_bridge(self):
+        import os
+        with tempfile.TemporaryDirectory() as tmp:
+            state = os.path.join(tmp, "s.json")
+            bridge_client.save_state({"failures": 2, "open_until": 0.0}, state)
+            for _ in range(5):
+                said = self.attempt(tmp, bridge_client.Busy(5))
+                self.assertFalse([line for line in said if "board route" in line or "ANNOUNCED" in line], said)
+            self.assertEqual({"failures": 2, "open_until": 0.0}, bridge_client.load_state(state),
+                             "five busy answers neither tripped the breaker nor reset it")
+
+    def test_a_busy_write_closes_its_journal_line_as_not_executed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            import os
+            self.attempt(tmp, bridge_client.Busy(5), write=True)
+            self.assertEqual([], bridge_client.pending(os.path.join(tmp, "j.jsonl")),
+                             "a write the bridge turned away is not left UNKNOWN")
+
+    def test_the_doorbell_sleeps_on_busy_and_waits_again_and_never_takes_the_board(self):
+        cursor = pathlib.Path(tempfile.mkdtemp()) / "cursor"
+        redis_doorbell.write_cursor(cursor, "6-0")
+        calls, slept = [], []
+
+        def attempt(op, key, *, me, after, count):
+            calls.append(op)
+            if len(calls) <= 2:
+                raise bridge_client.Busy(5)
+            return {"ok": True, "value": [{"id": "7-0", "text": "hello"}], "last": "7-0"}
+
+        out = io.StringIO()
+        code = redis_doorbell.ring("grok", attempt=attempt, out=out, cursor_file=cursor, rounds=5,
+                                   sleep=slept.append)
+        self.assertEqual(0, code, "busy is neither exit 2 (refused) nor exit 3 (use the board doorbell)")
+        self.assertEqual(["xwait"] * 3, calls)
+        self.assertEqual(2, len(slept))
+        for pause in slept:
+            self.assertTrue(5 <= pause <= 6, pause)
+        self.assertEqual("7-0", cursor.read_text(encoding="utf-8"))
+        self.assertEqual("hello", json.loads(out.getvalue().splitlines()[0])["text"])
+
+    def test_the_doorbell_on_the_real_client_backs_off_on_the_bridge_s_429(self):
+        import os
+        cursor = pathlib.Path(tempfile.mkdtemp()) / "cursor"
+        redis_doorbell.write_cursor(cursor, "6-0")
+        answers = [(429, {"error": "busy", "executed": False, "retry_after": 5}),
+                   (200, {"ok": True, "principal": "grok", "value": [{"id": "8-0"}], "last": "8-0"})]
+
+        class Answer:
+            def __init__(self, raw):
+                self.status, self.raw = 200, raw
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self, n=-1):
+                return self.raw
+
+        class Opener:
+            def open(self, req, timeout=None):
+                status, body = answers.pop(0)
+                raw = json.dumps(body).encode("utf-8")
+                if status != 200:
+                    raise bridge_client.urllib.error.HTTPError(req.full_url, status, "", {}, io.BytesIO(raw))
+                return Answer(raw)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            environ = {"REDIS_BRIDGE": "on", "REDIS_BRIDGE_URL": "https://bridge.invalid",
+                       "REDIS_BRIDGE_IMPERSONATE": "fleet-grok@sfdc24.iam.gserviceaccount.com"}
+            said, slept = [], []
+
+            def attempt(op, key, **kw):
+                return bridge_client.attempt(
+                    op, key, environ=environ, state_path=os.path.join(tmp, "s.json"),
+                    journal_path=os.path.join(tmp, "j.jsonl"), say=said.append, minter=lambda url, sa: "tok",
+                    callers={"fleet-grok@sfdc24.iam.gserviceaccount.com": "grok"},
+                    caller=lambda url, token, request: bridge_client.call(url, token, request, opener=Opener()), **kw)
+
+            code = redis_doorbell.ring("grok", attempt=attempt, out=io.StringIO(), cursor_file=cursor, rounds=3,
+                                       sleep=slept.append)
+            self.assertEqual(0, code)
+            self.assertEqual(1, len(slept))
+            self.assertEqual([], answers, "it asked the bridge again after the busy answer")
+            self.assertFalse([line for line in said if "board route" in line or "FAILED" in line], said)
+            self.assertEqual("8-0", cursor.read_text(encoding="utf-8"))
+
+
 class TheDoorbell(unittest.TestCase):
     def setUp(self):
         self.cursor = pathlib.Path(tempfile.mkdtemp()) / "cursor"

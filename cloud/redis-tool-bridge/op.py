@@ -28,13 +28,18 @@ THE TWO LAYERS THAT CAN FAIL ON THEIR OWN, AND THEIR STATUSES
         403 principal mismatch   the caller is bound to a different principal than the one the
                                  client said it expects to be; nothing was executed
         403 refused              redis_gov refused it; `reason` is redis_gov's own, and `audit` says
-                                 whether the refusal itself was recorded
+                                 whether the refusal itself was recorded. Or THE DOORBELL's door
+                                 refused it before any connection (below): `reason` is the door's,
+                                 `audit` is "not recorded" and "executed" is false
         503 redis unreachable    NO CONNECTION WAS MADE. Always with "executed": false
         502 failed               a READ raised inside Redis; the error TYPE only; nothing changed
         502 outcome unknown      a WRITE raised after the connection was made. It may have
                                  committed. The error TYPE only
         409 replay               the chair sent a request id it already sent; nothing was written
                                  and the hour was not charged
+        429 busy                 MAX_WAITS xwaits are already held on this instance (CAPACITY, below);
+                                 nothing was executed, and "retry_after" says how many seconds to
+                                 wait before asking again
         200                      redis_gov's result, as it returned it
 
     "EXECUTED": FALSE IS A PROMISE, AND ITS ABSENCE IS NOT ONE (Aya on 919fd52)
@@ -75,6 +80,7 @@ THE BODY
     so the chair can tell the acknowledgment of ITS request from any other 200. What a caller is FOR is
     its line in callers.json, never the request:
         a fleet agent     may not state either member: a 400. Its own name is already the verified one.
+        a doorbell        may not state either member: a 400, as a fleet agent.
         the chair         must state both on every op: a 400 without them.
         a probe account   is admitted to the service for /probe and is refused here: a 403.
 
@@ -104,6 +110,19 @@ THE BODY
     Each is refused before any connection, with "executed": false. 'Hold on, team' is the chair's to keep: the
     bridge does not hear the call.
 
+    THE DOORBELL (Codex on sfdc-24/Blackboard#489: the owner approved Grok reaching its Redis doorbell and nothing
+    wider). A caller whose line says "for": "doorbell" acts as its principal, as a fleet agent does, and may do two
+    things, both on its OWN lane, fleet:inbox:<principal>, exactly as sent:
+        xwait             the doorbell itself (redis_gov's OPS_WAIT: XREAD BLOCK after a cursor; redis_gov
+                          requires the cursor, caps the count and keeps the wait on the bridge).
+        xrange            count 1 and no after: the lane's newest entry id, which is where
+                          scripts/redis_doorbell.py starts on a first run (lane_position).
+    Neither takes a field, a value or an encoding. Every other op, every other key, and either form with anything
+    more, is refused here, before any connection: a 403 "refused" with the door's reason, "audit": "not recorded",
+    "executed": false (doorbell_refusal). A 403 "refused" is TERMINAL for scripts/bridge_client.py, so a client is
+    not moved to the board route around it. Whatever the access list allows the principal is not widened by this
+    line; it is narrowed to these two.
+
     THE HOUR, KEPT IN REDIS (Gemini on e6433ea, GROK-407FIX-428REV-0225Z: the service scales to zero, and a count
     kept only in memory starts again at nought with every new instance). Each ceiling is held twice:
         in Redis          redis_gov.hourly, a window of 3,600 seconds from the first count in it
@@ -117,6 +136,16 @@ THE BODY
     A REPEATED REQUEST ID (redis_gov.once, gov:once:chair:<what>:<id>) is not written and is not charged: 409
     "replay", "executed": false. The claim is forgotten when the quota was not touched or redis_gov refused the
     write, so that id can be sent again; a 200 and an outcome-unknown keep it.
+
+    CAPACITY (Gemini, GEMINI-ARCH-REDIS-DOORBELL-20261108T1645Z: PASS on the condition that held waits can never
+    starve the chair). An xwait holds its request for the whole wait, and the service runs one instance. So at
+    most MAX_WAITS xwaits are held at once on it (a BoundedSemaphore, taken without blocking after every other
+    refusal and before the connection, and given back in a finally whatever the wait does). The next one is not
+    queued behind them: it is a 429 "busy" at once, "executed": false, and scripts/bridge_client.py raises Busy,
+    which scripts/redis_doorbell.py sleeps on and asks again; it is not a refusal and not a reason to use the
+    board. deploy.sh serves 32 requests at once (main.py's ThreadingHTTPServer, a thread a request, and a
+    connection of the request's own from connect()), so with every wait slot held 24 remain for everything else,
+    the chair's ops among them. No other op touches the semaphore.
 
     WHAT THIS DOES NOT DO, AND MUST BE SAID WHEREVER THE PILOT IS APPROVED: THE BRIDGE TRUSTS THE CHAIR'S
     IDENTITY. It does not see the owner's confirmation and does not enforce it; the chair does. Whoever
@@ -133,6 +162,7 @@ import html
 import json
 import os
 import re
+import threading
 import time
 import urllib.parse
 
@@ -145,8 +175,16 @@ MEMBERS = ("op", "key", "field", "val", "enc", "count", "after", "expect", "auth
 # inside any other op is an unknown outcome. Restated from redis_gov.OPS_READ and held equal by a test.
 READS = ("get", "hgetall", "xrange")
 # What a caller is FOR: its line in callers.json says, and a line that says anything else maps nobody.
-FLEET, CHAIR, PROBE = "fleet-agent", "chair", "probe"
-PURPOSES = (FLEET, CHAIR, PROBE)
+FLEET, CHAIR, PROBE, DOORBELL = "fleet-agent", "chair", "probe", "doorbell"
+PURPOSES = (FLEET, CHAIR, PROBE, DOORBELL)
+# THE DOORBELL: a caller's own lane (redis_gov.WAIT_LANE), and the two ops it runs there.
+DOORBELL_LANE = "fleet:inbox:"
+DOORBELL_OPS = ("xwait", "xrange")
+# CAPACITY: the ops that hold their request for a wait (redis_gov.OPS_WAIT, restated and held equal by a test),
+# how many may be held at once on this instance, and how long a caller turned away is told to wait.
+WAITS = ("xwait",)
+MAX_WAITS = 8
+WAIT_RETRY_SECONDS = 5
 CHAIR_OPS = ("get", "set")
 CHAIR_WRITES_PER_HOUR = 20              # in Redis for 3,600s from the first count, and in memory for the last hour
 MAX_PERSONAS = 4                        # as the chair's own cast
@@ -177,6 +215,8 @@ _CANVAS_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 clock = time.time                       # the door's clock; a test puts its own here
 _SPENT = collections.deque()            # when this instance's chair writes were made, oldest first
 _CANVAS_SPENT = collections.deque()     # when this instance's chair canvas posts were made, oldest first
+_WAITING = threading.BoundedSemaphore(MAX_WAITS)   # the held xwaits (CAPACITY); nothing else takes it
+_TAKING = threading.Lock()              # take() reads and appends in one step: requests run on threads
 
 
 def _lines(path=None) -> dict:
@@ -186,6 +226,8 @@ def _lines(path=None) -> dict:
         "principal"                                             a fleet agent, as every line was at first
         {"principal": ..., "for": "fleet-agent" | "probe"}      a fleet agent; or an account admitted for the
                                                                 probe only, which /op refuses
+        {"principal": ..., "for": "doorbell"}                   its own lane's doorbell and nothing else
+                                                                (THE DOORBELL, doorbell_refusal)
         {"principal": ..., "for": "chair", "personas": [...]}   the conference chair, and the personas it may
                                                                 name: one to MAX_PERSONAS names, each once
         that line plus "rooms": [...]                          the rooms whose canvas it may post to: one to
@@ -205,7 +247,7 @@ def _lines(path=None) -> dict:
         personas, rooms = (), ()
         if isinstance(line, str):
             who, purpose = line, FLEET
-        elif isinstance(line, dict) and set(line) == {"principal", "for"} and line["for"] in (FLEET, PROBE):
+        elif isinstance(line, dict) and set(line) == {"principal", "for"} and line["for"] in (FLEET, PROBE, DOORBELL):
             who, purpose = line["principal"], line["for"]
         elif isinstance(line, dict) and line.get("for") == CHAIR and set(line) in (
                 {"principal", "for", "personas"}, {"principal", "for", "personas", "rooms"}):
@@ -262,13 +304,15 @@ def days(now: float) -> tuple:
 
 def take(now: float, spent, ceiling: int = CHAIR_WRITES_PER_HOUR) -> bool:
     """May the chair make one more write in this hour? `spent` holds the times of the ones made. THIS HALF IS
-    PER INSTANCE AND IN MEMORY, and forgotten when the instance stops; redis_gov.hourly is the half that is not."""
-    while spent and now - spent[0] >= 3600.0:
-        spent.popleft()
-    if len(spent) >= ceiling:
-        return False
-    spent.append(now)
-    return True
+    PER INSTANCE AND IN MEMORY, and forgotten when the instance stops; redis_gov.hourly is the half that is not.
+    Under a lock: main.py serves each request on its own thread, and two chair writes must not both see room."""
+    with _TAKING:
+        while spent and now - spent[0] >= 3600.0:
+            spent.popleft()
+        if len(spent) >= ceiling:
+            return False
+        spent.append(now)
+        return True
 
 
 
@@ -344,6 +388,22 @@ def canvas_refusal(request: dict, author: str) -> str:
     return ""
 
 
+def doorbell_refusal(request: dict, who: str) -> str:
+    """Why this is not an op a doorbell caller may run, in words fit for the caller; "" when it is. The op and
+    the key as they were SENT, as the chair's are read: the doorbell client sends them exact. Never the value."""
+    lane = DOORBELL_LANE + who
+    if request["op"] not in DOORBELL_OPS:
+        return ("a doorbell caller may run xwait on its own lane, and xrange for its first cursor, "
+                "and nothing else")
+    if request["key"] != lane:
+        return "a doorbell caller waits on its own lane, %s, and no other key" % lane
+    if request["field"] or request["val"] or request["enc"]:
+        return "a doorbell op takes no field, value or encoding"
+    if request["op"] == "xrange" and (request["after"] or request["count"] != 1):
+        return "a doorbell caller's xrange reads its lane's newest entry only: count 1 and no after"
+    return ""
+
+
 def parse(raw: bytes) -> tuple:
     """(request dict, None) or (None, why). The why is for our log; the caller gets 'bad request'."""
     try:
@@ -371,13 +431,14 @@ def parse(raw: bytes) -> tuple:
 
 
 def handle(caller: str, raw: bytes, connect, log, callers=None, gov=None, acl=None, purposes=None,
-           personas=None, rooms=None, now=None, spent=None, canvas_spent=None) -> tuple:
+           personas=None, rooms=None, now=None, spent=None, canvas_spent=None, waits=None) -> tuple:
     """(status, body) for one /op request from an ALREADY VERIFIED caller.
 
     caller   the email main.verify_caller returned: verified, and on BRIDGE_CALLERS.
     connect  main.connect; called only after the request has parsed, so a malformed body costs no
              connection.
     log      a callable taking one line. No value, no key content and no body ever goes to it.
+    waits    the semaphore that bounds held xwaits (CAPACITY); _WAITING unless a test gives its own.
     """
     email = str(caller or "").strip().lower()
     purpose = (load_purposes() if purposes is None else purposes).get(email, FLEET)
@@ -430,6 +491,33 @@ def handle(caller: str, raw: bytes, connect, log, callers=None, gov=None, acl=No
     elif author or asked:
         log("op by %s: author or request stated by a caller that is not the chair" % caller)
         return 400, {"error": "bad request", "executed": False}
+    if purpose == DOORBELL:
+        why = doorbell_refusal(request, who)
+        if why:
+            log("op by %s as %s: not a doorbell op (%s)" % (caller, who, why))
+            return 403, {"error": "refused", "reason": why, "executed": False, "audit": "not recorded",
+                         "caller": caller, "principal": who}
+    if op in WAITS:
+        # CAPACITY. After every refusal above, so a wait that would be refused anyway holds no slot; before the
+        # connection, so a caller turned away cost Redis nothing and "executed": false is true. Never blocking:
+        # a wait queued behind eight others would hold a request slot while it queued.
+        gate = _WAITING if waits is None else waits
+        if not gate.acquire(blocking=False):
+            log("op by %s as %s: %s busy (%d waits already held)" % (caller, who, op, MAX_WAITS))
+            return 429, {"error": "busy", "executed": False, "retry_after": WAIT_RETRY_SECONDS}
+        try:
+            return _governed(caller, who, purpose, request, op, author, asked, canvas, connect, log, gov, acl,
+                             now, spent, canvas_spent)
+        finally:
+            gate.release()
+    return _governed(caller, who, purpose, request, op, author, asked, canvas, connect, log, gov, acl,
+                     now, spent, canvas_spent)
+
+
+def _governed(caller, who, purpose, request, op, author, asked, canvas, connect, log, gov, acl, now, spent,
+              canvas_spent) -> tuple:
+    """handle()'s second half: the connection, the chair's hour, and the one governed call. Every refusal that
+    needs no connection is behind it already."""
     stated = {name: value for name, value in (("author", author), ("request", asked)) if value}
     if gov is None:
         import redis_gov as gov

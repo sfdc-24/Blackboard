@@ -910,10 +910,17 @@ class TheOpEndpoint(unittest.TestCase):
         # THE PILOT, pinned whole: the chair for one persona, Aya's account for the probe and no more, and
         # (the owner, 2026-11-08) claude-code-cli as the first fleet agent on /op, acting as itself.
         # Another caller, a second persona or another fleet agent fails HERE, in the PR that proposes it.
+        # Grok, Codex and Gemini (the owner, 2026-11-08: the doorbell for every agent) are DOORBELL callers, each
+        # as itself: its own lane and nothing else (Codex on #489). claude-code-cli's fleet-agent line covers its own.
         cli = "fleet-claude-code-cli@sfdc24.iam.gserviceaccount.com"
-        self.assertEqual({AYA: bridge_op.PROBE, CHAIR: bridge_op.CHAIR, cli: bridge_op.FLEET}, purposes,
-                         "every line says what it is for")
-        self.assertEqual({CHAIR: "conference-chair", cli: "claude-code-cli"}, callers,
+        grok = "fleet-grok@sfdc24.iam.gserviceaccount.com"
+        codex = "fleet-codex@sfdc24.iam.gserviceaccount.com"
+        gemini = "fleet-gemini@sfdc24.iam.gserviceaccount.com"
+        self.assertEqual({AYA: bridge_op.PROBE, CHAIR: bridge_op.CHAIR, cli: bridge_op.FLEET, grok: bridge_op.DOORBELL,
+                          codex: bridge_op.DOORBELL, gemini: bridge_op.DOORBELL},
+                         purposes, "every line says what it is for")
+        self.assertEqual({CHAIR: "conference-chair", cli: "claude-code-cli", grok: "grok",
+                          codex: "chatgpt-codex-desktop", gemini: "gemini"}, callers,
                          "an account admitted for the probe acts as nobody; the fleet agent acts as itself")
         self.assertEqual({CHAIR: ("claude",)}, bridge_op.load_personas())
         self.assertEqual({CHAIR: ("workshop",)}, bridge_op.load_rooms(), "the owner named one room")
@@ -935,6 +942,14 @@ class TheOpEndpoint(unittest.TestCase):
             if purposes[email] == bridge_op.FLEET:
                 for key in ("fleet:inbox:probe", "conf:side:20261013"):
                     self.assertTrue(may(who, "xadd", key), "%s cannot write %s" % (who, key))
+                continue
+            if purposes[email] == bridge_op.DOORBELL:
+                # The access list must let it read its own lane, or the doorbell is locked out; the door
+                # (doorbell_refusal) is what narrows it to that lane, and the doorbell tests below hold the door.
+                lane = bridge_op.DOORBELL_LANE + who
+                self.assertEqual(("xwait", "xrange"), bridge_op.DOORBELL_OPS)
+                for op in bridge_op.DOORBELL_OPS:
+                    self.assertTrue(may(who, op, lane), "%s cannot %s %s" % (who, op, lane))
                 continue
             self.assertEqual({"read": ["conf:persona:"], "write": ["conf:persona:", "conf:canvas:"]},
                              acl["principals"][who], "the chair's line is these entries and no more")
@@ -1007,16 +1022,21 @@ class TheOpEndpoint(unittest.TestCase):
         words = shlex.split(rendered)
         self.assertEqual(1, len(words), "the environment flag is one shell word: %r" % words[:3])
         self.assertTrue(words[0].startswith("--set-env-vars=^;^REDIS_HOST=10.0.0.1;"))
-        self.assertTrue(words[0].endswith("fleet-claude-code-cli@sfdc24.iam.gserviceaccount.com"))
+        self.assertTrue(words[0].endswith("fleet-claude-code-cli@sfdc24.iam.gserviceaccount.com,"
+                                          "fleet-grok@sfdc24.iam.gserviceaccount.com,"
+                                          "fleet-codex@sfdc24.iam.gserviceaccount.com,"
+                                          "fleet-gemini@sfdc24.iam.gserviceaccount.com"))
         self.assertIn("echo 'set -euo pipefail'", DEPLOY, "the generated script stops at its first failure")
         self.assertIn("deploy_cmds | bash -euo pipefail -s", DEPLOY)
         self.assertLess(DEPLOY.index("echo 'set -euo pipefail'"), DEPLOY.index("gcloud run deploy ${SERVICE}"),
                         "the stop is set before the deploy, so no IAM line can follow a failed one")
 
     def test_the_deploy_runs_one_instance_which_is_what_makes_the_hourly_ceiling_one_ceiling(self):
-        """take() counts in the instance's memory. Two instances would be two ceilings."""
-        self.assertEqual(1, DEPLOY.count("  --min-instances=0 --max-instances=1 --concurrency=4 \\"))
+        """take() counts in the instance's memory. Two instances would be two ceilings. 32 requests at once
+        (CAPACITY): at 4, four held waits left nothing for the chair."""
+        self.assertEqual(1, DEPLOY.count("  --min-instances=0 --max-instances=1 --concurrency=32 \\"))
         self.assertNotIn("--max-instances=2", DEPLOY)
+        self.assertNotIn("--concurrency=4 ", DEPLOY)
 
     def test_a_line_says_a_principal_and_what_the_caller_is_for_or_it_maps_nobody(self):
         import json
@@ -1027,6 +1047,9 @@ class TheOpEndpoint(unittest.TestCase):
             "agent@x": {"principal": "Grok", "for": "fleet-agent"},
             " Chair@X ": dict(chair, personas=["claude", "grok"]),
             "probe@x": {"principal": "Grok", "for": "probe"},              # admitted for the probe: acts as nobody
+            "door@x": {"principal": "Grok", "for": "doorbell"},            # its own lane's doorbell
+            "doorp@x": {"principal": "grok", "for": "doorbell", "personas": ["claude"]},
+            "doorr@x": {"principal": "grok", "for": "doorbell", "rooms": ["workshop"]},
             "other@x": {"principal": "grok", "for": "admin"},              # for nothing this file knows
             "more@x": dict(chair, personas=["claude"], note="x"),          # a member too many
             "none@x": {"for": "chair", "personas": ["claude"]}, "blank@x": dict(chair, principal=" ", personas=["claude"]),
@@ -1051,9 +1074,9 @@ class TheOpEndpoint(unittest.TestCase):
             path = os.path.join(tmp, "callers.json")
             pathlib.Path(path).write_text(json.dumps({"callers": lines}), encoding="utf-8")
             self.assertEqual({"old@x": "grok", "agent@x": "grok", "chair@x": "conference-chair",
-                              "rooms@x": "conference-chair"}, bridge_op.load_callers(path))
+                              "rooms@x": "conference-chair", "door@x": "grok"}, bridge_op.load_callers(path))
             self.assertEqual({"old@x": "fleet-agent", "agent@x": "fleet-agent", "chair@x": "chair", "probe@x": "probe",
-                              "rooms@x": "chair"},
+                              "rooms@x": "chair", "door@x": "doorbell"},
                              bridge_op.load_purposes(path))
             self.assertEqual({"chair@x": ("claude", "grok"), "rooms@x": ("claude",)}, bridge_op.load_personas(path))
             self.assertEqual({"rooms@x": ("workshop",)}, bridge_op.load_rooms(path))
@@ -1485,6 +1508,213 @@ class TheOpEndpoint(unittest.TestCase):
         self.assertEqual((403, {"error": "not authorised", "executed": False}), (code, self.said(out)))
         self.assertEqual([], self.conn.audit())
 
+
+    # --- THE DOORBELL (Codex on #489): grok, by fleet-grok@, may wait on its own lane and read that lane's newest
+    # entry id, and nothing else. Through the committed file and the real handler.
+    GROK = "fleet-grok@sfdc24.iam.gserviceaccount.com"
+    LANE = "fleet:inbox:grok"
+
+    def as_grok(self, body, **more):
+        return self.post(body, claims={"email": self.GROK, "email_verified": True}, admitted=self.GROK,
+                         committed=True, **more)
+
+    @staticmethod
+    def waiting():
+        from test_redis_xwait import WaitingRedis
+        return WaitingRedis()
+
+    def test_the_doorbell_waits_on_its_own_lane_as_itself(self):
+        conn = self.waiting()
+        for text in ("one", "two", "three"):
+            conn.xadd(self.LANE, {"by": "claude-code-cli", "text": text})
+        code, out = self.as_grok({"op": "xwait", "key": self.LANE, "after": "1-0", "expect": "grok"}, conn=conn)
+        self.assertEqual((200, "grok"), (code, out["principal"]), out)
+        self.assertEqual(["two", "three"], [entry["text"] for entry in out["value"]])
+        self.assertEqual("3-0", out["last"])
+        last = conn.audit()[-1]
+        self.assertEqual(("xwait", "grok", "bridge:" + self.GROK), (last["op"], last["actor"], last["via"]))
+
+    def test_the_doorbell_s_first_cursor_is_its_own_lane_s_newest_entry(self):
+        conn = self.waiting()
+        for text in ("one", "two"):
+            conn.xadd(self.LANE, {"by": "claude-code-cli", "text": text})
+        code, out = self.as_grok({"op": "xrange", "key": self.LANE, "count": 1, "expect": "grok"}, conn=conn)
+        self.assertEqual((200, ["2-0"]), (code, [entry["id"] for entry in out["value"]]), out)
+
+    def test_the_doorbell_client_runs_end_to_end_through_the_door_as_grok(self):
+        """scripts/redis_doorbell.py and scripts/bridge_client.py as Grok's box runs them, answered by the door
+        itself: neither needs to know what the caller is for."""
+        import json
+        import tempfile
+        import urllib.error
+        sys.path.insert(0, str(ROOT / "scripts"))
+        import bridge_client
+        import redis_doorbell
+        conn = self.waiting()
+        conn.xadd(self.LANE, {"by": "claude-code-cli", "text": "before"})
+        test = self
+
+        class Answer:
+            def __init__(self, status, raw):
+                self.status, self.raw = status, raw
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self, n=-1):
+                return self.raw
+
+        class Door:
+            def open(self, req, timeout=None):
+                code, out = test.as_grok(json.loads(req.data.decode("utf-8")), conn=conn)
+                raw = json.dumps(out).encode("utf-8")
+                if code != 200:
+                    raise urllib.error.HTTPError(req.full_url, code, "", {}, io.BytesIO(raw))
+                return Answer(code, raw)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            environ = {"REDIS_BRIDGE": "on", "REDIS_BRIDGE_URL": AUD, "REDIS_BRIDGE_IMPERSONATE": self.GROK}
+
+            def attempt(op, key, **kw):
+                return bridge_client.attempt(
+                    op, key, environ=environ, state_path=os.path.join(tmp, "s.json"),
+                    journal_path=os.path.join(tmp, "j.jsonl"), say=lambda line: None, minter=lambda url, sa: "tok",
+                    caller=lambda url, token, request: bridge_client.call(url, token, request, opener=Door()), **kw)
+            cursor, out = os.path.join(tmp, "cursor"), io.StringIO()
+            self.assertEqual(0, redis_doorbell.ring("grok", attempt=attempt, out=out, cursor_file=cursor, rounds=1))
+            self.assertEqual(("1-0", ""), (pathlib.Path(cursor).read_text(encoding="utf-8"), out.getvalue()),
+                             "a first run starts at the lane's newest entry")
+            conn.xadd(self.LANE, {"by": "claude-code-cli", "text": "after"})
+            self.assertEqual(0, redis_doorbell.ring("grok", attempt=attempt, out=out, cursor_file=cursor, rounds=1))
+            self.assertEqual(["after"], [json.loads(line)["text"] for line in out.getvalue().splitlines()])
+            self.assertEqual("2-0", pathlib.Path(cursor).read_text(encoding="utf-8"))
+            with self.assertRaises(bridge_client.Refused) as refused:
+                attempt("xadd", "fleet:inbox:claude-code-cli", me="grok", value="hello")
+            self.assertIn("doorbell", refused.exception.reason)
+            self.assertEqual("not confirmed", refused.exception.audit, "the door's refusal is not in gov:audit")
+        self.assertEqual(["xrange", "xwait", "xwait"], [entry["op"] for entry in conn.audit()],
+                         "the refused write never reached Redis")
+
+    def test_the_doorbell_may_do_nothing_else_and_nothing_else_reaches_redis(self):
+        connected = []
+
+        def connect():
+            connected.append(1)
+            return self.conn
+        val = {"val": self.b64("hunter2"), "enc": "b64"}
+        for body in ({"op": "xwait", "key": "fleet:inbox:claude-code-cli", "after": "0-0"},    # another agent's lane
+                     {"op": "xwait", "key": "fleet:inbox:grok-2", "after": "0-0"},
+                     {"op": "xwait", "key": "conf:side:20261108", "after": "0-0"},
+                     {"op": "xwait", "key": " fleet:inbox:grok", "after": "0-0"},             # exactly as sent
+                     {"op": "xwait", "key": self.LANE, "after": "0-0", "field": "x"},
+                     {"op": "xwait", "key": self.LANE, "after": "0-0", **val},
+                     {"op": "xrange", "key": self.LANE, "count": 5},                         # more than its cursor
+                     {"op": "xrange", "key": self.LANE},                                     # the default count is 10
+                     {"op": "xrange", "key": self.LANE, "count": 1, "after": "1-0"},
+                     {"op": "xrange", "key": "fleet:inbox:claude-code-cli", "count": 1},
+                     {"op": "xrange", "key": "gov:audit", "count": 1},
+                     {"op": "xrange", "key": "conf:side:20261108", "count": 1},
+                     {"op": "get", "key": self.LANE}, {"op": "get", "key": "proj:x"}, {"op": "get", "key": "fleet:x"},
+                     {"op": "hgetall", "key": self.LANE}, {"op": "hgetall", "key": "conf:canvas:workshop:chair"},
+                     {"op": "set", "key": self.LANE, **val}, {"op": "set", "key": "fleet:x", **val},
+                     {"op": "xadd", "key": self.LANE, **val}, {"op": "xadd", "key": "fleet:inbox:claude-code-cli", **val},
+                     {"op": "hset", "key": self.LANE, "field": "f", **val},
+                     {"op": "hset", "key": "conf:canvas:workshop:chair", "field": "f", **val},
+                     {"op": "del", "key": self.LANE}, {"op": "hput", "key": "proj:milestones:x", **val},
+                     {"op": "XWAIT", "key": self.LANE, "after": "0-0"}):
+            with self.subTest(body=body):
+                code, out = self.as_grok(body, connect=connect)
+                self.assertEqual((403, "refused", False, "not recorded", "grok"),
+                                 (code, out["error"], out["executed"], out["audit"], out["principal"]), out)
+                self.assertIn("doorbell", out["reason"])
+                self.assertIn("not a doorbell op", self.log)
+                self.assertNotIn("hunter2", self.log)
+        self.assertEqual(([], []), (connected, self.conn.audit()), "refused at the door, before any connection")
+        for body in ({"op": "xwait", "key": self.LANE, "after": "0-0", "author": "claude", "request": "R-1"},
+                     {"op": "xrange", "key": self.LANE, "count": 1, "author": "grok"}):
+            with self.subTest(body=body):
+                code, out = self.as_grok(body, connect=connect)
+                self.assertEqual((400, {"error": "bad request", "executed": False}), (code, self.said(out)))
+                self.assertIn("not the chair", self.log)
+        self.assertEqual([], connected)
+
+    def test_the_doorbell_s_reason_names_its_own_lane_and_never_the_key_it_was_sent(self):
+        code, out = self.as_grok({"op": "xwait", "key": "fleet:inbox:secretlane", "after": "0-0"})
+        self.assertEqual(403, code)
+        self.assertIn("fleet:inbox:grok", out["reason"])
+        self.assertNotIn("secretlane", out["reason"] + self.log)
+
+    def test_every_doorbell_account_waits_on_its_own_lane_and_on_no_other(self):
+        """The owner, 2026-11-08: the doorbell for every agent. Each account's lane is fleet:inbox:<its principal>,
+        the canonical id the board-to-Redis mirror writes (cloud/inbox-wake ALIASES: codex is chatgpt-codex-desktop)."""
+        accounts = {"fleet-grok@sfdc24.iam.gserviceaccount.com": "grok",
+                    "fleet-codex@sfdc24.iam.gserviceaccount.com": "chatgpt-codex-desktop",
+                    "fleet-gemini@sfdc24.iam.gserviceaccount.com": "gemini"}
+        self.assertEqual(accounts, {email: who for email, who in bridge_op.load_callers().items()
+                                    if bridge_op.load_purposes()[email] == bridge_op.DOORBELL})
+        lanes = ["fleet:inbox:" + who for who in accounts.values()] + ["fleet:inbox:claude-code-cli"]
+        for email, who in accounts.items():
+            conn = self.waiting()
+            for lane in lanes:
+                conn.xadd(lane, {"by": "claude-code-cli", "text": "for " + lane})
+            mine = "fleet:inbox:" + who
+
+            def as_it(body):
+                return self.post(dict(body, expect=who), claims={"email": email, "email_verified": True},
+                                 admitted=email, committed=True, conn=conn)
+            with self.subTest(account=email):
+                code, out = as_it({"op": "xrange", "key": mine, "count": 1})
+                self.assertEqual((200, ["for " + mine]), (code, [entry["text"] for entry in out["value"]]), out)
+                code, out = as_it({"op": "xwait", "key": mine, "after": "0-0"})
+                self.assertEqual((200, ["for " + mine]), (code, [entry["text"] for entry in out["value"]]), out)
+                self.assertEqual(("xwait", who, "bridge:" + email),
+                                 (conn.audit()[-1]["op"], conn.audit()[-1]["actor"], conn.audit()[-1]["via"]))
+                audited = len(conn.audit())
+                for other in lanes:
+                    if other == mine:
+                        continue
+                    for body in ({"op": "xwait", "key": other, "after": "0-0"},
+                                 {"op": "xrange", "key": other, "count": 1}):
+                        code, out = as_it(body)
+                        self.assertEqual((403, "refused", False), (code, out["error"], out["executed"]), body)
+                for body in ({"op": "get", "key": mine}, {"op": "xadd", "key": mine, "val": self.b64("v"), "enc": "b64"},
+                             {"op": "set", "key": "fleet:x", "val": self.b64("v"), "enc": "b64"},
+                             {"op": "hgetall", "key": "proj:x"}):
+                    code, out = as_it(body)
+                    self.assertEqual((403, "refused", False), (code, out["error"], out["executed"]), body)
+                self.assertEqual(audited, len(conn.audit()), "no refused op reached Redis")
+
+    def test_claude_code_cli_s_fleet_agent_line_already_covers_its_own_doorbell(self):
+        cli = "fleet-claude-code-cli@sfdc24.iam.gserviceaccount.com"
+        self.assertEqual(bridge_op.FLEET, bridge_op.load_purposes()[cli])
+        conn = self.waiting()
+        conn.xadd("fleet:inbox:claude-code-cli", {"by": "grok", "text": "ring"})
+        code, out = self.post({"op": "xwait", "key": "fleet:inbox:claude-code-cli", "after": "0-0"},
+                              claims={"email": cli, "email_verified": True}, admitted=cli, committed=True, conn=conn)
+        self.assertEqual((200, ["ring"]), (code, [entry["text"] for entry in out["value"]]), out)
+
+    def test_a_fleet_agent_on_the_committed_file_is_unchanged_by_the_doorbell(self):
+        cli = "fleet-claude-code-cli@sfdc24.iam.gserviceaccount.com"
+        conn = self.waiting()
+
+        def as_cli(body):
+            return self.post(body, claims={"email": cli, "email_verified": True}, admitted=cli, committed=True,
+                             conn=conn)
+        code, out = as_cli({"op": "xadd", "key": self.LANE, "val": self.b64("ring"), "enc": "b64"})
+        self.assertEqual((200, "claude-code-cli"), (code, out["principal"]), out)
+        code, out = as_cli({"op": "xrange", "key": self.LANE, "count": 5})
+        self.assertEqual((200, ["ring"]), (code, [entry["text"] for entry in out["value"]]), out)
+        code, out = as_cli({"op": "set", "key": "fleet:x", "val": self.b64("v"), "enc": "b64"})
+        self.assertEqual(200, code, out)
+        code, out = as_cli({"op": "xwait", "key": "fleet:inbox:claude-code-cli", "after": "0-0"})
+        self.assertEqual(200, code, out)
+        code, out = as_cli({"op": "xwait", "key": self.LANE, "after": "0-0"})
+        self.assertEqual((403, "refused", "ok"), (code, out["error"], out["audit"]), "redis_gov's own refusal, as before")
+        self.assertIn("own lane", out["reason"])
+
     def test_the_chair_gets_and_sets_its_persona_s_key_and_that_is_all_the_file_opens(self):
         note = "Converspan demo note 1"
         code, out = self.chair({"op": "set", "key": self.KEY, "val": self.b64(note), "enc": "b64"}, committed=True)
@@ -1539,6 +1769,296 @@ class TheOpEndpoint(unittest.TestCase):
         """D1 is not given. Until it is, the script keeps its own warning."""
         self.assertIn("DO NOT RUN THIS YET", DEPLOY)
 
+
+class HeldWaitsCannotStarveTheChair(unittest.TestCase):
+    """CAPACITY (Gemini, GEMINI-ARCH-REDIS-DOORBELL-20261108T1645Z: PASS on this condition). An xwait holds its
+    request for its whole wait. At most MAX_WAITS are held at once; the next is a 429 "busy" at once and is never
+    queued; a slot comes back however the wait ends; and no other op touches the limit, so the chair is served
+    while every wait slot is held. No network: the threaded test listens on 127.0.0.1 only."""
+
+    GROK = "fleet-grok@sfdc24.iam.gserviceaccount.com"
+    LANE = "fleet:inbox:grok"
+    WAIT = {"op": "xwait", "key": "fleet:inbox:grok", "after": "1-0", "expect": "grok"}
+
+    def setUp(self):
+        import threading
+        self.threading = threading
+        self.release = threading.Event()
+        self.addCleanup(self.release.set)           # a failed test must not leave threads holding slots
+
+    def free_slots(self):
+        """How many slots the real semaphore has free, by taking them all without blocking and giving them back."""
+        taken = 0
+        while bridge_op._WAITING.acquire(blocking=False):
+            taken += 1
+        for _ in range(taken):
+            bridge_op._WAITING.release()
+        return taken
+
+    def holding_gov(self, inside):
+        """A governor whose xwait blocks until self.release is set, and counts who is inside."""
+        test = self
+
+        class Gov:
+            Refused = redis_gov.Refused
+
+            @staticmethod
+            def load_acl():
+                return {}
+
+            @staticmethod
+            def execute(conn, acl, who, via, op, key, **kw):
+                if op == "xwait":
+                    inside.append(who)
+                    test.release.wait(10)
+                return {"ok": True, "op": op, "key": key, "entries": 0, "value": [], "last": kw.get("after", "")}
+        return Gov
+
+    def door(self, body, gov, connected=None):
+        log = []
+        code, out = bridge_op.handle(
+            self.GROK, __import__("json").dumps(body).encode("utf-8"),
+            lambda: connected.append(1) if connected is not None else object(), log.append,
+            callers={self.GROK: "grok"}, purposes={self.GROK: bridge_op.DOORBELL}, gov=gov, acl={})
+        return code, out, log
+
+    def test_the_limit_is_eight_held_waits_and_the_ops_are_redis_gov_s(self):
+        self.assertEqual(8, bridge_op.MAX_WAITS)
+        self.assertEqual(tuple(redis_gov.OPS_WAIT), bridge_op.WAITS)
+        self.assertIsInstance(bridge_op._WAITING, type(self.threading.BoundedSemaphore(1)))
+        self.assertEqual(bridge_op.MAX_WAITS, self.free_slots())
+
+    def test_eight_waits_are_admitted_and_the_ninth_is_busy_at_once_and_reaches_nothing(self):
+        import time
+        inside, results = [], []
+        gov = self.holding_gov(inside)
+        threads = [self.threading.Thread(target=lambda: results.append(self.door(self.WAIT, gov)[:2]))
+                   for _ in range(bridge_op.MAX_WAITS)]
+        for thread in threads:
+            thread.start()
+        deadline = time.time() + 5
+        while len(inside) < bridge_op.MAX_WAITS and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(bridge_op.MAX_WAITS, len(inside), "eight waits are held at once")
+        connected = []
+        started = time.time()
+        code, out, log = self.door(self.WAIT, gov, connected)
+        self.assertLess(time.time() - started, 1.0, "the ninth is answered at once, not queued")
+        self.assertEqual((429, {"error": "busy", "executed": False, "retry_after": bridge_op.WAIT_RETRY_SECONDS}),
+                         (code, out))
+        self.assertEqual([], connected, "a wait turned away never connects")
+        self.assertEqual(bridge_op.MAX_WAITS, len(inside), "and never reaches the governor")
+        self.assertIn("busy", log[-1])
+        self.release.set()
+        for thread in threads:
+            thread.join(5)
+        self.assertEqual([200] * bridge_op.MAX_WAITS, [code for code, _ in results])
+        self.assertEqual(bridge_op.MAX_WAITS, self.free_slots(), "every slot came back")
+
+    def test_a_slot_comes_back_when_a_wait_ends_whether_it_answers_raises_or_cannot_connect(self):
+        class Raising:
+            Refused = redis_gov.Refused
+
+            @staticmethod
+            def load_acl():
+                return {}
+
+            @staticmethod
+            def execute(*a, **k):
+                raise RuntimeError("the wait blew up")
+
+        for _ in range(bridge_op.MAX_WAITS * 2):
+            with self.assertRaises(RuntimeError):
+                self.door(self.WAIT, Raising)
+        self.assertEqual(bridge_op.MAX_WAITS, self.free_slots(), "a wait that raised gave its slot back")
+
+        def unreachable():
+            raise ConnectionError("no route")
+
+        for _ in range(bridge_op.MAX_WAITS * 2):
+            code, out = bridge_op.handle(self.GROK, __import__("json").dumps(self.WAIT).encode("utf-8"),
+                                         unreachable, lambda line: None, callers={self.GROK: "grok"},
+                                         purposes={self.GROK: bridge_op.DOORBELL}, gov=Raising, acl={})
+            self.assertEqual((503, "redis unreachable"), (code, out["error"]))
+        self.assertEqual(bridge_op.MAX_WAITS, self.free_slots(), "a wait that could not connect gave its slot back")
+        inside = []
+        self.release.set()
+        for _ in range(bridge_op.MAX_WAITS * 2):
+            self.assertEqual(200, self.door(self.WAIT, self.holding_gov(inside))[0])
+        self.assertEqual(bridge_op.MAX_WAITS, self.free_slots(), "a wait that answered gave its slot back")
+
+    def test_a_refused_wait_holds_no_slot_and_no_other_op_touches_the_limit(self):
+        held = []
+        while bridge_op._WAITING.acquire(blocking=False):
+            held.append(1)
+        try:
+            self.assertEqual(bridge_op.MAX_WAITS, len(held))
+            gov = self.holding_gov([])
+            code, out, _ = self.door(dict(self.WAIT, key="fleet:inbox:gemini"), gov)
+            self.assertEqual((403, "refused"), (code, out["error"]), "the door's refusal comes first, not busy")
+            code, out, _ = self.door({"op": "xrange", "key": self.LANE, "count": 1, "expect": "grok"}, gov)
+            self.assertEqual(200, code, "the doorbell's xrange is not a wait")
+            for op, purpose in (("get", bridge_op.FLEET), ("xadd", bridge_op.FLEET)):
+                code, out = bridge_op.handle(
+                    "agent@x", __import__("json").dumps({"op": op, "key": "fleet:x"}).encode("utf-8"),
+                    object, lambda line: None, callers={"agent@x": "claude-code-cli"},
+                    purposes={"agent@x": purpose}, gov=gov, acl={})
+                self.assertEqual(200, code, "%s does not wait on the limit" % op)
+        finally:
+            for _ in held:
+                bridge_op._WAITING.release()
+
+    def blocking_bridge(self):
+        """The real handler, op.handle, redis_gov and committed callers.json, with a Redis whose XREAD blocks until
+        self.release is set. Returns the list each blocked XREAD is appended to."""
+        import time
+        from test_redis_xwait import WaitingRedis
+        test = self
+        blocked = []
+
+        class BlockingRedis(WaitingRedis):
+            def xread(self, streams, count=None, block=None):
+                blocked.append(block)
+                test.release.wait(10)
+                return super().xread(streams, count=count, block=block)
+
+        saved = bridge.verify_caller, bridge.connect, bridge_op.clock
+        admitted = {self.GROK, CHAIR}
+        bridge.verify_caller = lambda token, aud, permitted: (token, None) if token in admitted else (None, "unauthenticated")
+        bridge.connect = BlockingRedis                # a connection of the request's own, as connect() makes
+        bridge_op.clock = time.time
+
+        def restore():
+            bridge.verify_caller, bridge.connect, bridge_op.clock = saved
+        self.addCleanup(restore)
+        return blocked
+
+    def chair_get(self):
+        import datetime
+        day = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d")
+        return {"op": "get", "key": "conf:persona:%s:claude" % day, "author": "claude", "request": "cap-1",
+                "expect": "conference-chair"}
+
+    def wait_for(self, seen, n):
+        import time
+        deadline = time.time() + 5
+        while len(seen) < n and time.time() < deadline:
+            time.sleep(0.01)
+        return len(seen)
+
+    def test_the_chair_is_served_by_the_handler_while_eight_waits_are_held(self):
+        """NO SOCKETS (CI runs the suites with no network at all). Each request is the real Handler.do_POST on its own
+        thread, as ThreadingHTTPServer runs it: eight waits blocked inside XREAD, then the chair's get must finish
+        while they are held, then a ninth wait is busy at once. A handler or door that serialises requests fails."""
+        import json
+        import time
+        blocked = self.blocking_bridge()
+
+        def do_post(who, body, sink):
+            handler = object.__new__(bridge.Handler)
+            handler.path = "/op"
+            raw = json.dumps(body).encode("utf-8")
+            handler.headers = {"Content-Length": str(len(raw)), "Authorization": "Bearer " + who}
+            handler.rfile = io.BytesIO(raw)
+            handler._send = lambda code, out: sink.append((code, out))
+            handler.do_POST()
+
+        def threaded(who, body):
+            sink = []
+            thread = self.threading.Thread(target=do_post, args=(who, body, sink), daemon=True)
+            thread.start()
+            return thread, sink
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            waits = [threaded(self.GROK, self.WAIT) for _ in range(bridge_op.MAX_WAITS)]
+            self.assertEqual(bridge_op.MAX_WAITS, self.wait_for(blocked, bridge_op.MAX_WAITS),
+                             "eight waits are held inside XREAD at once")
+            started = time.time()
+            chair, said = threaded(CHAIR, self.chair_get())
+            chair.join(3)
+            self.assertFalse(chair.is_alive(), "the chair's get finished while eight waits were held")
+            self.assertEqual(1, len(said))
+            code, out = said[0]
+            self.assertEqual((200, True, "conference-chair"), (code, out["ok"], out["principal"]), out)
+            ninth, busy = threaded(self.GROK, self.WAIT)
+            ninth.join(1)
+            self.assertFalse(ninth.is_alive(), "the ninth wait is answered at once, not queued")
+            self.assertEqual((429, "busy", False), (busy[0][0], busy[0][1]["error"], busy[0][1]["executed"]))
+            self.assertLess(time.time() - started, 3.0)
+            self.assertEqual(bridge_op.MAX_WAITS, len(blocked), "neither the chair nor the ninth reached XREAD")
+            self.release.set()
+            for thread, _ in waits:
+                thread.join(10)
+        self.assertEqual([200] * bridge_op.MAX_WAITS, [sink[0][0] for _, sink in waits])
+        self.assertEqual(bridge_op.MAX_WAITS, self.free_slots())
+
+    def test_main_serves_each_request_on_its_own_thread(self):
+        """The handler-level test above is only the service's behaviour if the server runs requests on threads:
+        the class main() constructs must be a ThreadingMixIn server."""
+        import socketserver
+        tree = ast.parse(SOURCE)
+        main_fn = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "main")
+        servers = [getattr(bridge, node.func.id) for node in ast.walk(main_fn)
+                   if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                   and node.func.id.endswith("Server")]
+        self.assertEqual(1, len(servers), "main() constructs one server")
+        self.assertTrue(issubclass(servers[0], socketserver.ThreadingMixIn), servers[0])
+        self.assertIs(servers[0], __import__("http.server").server.ThreadingHTTPServer)
+
+    def test_the_chair_is_served_on_a_real_loopback_server_while_eight_waits_are_held(self):
+        """The same, over real sockets on 127.0.0.1. Skipped where the host has no loopback (CI runs the suites with
+        no network); the handler-level test above holds the same condition everywhere."""
+        import http.client
+        import json
+        import time
+        from http.server import ThreadingHTTPServer
+        try:
+            server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+        except OSError as why:
+            self.skipTest("no loopback here (%s)" % type(why).__name__)
+        server.daemon_threads = True
+        self.threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        port = server.server_address[1]
+
+        def request(method, path, who=None, body=None, timeout=15):
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+            try:
+                raw = json.dumps(body).encode("utf-8") if body is not None else None
+                headers = {"Content-Type": "application/json"}
+                if who:
+                    headers["Authorization"] = "Bearer " + who
+                conn.request(method, path, body=raw, headers=headers)
+                answer = conn.getresponse()
+                return answer.status, json.loads(answer.read().decode("utf-8"))
+            finally:
+                conn.close()
+
+        try:
+            request("GET", "/healthz", timeout=3)
+        except OSError as why:
+            self.skipTest("127.0.0.1 is unreachable here (%s)" % type(why).__name__)
+        blocked = self.blocking_bridge()
+        with contextlib.redirect_stderr(io.StringIO()):
+            waits = []
+            threads = [self.threading.Thread(target=lambda: waits.append(request("POST", "/op", self.GROK, self.WAIT)))
+                       for _ in range(bridge_op.MAX_WAITS)]
+            for thread in threads:
+                thread.start()
+            self.assertEqual(bridge_op.MAX_WAITS, self.wait_for(blocked, bridge_op.MAX_WAITS))
+            started = time.time()
+            code, out = request("POST", "/op", self.GROK, self.WAIT, timeout=3)
+            self.assertEqual((429, "busy", False), (code, out["error"], out["executed"]))
+            code, out = request("POST", "/op", CHAIR, self.chair_get(), timeout=3)
+            self.assertEqual((200, True, "conference-chair"), (code, out["ok"], out["principal"]), out)
+            self.assertLess(time.time() - started, 3.0, "the chair was not queued behind the waits")
+            self.assertEqual(bridge_op.MAX_WAITS, len(blocked), "the chair's get did not wait")
+            self.release.set()
+            for thread in threads:
+                thread.join(10)
+        self.assertEqual([200] * bridge_op.MAX_WAITS, [code for code, _ in waits])
+        self.assertEqual(bridge_op.MAX_WAITS, self.free_slots())
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

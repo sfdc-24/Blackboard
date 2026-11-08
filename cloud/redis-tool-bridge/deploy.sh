@@ -22,8 +22,9 @@ IMAGE="us-central1-docker.pkg.dev/${PROJECT}/cloud-run-source-deploy/${SERVICE}:
 
 # WHO MAY CALL IT. Named service accounts, never allUsers and never allAuthenticatedUsers.
 # aya-runtime and conference-chair were read back from the running service's IAM policy on
-# 2026-11-08 (00003-j9j); fleet-claude-code-cli is the owner's 2026-11-08 addition.
-INVOKERS=("serviceAccount:aya-runtime@${PROJECT}.iam.gserviceaccount.com" "serviceAccount:conference-chair@${PROJECT}.iam.gserviceaccount.com" "serviceAccount:fleet-claude-code-cli@${PROJECT}.iam.gserviceaccount.com")
+# 2026-11-08 (00003-j9j); fleet-claude-code-cli, and the doorbell accounts fleet-grok, fleet-codex and
+# fleet-gemini, are the owner's 2026-11-08 additions (callers.json says what each is for).
+INVOKERS=("serviceAccount:aya-runtime@${PROJECT}.iam.gserviceaccount.com" "serviceAccount:conference-chair@${PROJECT}.iam.gserviceaccount.com" "serviceAccount:fleet-claude-code-cli@${PROJECT}.iam.gserviceaccount.com" "serviceAccount:fleet-grok@${PROJECT}.iam.gserviceaccount.com" "serviceAccount:fleet-codex@${PROJECT}.iam.gserviceaccount.com" "serviceAccount:fleet-gemini@${PROJECT}.iam.gserviceaccount.com")
 
 usage() {
   cat <<'TXT'
@@ -106,6 +107,10 @@ deploy_cmds() {
   # simply wrong.
   # THE GENERATED SCRIPT STOPS AT ITS FIRST FAILURE (Codex on #477): an IAM binding must never run after
   # a deploy that did not happen, where its green output would hide the failure.
+  # CAPACITY (Gemini, GEMINI-ARCH-REDIS-DOORBELL-20261108T1645Z): an xwait holds its request slot for its whole
+  # wait, so at 4 slots four waiting agents left nothing for the chair. 32 slots, of which op.py lets xwait hold
+  # at most MAX_WAITS (8); main.py is a ThreadingHTTPServer, so the slots are real threads. ONE instance still:
+  # take() counts the chair's hour in memory, and two instances would be two ceilings.
   echo 'set -euo pipefail'
   cat <<CMD
 gcloud run deploy ${SERVICE} \\
@@ -114,10 +119,10 @@ gcloud run deploy ${SERVICE} \\
   --service-account=${RUNTIME_SA} \\
   --no-allow-unauthenticated \\
   --ingress=all \\
-  --min-instances=0 --max-instances=1 --concurrency=4 \\
+  --min-instances=0 --max-instances=1 --concurrency=32 \\
   --network=default --subnet=default --vpc-egress=private-ranges-only \\
   --set-secrets=/secrets/auth/redis-auth=REDIS_AUTH_STRING:2,/secrets/ca/redis-ca.pem=REDIS_CA_CERT:1 \\
-  '--set-env-vars=^;^REDIS_HOST=${REDIS_HOST};REDIS_PORT=${REDIS_PORT:-6378};REDIS_AUTH_FILE=/secrets/auth/redis-auth;REDIS_CA_CERT_PATH=/secrets/ca/redis-ca.pem;BRIDGE_AUDIENCE=${url};BRIDGE_CALLERS=aya-runtime@${PROJECT}.iam.gserviceaccount.com,conference-chair@${PROJECT}.iam.gserviceaccount.com,fleet-claude-code-cli@${PROJECT}.iam.gserviceaccount.com'
+  '--set-env-vars=^;^REDIS_HOST=${REDIS_HOST};REDIS_PORT=${REDIS_PORT:-6378};REDIS_AUTH_FILE=/secrets/auth/redis-auth;REDIS_CA_CERT_PATH=/secrets/ca/redis-ca.pem;BRIDGE_AUDIENCE=${url};BRIDGE_CALLERS=aya-runtime@${PROJECT}.iam.gserviceaccount.com,conference-chair@${PROJECT}.iam.gserviceaccount.com,fleet-claude-code-cli@${PROJECT}.iam.gserviceaccount.com,fleet-grok@${PROJECT}.iam.gserviceaccount.com,fleet-codex@${PROJECT}.iam.gserviceaccount.com,fleet-gemini@${PROJECT}.iam.gserviceaccount.com'
 CMD
   # --no-allow-unauthenticated is the platform half of defect 3. The application allowlist
   # (BRIDGE_CALLERS) is the half this repository can review. Both, independently.

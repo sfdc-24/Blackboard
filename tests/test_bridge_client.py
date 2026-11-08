@@ -502,6 +502,8 @@ class Outcomes(unittest.TestCase):
         lines = {
             "old@x": "grok", "agent@x": {"principal": "Grok", "for": "fleet-agent"},
             " Chair@X ": dict(chair, personas=["claude", "grok"]),
+            "door@x": {"principal": "Grok", "for": "doorbell"},
+            "doorp@x": {"principal": "grok", "for": "doorbell", "personas": ["claude"]},
             "probe@x": {"principal": "grok", "for": "probe"}, "probep@x": {"principal": "grok", "for": "probe", "personas": ["claude"]},
             "other@x": {"principal": "grok", "for": "admin"}, "more@x": dict(chair, personas=["claude"], n=1),
             "none@x": {"for": "chair", "personas": ["claude"]}, "blank@x": dict(chair, principal=" ", personas=["claude"]),
@@ -520,7 +522,7 @@ class Outcomes(unittest.TestCase):
         path = os.path.join(self.tmp.name, "lines.json")
         pathlib.Path(path).write_text(json.dumps({"callers": lines}), encoding="utf-8")
         self.assertEqual({"old@x": "grok", "agent@x": "grok", "chair@x": "conference-chair", "four@x": "conference-chair",
-                          "rooms@x": "conference-chair"},
+                          "rooms@x": "conference-chair", "door@x": "grok"},
                          bc.load_callers(path))
         self.assertEqual(bridge_op.load_callers(path), bc.load_callers(path))
         self.assertEqual(bridge_op.load_callers(), bc.load_callers(), "and the committed file")
@@ -972,9 +974,13 @@ class TheRealBoundary(Harness, unittest.TestCase):
         for the probe only (conference docs/PERSONA-WRITE-CONFIRMATION-A1.md, section 12). So the client does
         not ask with it, and the service refuses it should anything ask anyway. Neither half alone is enough."""
         conn = FakeRedis()
-        # Since the owner's 2026-11-08 go, claude-code-cli is the one fleet agent on /op, by its own account.
+        # Since the owner's 2026-11-08 go, claude-code-cli is the one fleet agent on /op, by its own account, and grok,
+        # Codex and Gemini are doorbell callers (each its own lane only): the client maps them all, as the service does.
         self.assertEqual({"conference-chair@sfdc24.iam.gserviceaccount.com": "conference-chair",
-                          "fleet-claude-code-cli@sfdc24.iam.gserviceaccount.com": "claude-code-cli"},
+                          "fleet-claude-code-cli@sfdc24.iam.gserviceaccount.com": "claude-code-cli",
+                          "fleet-grok@sfdc24.iam.gserviceaccount.com": "grok",
+                          "fleet-codex@sfdc24.iam.gserviceaccount.com": "chatgpt-codex-desktop",
+                          "fleet-gemini@sfdc24.iam.gserviceaccount.com": "gemini"},
                          bc.load_callers())
         for me, account in ((AYA, AYA_SA), (ME, SA)):
             out, said = self.attempt(BridgeSim(conn, principal="file", account=account), me=me, account=account,
