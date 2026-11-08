@@ -161,8 +161,16 @@ class Board:
         self.appends.append(spec)
         if spec["row_id"] not in self.hidden:
             stored = dict(spec)
-            stored.setdefault("sender", sr.VERIFIED_STAMP)
+            stored.setdefault("sender", gateway_stamp(spec))
             self.rows[spec["row_id"]] = stored
+
+
+def gateway_stamp(spec):
+    """What gas-bus senderCheck_ stamps for a bus-reconciler post with its ID token: column C against from=."""
+    claimed, said = spec["source_tag"], sr._field(spec["payload"], "from")
+    if said and claimed and said != claimed:
+        return "sender=mismatch;claimed=%s;from=%s" % (claimed, said)
+    return sr.VERIFIED_STAMP
 
 
 def _stamp(moment):
@@ -197,11 +205,11 @@ class CallEvents(unittest.TestCase):
         self.assertEqual(["CALLSTART-" + LIVE, "CALLEND-" + LIVE], list(by_id))
         start, end = by_id["CALLSTART-" + LIVE], by_id["CALLEND-" + LIVE]
         self.assertEqual(
-            "BCB|v=1|id=CALLSTART-%s|phase=RESULT|class=CALL|from=conference-chair|to=ALL|"
+            "BCB|v=1|id=CALLSTART-%s|phase=RESULT|class=CALL|from=bus-reconciler|to=ALL|"
             "msg_type=CALL_START|call_id=%s|epoch=7|started_at=%s|"
             "relayer=bus-reconciler|claimed_author=conference-chair" % (LIVE, LIVE, start_at), start["payload"])
         self.assertEqual(
-            "BCB|v=1|id=CALLEND-%s|phase=RESULT|class=CALL|from=conference-chair|to=ALL|"
+            "BCB|v=1|id=CALLEND-%s|phase=RESULT|class=CALL|from=bus-reconciler|to=ALL|"
             "msg_type=CALL_END|call_id=%s|epoch=7|ended_at=%s|reason=hangup|"
             "relayer=bus-reconciler|claimed_author=conference-chair" % (LIVE, LIVE, end_at), end["payload"])
         for spec in (start, end):
@@ -262,6 +270,50 @@ class CallEvents(unittest.TestCase):
         _mirror(conn, board)
         self.assertEqual([], board.appends)
         self.assertEqual("1000-0", conn.get(sr.CALLS_CURSOR))
+
+    def test_every_row_the_mirror_writes_is_one_the_gateway_verifies(self):
+        conn, board = FakeRedis(), Board()
+        conn.add(sr.CALLS_KEY, "1000-0", {"event": "start", "call_id": LIVE, "epoch": "7",
+                                          "at": "2026-11-08T12:10:00Z", "reason": ""})
+        _mirror(conn, board)
+        for row in board.rows.values():
+            self.assertEqual(sr.VERIFIED_STAMP, row["sender"], row["row_id"])
+        self.assertEqual("1000-0", conn.get(sr.CALLS_CURSOR), "its own row reads back as done")
+
+    def test_a_legacy_row_from_before_the_fix_is_passed_not_reposted(self):
+        conn, board = FakeRedis(), Board()
+        fields = {"event": "start", "call_id": LIVE, "epoch": "7", "at": "2026-11-08T12:10:00Z", "reason": ""}
+        spec = sr._event_spec(fields)
+        old = spec["payload"].replace("|from=bus-reconciler|", "|from=conference-chair|", 1)
+        board.rows[spec["row_id"]] = dict(spec, payload=old, sender=sr.LEGACY_STAMP)
+        conn.add(sr.CALLS_KEY, "1000-0", fields)
+        with self.assertLogs("bus-requests", level="WARNING") as caught:
+            _mirror(conn, board)
+        self.assertEqual([], board.appends, "never re-posted")
+        self.assertEqual("1000-0", conn.get(sr.CALLS_CURSOR), "the cursor moves past it")
+        self.assertIn("legacy", "\n".join(caught.output))
+
+    def test_a_legacy_stamp_on_any_other_payload_is_still_a_conflict(self):
+        conn, board = FakeRedis(), Board()
+        fields = {"event": "start", "call_id": LIVE, "epoch": "7", "at": "2026-11-08T12:10:00Z", "reason": ""}
+        spec = sr._event_spec(fields)
+        old = spec["payload"].replace("|from=bus-reconciler|", "|from=conference-chair|", 1) + "|note=x"
+        board.rows[spec["row_id"]] = dict(spec, payload=old, sender=sr.LEGACY_STAMP)
+        conn.add(sr.CALLS_KEY, "1000-0", fields)
+        with self.assertLogs("bus-requests", level="WARNING"):
+            _mirror(conn, board)
+        self.assertIsNone(conn.strings.get(sr.CALLS_CURSOR))
+
+    def test_a_legacy_stamp_from_another_source_is_still_a_conflict(self):
+        conn, board = FakeRedis(), Board()
+        fields = {"event": "start", "call_id": LIVE, "epoch": "7", "at": "2026-11-08T12:10:00Z", "reason": ""}
+        spec = sr._event_spec(fields)
+        old = spec["payload"].replace("|from=bus-reconciler|", "|from=conference-chair|", 1)
+        board.rows[spec["row_id"]] = dict(spec, payload=old, source_tag="grok", sender=sr.LEGACY_STAMP)
+        conn.add(sr.CALLS_KEY, "1000-0", fields)
+        with self.assertLogs("bus-requests", level="WARNING"):
+            _mirror(conn, board)
+        self.assertIsNone(conn.strings.get(sr.CALLS_CURSOR))
 
     def test_two_identical_copies_are_a_conflict(self):
         conn, board = FakeRedis(), Board()
@@ -378,16 +430,16 @@ class CallTurns(unittest.TestCase):
         by_id = {spec["row_id"]: spec for spec in board.appends}
         self.assertEqual(["CALLTURN-t-other", "CALLTURN-t-cmd", "CALLTURN-t-said"], list(by_id))
         other = (
-            "BCB|v=1|id=CALLTURN-t-other|phase=ASK|class=CALL|from=conference-chair|to=grok|"
+            "BCB|v=1|id=CALLTURN-t-other|phase=ASK|class=CALL|from=bus-reconciler|to=grok|"
             "msg_type=CALL_TURN|call_id=%s|epoch=7|turn_key=t-other|said_at=%s|withheld=1|"
             "turn_class=other|chars=40|relayer=bus-reconciler|claimed_author=conference-chair" % (LIVE, said))
         command = (
-            "BCB|v=1|id=CALLTURN-t-cmd|phase=ASK|class=CALL|from=conference-chair|to=gemini|"
+            "BCB|v=1|id=CALLTURN-t-cmd|phase=ASK|class=CALL|from=bus-reconciler|to=gemini|"
             "msg_type=CALL_TURN|call_id=%s|epoch=7|turn_key=t-cmd|said_at=%s|withheld=1|"
             "turn_class=command|verb=status|target_chars=12|"
             "relayer=bus-reconciler|claimed_author=conference-chair" % (LIVE, said))
         said_row = (
-            "BCB|v=1|id=CALLTURN-t-said|phase=ASK|class=CALL|from=conference-chair|to=grok|"
+            "BCB|v=1|id=CALLTURN-t-said|phase=ASK|class=CALL|from=bus-reconciler|to=grok|"
             "msg_type=CALL_TURN|call_id=%s|epoch=7|turn_key=t-said|said_at=%s|text=hello|"
             "turn_class=command|verb=status|target_chars=4|"
             "relayer=bus-reconciler|claimed_author=conference-chair" % (LIVE, said))
@@ -425,7 +477,8 @@ class CallTurns(unittest.TestCase):
             self.assertEqual("bus-reconciler", spec["source_tag"])
             self.assertEqual([], signature.check(spec["source_tag"], spec["payload"]))
         self.assertIn("|msg_type=CALL_TURN|call_id=%s|" % LIVE, turn["payload"])
-        self.assertEqual("conference-chair", sr._field(turn["payload"], "from"))
+        self.assertEqual("bus-reconciler", sr._field(turn["payload"], "from"), "from= is the poster (the gateway's rule)")
+        self.assertEqual("conference-chair", sr._field(turn["payload"], "claimed_author"))
         self.assertEqual("bus-reconciler", sr._field(turn["payload"], "relayer"))
 
 
