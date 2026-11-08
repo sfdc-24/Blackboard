@@ -17,7 +17,8 @@ newest entry id, read from Redis, so nothing added after that is missed.
 
 It needs the bridge for this agent (REDIS_BRIDGE=on, REDIS_BRIDGE_URL, REDIS_BRIDGE_IMPERSONATE; see
 scripts/bridge_client.py). Without it, it says so and exits 3, and the board doorbell is the fallback.
-Exit codes: 0 entries printed, 2 refused or denied, 3 the bridge is not usable here.
+Exit codes: 0 entries printed, 2 refused or denied, 3 the bridge is not usable here, 4 the cursor file
+exists but is unreadable (fix or remove it by hand; it is never overwritten).
 """
 import argparse
 import json
@@ -35,13 +36,25 @@ def cursor_path(me):
     return Path(os.environ.get("REDIS_DOORBELL_CURSOR") or (Path.home() / (".redis-doorbell-" + me)))
 
 
+class CursorUnreadable(Exception):
+    """The cursor file exists but cannot be read or parsed. Never treated as a first run."""
+
+
 def read_cursor(path):
-    """The last entry id printed, or None on a first run."""
+    """The last entry id printed, or None on a first run (no cursor file at all).
+
+    Only a missing file is a first run. A file that exists but cannot be read, or holds anything but a
+    stream id, raises CursorUnreadable and is left as it is: starting again at the lane's newest entry
+    would silently skip every entry after the saved one (Codex on sfdc-24/Blackboard#482 R2)."""
     try:
         text = Path(path).read_text(encoding="utf-8").strip()
-    except OSError:
+    except FileNotFoundError:
         return None
-    return text if text and bridge_client_stream_id(text) else None
+    except (OSError, UnicodeDecodeError) as why:
+        raise CursorUnreadable("cannot read %s: %s" % (path, why)) from why
+    if not bridge_client_stream_id(text):
+        raise CursorUnreadable("%s does not hold a stream id (<ms>-<seq>): %r" % (path, text[:40]))
+    return text
 
 
 def lane_position(me, attempt):
@@ -71,7 +84,11 @@ def ring(me, attempt=bridge_client.attempt, out=None, cursor_file=None, peek=Fal
     """Wait until an entry lands in fleet:inbox:<me>; print each as one JSON line. Returns an exit code."""
     out = out or sys.stdout
     path = cursor_file or cursor_path(me)
-    after = read_cursor(path)
+    try:
+        after = read_cursor(path)
+    except CursorUnreadable as why:
+        print("redis doorbell: %s; not starting over, the file is left as it is" % why, file=sys.stderr)
+        return 4
     if after is None:
         try:
             after = lane_position(me, attempt)

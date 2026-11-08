@@ -223,6 +223,29 @@ class TheDoorbell(unittest.TestCase):
         self.assertEqual("0-0", redis_doorbell.lane_position("claude-code-cli", self.governed(conn)))
         self.assertIsNone(redis_doorbell.lane_position("claude-code-cli", lambda *a, **k: None))
 
+    def test_a_cursor_that_exists_but_cannot_be_used_stops_and_is_never_overwritten(self):
+        # Codex on sfdc-24/Blackboard#482 R2: only a missing file is a first run.
+        def attempt(*a, **k):
+            raise AssertionError("an unreadable cursor must not reach the bridge")
+
+        for content in (b"", b"latest", b"7-x", b"\xff\xfe\x00garbage"):
+            with self.subTest(content=content):
+                self.cursor.write_bytes(content)
+                code = redis_doorbell.ring("claude-code-cli", attempt=attempt, out=io.StringIO(),
+                                           cursor_file=self.cursor, rounds=1)
+                self.assertEqual(4, code)
+                self.assertEqual(content, self.cursor.read_bytes(), "the saved state is left as it was")
+        self.cursor.unlink()
+        self.cursor.mkdir()                                 # exists, but reading it is an OSError
+        self.assertEqual(4, redis_doorbell.ring("claude-code-cli", attempt=attempt, out=io.StringIO(),
+                                                cursor_file=self.cursor, rounds=1))
+        self.assertTrue(self.cursor.is_dir())
+
+    def test_only_a_missing_cursor_is_a_first_run(self):
+        self.assertIsNone(redis_doorbell.read_cursor(self.cursor))
+        redis_doorbell.write_cursor(self.cursor, "9-1")
+        self.assertEqual("9-1", redis_doorbell.read_cursor(self.cursor))
+
     def test_no_bridge_says_so_and_a_refusal_stops(self):
         self.assertEqual(3, redis_doorbell.ring("claude-code-cli", out=io.StringIO(), cursor_file=self.cursor,
                                                 attempt=lambda *a, **k: None, rounds=1))
