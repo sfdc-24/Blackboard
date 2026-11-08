@@ -46,6 +46,7 @@ The fleet's rules for the conference line moved to the private `sfdc-24/conferen
 | ADR-20260925-…-CONTROL-PLANE.md | CANON | The architecture and gates G1–G9. Its snapshot tables are dated (R5/R5b); read live state instead. |
 | AGENCY-DOCTRINE.md | CANON | Decision rights (clause 4 lists six carve-outs) and evidence. Stale: the "Today:" notes that name the laptop `board_waker.py` (lines 61–63, 188–190) and the `inference_report.py` step (line 232), both laptop tasks. |
 | PRODUCT.md | CANON | The four beats (sheet L-90). |
+| REDIS-RING.md | REFERENCE | The Redis ring: each agent's wake on an entry in its own Redis lane (the wake table, the start command per machine, failures, no board fallback). Source for review until it is installed. |
 | REDIS-ACCESS.md | CANON | How every agent reads and writes Redis: the access list, the one row the worker answers, the tool that builds it, the waker's REDIS-OP line, the heartbeat, and what is proved live versus by test. |
 | POKA-YOKE.md | CANON | Repo lessons L-91 onward. Stale lines: 19 ("highest was L-90") and 34–42. L-91 is now enforced on main, and site #13 merged. |
 | ACCEPTANCE-CHECKLIST.md | CANON | Client-gating checklist. |
