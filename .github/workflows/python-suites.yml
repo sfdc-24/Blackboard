@@ -159,6 +159,9 @@ on:
       - "tests/test_inbox_wake.py"
       - "cloud/inbox-wake/main.py"
       - "cloud/inbox-wake/Dockerfile"
+      - "cloud/fleet-dispatch/**"
+      - "tests/test_fleet_dispatch.py"
+      - "tests/mutate_fleet_dispatch.py"
       - ".github/workflows/inbox-wake-sweep.yml"
       - ".github/workflows/inbox-wake-claude.yml"
       - ".github/workflows/inbox-wake-codex.yml"
@@ -288,6 +291,9 @@ on:
       - "tests/test_inbox_wake.py"
       - "cloud/inbox-wake/main.py"
       - "cloud/inbox-wake/Dockerfile"
+      - "cloud/fleet-dispatch/**"
+      - "tests/test_fleet_dispatch.py"
+      - "tests/mutate_fleet_dispatch.py"
       - ".github/workflows/inbox-wake-sweep.yml"
       - ".github/workflows/inbox-wake-claude.yml"
       - ".github/workflows/inbox-wake-codex.yml"
@@ -1202,6 +1208,27 @@ jobs:
           if [ -f tests/test_inbox_wake.py ]; then
             python_bin="$(command -v python3)"
             sudo unshare -n -- "$python_bin" -B tests/test_inbox_wake.py
+          else
+            echo "not on this branch; skipping"
+          fi
+
+      # Q1b. FakeRedis and a fake ring: one entry rings once, a re-read rings
+      # nothing, the cursor moves only after the outcome is recorded, a crash
+      # between those two reconsiders the entry once and the seen NX stops the
+      # second wake, a burst collapses, an agent off the allowlist is never
+      # rung, and the flag off opens no connection. The mutant harness then
+      # deletes the NX gate, the cursor order and the allowlist, and each
+      # deletion has to fail the suite that names it.
+      - name: "fleet dispatch blocks on the cloud lanes and rings once (no network)"
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_fleet_dispatch.py ]; then
+            python_bin="$(command -v python3)"
+            sudo unshare -n -- "$python_bin" -B tests/test_fleet_dispatch.py
+            sudo unshare -n -- "$python_bin" -B tests/mutate_fleet_dispatch.py
+          elif [ -f cloud/fleet-dispatch/main.py ]; then
+            echo "::error::cloud/fleet-dispatch/main.py is on this branch but tests/test_fleet_dispatch.py is not: the worker would ship ungated"
+            exit 1
           else
             echo "not on this branch; skipping"
           fi
