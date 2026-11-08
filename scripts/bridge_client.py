@@ -211,6 +211,7 @@ def load_callers(path=None) -> dict:
     file maps NOBODY, so the bridge is not used: stricter, never looser.
 
     A line is a bare principal or {"principal", "for": "fleet-agent"} for a fleet agent, {"principal",
+    "for": "doorbell"} for a caller the service lets wait on its own lane and nothing else, {"principal",
     "for": "chair", "personas": [...]} for the conference chair, optionally with "rooms": [one room],
     or {"principal", "for": "probe"} for an
     account admitted for the probe only, which the service refuses on /op and which is therefore NOT
@@ -228,7 +229,7 @@ def load_callers(path=None) -> dict:
     for email, line in callers.items():
         if isinstance(line, str):
             who = line
-        elif isinstance(line, dict) and set(line) == {"principal", "for"} and line["for"] == "fleet-agent":
+        elif isinstance(line, dict) and set(line) == {"principal", "for"} and line["for"] in ("fleet-agent", "doorbell"):
             who = line["principal"]
         elif isinstance(line, dict) and line.get("for") == "chair" and set(line) in (
                 {"principal", "for", "personas"}, {"principal", "for", "personas", "rooms"}):

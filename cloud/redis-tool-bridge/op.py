@@ -28,7 +28,9 @@ THE TWO LAYERS THAT CAN FAIL ON THEIR OWN, AND THEIR STATUSES
         403 principal mismatch   the caller is bound to a different principal than the one the
                                  client said it expects to be; nothing was executed
         403 refused              redis_gov refused it; `reason` is redis_gov's own, and `audit` says
-                                 whether the refusal itself was recorded
+                                 whether the refusal itself was recorded. Or THE DOORBELL's door
+                                 refused it before any connection (below): `reason` is the door's,
+                                 `audit` is "not recorded" and "executed" is false
         503 redis unreachable    NO CONNECTION WAS MADE. Always with "executed": false
         502 failed               a READ raised inside Redis; the error TYPE only; nothing changed
         502 outcome unknown      a WRITE raised after the connection was made. It may have
@@ -75,6 +77,7 @@ THE BODY
     so the chair can tell the acknowledgment of ITS request from any other 200. What a caller is FOR is
     its line in callers.json, never the request:
         a fleet agent     may not state either member: a 400. Its own name is already the verified one.
+        a doorbell        may not state either member: a 400, as a fleet agent.
         the chair         must state both on every op: a 400 without them.
         a probe account   is admitted to the service for /probe and is refused here: a 403.
 
@@ -103,6 +106,19 @@ THE BODY
         the ceiling       CHAIR_CANVAS_PER_HOUR posts an hour, apart from the persona writes': a 429 (THE HOUR).
     Each is refused before any connection, with "executed": false. 'Hold on, team' is the chair's to keep: the
     bridge does not hear the call.
+
+    THE DOORBELL (Codex on sfdc-24/Blackboard#489: the owner approved Grok reaching its Redis doorbell and nothing
+    wider). A caller whose line says "for": "doorbell" acts as its principal, as a fleet agent does, and may do two
+    things, both on its OWN lane, fleet:inbox:<principal>, exactly as sent:
+        xwait             the doorbell itself (redis_gov's OPS_WAIT: XREAD BLOCK after a cursor; redis_gov
+                          requires the cursor, caps the count and keeps the wait on the bridge).
+        xrange            count 1 and no after: the lane's newest entry id, which is where
+                          scripts/redis_doorbell.py starts on a first run (lane_position).
+    Neither takes a field, a value or an encoding. Every other op, every other key, and either form with anything
+    more, is refused here, before any connection: a 403 "refused" with the door's reason, "audit": "not recorded",
+    "executed": false (doorbell_refusal). A 403 "refused" is TERMINAL for scripts/bridge_client.py, so a client is
+    not moved to the board route around it. Whatever the access list allows the principal is not widened by this
+    line; it is narrowed to these two.
 
     THE HOUR, KEPT IN REDIS (Gemini on e6433ea, GROK-407FIX-428REV-0225Z: the service scales to zero, and a count
     kept only in memory starts again at nought with every new instance). Each ceiling is held twice:
@@ -145,8 +161,11 @@ MEMBERS = ("op", "key", "field", "val", "enc", "count", "after", "expect", "auth
 # inside any other op is an unknown outcome. Restated from redis_gov.OPS_READ and held equal by a test.
 READS = ("get", "hgetall", "xrange")
 # What a caller is FOR: its line in callers.json says, and a line that says anything else maps nobody.
-FLEET, CHAIR, PROBE = "fleet-agent", "chair", "probe"
-PURPOSES = (FLEET, CHAIR, PROBE)
+FLEET, CHAIR, PROBE, DOORBELL = "fleet-agent", "chair", "probe", "doorbell"
+PURPOSES = (FLEET, CHAIR, PROBE, DOORBELL)
+# THE DOORBELL: a caller's own lane (redis_gov.WAIT_LANE), and the two ops it runs there.
+DOORBELL_LANE = "fleet:inbox:"
+DOORBELL_OPS = ("xwait", "xrange")
 CHAIR_OPS = ("get", "set")
 CHAIR_WRITES_PER_HOUR = 20              # in Redis for 3,600s from the first count, and in memory for the last hour
 MAX_PERSONAS = 4                        # as the chair's own cast
@@ -186,6 +205,8 @@ def _lines(path=None) -> dict:
         "principal"                                             a fleet agent, as every line was at first
         {"principal": ..., "for": "fleet-agent" | "probe"}      a fleet agent; or an account admitted for the
                                                                 probe only, which /op refuses
+        {"principal": ..., "for": "doorbell"}                   its own lane's doorbell and nothing else
+                                                                (THE DOORBELL, doorbell_refusal)
         {"principal": ..., "for": "chair", "personas": [...]}   the conference chair, and the personas it may
                                                                 name: one to MAX_PERSONAS names, each once
         that line plus "rooms": [...]                          the rooms whose canvas it may post to: one to
@@ -205,7 +226,7 @@ def _lines(path=None) -> dict:
         personas, rooms = (), ()
         if isinstance(line, str):
             who, purpose = line, FLEET
-        elif isinstance(line, dict) and set(line) == {"principal", "for"} and line["for"] in (FLEET, PROBE):
+        elif isinstance(line, dict) and set(line) == {"principal", "for"} and line["for"] in (FLEET, PROBE, DOORBELL):
             who, purpose = line["principal"], line["for"]
         elif isinstance(line, dict) and line.get("for") == CHAIR and set(line) in (
                 {"principal", "for", "personas"}, {"principal", "for", "personas", "rooms"}):
@@ -344,6 +365,22 @@ def canvas_refusal(request: dict, author: str) -> str:
     return ""
 
 
+def doorbell_refusal(request: dict, who: str) -> str:
+    """Why this is not an op a doorbell caller may run, in words fit for the caller; "" when it is. The op and
+    the key as they were SENT, as the chair's are read: the doorbell client sends them exact. Never the value."""
+    lane = DOORBELL_LANE + who
+    if request["op"] not in DOORBELL_OPS:
+        return ("a doorbell caller may run xwait on its own lane, and xrange for its first cursor, "
+                "and nothing else")
+    if request["key"] != lane:
+        return "a doorbell caller waits on its own lane, %s, and no other key" % lane
+    if request["field"] or request["val"] or request["enc"]:
+        return "a doorbell op takes no field, value or encoding"
+    if request["op"] == "xrange" and (request["after"] or request["count"] != 1):
+        return "a doorbell caller's xrange reads its lane's newest entry only: count 1 and no after"
+    return ""
+
+
 def parse(raw: bytes) -> tuple:
     """(request dict, None) or (None, why). The why is for our log; the caller gets 'bad request'."""
     try:
@@ -430,6 +467,12 @@ def handle(caller: str, raw: bytes, connect, log, callers=None, gov=None, acl=No
     elif author or asked:
         log("op by %s: author or request stated by a caller that is not the chair" % caller)
         return 400, {"error": "bad request", "executed": False}
+    if purpose == DOORBELL:
+        why = doorbell_refusal(request, who)
+        if why:
+            log("op by %s as %s: not a doorbell op (%s)" % (caller, who, why))
+            return 403, {"error": "refused", "reason": why, "executed": False, "audit": "not recorded",
+                         "caller": caller, "principal": who}
     stated = {name: value for name, value in (("author", author), ("request", asked)) if value}
     if gov is None:
         import redis_gov as gov
