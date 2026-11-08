@@ -955,10 +955,26 @@ class TheOpEndpoint(unittest.TestCase):
 
     def test_every_caller_the_deploy_admits_has_a_line_that_says_what_it_is_for(self):
         import re
-        admitted = re.search(r"BRIDGE_CALLERS=([^\s\\]+)", DEPLOY).group(1)
+        admitted = re.search(r"BRIDGE_CALLERS=([^\s\\']+)", DEPLOY).group(1)
         for email in admitted.replace("${PROJECT}", "sfdc24").split(","):
             self.assertIn(email.strip().lower(), bridge_op.load_purposes(),
                           "deploy.sh admits %s but callers.json has no line for it" % email)
+
+    def test_the_generated_deploy_passes_the_environment_as_ONE_argument_and_stops_at_a_failure(self):
+        """Codex on #477 (CODEX-RESULT-PR477-20261108T0135Z): the ^;^ list was written unquoted into a script
+        piped to bash, so its semicolons ended the gcloud command and the IAM bindings after it ran anyway."""
+        import shlex
+        line = next(l for l in DEPLOY.splitlines() if "--set-env-vars=" in l)
+        rendered = line.replace("${REDIS_PORT:-6378}", "6378").replace("${PROJECT}", "sfdc24")
+        rendered = rendered.replace("${REDIS_HOST}", "10.0.0.1").replace("${url}", "https://x.invalid")
+        words = shlex.split(rendered)
+        self.assertEqual(1, len(words), "the environment flag is one shell word: %r" % words[:3])
+        self.assertTrue(words[0].startswith("--set-env-vars=^;^REDIS_HOST=10.0.0.1;"))
+        self.assertTrue(words[0].endswith("fleet-claude-code-cli@sfdc24.iam.gserviceaccount.com"))
+        self.assertIn("echo 'set -euo pipefail'", DEPLOY, "the generated script stops at its first failure")
+        self.assertIn("deploy_cmds | bash -euo pipefail -s", DEPLOY)
+        self.assertLess(DEPLOY.index("echo 'set -euo pipefail'"), DEPLOY.index("gcloud run deploy ${SERVICE}"),
+                        "the stop is set before the deploy, so no IAM line can follow a failed one")
 
     def test_the_deploy_runs_one_instance_which_is_what_makes_the_hourly_ceiling_one_ceiling(self):
         """take() counts in the instance's memory. Two instances would be two ceilings."""
