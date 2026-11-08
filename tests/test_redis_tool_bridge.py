@@ -1908,14 +1908,10 @@ class HeldWaitsCannotStarveTheChair(unittest.TestCase):
             for _ in held:
                 bridge_op._WAITING.release()
 
-    def test_the_chair_is_served_on_the_threaded_server_while_eight_waits_are_held(self):
-        """The real ThreadingHTTPServer and handler, the real op.handle, redis_gov and committed callers.json, and a
-        Redis whose XREAD blocks until released."""
-        import datetime
-        import http.client
-        import json
+    def blocking_bridge(self):
+        """The real handler, op.handle, redis_gov and committed callers.json, with a Redis whose XREAD blocks until
+        self.release is set. Returns the list each blocked XREAD is appended to."""
         import time
-        from http.server import ThreadingHTTPServer
         from test_redis_xwait import WaitingRedis
         test = self
         blocked = []
@@ -1935,49 +1931,134 @@ class HeldWaitsCannotStarveTheChair(unittest.TestCase):
         def restore():
             bridge.verify_caller, bridge.connect, bridge_op.clock = saved
         self.addCleanup(restore)
-        server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+        return blocked
+
+    def chair_get(self):
+        import datetime
+        day = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d")
+        return {"op": "get", "key": "conf:persona:%s:claude" % day, "author": "claude", "request": "cap-1",
+                "expect": "conference-chair"}
+
+    def wait_for(self, seen, n):
+        import time
+        deadline = time.time() + 5
+        while len(seen) < n and time.time() < deadline:
+            time.sleep(0.01)
+        return len(seen)
+
+    def test_the_chair_is_served_by_the_handler_while_eight_waits_are_held(self):
+        """NO SOCKETS (CI runs the suites with no network at all). Each request is the real Handler.do_POST on its own
+        thread, as ThreadingHTTPServer runs it: eight waits blocked inside XREAD, then the chair's get must finish
+        while they are held, then a ninth wait is busy at once. A handler or door that serialises requests fails."""
+        import json
+        import time
+        blocked = self.blocking_bridge()
+
+        def do_post(who, body, sink):
+            handler = object.__new__(bridge.Handler)
+            handler.path = "/op"
+            raw = json.dumps(body).encode("utf-8")
+            handler.headers = {"Content-Length": str(len(raw)), "Authorization": "Bearer " + who}
+            handler.rfile = io.BytesIO(raw)
+            handler._send = lambda code, out: sink.append((code, out))
+            handler.do_POST()
+
+        def threaded(who, body):
+            sink = []
+            thread = self.threading.Thread(target=do_post, args=(who, body, sink), daemon=True)
+            thread.start()
+            return thread, sink
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            waits = [threaded(self.GROK, self.WAIT) for _ in range(bridge_op.MAX_WAITS)]
+            self.assertEqual(bridge_op.MAX_WAITS, self.wait_for(blocked, bridge_op.MAX_WAITS),
+                             "eight waits are held inside XREAD at once")
+            started = time.time()
+            chair, said = threaded(CHAIR, self.chair_get())
+            chair.join(3)
+            self.assertFalse(chair.is_alive(), "the chair's get finished while eight waits were held")
+            self.assertEqual(1, len(said))
+            code, out = said[0]
+            self.assertEqual((200, True, "conference-chair"), (code, out["ok"], out["principal"]), out)
+            ninth, busy = threaded(self.GROK, self.WAIT)
+            ninth.join(1)
+            self.assertFalse(ninth.is_alive(), "the ninth wait is answered at once, not queued")
+            self.assertEqual((429, "busy", False), (busy[0][0], busy[0][1]["error"], busy[0][1]["executed"]))
+            self.assertLess(time.time() - started, 3.0)
+            self.assertEqual(bridge_op.MAX_WAITS, len(blocked), "neither the chair nor the ninth reached XREAD")
+            self.release.set()
+            for thread, _ in waits:
+                thread.join(10)
+        self.assertEqual([200] * bridge_op.MAX_WAITS, [sink[0][0] for _, sink in waits])
+        self.assertEqual(bridge_op.MAX_WAITS, self.free_slots())
+
+    def test_main_serves_each_request_on_its_own_thread(self):
+        """The handler-level test above is only the service's behaviour if the server runs requests on threads:
+        the class main() constructs must be a ThreadingMixIn server."""
+        import socketserver
+        tree = ast.parse(SOURCE)
+        main_fn = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "main")
+        servers = [getattr(bridge, node.func.id) for node in ast.walk(main_fn)
+                   if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                   and node.func.id.endswith("Server")]
+        self.assertEqual(1, len(servers), "main() constructs one server")
+        self.assertTrue(issubclass(servers[0], socketserver.ThreadingMixIn), servers[0])
+        self.assertIs(servers[0], __import__("http.server").server.ThreadingHTTPServer)
+
+    def test_the_chair_is_served_on_a_real_loopback_server_while_eight_waits_are_held(self):
+        """The same, over real sockets on 127.0.0.1. Skipped where the host has no loopback (CI runs the suites with
+        no network); the handler-level test above holds the same condition everywhere."""
+        import http.client
+        import json
+        import time
+        from http.server import ThreadingHTTPServer
+        try:
+            server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+        except OSError as why:
+            self.skipTest("no loopback here (%s)" % type(why).__name__)
         server.daemon_threads = True
-        serving = self.threading.Thread(target=server.serve_forever, daemon=True)
-        serving.start()
+        self.threading.Thread(target=server.serve_forever, daemon=True).start()
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
         port = server.server_address[1]
 
-        def post(who, body, timeout=15):
+        def request(method, path, who=None, body=None, timeout=15):
             conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
             try:
-                raw = json.dumps(body).encode("utf-8")
-                conn.request("POST", "/op", body=raw, headers={"Authorization": "Bearer " + who,
-                                                               "Content-Type": "application/json"})
+                raw = json.dumps(body).encode("utf-8") if body is not None else None
+                headers = {"Content-Type": "application/json"}
+                if who:
+                    headers["Authorization"] = "Bearer " + who
+                conn.request(method, path, body=raw, headers=headers)
                 answer = conn.getresponse()
                 return answer.status, json.loads(answer.read().decode("utf-8"))
             finally:
                 conn.close()
 
-        waits = []
-        threads = [self.threading.Thread(target=lambda: waits.append(post(self.GROK, self.WAIT)))
-                   for _ in range(bridge_op.MAX_WAITS)]
-        for thread in threads:
-            thread.start()
-        deadline = time.time() + 5
-        while len(blocked) < bridge_op.MAX_WAITS and time.time() < deadline:
-            time.sleep(0.01)
-        self.assertEqual(bridge_op.MAX_WAITS, len(blocked), "eight waits are held inside XREAD")
-        started = time.time()
-        code, out = post(self.GROK, self.WAIT, timeout=3)
-        self.assertEqual((429, "busy", False), (code, out["error"], out["executed"]))
-        day = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d")
-        code, out = post(CHAIR, {"op": "get", "key": "conf:persona:%s:claude" % day, "author": "claude",
-                                 "request": "cap-1", "expect": "conference-chair"}, timeout=3)
-        self.assertEqual((200, True, "conference-chair"), (code, out["ok"], out["principal"]), out)
-        self.assertLess(time.time() - started, 3.0, "the chair was not queued behind the waits")
-        self.assertEqual(bridge_op.MAX_WAITS, len(blocked), "the chair's get did not wait")
-        self.release.set()
-        for thread in threads:
-            thread.join(10)
+        try:
+            request("GET", "/healthz", timeout=3)
+        except OSError as why:
+            self.skipTest("127.0.0.1 is unreachable here (%s)" % type(why).__name__)
+        blocked = self.blocking_bridge()
+        with contextlib.redirect_stderr(io.StringIO()):
+            waits = []
+            threads = [self.threading.Thread(target=lambda: waits.append(request("POST", "/op", self.GROK, self.WAIT)))
+                       for _ in range(bridge_op.MAX_WAITS)]
+            for thread in threads:
+                thread.start()
+            self.assertEqual(bridge_op.MAX_WAITS, self.wait_for(blocked, bridge_op.MAX_WAITS))
+            started = time.time()
+            code, out = request("POST", "/op", self.GROK, self.WAIT, timeout=3)
+            self.assertEqual((429, "busy", False), (code, out["error"], out["executed"]))
+            code, out = request("POST", "/op", CHAIR, self.chair_get(), timeout=3)
+            self.assertEqual((200, True, "conference-chair"), (code, out["ok"], out["principal"]), out)
+            self.assertLess(time.time() - started, 3.0, "the chair was not queued behind the waits")
+            self.assertEqual(bridge_op.MAX_WAITS, len(blocked), "the chair's get did not wait")
+            self.release.set()
+            for thread in threads:
+                thread.join(10)
         self.assertEqual([200] * bridge_op.MAX_WAITS, [code for code, _ in waits])
         self.assertEqual(bridge_op.MAX_WAITS, self.free_slots())
-
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
