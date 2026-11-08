@@ -143,8 +143,8 @@ MUTANTS = [
     ),
     (
         "drop-withheld",
-        "             (\"said_at\", fields.get(\"said_at\")), (\"withheld\", \"1\")]",
-        "             (\"said_at\", fields.get(\"said_at\"))]",
+        "(\"said_at\", fields.get(\"said_at\")), (\"withheld\", \"1\")]",
+        "(\"said_at\", fields.get(\"said_at\"))]",
         "a turn with no text is posted without withheld=1",
         "test_a_turn_without_text_records_the_class_and_withheld",
     ),
@@ -161,6 +161,22 @@ MUTANTS = [
         "    kind = (fields.get(\"class\") or \"\").strip()  # MUTANT: the old field name",
         "turn_class is taken from class=, which the chair no longer sends",
         "test_a_turn_without_text_records_the_class_and_withheld",
+    ),
+    (
+        "post-as-the-chair",
+        "    return {\"row_id\": rid, \"source_tag\": SHEET_SOURCE, \"target_surface\": to, \"action_type\": action,",
+        "    return {\"row_id\": rid, \"source_tag\": SHEET_FROM, \"target_surface\": to, \"action_type\": action,",
+        "CALL rows are posted as conference-chair, which the gateway does not stamp verified",
+        "test_the_box_reads_a_bus_reconciler_row_at_its_turn_substring",
+    ),
+    (
+        "split-the-box-substring",
+        "            (\"from\", SHEET_FROM), (\"to\", tag), (\"msg_type\", \"CALL_TURN\"),\n"
+        "            (\"call_id\", call_id)]",
+        "            (\"from\", SHEET_FROM), (\"to\", tag), (\"msg_type\", \"CALL_TURN\"),\n"
+        "            (\"epoch\", \"0\"), (\"call_id\", call_id)]  # MUTANT: call_id is not next",
+        "msg_type=CALL_TURN is no longer immediately followed by call_id=",
+        "test_the_box_reads_a_bus_reconciler_row_at_its_turn_substring",
     ),
     (
         "flag-always-on",

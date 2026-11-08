@@ -163,12 +163,14 @@ class CallEvents(unittest.TestCase):
         start, end = by_id["CALLSTART-" + LIVE], by_id["CALLEND-" + LIVE]
         self.assertEqual(
             "BCB|v=1|id=CALLSTART-%s|phase=RESULT|class=CALL|from=conference-chair|to=ALL|"
-            "msg_type=CALL_START|call_id=%s|epoch=7|started_at=%s" % (LIVE, LIVE, start_at), start["payload"])
+            "msg_type=CALL_START|call_id=%s|epoch=7|started_at=%s|"
+            "relayer=bus-reconciler|claimed_author=conference-chair" % (LIVE, LIVE, start_at), start["payload"])
         self.assertEqual(
             "BCB|v=1|id=CALLEND-%s|phase=RESULT|class=CALL|from=conference-chair|to=ALL|"
-            "msg_type=CALL_END|call_id=%s|epoch=7|ended_at=%s|reason=hangup" % (LIVE, LIVE, end_at), end["payload"])
+            "msg_type=CALL_END|call_id=%s|epoch=7|ended_at=%s|reason=hangup|"
+            "relayer=bus-reconciler|claimed_author=conference-chair" % (LIVE, LIVE, end_at), end["payload"])
         for spec in (start, end):
-            self.assertEqual(("conference-chair", "ALL", "RESULT"),
+            self.assertEqual(("bus-reconciler", "ALL", "RESULT"),
                              (spec["source_tag"], spec["target_surface"], spec["action_type"]))
             self.assertEqual([], signature.check(spec["source_tag"], spec["payload"]))
             self.assertEqual([], board_row.problems(spec["payload"]))
@@ -313,15 +315,17 @@ class CallTurns(unittest.TestCase):
         other = (
             "BCB|v=1|id=CALLTURN-t-other|phase=ASK|class=CALL|from=conference-chair|to=grok|"
             "msg_type=CALL_TURN|call_id=%s|epoch=7|turn_key=t-other|said_at=%s|withheld=1|"
-            "turn_class=other|chars=40" % (LIVE, said))
+            "turn_class=other|chars=40|relayer=bus-reconciler|claimed_author=conference-chair" % (LIVE, said))
         command = (
             "BCB|v=1|id=CALLTURN-t-cmd|phase=ASK|class=CALL|from=conference-chair|to=gemini|"
             "msg_type=CALL_TURN|call_id=%s|epoch=7|turn_key=t-cmd|said_at=%s|withheld=1|"
-            "turn_class=command|verb=status|target_chars=12" % (LIVE, said))
+            "turn_class=command|verb=status|target_chars=12|"
+            "relayer=bus-reconciler|claimed_author=conference-chair" % (LIVE, said))
         said_row = (
             "BCB|v=1|id=CALLTURN-t-said|phase=ASK|class=CALL|from=conference-chair|to=grok|"
             "msg_type=CALL_TURN|call_id=%s|epoch=7|turn_key=t-said|said_at=%s|text=hello|"
-            "turn_class=command|verb=status|target_chars=4" % (LIVE, said))
+            "turn_class=command|verb=status|target_chars=4|"
+            "relayer=bus-reconciler|claimed_author=conference-chair" % (LIVE, said))
         self.assertEqual(other, by_id["CALLTURN-t-other"]["payload"])
         self.assertEqual(command, by_id["CALLTURN-t-cmd"]["payload"])
         self.assertEqual(said_row, by_id["CALLTURN-t-said"]["payload"])
@@ -336,6 +340,28 @@ class CallTurns(unittest.TestCase):
             self.assertEqual([], board_row.problems(spec["payload"]))
             self.assertEqual([], signature.check(spec["source_tag"], spec["payload"]))
         self.assertNotIn("CALLTURN-t-dead", by_id)
+
+    def test_the_box_reads_a_bus_reconciler_row_at_its_turn_substring(self):
+        """conference#375: the box takes a turn only from a row stamped for bus-reconciler,
+        and only when msg_type=CALL_TURN is immediately followed by call_id=<room>."""
+        conn, board = FakeRedis(), Board()
+        said = "2026-11-08T12:55:00Z"
+        conn.add(sr.CALLS_KEY, "1000-0", {
+            "event": "start", "call_id": LIVE, "epoch": "7", "at": said, "reason": ""})
+        conn.hashes[sr.CALL_KEY % LIVE] = {
+            "state": "live", "epoch": "7", "started_at": said, "ended_at": "", "reason": ""}
+        conn.add(sr.TURNS_KEY % LIVE, "5000-0", {
+            "turn_key": "t-box", "to": "grok", "epoch": "7", "said_at": said, "text": "hello",
+            "turn_class": "other", "chars": "5"})
+        _mirror(conn, board)
+        by_id = {spec["row_id"]: spec for spec in board.appends}
+        start, turn = by_id["CALLSTART-" + LIVE], by_id["CALLTURN-t-box"]
+        for spec in (start, turn):
+            self.assertEqual("bus-reconciler", spec["source_tag"])
+            self.assertEqual([], signature.check(spec["source_tag"], spec["payload"]))
+        self.assertIn("|msg_type=CALL_TURN|call_id=%s|" % LIVE, turn["payload"])
+        self.assertEqual("conference-chair", sr._field(turn["payload"], "from"))
+        self.assertEqual("bus-reconciler", sr._field(turn["payload"], "relayer"))
 
 
 class StaleSweep(unittest.TestCase):

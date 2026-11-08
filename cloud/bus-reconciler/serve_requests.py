@@ -439,7 +439,8 @@ TURNS_CURSOR = "gov:mirror:turns:%s:cursor"
 STALE_AFTER = datetime.timedelta(minutes=50)
 TURN_TEXT_MAX = 1000
 MIRROR_PAGE = 100
-SHEET_FROM = "conference-chair"
+SHEET_FROM = "conference-chair"   # who the call record is from
+SHEET_SOURCE = "bus-reconciler"  # who posts it; the gateway stamps sender=verified for this tag
 
 
 def call_sheet_on():
@@ -478,6 +479,13 @@ def _cell(value):
 
 def _bcb(pairs):
     return "|".join(["BCB"] + ["%s=%s" % (key, _cell(value)) for key, value in pairs])
+
+
+def _carry(pairs):
+    """The worker posts the chair's record. relayer= is the source tag, so the signature is legal
+    and the gateway can stamp sender=verified for bus-reconciler. These fields stay off the
+    msg_type|call_id pair the box reader matches."""
+    return list(pairs) + [("relayer", SHEET_SOURCE), ("claimed_author", SHEET_FROM)]
 
 
 def _field(payload, key):
@@ -584,7 +592,7 @@ def _land(conn, cursor_key, entry_id, spec, append, present):
 
 
 def _sheet_spec(rid, to, action, payload, gist):
-    return {"row_id": rid, "source_tag": SHEET_FROM, "target_surface": to, "action_type": action,
+    return {"row_id": rid, "source_tag": SHEET_SOURCE, "target_surface": to, "action_type": action,
             "category": "DONE" if action == "RESULT" else "OPEN", "project_tag": "CALL",
             "gist": _cell(gist)[:180], "payload": payload}
 
@@ -599,15 +607,15 @@ def _event_spec(fields):
     at = _cell(fields.get("at"))
     if event == "start":
         rid = "CALLSTART-" + call_id
-        payload = _bcb([("v", "1"), ("id", rid), ("phase", "RESULT"), ("class", "CALL"),
-                        ("from", SHEET_FROM), ("to", "ALL"), ("msg_type", "CALL_START"),
-                        ("call_id", call_id), ("epoch", epoch), ("started_at", at)])
+        payload = _bcb(_carry([("v", "1"), ("id", rid), ("phase", "RESULT"), ("class", "CALL"),
+                               ("from", SHEET_FROM), ("to", "ALL"), ("msg_type", "CALL_START"),
+                               ("call_id", call_id), ("epoch", epoch), ("started_at", at)]))
         return _sheet_spec(rid, "ALL", "RESULT", payload, "CALL_START " + call_id)
     rid = "CALLEND-" + call_id
-    payload = _bcb([("v", "1"), ("id", rid), ("phase", "RESULT"), ("class", "CALL"),
-                    ("from", SHEET_FROM), ("to", "ALL"), ("msg_type", "CALL_END"),
-                    ("call_id", call_id), ("epoch", epoch), ("ended_at", at),
-                    ("reason", fields.get("reason"))])
+    payload = _bcb(_carry([("v", "1"), ("id", rid), ("phase", "RESULT"), ("class", "CALL"),
+                           ("from", SHEET_FROM), ("to", "ALL"), ("msg_type", "CALL_END"),
+                           ("call_id", call_id), ("epoch", epoch), ("ended_at", at),
+                           ("reason", fields.get("reason"))]))
     return _sheet_spec(rid, "ALL", "RESULT", payload, "CALL_END " + call_id)
 
 
@@ -677,15 +685,13 @@ def _turn_spec(call_id, fields):
     if not text:
         return _withheld_turn(call_id, fields, rid, tag, epoch, turn_key)
     shown, cut = (text, False) if len(text) <= TURN_TEXT_MAX else (text[:TURN_TEXT_MAX], True)
-    pairs = [("v", "1"), ("id", rid), ("phase", "ASK"), ("class", "CALL"),
-             ("from", SHEET_FROM), ("to", tag), ("msg_type", "CALL_TURN"),
-             ("call_id", call_id), ("epoch", epoch), ("turn_key", turn_key),
-             ("said_at", fields.get("said_at")), ("text", shown)]
+    pairs = _turn_head(rid, tag, call_id) + [
+        ("epoch", epoch), ("turn_key", turn_key), ("said_at", fields.get("said_at")), ("text", shown)]
     if cut:
         digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
         pairs += [("truncated", "1"), ("chars", str(len(text))), ("sha256", digest)]
     pairs = _with_class(pairs, fields)
-    return _sheet_spec(rid, tag, "ASK", _bcb(pairs), "CALL_TURN %s %d" % (turn_key, len(shown)))
+    return _sheet_spec(rid, tag, "ASK", _bcb(_carry(pairs)), "CALL_TURN %s %d" % (turn_key, len(shown)))
 
 
 def _with_class(pairs, fields):
@@ -697,15 +703,20 @@ def _with_class(pairs, fields):
     return pairs
 
 
+def _turn_head(rid, tag, call_id):
+    """msg_type=CALL_TURN is immediately followed by call_id=. The box reader matches that substring."""
+    return [("v", "1"), ("id", rid), ("phase", "ASK"), ("class", "CALL"),
+            ("from", SHEET_FROM), ("to", tag), ("msg_type", "CALL_TURN"),
+            ("call_id", call_id)]
+
+
 def _withheld_turn(call_id, fields, rid, tag, epoch, turn_key):
     """No text on the entry: record turn_class and the counts, and do not invent the words.
 
     class=CALL stays the envelope class. turn_class is the chair's own field."""
-    pairs = [("v", "1"), ("id", rid), ("phase", "ASK"), ("class", "CALL"),
-             ("from", SHEET_FROM), ("to", tag), ("msg_type", "CALL_TURN"),
-             ("call_id", call_id), ("epoch", epoch), ("turn_key", turn_key),
-             ("said_at", fields.get("said_at")), ("withheld", "1")]
-    return _sheet_spec(rid, tag, "ASK", _bcb(_with_class(pairs, fields)),
+    pairs = _turn_head(rid, tag, call_id) + [
+        ("epoch", epoch), ("turn_key", turn_key), ("said_at", fields.get("said_at")), ("withheld", "1")]
+    return _sheet_spec(rid, tag, "ASK", _bcb(_carry(_with_class(pairs, fields))),
                        "CALL_TURN %s withheld" % turn_key)
 
 
