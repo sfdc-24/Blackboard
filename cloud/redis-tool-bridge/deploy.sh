@@ -57,6 +57,17 @@ deploy_cmds() {
     echo "refusing: set REDIS_HOST in the environment (the instance's private address)" >&2
     return 1
   fi
+  # THE OPERATOR'S VALUES ARE CHECKED BEFORE THEY ARE WRITTEN INTO A SCRIPT (Codex on #477, R2): they go
+  # inside a single-quoted word that bash then runs, so a quote in them would end the word. A host is
+  # letters, digits, dots and dashes (an IPv4 address or a DNS name) and a port is digits; nothing else.
+  if ! [[ "${REDIS_HOST}" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$ ]]; then
+    echo "refusing: REDIS_HOST must be an IPv4 address or a DNS name" >&2
+    return 1
+  fi
+  if ! [[ "${REDIS_PORT:-6378}" =~ ^[0-9]{1,5}$ ]]; then
+    echo "refusing: REDIS_PORT must be a number" >&2
+    return 1
+  fi
   local url
   url="$(gcloud run services describe "${SERVICE}" --project="${PROJECT}" --region="${REGION}" \
           --format='value(status.url)')"

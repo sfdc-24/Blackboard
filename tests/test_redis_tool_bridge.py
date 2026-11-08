@@ -960,6 +960,33 @@ class TheOpEndpoint(unittest.TestCase):
             self.assertIn(email.strip().lower(), bridge_op.load_purposes(),
                           "deploy.sh admits %s but callers.json has no line for it" % email)
 
+    def test_an_operator_value_that_could_leave_its_quotes_is_refused_before_any_command(self):
+        """Codex on #477 R2 (CODEX-RESULT-BB477R2-20261108T0200Z): REDIS_HOST went unescaped into a single-quoted
+        word of a script piped to bash, so an apostrophe in it would run in the deploy shell."""
+        import shutil
+        import subprocess
+        bash = shutil.which("bash")
+        if bash is None:
+            self.skipTest("no bash here")
+        script = ('eval "$(sed -n \'/^deploy_cmds()/,/^}/p\' "$1")"; PROJECT=sfdc24; REGION=us-central1; '
+                  'SERVICE=redis-tool-bridge; RUNTIME_SA=sa; IMAGE=img; INVOKERS=(m); '
+                  'gcloud(){ echo https://x.invalid; }; deploy_cmds')
+        path = str(ROOT / "cloud" / "redis-tool-bridge" / "deploy.sh")
+
+        def plan(host, port="6378"):
+            env = dict(os.environ, REDIS_HOST=host, REDIS_PORT=port)
+            return subprocess.run([bash, "-c", script, "plan", path], capture_output=True, text=True, env=env)
+
+        good = plan("10.1.2.3")
+        self.assertEqual(0, good.returncode, good.stderr)
+        self.assertIn("gcloud run deploy", good.stdout)
+        for host, port in (("10.0.0.1'; touch /tmp/pwned; echo '", "6378"), ("a b", "6378"), ("$(id)", "6378"),
+                           ("-x", "6378"), ("10.0.0.1", "63'78"), ("10.0.0.1", "6378;id")):
+            with self.subTest(host=host, port=port):
+                bad = plan(host, port)
+                self.assertNotEqual(0, bad.returncode)
+                self.assertNotIn("gcloud run deploy", bad.stdout, "no command is generated")
+
     def test_the_generated_deploy_passes_the_environment_as_ONE_argument_and_stops_at_a_failure(self):
         """Codex on #477 (CODEX-RESULT-PR477-20261108T0135Z): the ^;^ list was written unquoted into a script
         piped to bash, so its semicolons ended the gcloud command and the IAM bindings after it ran anyway."""
