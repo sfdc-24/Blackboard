@@ -21,18 +21,24 @@ Redis and has just written the entry, so it sends the event:
    `POST /wake` with `X-GitHub-Event: redis_lane`, body `{"by": "bus-reconciler", "lane": "claude-api"}`, signed with
    the ring's HMAC (`X-Hub-Signature-256`) and sent with its own ID token. It carries no row text. A failed or unrung
    nudge is sent again no sooner than 60 s later while that live run lasts.
-2. **The drain.** inbox-wake reads the lane's newest 50 entries and takes the ones after its cursor
-   `fleet:wake:cursor:claude-api`. They are **one** worker start (the worker reads the whole lane on every execution),
-   made through the same `decide()` a GitHub event uses, under the newest entry's id. `woke`, or `duplicate` (a start
-   already made after that entry landed, such as drive-intake's own ring), counts as rung. The older entries' ids are
-   claimed as well, so the per-entry sweep never starts them again, and then the cursor moves. Any other answer leaves
-   the cursor where it was.
-3. **The fail-safe.** With the flag on, the 15-minute sweep drains the lane the same way. That catches a lost nudge,
-   and it also catches an entry from a writer that never nudges (an agent's own governed `xadd`).
+2. **The drain starts the worker while the worker is behind.** The worker records its own progress in
+   `fleet:worker:inbox_scan:claude-api` (JSON; `after` is the last entry it considered), and a pass takes at most 500
+   entries. inbox-wake reads that position and the lane's newest id. While the position is behind, it makes one start
+   through the same `decide()` a GitHub event uses, under the start id `scan:<position>:<head>`. So the worker is never
+   started twice for the same position and head. A backlog bigger than one pass is started again on each nudge or
+   sweep, each time from the position the worker reached, until the worker is at the head. No tail is stranded behind
+   an idle wake. A worker that did not move gets one start per position and is not restarted every sweep; a new entry
+   gives it a new start.
+3. **The wake cursor is bookkeeping.** `fleet:wake:cursor:claude-api` is read **forward** (`XRANGE` from the cursor,
+   oldest first, 50 a page, at most 4 pages a request, so a call stays well inside the 60 s timeout). Those entries
+   are claimed and passed once the worker has been started for them or is already past them. That way the per-entry
+   sweep, after a rollback, starts none of them again. If `MAXLEN` trimmed the lane past the cursor's own entry, the
+   drain logs that (no ids, no text) and goes on from the oldest entry.
+4. **The fail-safe.** With the flag on, the 15-minute sweep drains the same way. That catches a lost nudge, an entry
+   from a writer that never nudges (an agent's own governed `xadd`), and a backlog left after a capped pass.
 
-So delivery is **at least once**. The cursor moves only after the start succeeded, so a failed start is retried by the
-next nudge or sweep, and the worker may be started twice for one entry but never zero times. The cursor and the seen
-keys are `fleet:` keys with the fleet ttl. The flag off changes nothing: a nudge answers `lane_off` and reads nothing,
+So delivery is **at least once**. A failed start moves nothing and is retried by the next nudge or sweep. The cursor,
+the seen keys and the start ids are `fleet:` keys with the fleet ttl; the worker's scan state is only read. The flag off changes nothing: a nudge answers `lane_off` and reads nothing,
 the sweep is the per-entry sweep it was, and no cursor is written.
 
 **To turn it on (owner's decision, not done here):** `INBOX_WAKE_REDIS=on` on this service. On the bus-requests job:

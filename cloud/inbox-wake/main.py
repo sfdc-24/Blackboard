@@ -25,6 +25,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import urllib.request
@@ -65,11 +66,14 @@ AGENTS_ENV = "INBOX_WAKE_AGENTS"
 
 # THE LANE PATH (README.md). INBOX_WAKE_REDIS must be exactly "on". Then a signed POST /wake with
 # X-GitHub-Event: redis_lane (bus-requests sends one right after its board mirror XADDs to
-# fleet:inbox:claude-api) drains that lane: the entries after the cursor fleet:wake:cursor:<agent> are ONE
-# start of the worker, under the newest entry's id, through the same decide() a GitHub event goes through
-# (the worker reads the whole lane on every execution). The cursor moves only after that start succeeds,
-# so delivery is at least once. With the flag on, the 15-minute sweep drains the lane the same way, which
-# catches a nudge that never arrived and an entry from any other writer.
+# fleet:inbox:claude-api) drains that lane (drain): while the WORKER's own position
+# (fleet:worker:inbox_scan:<agent>, which it writes) is behind the lane's newest id, one start, through the
+# same decide() a GitHub event goes through, keyed by that position so it is never made twice for one
+# position. A worker pass takes at most 500 entries, so a larger backlog is started again on each nudge or
+# sweep until the worker reaches the head. Beside it, the wake cursor fleet:wake:cursor:<agent> is read
+# forward and moves only once the worker was started for its entries or is past them. With the flag on,
+# the 15-minute sweep drains the same way, which catches a nudge that never arrived, an entry from any
+# other writer, and a backlog left after a capped pass.
 # WHY A NUDGE AND NOT A BLOCKING XREAD: this service is scale-to-zero (min-instances 0, a 60 s request
 # timeout, CPU only inside a request), so it cannot hold a loop open. The nudge is the event; the lane and
 # its cursor are the state, so a lost nudge costs latency, never the wake.
@@ -78,6 +82,15 @@ LANE_EVENT = "redis_lane"
 LANE_AGENTS = ("claude-api",)
 CURSOR_KEY = "fleet:wake:cursor:"
 RUNG = ("woke", "duplicate")
+# The drain reads FORWARD from the cursor, DRAIN_PAGE entries a page and at most DRAIN_PAGES pages a call,
+# so one request stays far inside the 60 s timeout. What is left is the next nudge's or sweep's, from a
+# cursor at the last entry this call covered: nothing between the cursor and the newest entry is skipped.
+DRAIN_PAGE = 50
+DRAIN_PAGES = 4
+# The worker's own progress through its lane (cloud/claude-api-worker/main.py RedisInbox._cursor_key):
+# JSON {"after": <last entry it considered>, "through": <the lane's head when that sweep began>}. Read only.
+SCAN_KEY = "fleet:worker:inbox_scan:"
+log = logging.getLogger("inbox-wake")
 
 
 class Unconfigured(Exception):
@@ -268,16 +281,43 @@ def _stream_key(stream_id):
     return int(head), int(tail or 0)
 
 
-def drain(agent: str, deps) -> dict:
-    """The lane path: the entries after the cursor are one worker start, and only then the cursor moves.
+def _forward(agent: str, cursor: str, deps):
+    """The entries after `cursor`, oldest first, in at most DRAIN_PAGES pages. Returns (entries, caught_up,
+    gap). Each page is read INCLUSIVE from the last id seen (so no exclusive-range syntax is needed) and the
+    entries at or before it are dropped. gap: the cursor's own entry is gone and the lane starts after it,
+    so the lane was trimmed (MAXLEN) or emptied past the cursor; the drain goes on from the oldest entry."""
+    covered, start, gap = [], cursor, False
+    for page_no in range(DRAIN_PAGES):
+        asked = DRAIN_PAGE + 1 if start else DRAIN_PAGE     # +1: an inclusive read gives `start` back
+        page = list(deps.lane(agent, start, asked) or [])
+        if page_no == 0 and cursor and page and page[0].get("stream_id") != cursor:
+            gap = True
+        floor = _stream_key(start) or (0, 0)
+        fresh = [e for e in page if (_stream_key(e.get("stream_id")) or (0, 0)) > floor]
+        covered.extend(fresh)
+        if len(page) < asked or not fresh:
+            return covered, True, gap
+        start = fresh[-1]["stream_id"]
+    return covered, False, gap
 
-    Every entry newer than fleet:wake:cursor:<agent> (in the sweep's window of the newest SWEEP_WINDOW) is
-    covered by ONE decide() under the newest entry's id: the worker reads the whole lane on each
-    execution, so a burst is one run. woke, or duplicate (a start already made after that entry landed,
-    by drive-intake's ring or an earlier drain), counts as rung: the older entries' ids are claimed too,
-    so the per-entry sweep never starts them again, and the cursor moves to the newest. Any other answer
-    (a failed start, no credential) leaves the cursor where it was, and the next nudge or sweep retries.
-    The worker gets no text from here: the claude-api route takes none, and a lane entry has none."""
+
+def drain(agent: str, deps) -> dict:
+    """The lane path: start the worker while ITS OWN progress is behind the lane's head.
+
+    THE START. The worker keeps how far it has got in fleet:worker:inbox_scan:<agent> (`after`, the last
+    entry it considered; cloud/claude-api-worker/main.py RedisInbox) and takes at most 500 entries a pass.
+    So the test is the worker's position against the lane's newest id (read_progress), not which entries
+    this service has seen: while `after` is behind the head, one decide() under the start id
+    scan:<after>:<head>. The id is the position, so the worker is never started twice for one position and
+    one head; the next start needs the worker to have moved (it caught up 500 and more is left) or a new
+    entry. A burst is one start, and a backlog larger than one pass is started again on every nudge or
+    sweep until the worker's position reaches the head, so no tail is stranded.
+
+    THE WAKE CURSOR is bookkeeping beside it: the entries after fleet:wake:cursor:<agent>, read forward
+    (_forward), are claimed and passed once the worker is started for them or already past them, so the
+    per-entry sweep, after a rollback of this flag, starts none of them again. A failed start (anything but
+    woke or duplicate) moves nothing, and the next nudge or sweep retries. The worker gets no text from
+    here: the claude-api route takes none, and a lane entry has none."""
     if not deps.enabled:
         return {"status": "disabled", "woke": False}
     if not deps.redis_wake:
@@ -287,29 +327,35 @@ def drain(agent: str, deps) -> dict:
         return {"status": "no_lane", "woke": False}
     if deps.agents is not None and agent not in deps.agents:
         return {"status": "not_allowed", "woke": False, "to": agent}
-    if deps.reader is None or deps.seen is None or deps.cursor is None:
+    if deps.lane is None or deps.seen is None or deps.cursor is None or deps.progress is None:
         return {"status": "no_store", "woke": False, "to": agent}
     try:
-        floor = _stream_key(deps.cursor.get(agent)) or (0, 0)
-        entries = deps.reader(agent) or []
+        position, head = deps.progress(agent)
+        new, caught_up, gap = _forward(agent, deps.cursor.get(agent), deps)
     except Exception as exc:  # noqa: BLE001 - an unread lane keeps its cursor
         return {"status": "read_error", "woke": False, "to": agent, "error": type(exc).__name__}
-    new = [e for e in entries if (_stream_key(e.get("stream_id")) or (0, 0)) > floor]
+    if gap:
+        # No id and no entry text: only that the lane no longer holds the cursor's entry.
+        log.warning("lane %s was trimmed past its wake cursor; draining from the oldest entry", agent)
+    lagging = bool(_stream_key(head)) and (_stream_key(position) or (0, -1)) < _stream_key(head)
+    if lagging:
+        result = dict(decide({"to": agent, "id": "scan:%s:%s" % (position or "0", head),
+                              "by": new[-1].get("by") if new else ""}, deps), lane=True)
+        if result["status"] not in RUNG:
+            return dict(result, entries=len(new))   # nothing moves: the next nudge or sweep retries
+    else:
+        result = {"status": "caught_up" if new else "idle", "woke": False, "to": agent, "lane": True}
+    result.update(entries=len(new), more=not caught_up, gap=gap, lagging=lagging)
     if not new:
-        return {"status": "idle", "woke": False, "to": agent}
-    last = new[-1]
-    result = dict(decide({"to": agent, "id": last["id"], "by": last.get("by") or ""}, deps),
-                  lane=True, entries=len(new))
-    if result["status"] not in RUNG:
-        return result                       # the cursor stays: the next nudge or sweep retries
+        return result
     try:
-        for entry in new[:-1]:
+        for entry in new:
             deps.seen.claim("%s:%s" % (agent, entry["id"]))
-        deps.cursor.set(agent, last["stream_id"])
-    except Exception as exc:  # noqa: BLE001 - started, cursor unmoved: the next drain is a duplicate
+        deps.cursor.set(agent, new[-1]["stream_id"])
+    except Exception as exc:  # noqa: BLE001 - the wake cursor is bookkeeping; the next drain redoes it
         result["cursor_error"] = type(exc).__name__
         return result
-    result["cursor"] = last["stream_id"]
+    result["cursor"] = new[-1]["stream_id"]
     return result
 
 
@@ -455,37 +501,67 @@ def read_inbox(client, agent: str) -> list:
     minutes, which the 2-minute Drive poll and one folder do not produce."""
     rows = list(client.xrevrange("fleet:inbox:" + agent, count=SWEEP_WINDOW) or ())
     rows.reverse()
-    out = []
-    for entry_id, fields in rows:
-        if isinstance(entry_id, bytes):
-            entry_id = entry_id.decode("utf-8")
+    return [_entry(entry_id, fields) for entry_id, fields in rows]
 
-        def field(name, fields=fields):
-            value = fields.get(name)
-            if value is None:
-                value = fields.get(name.encode("utf-8"))
-            if isinstance(value, bytes):
-                value = value.decode("utf-8", "replace")
-            return value or ""
 
-        # A drive-intake entry carries its task id, and drive-intake rings with THAT id. The sweep
-        # wakes under the same id, so one task is one claim (fleet:wake:seen:<agent>:<task id>)
-        # whichever finds it first; an entry without one is woken under its stream id, as before.
-        task_id = field("task_id")
-        out.append({"id": task_id if ID_OK.fullmatch(task_id) else str(entry_id),
-                    "text": field("text"), "by": field("by"), "at": field("at"),
-                    "stream_id": str(entry_id)})
-    return out
+def _entry(entry_id, fields) -> dict:
+    """One fleet:inbox entry as the sweep and the drain take it."""
+    if isinstance(entry_id, bytes):
+        entry_id = entry_id.decode("utf-8")
+
+    def field(name):
+        value = fields.get(name)
+        if value is None:
+            value = fields.get(name.encode("utf-8"))
+        if isinstance(value, bytes):
+            value = value.decode("utf-8", "replace")
+        return value or ""
+
+    # A drive-intake entry carries its task id, and drive-intake rings with THAT id. The sweep
+    # wakes under the same id, so one task is one claim (fleet:wake:seen:<agent>:<task id>)
+    # whichever finds it first; an entry without one is woken under its stream id, as before.
+    task_id = field("task_id")
+    return {"id": task_id if ID_OK.fullmatch(task_id) else str(entry_id),
+            "text": field("text"), "by": field("by"), "at": field("at"),
+            "stream_id": str(entry_id)}
+
+
+def read_progress(client, agent: str) -> tuple:
+    """(the worker's position, the lane's newest id), each "" when there is none. A scan state that is
+    missing, unreadable or not a stream id is position "": the worker has not provably got anywhere."""
+    raw = client.get(SCAN_KEY + agent)
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", "replace")
+    try:
+        state = json.loads(raw) if raw else {}
+    except ValueError:
+        state = {}
+    after = str(state.get("after") or "") if isinstance(state, dict) else ""
+    newest = client.xrevrange("fleet:inbox:" + agent, count=1) or ()
+    head = newest[0][0] if newest else ""
+    if isinstance(head, bytes):
+        head = head.decode("utf-8")
+    return (after if _stream_key(after) else ""), str(head or "")
+
+
+def read_lane(client, agent: str, start: str, count: int) -> list:
+    """The drain's read: fleet:inbox:<agent> FORWARD from `start` (inclusive; "" is the oldest entry),
+    oldest first, at most `count` entries. XRANGE, not the sweep's newest window."""
+    rows = client.xrange("fleet:inbox:" + agent, min=start or "-", max="+", count=count) or ()
+    return [_entry(entry_id, fields) for entry_id, fields in rows]
 
 
 class Deps:
     def __init__(self, enabled=False, seen=None, wakers=None, reader=None,
-                 webhook_secret="", sweep_token="", agents=None, redis_wake=False, cursor=None):
+                 webhook_secret="", sweep_token="", agents=None, redis_wake=False, cursor=None,
+                 lane=None, progress=None):
         self.enabled = enabled
         # The lane path (INBOX_WAKE_REDIS): off unless deps_from_env reads exactly "on", and then only with
         # a cursor store beside the seen store.
         self.redis_wake = redis_wake
         self.cursor = cursor
+        self.lane = lane                    # lane(agent, start, count): the drain's forward read
+        self.progress = progress            # progress(agent) -> (worker position, lane head)
         # The recipients this deploy may wake; None is every route (tests). deps_from_env always
         # sets it from AGENTS_ENV, so a server with the variable unset wakes nobody.
         self.agents = agents
@@ -519,6 +595,8 @@ def deps_from_env() -> Deps:
         deps.reader = lambda agent, client=client: read_inbox(client, agent)
         if deps.redis_wake:
             deps.cursor = RedisCursor(client)
+            deps.lane = lambda agent, start, count, client=client: read_lane(client, agent, start, count)
+            deps.progress = lambda agent, client=client: read_progress(client, agent)
     return deps
 
 

@@ -229,8 +229,8 @@ agent's ring wakes on that lane (`docs/REDIS-RING.md`, #491). Two agents have no
 flags close that gap. Each must be exactly `on`, and each does nothing unless `BOARD_TO_REDIS` is on as well.
 
 - **`INBOX_WAKE_REDIS` (claude-api).** When an entry lands on `fleet:inbox:claude-api`, the live loop sends
-  cloud/inbox-wake one signed `redis_lane` nudge, which carries no row text. inbox-wake drains the lane from its own
-  cursor and starts `claude-api-worker`; `cloud/inbox-wake/README.md` explains why this is a nudge and not a blocking
+  cloud/inbox-wake one signed `redis_lane` nudge, which carries no row text. inbox-wake starts `claude-api-worker`
+  while the worker's own position is behind the lane's head, once per position; `cloud/inbox-wake/README.md` explains why this is a nudge and not a blocking
   read there. The job also needs `INBOX_WAKE_URL` (the service's `/wake` URL), the `INBOX_WAKE_SECRET` secret as that
   variable, and `run.invoker` on inbox-wake for its identity. Without the URL or the secret it logs one error and
   sends nothing.

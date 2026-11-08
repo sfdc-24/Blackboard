@@ -13,7 +13,8 @@ fake, which executes the script text it is given and refuses any line it does no
 The cloud-agent wake (BOARD_TO_REDIS_RELAY_CURSOR, INBOX_WAKE_REDIS) has its guards here too: the relay's
 flag, its own mark, its for=cursor and its refusal to relay a broadcast; the nudge's claude-api-only
 scope, its signature and its retry; and in cloud/inbox-wake (run against tests/test_inbox_wake.py) the
-cursor that moves only after a start succeeds, the one start per burst, and the lane flag itself.
+cursor that moves only after a start succeeds, the forward read, the start while the worker's own
+position lags the lane head (one per position), the page bound, and the lane flag itself.
 
 scripts/ is copied per mutant and the edit is applied to the copy, so a bad replace cannot land
 on the real worker. An anchor that is not in the file is ANCHOR-MISS, not a pass.
@@ -212,8 +213,8 @@ MUTANTS = [
     (
         "the-cursor-moves-before-the-start",
         "cloud/inbox-wake/main.py",
-        "    last = new[-1]\n",
-        "    last = new[-1]\n    deps.cursor.set(agent, last[\"stream_id\"])\n",
+        "    if lagging:\n        result = dict(decide(",
+        "    if new:\n        deps.cursor.set(agent, new[-1][\"stream_id\"])\n    if lagging:\n        result = dict(decide(",
         "a start that fails after the cursor moved is never retried: an entry woken zero times",
         "test_a_new_entry_starts_the_worker_once_and_the_cursor_moves_only_after",
         "tests.test_inbox_wake",
@@ -230,7 +231,7 @@ MUTANTS = [
     (
         "a-burst-leaves-older-ids-unclaimed",
         "cloud/inbox-wake/main.py",
-        '        for entry in new[:-1]:\n            deps.seen.claim("%s:%s" % (agent, entry["id"]))\n',
+        '        for entry in new:\n            deps.seen.claim("%s:%s" % (agent, entry["id"]))\n',
         "",
         "the per-entry sweep starts the worker again for each older entry of a burst already started",
         "test_a_burst_is_one_start_and_no_later_sweep_starts_it_again",
@@ -279,6 +280,62 @@ MUTANTS = [
         "test_the_nudge_is_signed_and_names_a_lane_this_deploy_may_wake",
         "tests.test_inbox_wake",
     ),
+    # Codex on c497137a: read forward, and start while the WORKER's own position lags the head.
+    (
+        "the-drain-reads-the-newest-50-window",
+        "cloud/inbox-wake/main.py",
+        "        page = list(deps.lane(agent, start, asked) or [])\n",
+        "        page = [e for e in (deps.reader(agent) or [])\n"
+        "                if (_stream_key(e.get(\"stream_id\")) or (0, 0)) >= (_stream_key(start) or (0, -1))]\n",
+        "more than fifty behind the cursor: the oldest are skipped and never claimed",
+        "test_120_entries_behind_are_all_covered_in_order_by_one_start",
+        "tests.test_inbox_wake",
+    ),
+    (
+        "the-sweep-ignores-worker-lag",
+        "cloud/inbox-wake/main.py",
+        "    lagging = bool(_stream_key(head)) and (_stream_key(position) or (0, -1)) < _stream_key(head)\n",
+        "    lagging = bool(new)\n",
+        "one start takes 500 of 1200; the wake cursor is idle, so the tail waits for a new entry",
+        "test_1200_behind_a_500_cap_is_three_starts_and_no_tail_is_stranded",
+        "tests.test_inbox_wake",
+    ),
+    (
+        "the-start-is-not-keyed-by-position",
+        "cloud/inbox-wake/main.py",
+        '"id": "scan:%s:%s" % (position or "0", head),',
+        '"id": new[-1]["stream_id"] if new else "scan:%s" % head,',
+        "a worker that did not move is started again for the same position",
+        "test_a_stalled_worker_is_not_started_twice_for_one_position",
+        "tests.test_inbox_wake",
+    ),
+    (
+        "the-trim-gap-is-silent",
+        "cloud/inbox-wake/main.py",
+        '        log.warning("lane %s was trimmed past its wake cursor; draining from the oldest entry", agent)\n',
+        "        pass\n",
+        "entries lost to a MAXLEN trim leave no trace",
+        "test_a_lane_trimmed_past_the_cursor_is_logged_without_words_and_drains_on",
+        "tests.test_inbox_wake",
+    ),
+    (
+        "the-page-bound-is-gone",
+        "cloud/inbox-wake/main.py",
+        "    for page_no in range(DRAIN_PAGES):\n",
+        "    for page_no in range(10 ** 6):\n",
+        "a 10000-entry backlog is read in one request, past the 60 s timeout",
+        "test_the_page_bound_keeps_a_call_short_and_the_rest_drains_next_time",
+        "tests.test_inbox_wake",
+    ),
+    (
+        "the-progress-is-another-key",
+        "cloud/inbox-wake/main.py",
+        'SCAN_KEY = "fleet:worker:inbox_scan:"',
+        'SCAN_KEY = "fleet:worker:inbox:"',
+        "the wake reads a key the worker never writes: every position is unknown, every sweep a start",
+        "test_read_progress_is_the_worker_s_own_scan_state_and_the_lane_head",
+        "tests.test_inbox_wake",
+    ),
 ]
 
 
@@ -292,6 +349,7 @@ def stage() -> Path:
     for rel in ("cloud/bus-reconciler/serve_requests.py",
                 "tests/test_board_to_redis.py",
                 "tests/test_inbox_wake.py",
+                "cloud/claude-api-worker/main.py",
                 ".gcloudignore",
                 ".github/workflows/inbox-wake-sweep.yml",
                 ".github/workflows/inbox-wake-claude.yml",

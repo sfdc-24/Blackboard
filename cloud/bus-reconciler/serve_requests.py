@@ -616,15 +616,15 @@ def mirror_addressed(conn, rows, relay=False, on_added=None) -> int:
 # block on the lane itself. This loop already holds Redis and has just XADDed the entry, so it tells
 # inbox-wake: one POST /wake, X-GitHub-Event: redis_lane, body {"by": "bus-reconciler", "lane":
 # "claude-api"} and nothing else, signed with the ring's HMAC (X-Hub-Signature-256, as drive-intake
-# signs) and carrying this job's ID token for the private service. inbox-wake drains the lane from its
-# own cursor (cloud/inbox-wake/README.md), so a nudge says only "look", and a repeated one is harmless.
+# signs) and carrying this job's ID token for the private service. inbox-wake starts the worker while the
+# worker's own position lags the lane (cloud/inbox-wake/README.md), so a nudge says only "look", and a repeated one is harmless.
 # A nudge that fails or comes back unrung stays pending and is sent again no sooner than
 # NUDGE_RETRY_SECONDS later, while this run lasts; after that the 15-minute sweep drains the lane.
 INBOX_WAKE_REDIS = "INBOX_WAKE_REDIS"
 NUDGE_AGENTS = frozenset({"claude-api"})
 NUDGE_EVENT = "redis_lane"
 NUDGE_RETRY_SECONDS = 60
-NUDGE_DONE = frozenset({"woke", "duplicate", "idle"})
+NUDGE_DONE = frozenset({"woke", "duplicate", "idle", "caught_up"})
 # Answers a retry cannot change (the flag or the recipient list on inbox-wake): dropped, logged by status.
 NUDGE_FINAL = frozenset({"disabled", "lane_off", "no_lane", "not_allowed"})
 IDENTITY_URL = ("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/"

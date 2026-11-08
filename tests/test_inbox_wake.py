@@ -10,6 +10,7 @@ import json
 import pathlib
 import sys
 import unittest
+from unittest import mock
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location(
@@ -402,31 +403,74 @@ class SweepAndWebhook(unittest.TestCase):
 
 
 class Lane:
-    """fleet:inbox:claude-api as read_inbox hands it over: the newest window, oldest first, each entry
-    with its stream id. add() is an XADD."""
+    """fleet:inbox:claude-api. Called, it is read_inbox: the sweep's newest window, oldest first. read() is
+    read_lane: XRANGE forward from `start`, inclusive, at most `count`. add() is an XADD; trim(n) is a
+    MAXLEN trim to the newest n."""
 
     def __init__(self):
-        self.entries, self.reads = [], 0
+        self.entries, self.reads, self.pages, self.seq = [], 0, [], 0
 
     def add(self, by="grok", task_id=""):
-        sid = "%d-0" % (1000 + len(self.entries))
+        self.seq += 1
+        sid = "%d-0" % (1000 + self.seq)
         self.entries.append({"id": task_id or sid, "stream_id": sid, "by": by, "text": "", "at": ""})
         return sid
 
+    def trim(self, keep):
+        del self.entries[:max(0, len(self.entries) - keep)]
+
+    def head(self):
+        return self.entries[-1]["stream_id"] if self.entries else ""
+
     def __call__(self, agent):
         self.reads += 1
-        return list(self.entries) if agent == "claude-api" else []
+        return list(self.entries[-wake.SWEEP_WINDOW:]) if agent == "claude-api" else []
+
+    def read(self, agent, start, count):
+        self.reads += 1
+        self.pages.append((start, count))
+        floor = wake._stream_key(start) or (0, -1)
+        found = [e for e in self.entries if wake._stream_key(e["stream_id"]) >= floor] if start else self.entries
+        return list(found[:count]) if agent == "claude-api" else []
 
 
-def lane_deps(on=True, run_job=None):
-    """claude-api only, the lane path on (or off), a memory cursor and a lane."""
+class Worker:
+    """claude-api-worker as the wake sees it: each start considers at most `cap` entries after its own
+    position (fleet:worker:inbox_scan:claude-api `after`). stalled: a start that moves nothing."""
+
+    def __init__(self, lane, cap=500):
+        self.lane, self.cap, self.after, self.stalled, self.starts = lane, cap, "", False, []
+
+    def progress(self, agent):
+        return self.after, self.lane.head()
+
+    def run(self, job):
+        self.starts.append((job, self.after))
+        if self.stalled:
+            return
+        floor = wake._stream_key(self.after) or (0, -1)
+        ahead = [e for e in self.lane.entries if wake._stream_key(e["stream_id"]) > floor][:self.cap]
+        if ahead:
+            self.after = ahead[-1]["stream_id"]
+
+
+def lane_deps(on=True, run_job=None, cap=500):
+    """claude-api only, the lane path on (or off), a memory cursor, a lane and a worker that keeps its own
+    position. rec.jobs records every start."""
     d, rec = deps()
     d.agents = frozenset({"claude-api"})
     d.redis_wake = on
     d.cursor = wake.MemoryCursor()
     d.reader = lane = Lane()
-    if run_job is not None:
-        d.wakers.run_job = run_job
+    d.lane = lane.read
+    worker = Worker(lane, cap=cap)
+    d.progress = worker.progress
+
+    def started(job):
+        rec.jobs.append(job)
+        worker.run(job)
+    d.wakers.run_job = run_job or started
+    d.worker = worker
     return d, rec, lane
 
 
@@ -439,8 +483,9 @@ def nudge(d, lane="claude-api", secret="hook", signature=None):
 
 
 class TheLanePath(unittest.TestCase):
-    """INBOX_WAKE_REDIS: a nudge (or the sweep) drains fleet:inbox:claude-api from its cursor. The cursor
-    moves only after the worker start succeeded, so an entry is woken at least once, and a burst once."""
+    """INBOX_WAKE_REDIS: a nudge (or the sweep) starts the worker while the worker's OWN position is behind
+    the lane's head, once per position. The wake cursor reads forward and moves only once the worker was
+    started for its entries or is already past them."""
 
     def test_only_the_exact_string_on_enables_the_lane_path(self):
         self.assertTrue(wake.redis_wake_from_env({"INBOX_WAKE_REDIS": "on"}))
@@ -449,12 +494,13 @@ class TheLanePath(unittest.TestCase):
         self.assertFalse(wake.redis_wake_from_env({}))
         self.assertFalse(wake.Deps().redis_wake)
         self.assertIsNone(wake.Deps().cursor)
+        self.assertIsNone(wake.Deps().progress)
 
     def test_a_new_entry_starts_the_worker_once_and_the_cursor_moves_only_after(self):
         cursor_at_start = []
         d, rec, lane = lane_deps()
         d.wakers.run_job = lambda job: (cursor_at_start.append(d.cursor.get("claude-api")),
-                                        rec.jobs.append(job))
+                                        rec.jobs.append(job), d.worker.run(job))
         sid = lane.add()
         status, payload = nudge(d)
         self.assertEqual(200, status)
@@ -462,26 +508,24 @@ class TheLanePath(unittest.TestCase):
         self.assertEqual(["claude-api-worker"], rec.jobs)
         self.assertEqual([""], cursor_at_start, "the cursor had not moved when the worker was started")
         self.assertEqual(sid, d.cursor.get("claude-api"))
-        status, payload = nudge(d)                  # the same lane again: nothing new
+        status, payload = nudge(d)                  # the same lane again, the worker caught up: nothing
         self.assertEqual("idle", payload["woke"][0]["status"])
         self.assertEqual(["claude-api-worker"], rec.jobs)
 
     def test_a_failed_start_keeps_the_cursor_and_the_next_nudge_retries(self):
+        d, rec, lane = lane_deps()
         attempts = []
 
         def run_job(job):
             attempts.append(job)
             if len(attempts) == 1:
                 raise OSError("run API down")
-        d, rec, lane = lane_deps(run_job=run_job)
+            d.worker.run(job)
+        d.wakers.run_job = run_job
         sid = lane.add()
-        status, payload = nudge(d)
-        self.assertEqual("error", payload["woke"][0]["status"])
+        self.assertEqual("error", nudge(d)[1]["woke"][0]["status"])
         self.assertEqual("", d.cursor.get("claude-api"), "a failed start does not move the cursor")
-        self.assertTrue(d.seen.claim("claude-api:" + sid), "and the claim was released")
-        d.seen.release("claude-api:" + sid)
-        status, payload = nudge(d)
-        self.assertEqual("woke", payload["woke"][0]["status"])
+        self.assertEqual("woke", nudge(d)[1]["woke"][0]["status"], "the same position is retried")
         self.assertEqual(sid, d.cursor.get("claude-api"))
         self.assertEqual(2, len(attempts))
         self.assertEqual("idle", nudge(d)[1]["woke"][0]["status"])
@@ -495,6 +539,46 @@ class TheLanePath(unittest.TestCase):
         self.assertEqual("unconfigured", nudge(d)[1]["woke"][0]["status"])
         self.assertEqual("", d.cursor.get("claude-api"))
 
+    def test_1200_behind_a_500_cap_is_three_starts_and_no_tail_is_stranded(self):
+        """Codex on c497137a: one start takes at most 500, so a wake that counts only ITS cursor left the
+        tail with no start until a new entry came. The wake follows the worker's own position."""
+        d, rec, lane = lane_deps(cap=500)
+        sids = [lane.add() for _ in range(1200)]
+        with mock.patch.object(wake, "DRAIN_PAGES", 30):     # the wake cursor catches up in one call
+            first = nudge(d)[1]["woke"][0]
+            self.assertEqual(("woke", 1200, False), (first["status"], first["entries"], first["more"]))
+            self.assertEqual(sids[-1], d.cursor.get("claude-api"))
+            self.assertEqual(sids[499], d.worker.after)
+            for _ in range(5):
+                wake.sweep(d)
+        self.assertEqual(3, len(rec.jobs))
+        self.assertEqual(["", sids[499], sids[999]], [after for _job, after in d.worker.starts])
+        self.assertEqual(sids[-1], d.worker.after, "the worker reached the head")
+        self.assertEqual("idle", nudge(d)[1]["woke"][0]["status"])
+
+    def test_1200_behind_with_the_paged_wake_cursor_still_catches_up(self):
+        d, rec, lane = lane_deps(cap=500)
+        sids = [lane.add() for _ in range(1200)]
+        for _ in range(10):
+            wake.sweep(d)
+        self.assertEqual(sids[-1], d.worker.after)
+        self.assertEqual(sids[-1], d.cursor.get("claude-api"))
+        self.assertLessEqual(len(rec.jobs), 4)
+        self.assertEqual(len(rec.jobs), len({after for _job, after in d.worker.starts}),
+                         "never two starts at one worker position")
+
+    def test_a_stalled_worker_is_not_started_twice_for_one_position(self):
+        d, rec, lane = lane_deps()
+        d.worker.stalled = True
+        lane.add()
+        self.assertEqual("woke", nudge(d)[1]["woke"][0]["status"])
+        for _ in range(3):
+            self.assertEqual("duplicate", wake.sweep(d)[0]["status"])
+        self.assertEqual(1, len(rec.jobs))
+        lane.add()                                  # a new head is a new start
+        self.assertEqual("woke", nudge(d)[1]["woke"][0]["status"])
+        self.assertEqual(2, len(rec.jobs))
+
     def test_a_burst_is_one_start_and_no_later_sweep_starts_it_again(self):
         d, rec, lane = lane_deps()
         sids = [lane.add() for _ in range(3)]
@@ -502,31 +586,29 @@ class TheLanePath(unittest.TestCase):
         self.assertEqual(("woke", 3), (payload["status"], payload["entries"]))
         self.assertEqual(["claude-api-worker"], rec.jobs)
         self.assertEqual(sids[-1], d.cursor.get("claude-api"))
-        wake.sweep(d)                               # the lane path's sweep: idle
+        self.assertEqual("idle", wake.sweep(d)[0]["status"])
         d.redis_wake = False                        # and the old per-entry sweep, after a rollback
         out = wake.sweep(d)
         self.assertEqual(["duplicate"] * 3, [item["status"] for item in out])
         self.assertEqual(["claude-api-worker"], rec.jobs)
 
-    def test_an_entry_already_rung_by_drive_intake_is_not_started_again(self):
+    def test_entries_the_worker_is_already_past_start_nothing(self):
         d, rec, lane = lane_deps()
         lane.add(by="drive-intake", task_id="task-0123456789abcdef")
-        self.assertEqual("woke", wake.decide({"to": "claude-api", "id": "task-0123456789abcdef",
-                                              "by": "drive-intake"}, d)["status"])
+        d.worker.run("claude-api-worker")           # drive-intake's own ring ran it
         payload = nudge(d)[1]["woke"][0]
-        self.assertEqual("duplicate", payload["status"])
-        self.assertEqual(["claude-api-worker"], rec.jobs)
+        self.assertEqual(("caught_up", 1, False), (payload["status"], payload["entries"], payload["lagging"]))
+        self.assertEqual([], rec.jobs)
         self.assertEqual(lane.entries[0]["stream_id"], d.cursor.get("claude-api"))
 
     def test_the_sweep_drains_the_lane_when_a_nudge_never_came(self):
         d, rec, lane = lane_deps()
-        sid = lane.add()
+        lane.add()
         lane.add()
         out = wake.sweep(d)
         self.assertEqual(1, len(out))
         self.assertEqual(("woke", 2), (out[0]["status"], out[0]["entries"]))
         self.assertEqual(["claude-api-worker"], rec.jobs)
-        self.assertNotEqual(sid, d.cursor.get("claude-api"))
         self.assertEqual(lane.entries[-1]["stream_id"], d.cursor.get("claude-api"))
 
     def test_the_nudge_is_signed_and_names_a_lane_this_deploy_may_wake(self):
@@ -546,6 +628,7 @@ class TheLanePath(unittest.TestCase):
     def test_the_flag_off_changes_nothing(self):
         """Off: a nudge drains nothing and the sweep is the per-entry sweep it was, cursor untouched."""
         d, rec, lane = lane_deps(on=False)
+        d.progress = lambda agent: self.fail("the worker's progress is read with the flag off")
         for _ in range(2):
             lane.add()
         payload = nudge(d)[1]["woke"][0]
@@ -575,9 +658,101 @@ class TheLanePath(unittest.TestCase):
         lane.entries = [{"id": "9-0", "stream_id": "9-0", "by": "grok"},
                         {"id": "10-0", "stream_id": "10-0", "by": "grok"}]
         d.cursor.set("claude-api", "9-0")
+        d.worker.after = "9-0"
+        self.assertGreater(wake._stream_key("10-0"), wake._stream_key("9-0"))
         payload = nudge(d)[1]["woke"][0]
         self.assertEqual(("woke", 1), (payload["status"], payload["entries"]))
         self.assertEqual("10-0", d.cursor.get("claude-api"))
+
+    def test_120_entries_behind_are_all_covered_in_order_by_one_start(self):
+        """Codex on c497137a: the newest-50 window skipped what lay behind it. The drain reads forward."""
+        d, rec, lane = lane_deps()
+        lane.add()
+        self.assertEqual("woke", nudge(d)[1]["woke"][0]["status"])
+        sids = [lane.add() for _ in range(120)]
+        claims = []
+        claim = d.seen.claim
+        d.seen.claim = lambda key: (claims.append(key), claim(key))[1]
+        payload = nudge(d)[1]["woke"][0]
+        self.assertEqual(("woke", 120, False), (payload["status"], payload["entries"], payload["more"]))
+        self.assertEqual(["claude-api-worker"] * 2, rec.jobs, "one start for the 120")
+        self.assertEqual(["claude-api:" + s for s in sids], claims[1:], "every entry, in order")
+        self.assertTrue(claims[0].startswith("claude-api:scan:"), "the start is claimed by position")
+        self.assertEqual(sids[-1], d.cursor.get("claude-api"))
+        self.assertTrue(all(start for start, _count in lane.pages[1:]), "every page starts at an id")
+        d.redis_wake = False                        # a rollback: the per-entry sweep starts none of them
+        self.assertEqual({"duplicate"}, {item["status"] for item in wake.sweep(d)})
+        self.assertEqual(2, len(rec.jobs))
+
+    def test_the_page_bound_keeps_a_call_short_and_the_rest_drains_next_time(self):
+        d, rec, lane = lane_deps()
+        limit = wake.DRAIN_PAGE * wake.DRAIN_PAGES
+        sids = [lane.add() for _ in range(limit + 30)]
+        payload = nudge(d)[1]["woke"][0]
+        self.assertEqual(("woke", limit, True), (payload["status"], payload["entries"], payload["more"]))
+        self.assertLessEqual(len(lane.pages), wake.DRAIN_PAGES)
+        self.assertEqual(sids[limit - 1], d.cursor.get("claude-api"), "the cursor at the last entry covered")
+        payload = wake.sweep(d)[0]
+        self.assertEqual(("caught_up", 30, False), (payload["status"], payload["entries"], payload["more"]))
+        self.assertEqual(sids[-1], d.cursor.get("claude-api"))
+        self.assertEqual(["claude-api-worker"], rec.jobs, "the worker was already past the rest")
+        self.assertEqual("idle", nudge(d)[1]["woke"][0]["status"])
+
+    def test_a_lane_trimmed_past_the_cursor_is_logged_without_words_and_drains_on(self):
+        d, rec, lane = lane_deps()
+        lane.add(by="the guest's home address")
+        self.assertEqual("woke", nudge(d)[1]["woke"][0]["status"])
+        cursor = d.cursor.get("claude-api")
+        sids = [lane.add() for _ in range(5)]
+        lane.trim(3)                                # MAXLEN ~ took the cursor's entry and two after it
+        with self.assertLogs("inbox-wake", level="WARNING") as logs:
+            payload = nudge(d)[1]["woke"][0]
+        self.assertEqual(("woke", 3, True), (payload["status"], payload["entries"], payload["gap"]))
+        self.assertEqual(sids[-1], d.cursor.get("claude-api"))
+        text = " ".join(logs.output)
+        self.assertIn("trimmed", text)
+        for word in (cursor, sids[0], "address", "guest"):
+            self.assertNotIn(word, text)
+        with self.assertRaises(AssertionError):     # an untrimmed lane logs nothing
+            with self.assertLogs("inbox-wake", level="WARNING"):
+                lane.add()
+                self.assertFalse(nudge(d)[1]["woke"][0]["gap"])
+
+    def test_read_lane_is_a_forward_xrange_from_the_cursor(self):
+        class Client:
+            def __init__(self):
+                self.asked = []
+
+            def xrange(self, key, min=None, max=None, count=None):
+                self.asked.append((key, min, max, count))
+                return [(b"1700000000001-0", {b"by": b"grok"})]
+        client = Client()
+        out = wake.read_lane(client, "claude-api", "1700000000000-0", 51)
+        self.assertEqual([("fleet:inbox:claude-api", "1700000000000-0", "+", 51)], client.asked)
+        self.assertEqual(["1700000000001-0"], [e["stream_id"] for e in out])
+        wake.read_lane(client, "claude-api", "", 51)
+        self.assertEqual("-", client.asked[-1][1])
+
+    def test_read_progress_is_the_worker_s_own_scan_state_and_the_lane_head(self):
+        class Client(FakeRedis):
+            head = [(b"1700000000009-0", {})]
+
+            def xrevrange(self, key, count=None):
+                self.asked = (key, count)
+                return self.head
+        client = Client()
+        self.assertEqual(("", "1700000000009-0"), wake.read_progress(client, "claude-api"))
+        self.assertEqual(("fleet:inbox:claude-api", 1), client.asked)
+        client.set("fleet:worker:inbox_scan:claude-api",
+                   json.dumps({"after": "1700000000004-0", "through": "1700000000009-0"}))
+        self.assertEqual(("1700000000004-0", "1700000000009-0"), wake.read_progress(client, "claude-api"))
+        for raw in ("{}", "not json", json.dumps({"after": "the guest"}), json.dumps(["x"])):
+            client.set("fleet:worker:inbox_scan:claude-api", raw)
+            self.assertEqual("", wake.read_progress(client, "claude-api")[0], raw)
+        client.head = []
+        self.assertEqual("", wake.read_progress(client, "claude-api")[1])
+        worker = (REPO / "cloud" / "claude-api-worker" / "main.py").read_text(encoding="utf-8")
+        self.assertIn('"%s" + agent' % wake.SCAN_KEY, worker, "the key the worker writes")
 
     def test_read_inbox_hands_over_the_stream_id(self):
         class Client:

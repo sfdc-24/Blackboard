@@ -830,7 +830,7 @@ class TheClaudeApiNudge(unittest.TestCase):
         self.assertNotIn("inbox-wake.example", text)
 
     def test_an_answer_a_retry_cannot_change_is_dropped(self):
-        for status in ("lane_off", "not_allowed", "disabled", "no_lane", "idle", "duplicate"):
+        for status in ("lane_off", "not_allowed", "disabled", "no_lane", "idle", "duplicate", "caught_up"):
             nudger, sent, _clock = self.nudger([status])
             nudger.note("claude-api")
             with mock.patch.object(sr.log, "warning"):
@@ -841,14 +841,26 @@ class TheClaudeApiNudge(unittest.TestCase):
         """End to end, in process: the mirror's entry, the signed nudge, inbox-wake's real handle and drain
         over the same lane, and the worker started once. A second pass starts nothing."""
         wake = load_inbox_wake()
-        conn, jobs = FakeRedis(), []
+        conn, jobs, worker = FakeRedis(), [], {"after": ""}
 
         def reader(agent):
             return [{"id": "%d-0" % (i + 1), "stream_id": "%d-0" % (i + 1), "by": e.get("by", "")}
                     for i, e in enumerate(conn.inbox(agent))]
+
+        def lane(agent, start, count):
+            floor = wake._stream_key(start) or (0, -1)
+            return [e for e in reader(agent) if wake._stream_key(e["stream_id"]) >= floor][:count]
+
+        def head(agent="claude-api"):
+            return "%d-0" % len(conn.inbox(agent)) if conn.inbox(agent) else ""
+
+        def run_job(job):                           # the worker: it reads its lane to the head
+            jobs.append(job)
+            worker["after"] = head()
         deps = wake.Deps(enabled=True, seen=wake.MemorySeen(), reader=reader, webhook_secret="shared",
                          agents=frozenset({"claude-api"}), redis_wake=True, cursor=wake.MemoryCursor(),
-                         wakers=wake.Wakers(run_job=jobs.append))
+                         lane=lane, progress=lambda agent: (worker["after"], head(agent)),
+                         wakers=wake.Wakers(run_job=run_job))
         nudger = sr.Nudger("https://inbox-wake.example/wake", "shared",
                            post=lambda url, body, headers: wake.handle("POST", "/wake", headers, body, deps)[1])
         rows = [row("ROW-A", "claude-api", "ping")]
