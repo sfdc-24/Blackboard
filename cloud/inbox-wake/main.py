@@ -63,6 +63,22 @@ ROUTES = {
 # Gate 3 Step 3 is "recipient claude-api only. No other folder, no other recipient."
 AGENTS_ENV = "INBOX_WAKE_AGENTS"
 
+# THE LANE PATH (README.md). INBOX_WAKE_REDIS must be exactly "on". Then a signed POST /wake with
+# X-GitHub-Event: redis_lane (bus-requests sends one right after its board mirror XADDs to
+# fleet:inbox:claude-api) drains that lane: the entries after the cursor fleet:wake:cursor:<agent> are ONE
+# start of the worker, under the newest entry's id, through the same decide() a GitHub event goes through
+# (the worker reads the whole lane on every execution). The cursor moves only after that start succeeds,
+# so delivery is at least once. With the flag on, the 15-minute sweep drains the lane the same way, which
+# catches a nudge that never arrived and an entry from any other writer.
+# WHY A NUDGE AND NOT A BLOCKING XREAD: this service is scale-to-zero (min-instances 0, a 60 s request
+# timeout, CPU only inside a request), so it cannot hold a loop open. The nudge is the event; the lane and
+# its cursor are the state, so a lost nudge costs latency, never the wake.
+REDIS_WAKE_ENV = "INBOX_WAKE_REDIS"
+LANE_EVENT = "redis_lane"
+LANE_AGENTS = ("claude-api",)
+CURSOR_KEY = "fleet:wake:cursor:"
+RUNG = ("woke", "duplicate")
+
 
 class Unconfigured(Exception):
     """A route has no credential or URL. The id is released so a later sweep can retry."""
@@ -71,6 +87,12 @@ class Unconfigured(Exception):
 def enabled_from_env(environ=None) -> bool:
     environ = os.environ if environ is None else environ
     return environ.get("INBOX_WAKE_ENABLED") == "on"
+
+
+def redis_wake_from_env(environ=None) -> bool:
+    """The lane path's flag: exactly "on". Unset, empty and every other value leave it off."""
+    environ = os.environ if environ is None else environ
+    return environ.get(REDIS_WAKE_ENV) == "on"
 
 
 def canonical(agent: str):
@@ -113,6 +135,35 @@ class RedisSeen:
 
     def release(self, key: str) -> None:
         self.client.delete("fleet:wake:seen:" + key)
+
+
+class MemoryCursor:
+    """Process-local stand-in for RedisCursor. Tests use this."""
+
+    def __init__(self):
+        self.ids = {}
+
+    def get(self, agent: str) -> str:
+        return self.ids.get(agent, "")
+
+    def set(self, agent: str, stream_id: str) -> None:
+        self.ids[agent] = stream_id
+
+
+class RedisCursor:
+    """fleet:wake:cursor:<agent>: the newest lane entry whose worker start succeeded. The fleet ttl."""
+
+    def __init__(self, client):
+        self.client = client
+
+    def get(self, agent: str) -> str:
+        value = self.client.get(CURSOR_KEY + agent)
+        if isinstance(value, bytes):
+            value = value.decode("utf-8", "replace")
+        return value or ""
+
+    def set(self, agent: str, stream_id: str) -> None:
+        self.client.set(CURSOR_KEY + agent, stream_id, ex=SEEN_TTL)
 
 
 class Wakers:
@@ -209,8 +260,72 @@ def decide(message: dict, deps) -> dict:
             "route": kind, "target": target}
 
 
+def _stream_key(stream_id):
+    """A stream id as (ms, seq), or None when it is not one. Ids compare in that order, not as text."""
+    head, _, tail = str(stream_id or "").partition("-")
+    if not head.isdigit() or (tail and not tail.isdigit()):
+        return None
+    return int(head), int(tail or 0)
+
+
+def drain(agent: str, deps) -> dict:
+    """The lane path: the entries after the cursor are one worker start, and only then the cursor moves.
+
+    Every entry newer than fleet:wake:cursor:<agent> (in the sweep's window of the newest SWEEP_WINDOW) is
+    covered by ONE decide() under the newest entry's id: the worker reads the whole lane on each
+    execution, so a burst is one run. woke, or duplicate (a start already made after that entry landed,
+    by drive-intake's ring or an earlier drain), counts as rung: the older entries' ids are claimed too,
+    so the per-entry sweep never starts them again, and the cursor moves to the newest. Any other answer
+    (a failed start, no credential) leaves the cursor where it was, and the next nudge or sweep retries.
+    The worker gets no text from here: the claude-api route takes none, and a lane entry has none."""
+    if not deps.enabled:
+        return {"status": "disabled", "woke": False}
+    if not deps.redis_wake:
+        return {"status": "lane_off", "woke": False}
+    agent = canonical(agent) or ""
+    if agent not in LANE_AGENTS:
+        return {"status": "no_lane", "woke": False}
+    if deps.agents is not None and agent not in deps.agents:
+        return {"status": "not_allowed", "woke": False, "to": agent}
+    if deps.reader is None or deps.seen is None or deps.cursor is None:
+        return {"status": "no_store", "woke": False, "to": agent}
+    try:
+        floor = _stream_key(deps.cursor.get(agent)) or (0, 0)
+        entries = deps.reader(agent) or []
+    except Exception as exc:  # noqa: BLE001 - an unread lane keeps its cursor
+        return {"status": "read_error", "woke": False, "to": agent, "error": type(exc).__name__}
+    new = [e for e in entries if (_stream_key(e.get("stream_id")) or (0, 0)) > floor]
+    if not new:
+        return {"status": "idle", "woke": False, "to": agent}
+    last = new[-1]
+    result = dict(decide({"to": agent, "id": last["id"], "by": last.get("by") or ""}, deps),
+                  lane=True, entries=len(new))
+    if result["status"] not in RUNG:
+        return result                       # the cursor stays: the next nudge or sweep retries
+    try:
+        for entry in new[:-1]:
+            deps.seen.claim("%s:%s" % (agent, entry["id"]))
+        deps.cursor.set(agent, last["stream_id"])
+    except Exception as exc:  # noqa: BLE001 - started, cursor unmoved: the next drain is a duplicate
+        result["cursor_error"] = type(exc).__name__
+        return result
+    result["cursor"] = last["stream_id"]
+    return result
+
+
+def lane_of(body: bytes) -> str:
+    """The lane a redis_lane nudge names, or "". The body is {"lane": <agent>}; nothing else is read."""
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return ""
+    return str(data.get("lane") or "") if isinstance(data, dict) else ""
+
+
 def sweep(deps) -> list:
-    """Read each inbox and wake what the webhook missed. Flag off reads nothing."""
+    """Read each inbox and wake what the webhook missed. Flag off reads nothing.
+
+    With INBOX_WAKE_REDIS on, a lane agent's inbox is drained (drain) instead of swept entry by entry."""
     if not deps.enabled:
         return []
     if deps.reader is None or deps.seen is None:
@@ -219,6 +334,9 @@ def sweep(deps) -> list:
     for agent in ROUTES:
         if deps.agents is not None and agent not in deps.agents:
             continue                        # an inbox this deploy may not wake is not read either
+        if deps.redis_wake and agent in LANE_AGENTS:
+            out.append(drain(agent, deps))
+            continue
         try:
             entries = deps.reader(agent) or []
         except Exception as exc:  # noqa: BLE001 - one inbox must not sink the others
@@ -280,6 +398,8 @@ def handle(method: str, path: str, headers: dict, body: bytes, deps) -> tuple:
             return 200, {"enabled": False, "woke": []}
         if not signature_ok(deps.webhook_secret, body, headers.get("x-hub-signature-256", "")):
             return 401, {"error": "bad signature"}
+        if headers.get("x-github-event", "") == LANE_EVENT:
+            return 200, {"enabled": True, "woke": [drain(lane_of(body), deps)]}
         messages = parse_event(headers.get("x-github-event", ""), body)
         return 200, {"enabled": True, "woke": [decide(m, deps) for m in messages]}
     if method == "POST" and path == "/sweep":
@@ -353,14 +473,19 @@ def read_inbox(client, agent: str) -> list:
         # whichever finds it first; an entry without one is woken under its stream id, as before.
         task_id = field("task_id")
         out.append({"id": task_id if ID_OK.fullmatch(task_id) else str(entry_id),
-                    "text": field("text"), "by": field("by"), "at": field("at")})
+                    "text": field("text"), "by": field("by"), "at": field("at"),
+                    "stream_id": str(entry_id)})
     return out
 
 
 class Deps:
     def __init__(self, enabled=False, seen=None, wakers=None, reader=None,
-                 webhook_secret="", sweep_token="", agents=None):
+                 webhook_secret="", sweep_token="", agents=None, redis_wake=False, cursor=None):
         self.enabled = enabled
+        # The lane path (INBOX_WAKE_REDIS): off unless deps_from_env reads exactly "on", and then only with
+        # a cursor store beside the seen store.
+        self.redis_wake = redis_wake
+        self.cursor = cursor
         # The recipients this deploy may wake; None is every route (tests). deps_from_env always
         # sets it from AGENTS_ENV, so a server with the variable unset wakes nobody.
         self.agents = agents
@@ -379,6 +504,7 @@ def deps_from_env() -> Deps:
         webhook_secret=os.environ.get("GITHUB_WEBHOOK_SECRET") or "",
         sweep_token=os.environ.get("INBOX_WAKE_SWEEP_TOKEN") or "",
         agents=agents_from_env(),
+        redis_wake=redis_wake_from_env(),
         wakers=Wakers(
             github_token=os.environ.get("GITHUB_WAKE_TOKEN") or "",
             grok_url=os.environ.get("GROK_WAKE_URL") or "",
@@ -391,6 +517,8 @@ def deps_from_env() -> Deps:
     if client is not None:
         deps.seen = RedisSeen(client)
         deps.reader = lambda agent, client=client: read_inbox(client, agent)
+        if deps.redis_wake:
+            deps.cursor = RedisCursor(client)
     return deps
 
 

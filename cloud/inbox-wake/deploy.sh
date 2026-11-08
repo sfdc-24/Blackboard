@@ -96,7 +96,7 @@ deploy() {
     --image "$IMAGE" --service-account "$SA" \
     --no-allow-unauthenticated --min-instances 0 --max-instances 2 \
     --set-secrets "${CA_PATH}=REDIS_CA_CERT:latest,${AUTH_PATH}=REDIS_AUTH_STRING:latest,GITHUB_WEBHOOK_SECRET=INBOX_WAKE_SECRET:latest" \
-    --set-env-vars "INBOX_WAKE_ENABLED=off,INBOX_WAKE_AGENTS=${AGENTS},REDIS_CONNECT=true,REDIS_HOST=${REDIS_HOST},REDIS_PORT=${REDIS_PORT},RUN_PROJECT=${PROJECT},RUN_REGION=${REGION}" \
+    --set-env-vars "INBOX_WAKE_ENABLED=off,INBOX_WAKE_REDIS=off,INBOX_WAKE_AGENTS=${AGENTS},REDIS_CONNECT=true,REDIS_HOST=${REDIS_HOST},REDIS_PORT=${REDIS_PORT},RUN_PROJECT=${PROJECT},RUN_REGION=${REGION}" \
     --network "$NETWORK" --subnet "$SUBNET" --vpc-egress "$EGRESS" \
     --cpu 1 --memory 256Mi --timeout 60
   "$GCLOUD" run services add-iam-policy-binding "$SERVICE" --project "$PROJECT" --region "$REGION" \

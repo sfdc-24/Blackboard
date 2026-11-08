@@ -4,6 +4,10 @@ BOARD_TO_REDIS must be exactly "on". Anything else, the live loop does not take 
 writes nothing under fleet:inbox or fleet:wake:mirrored.
 """
 import datetime
+import hashlib
+import hmac
+import importlib.util
+import json
 import re
 import sys
 import unittest
@@ -583,7 +587,7 @@ class TheFlag(unittest.TestCase):
                 sr.live(None, {}, "", "me", until, 10, 300)
         self.assertTrue(callable(seen[0]["mirror"]))
 
-    def run_live(self, rows, flag, git_rows=None):
+    def run_live(self, rows, flag, git_rows=None, extra=None):
         conn = FakeRedis()
         clock = {"t": START}
         handled = []
@@ -606,9 +610,11 @@ class TheFlag(unittest.TestCase):
                 mock.patch("git_requests.poll_seconds", return_value=10 ** 6), \
                 mock.patch("git_requests.git_rows", return_value=list(git_rows or [])), \
                 mock.patch.dict(sr.os.environ, {}, clear=False):
-            sr.os.environ.pop(sr.BOARD_TO_REDIS, None)
+            for name in (sr.BOARD_TO_REDIS, sr.RELAY_CURSOR, sr.INBOX_WAKE_REDIS):
+                sr.os.environ.pop(name, None)
             if flag is not None:
                 sr.os.environ[sr.BOARD_TO_REDIS] = flag
+            sr.os.environ.update(extra or {})
             code = sr.live(conn, {}, "exec-1", "exec-1", START + datetime.timedelta(seconds=12), 10, 300)
         return code, conn, handled
 
@@ -643,6 +649,230 @@ class TheFlag(unittest.TestCase):
         self.assertEqual("1", conn.data["fleet:wake:mirrored:ROW-1:grok"])
         self.assertIn("ROW-GIT", [r[0] for r in handled[0]])
         self.assertEqual(["ROW-1"], [r[0] for r in handled[1]], "the second pass had no git read")
+
+
+class TheCursorRelay(unittest.TestCase):
+    """BOARD_TO_REDIS_RELAY_CURSOR: a row that names cursor also gives grok, Cursor's dispatcher, one
+    metadata-only entry with for=cursor, exactly once under its own mark."""
+
+    def setUp(self):
+        self.conn = FakeRedis()
+
+    def test_only_exactly_on_enables_it(self):
+        self.assertTrue(sr.relay_cursor_on({"BOARD_TO_REDIS_RELAY_CURSOR": "on"}))
+        for value in ("", "off", "ON", "true", "1", " on"):
+            self.assertFalse(sr.relay_cursor_on({"BOARD_TO_REDIS_RELAY_CURSOR": value}), value)
+        self.assertFalse(sr.relay_cursor_on({}))
+
+    def test_a_cursor_row_gives_grok_one_entry_for_cursor_and_a_reread_adds_nothing(self):
+        payload = ("BCB|v=1|id=ROW-C|phase=ASK|class=TASK|msg_type=REVIEW_ASK|thread_id=TH-Q2-9"
+                   "|text=" + WORDS)
+        rows = [row("ROW-C", "cursor", payload, source="claude-code-cli")]
+        self.assertEqual(2, sr.mirror_addressed(self.conn, rows, relay=True))
+        own = self.conn.inbox("cursor")
+        relayed = self.conn.inbox("grok")
+        self.assertEqual(1, len(own))
+        self.assertEqual([dict(own[0], **{"for": "cursor"})], relayed)
+        self.assertEqual({"by", "row_id", "at", "phase", "thread_id", "msg_type", "class", "for"},
+                         set(relayed[0]))
+        mark = "fleet:wake:relayed:ROW-C:cursor:grok"
+        self.assertEqual("1", self.conn.data[mark])
+        self.assertEqual(redis_gov.ttl_for(redis_gov.load_acl(), mark), self.conn.expires[mark])
+        self.assertIn("fleet:wake:mirrored:ROW-C:cursor", self.conn.data)
+        self.assertNotIn("fleet:wake:mirrored:ROW-C:grok", self.conn.data)
+        self.assertEqual(0, sr.mirror_addressed(self.conn, rows, relay=True))
+        self.assertEqual(1, len(self.conn.inbox("grok")))
+        self.assertEqual(1, len(self.conn.inbox("cursor")))
+        held = self.conn.dumped()
+        for text in (WORDS, "sample queue flow", "Codex,"):
+            self.assertNotIn(text, held)
+
+    def test_relay_off_gives_no_grok_entry(self):
+        rows = [row("ROW-C", "cursor", "please look")]
+        self.assertEqual(1, sr.mirror_addressed(self.conn, rows))
+        self.assertEqual(0, sr.mirror_addressed(self.conn, rows, relay=False))
+        self.assertEqual(["fleet:inbox:cursor"], list(self.conn.streams))
+        self.assertNotIn("relayed", self.conn.dumped())
+
+    def test_a_row_for_grok_and_cursor_gives_grok_its_copy_and_the_relay_once_each(self):
+        rows = [row("ROW-B", "grok; cursor", "please look")]
+        self.assertEqual(3, sr.mirror_addressed(self.conn, rows, relay=True))
+        self.assertEqual([None, "cursor"], [e.get("for") for e in self.conn.inbox("grok")])
+        self.assertEqual(0, sr.mirror_addressed(self.conn, rows, relay=True))
+        self.assertEqual(2, len(self.conn.inbox("grok")))
+
+    def test_a_broadcast_is_not_a_dispatch(self):
+        sr.mirror_addressed(self.conn, [row("ROW-ALL", "ALL", "hello fleet"),
+                                        row("ROW-FL", "fleet", "hello again")], relay=True)
+        self.assertEqual(["ROW-ALL", "ROW-FL"], [e["row_id"] for e in self.conn.inbox("cursor")])
+        self.assertEqual([None, None], [e.get("for") for e in self.conn.inbox("grok")])
+        self.assertNotIn("relayed", self.conn.dumped())
+        conn = FakeRedis()
+        sr.mirror_addressed(conn, [row("ROW-ALLC", "ALL; Cursor", "hello")], relay=True)
+        self.assertEqual([None, "cursor"], [e.get("for") for e in conn.inbox("grok")])
+
+    def test_a_failed_relay_is_retried_and_delivered_once(self):
+        self.conn.fail_xadd = {"fleet:inbox:grok": 1}
+        rows = [row("ROW-C", "cursor", WORDS)]
+        with mock.patch.object(sr.log, "warning") as warning:
+            self.assertEqual(1, sr.mirror_addressed(self.conn, rows, relay=True))
+        self.assertNotIn("fleet:wake:relayed:ROW-C:cursor:grok", self.conn.data)
+        self.assertNotIn(WORDS, str(warning.call_args_list))
+        self.assertEqual(1, sr.mirror_addressed(self.conn, rows, relay=True))
+        self.assertEqual(0, sr.mirror_addressed(self.conn, rows, relay=True))
+        self.assertEqual(["cursor"], [e["for"] for e in self.conn.inbox("grok")])
+        self.assertEqual(1, len(self.conn.inbox("cursor")))
+
+    def test_the_largest_relay_entry_fits_the_governed_value_cap(self):
+        acl = redis_gov.load_acl()
+        payload = "|".join(["BCB", "phase=" + "P" * 32, "thread_id=TH-" + "9" * 64,
+                            "msg_type=" + "M" * 32, "class=" + "C" * 32])
+        sr.mirror_addressed(self.conn, [row("R" * 128, "cursor", payload, source="s" * 64, ts="2" * 40)],
+                            relay=True)
+        entry = self.conn.inbox("grok")[0]
+        size = sum(len(k.encode("utf-8")) + len(v.encode("utf-8")) for k, v in entry.items())
+        self.assertLessEqual(size, redis_gov.value_cap(acl, "fleet:inbox:grok"))
+
+    def test_the_live_loop_relays_only_with_both_flags_exactly_on(self):
+        rows = [row("ROW-C", "cursor", "please look", source="owner")]
+        live = TheFlag("run_live")
+        for extra in ({}, {sr.RELAY_CURSOR: "ON"}, {sr.RELAY_CURSOR: "true"}):
+            code, conn, _handled = live.run_live(rows, "on", extra=extra)
+            self.assertEqual(["fleet:inbox:cursor"], list(conn.streams), extra)
+        code, conn, _handled = live.run_live(rows, "on", extra={sr.RELAY_CURSOR: "on"})
+        self.assertEqual(["cursor"], [e["for"] for e in conn.inbox("grok")])
+        self.assertEqual(1, len([c for c in conn.calls if c[0] == "xadd" and c[1] == "fleet:inbox:grok"]))
+        code, conn, _handled = live.run_live(rows, None, extra={sr.RELAY_CURSOR: "on"})
+        self.assertEqual({}, conn.streams, "the relay rides on BOARD_TO_REDIS; alone it is nothing")
+
+
+def load_inbox_wake():
+    spec = importlib.util.spec_from_file_location(
+        "inbox_wake_for_nudge", ROOT / "cloud" / "inbox-wake" / "main.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class Clock:
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+
+class TheClaudeApiNudge(unittest.TestCase):
+    """INBOX_WAKE_REDIS: after the mirror lands an entry on fleet:inbox:claude-api, one signed nudge to
+    cloud/inbox-wake, which drains that lane and starts the worker. Nothing else is nudged."""
+
+    def nudger(self, answers):
+        sent, clock = [], Clock()
+
+        def post(url, body, headers):
+            sent.append((url, body, headers))
+            answer = answers.pop(0)
+            if isinstance(answer, Exception):
+                raise answer
+            return json.dumps({"enabled": True, "woke": [{"status": answer}]}).encode()
+        return sr.Nudger("https://inbox-wake.example/wake", "shared", post=post, clock=clock), sent, clock
+
+    def test_only_exactly_on_and_configured_builds_a_nudger(self):
+        full = {"INBOX_WAKE_REDIS": "on", "INBOX_WAKE_URL": "https://w.example/wake", "INBOX_WAKE_SECRET": "s"}
+        self.assertIsInstance(sr.nudger_from_env(full), sr.Nudger)
+        for value in ("", "off", "ON", "true", " on"):
+            self.assertIsNone(sr.nudger_from_env(dict(full, INBOX_WAKE_REDIS=value)), value)
+        with mock.patch.object(sr.log, "error") as error:
+            self.assertIsNone(sr.nudger_from_env(dict(full, INBOX_WAKE_URL="")))
+            self.assertIsNone(sr.nudger_from_env(dict(full, INBOX_WAKE_SECRET="")))
+        self.assertNotIn("w.example", str(error.call_args_list))
+
+    def test_a_claude_api_entry_is_one_signed_nudge_with_no_text(self):
+        nudger, sent, _clock = self.nudger(["woke"])
+        conn = FakeRedis()
+        rows = [row("ROW-A", "claude-api; grok", "BCB|v=1|phase=ASK|text=" + WORDS)]
+        self.assertEqual(2, sr.mirror_pass(conn, rows, nudger=nudger))
+        self.assertEqual(1, len(sent))
+        url, body, headers = sent[0]
+        self.assertEqual("https://inbox-wake.example/wake", url)
+        self.assertEqual({"by": "bus-reconciler", "lane": "claude-api"}, json.loads(body))
+        self.assertEqual("redis_lane", headers["X-GitHub-Event"])
+        mac = hmac.new(b"shared", body, hashlib.sha256).hexdigest()
+        self.assertEqual("sha256=" + mac, headers["X-Hub-Signature-256"])
+        self.assertNotIn(WORDS, body.decode())
+        self.assertEqual(set(), nudger.pending)
+        self.assertEqual(0, sr.mirror_pass(conn, rows, nudger=nudger), "a re-read adds and nudges nothing")
+        self.assertEqual(1, len(sent))
+
+    def test_no_nudge_for_another_lane(self):
+        nudger, sent, _clock = self.nudger([])
+        sr.mirror_pass(FakeRedis(), [row("ROW-G", "grok; cursor; gemini", "ping")], relay=True, nudger=nudger)
+        self.assertEqual([], sent)
+
+    def test_a_failed_or_unrung_nudge_is_sent_again_after_the_retry_gap(self):
+        nudger, sent, clock = self.nudger([OSError("down"), "error", "woke"])
+        nudger.note("claude-api")
+        with mock.patch.object(sr.log, "warning") as warning:
+            nudger.flush()
+            self.assertEqual({"claude-api"}, nudger.pending)
+            nudger.flush()                          # inside the gap: not sent
+            self.assertEqual(1, len(sent))
+            clock.now += sr.NUDGE_RETRY_SECONDS
+            nudger.flush()                          # sent; inbox-wake's start failed: still pending
+            self.assertEqual(2, len(sent))
+            self.assertEqual({"claude-api"}, nudger.pending)
+            clock.now += sr.NUDGE_RETRY_SECONDS
+            nudger.flush()
+        self.assertEqual(3, len(sent))
+        self.assertEqual(set(), nudger.pending)
+        text = str(warning.call_args_list)
+        self.assertIn("OSError", text)
+        self.assertNotIn("inbox-wake.example", text)
+
+    def test_an_answer_a_retry_cannot_change_is_dropped(self):
+        for status in ("lane_off", "not_allowed", "disabled", "no_lane", "idle", "duplicate"):
+            nudger, sent, _clock = self.nudger([status])
+            nudger.note("claude-api")
+            with mock.patch.object(sr.log, "warning"):
+                nudger.flush()
+            self.assertEqual(set(), nudger.pending, status)
+
+    def test_the_nudge_starts_the_worker_through_inbox_wake_once(self):
+        """End to end, in process: the mirror's entry, the signed nudge, inbox-wake's real handle and drain
+        over the same lane, and the worker started once. A second pass starts nothing."""
+        wake = load_inbox_wake()
+        conn, jobs = FakeRedis(), []
+
+        def reader(agent):
+            return [{"id": "%d-0" % (i + 1), "stream_id": "%d-0" % (i + 1), "by": e.get("by", "")}
+                    for i, e in enumerate(conn.inbox(agent))]
+        deps = wake.Deps(enabled=True, seen=wake.MemorySeen(), reader=reader, webhook_secret="shared",
+                         agents=frozenset({"claude-api"}), redis_wake=True, cursor=wake.MemoryCursor(),
+                         wakers=wake.Wakers(run_job=jobs.append))
+        nudger = sr.Nudger("https://inbox-wake.example/wake", "shared",
+                           post=lambda url, body, headers: wake.handle("POST", "/wake", headers, body, deps)[1])
+        rows = [row("ROW-A", "claude-api", "ping")]
+        sr.mirror_pass(conn, rows, nudger=nudger)
+        self.assertEqual(["claude-api-worker"], jobs)
+        self.assertEqual("1-0", deps.cursor.get("claude-api"))
+        sr.mirror_pass(conn, rows, nudger=nudger)
+        sr.mirror_pass(conn, rows + [row("ROW-B", "claude-api", "pong")], nudger=nudger)
+        self.assertEqual(["claude-api-worker"] * 2, jobs)
+        self.assertEqual("2-0", deps.cursor.get("claude-api"))
+
+    def test_the_live_loop_nudges_only_with_the_flag_exactly_on(self):
+        rows = [row("ROW-A", "claude-api", "ping", source="owner")]
+        live = TheFlag("run_live")
+        env = {"INBOX_WAKE_URL": "https://inbox-wake.example/wake", "INBOX_WAKE_SECRET": "shared"}
+        for value in ("", "off", "ON"):
+            with mock.patch.object(sr, "private_post") as post:
+                live.run_live(rows, "on", extra=dict(env, INBOX_WAKE_REDIS=value))
+            self.assertFalse(post.called, value)
+        with mock.patch.object(sr, "private_post",
+                               return_value=b'{"woke": [{"status": "woke"}]}') as post:
+            code, conn, _handled = live.run_live(rows, "on", extra=dict(env, INBOX_WAKE_REDIS="on"))
+        self.assertEqual(1, post.call_count, "two passes, one entry, one nudge")
+        self.assertEqual(["ROW-A"], [e["row_id"] for e in conn.inbox("claude-api")])
 
 
 class TheFake(unittest.TestCase):

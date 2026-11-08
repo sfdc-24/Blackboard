@@ -25,12 +25,19 @@ BOARD_TO_REDIS must be exactly "on" before a live pass also adds a metadata-only
 text) for an addressed board row to each named agent's fleet:inbox. Unset, empty, "off", "ON" and
 "true" leave that copy out, and the pass's Redis use is the lock and the heartbeat (plus the
 call-sheet keys above, when that flag is on).
+
+Two more flags ride on that copy, each exactly "on" and each meaningless without BOARD_TO_REDIS:
+BOARD_TO_REDIS_RELAY_CURSOR also puts one metadata-only entry, with for=cursor, on fleet:inbox:grok for a
+row that names cursor (Grok dispatches Cursor, which has no ring of its own); INBOX_WAKE_REDIS also sends
+cloud/inbox-wake one signed nudge after an entry lands on fleet:inbox:claude-api, so the cloud worker
+starts on the entry rather than on the next 15-minute sweep.
 """
 from __future__ import annotations
 
 import ast
 import datetime
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -265,8 +272,12 @@ def live(conn, env, execution, me, until, interval, lock_ttl, settle=None) -> in
     log.info("live mode: every %ds, GitHub every %ds, until %s", interval, git_every, stop.strftime("%H:%M:%SZ"))
     last_git, passes = None, 0
     # Exactly "on". Anything else leaves `mirror` unset, and the one_pass call below is the one it
-    # was: no mirror keyword, no inbox write.
-    mirror = (lambda rows, _conn=conn: mirror_addressed(_conn, rows)) if board_to_redis_on() else None
+    # was: no mirror keyword, no inbox write. The cursor relay and the claude-api nudge are read once, here,
+    # and only when the mirror runs at all.
+    mirror = None
+    if board_to_redis_on():
+        relay, nudger = relay_cursor_on(), nudger_from_env()
+        mirror = lambda rows, _conn=conn: mirror_pass(_conn, rows, relay, nudger)        # noqa: E731
     while datetime.datetime.now(datetime.timezone.utc) < stop:
         held = keep_lock(conn, me, lock_ttl)
         if held is False:
@@ -399,7 +410,17 @@ def _loop_until(text):
 # Rows from bus-reconciler or redis-audit are not copied: those writers are this process and the
 # audit, and copying them would loop. Nothing here appends a board row, and a log line from this
 # path is an exception type, never a key and never a value.
+#
+# THE CURSOR RELAY (BOARD_TO_REDIS_RELAY_CURSOR exactly "on"). Cursor is a cloud agent with no machine to
+# run a ring on; Grok is its dispatcher. So a row that NAMES cursor (by name or alias, not by ALL or fleet:
+# a broadcast is not a dispatch) also gets one entry on fleet:inbox:grok: the same metadata plus
+# for=cursor, under its own mark fleet:wake:relayed:<row_id>:cursor:grok, through the same MIRROR_LUA. So
+# the relay is exactly once on its own, apart from cursor's copy and from grok's own copy of a row that
+# names both. Grok's ring wakes on it, Grok reads the row on the board and dispatches Cursor. Off, no
+# relay key is written.
 BOARD_TO_REDIS = "BOARD_TO_REDIS"
+RELAY_CURSOR = "BOARD_TO_REDIS_RELAY_CURSOR"
+RELAYS = {"cursor": "grok"}             # an agent with no ring of its own -> the agent that dispatches it
 LOOP_SOURCES = frozenset({"bus-reconciler", "redis-audit"})
 _EXPAND = frozenset({"all", "fleet"})
 _ENTRY_KEYS = ("phase", "thread_id", "msg_type", "class")
@@ -434,6 +455,12 @@ def board_to_redis_on(environ=None) -> bool:
     """True only when BOARD_TO_REDIS is exactly "on". Unset, empty, and every other value are off."""
     environ = os.environ if environ is None else environ
     return environ.get(BOARD_TO_REDIS) == "on"
+
+
+def relay_cursor_on(environ=None) -> bool:
+    """True only when BOARD_TO_REDIS_RELAY_CURSOR is exactly "on"."""
+    environ = os.environ if environ is None else environ
+    return environ.get(RELAY_CURSOR) == "on"
 
 
 def _row_cell(row, index) -> str:
@@ -479,15 +506,17 @@ def inbox_wake_aliases() -> dict:
     return {}
 
 
-def addressed_agents(target, principals, aliases) -> list:
-    """Principals named by a Target_Surface. ALL and fleet mean every principal. One hop of alias,
-    then the name has to be a principal. Order is the address list, then principal order for an
-    expansion, and a name is kept once."""
+def addressed_agents(target, principals, aliases, expand=True) -> list:
+    """Principals named by a Target_Surface. ALL and fleet mean every principal (expand=False: they
+    name nobody). One hop of alias, then the name has to be a principal. Order is the address list,
+    then principal order for an expansion, and a name is kept once."""
     known = set(principals)
     out, seen = [], set()
     for part in re.split(r"[,;]", str(target or "")):
         token = part.strip().lower()
         if not token:
+            continue
+        if token in _EXPAND and not expand:
             continue
         names = list(principals) if token in _EXPAND else (aliases.get(token, token),)
         for name in names:
@@ -525,13 +554,15 @@ def mirror_fields(source, row_id, at, payload) -> dict:
     return fields
 
 
-def mirror_addressed(conn, rows) -> int:
+def mirror_addressed(conn, rows, relay=False, on_added=None) -> int:
     """XADD one entry per named agent for each board row. Returns how many entries were added.
 
     The access list decides who a principal is and what the fleet ttl is. Inbox-wake aliases are
     merged on top of the access list's aliases. An unreadable list, or a fleet ttl that is not
     set, copies nothing: there is no second ttl to invent. Does not log a key or a value.
-    A failed copy for one agent is logged by exception type and does not stop the rest."""
+    A failed copy for one agent is logged by exception type and does not stop the rest.
+    relay=True adds the RELAYS entries (the cursor relay); on_added(lane agent) is called once for each
+    entry that landed, and its failure is that callback's, not the copy's."""
     acl = redis_gov.load_acl()
     if not acl.get("readable"):
         return 0
@@ -550,21 +581,138 @@ def mirror_addressed(conn, rows) -> int:
         agents = addressed_agents(_row_cell(row, 3), principals, aliases)
         if not agents:
             continue
+        named = addressed_agents(_row_cell(row, 3), principals, aliases, expand=False) if relay else []
         fields = mirror_fields(source, row_id, _row_cell(row, 1), _payload(row))
         pairs = [item for pair in fields.items() for item in pair]
+        targets = []
         for agent in agents:
-            mark, lane = "fleet:wake:mirrored:%s:%s" % (row_id, agent), "fleet:inbox:%s" % agent
+            targets.append(("fleet:wake:mirrored:%s:%s" % (row_id, agent), agent, pairs))
+            if relay and agent in named and RELAYS.get(agent) in principals:
+                # The relay's own mark, per row and per relay target: exactly once apart from the copy.
+                targets.append(("fleet:wake:relayed:%s:%s:%s" % (row_id, agent, RELAYS[agent]),
+                                RELAYS[agent], pairs + ["for", agent]))
+        for mark, agent, entry in targets:
+            lane = "fleet:inbox:%s" % agent
             mark_ttl, lane_ttl = redis_gov.ttl_for(acl, mark), redis_gov.ttl_for(acl, lane)
             if not mark_ttl or not lane_ttl:
                 continue
             try:
                 # One script: the NX mark and the XADD, or neither. 0 is a row already copied.
-                if conn.eval(MIRROR_LUA, 2, mark, lane, int(mark_ttl), int(redis_gov.STREAM_MAXLEN),
-                             int(lane_ttl), *pairs):
-                    added += 1
+                landed = conn.eval(MIRROR_LUA, 2, mark, lane, int(mark_ttl), int(redis_gov.STREAM_MAXLEN),
+                                   int(lane_ttl), *entry)
             except Exception as error:                                   # noqa: BLE001
                 # The type only. This agent's copy is retried by the next pass; the others go on.
                 log.warning("board mirror copy failed (%s)", type(error).__name__)
+                continue
+            if landed:
+                added += 1
+                if on_added is not None:
+                    on_added(agent)
+    return added
+
+
+# THE CLAUDE-API NUDGE (INBOX_WAKE_REDIS exactly "on", with INBOX_WAKE_URL and INBOX_WAKE_SECRET set).
+# claude-api is a Cloud Run job; cloud/inbox-wake starts it, and inbox-wake is scale-to-zero, so it cannot
+# block on the lane itself. This loop already holds Redis and has just XADDed the entry, so it tells
+# inbox-wake: one POST /wake, X-GitHub-Event: redis_lane, body {"by": "bus-reconciler", "lane":
+# "claude-api"} and nothing else, signed with the ring's HMAC (X-Hub-Signature-256, as drive-intake
+# signs) and carrying this job's ID token for the private service. inbox-wake drains the lane from its
+# own cursor (cloud/inbox-wake/README.md), so a nudge says only "look", and a repeated one is harmless.
+# A nudge that fails or comes back unrung stays pending and is sent again no sooner than
+# NUDGE_RETRY_SECONDS later, while this run lasts; after that the 15-minute sweep drains the lane.
+INBOX_WAKE_REDIS = "INBOX_WAKE_REDIS"
+NUDGE_AGENTS = frozenset({"claude-api"})
+NUDGE_EVENT = "redis_lane"
+NUDGE_RETRY_SECONDS = 60
+NUDGE_DONE = frozenset({"woke", "duplicate", "idle"})
+# Answers a retry cannot change (the flag or the recipient list on inbox-wake): dropped, logged by status.
+NUDGE_FINAL = frozenset({"disabled", "lane_off", "no_lane", "not_allowed"})
+IDENTITY_URL = ("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/"
+                "identity?audience=%s")
+
+
+def _origin(url):
+    import urllib.parse                                                  # noqa: PLC0415
+    parts = urllib.parse.urlsplit(url)
+    return "%s://%s" % (parts.scheme, parts.netloc)
+
+
+def private_post(url, body, headers):  # pragma: no cover - the nudge's one socket
+    """POST to the PRIVATE inbox-wake service with this job's ID token for its origin."""
+    import urllib.parse                                                  # noqa: PLC0415
+    import urllib.request                                                # noqa: PLC0415
+    ask = urllib.request.Request(IDENTITY_URL % urllib.parse.quote(_origin(url), safe=""),
+                                 headers={"Metadata-Flavor": "Google"})
+    with urllib.request.urlopen(ask, timeout=10) as resp:
+        token = resp.read().decode("utf-8").strip()
+    signed = dict(headers, Authorization="Bearer " + token)
+    req = urllib.request.Request(url, data=body, headers=signed, method="POST")
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return resp.read()
+
+
+class Nudger:
+    """Collects the lanes the mirror wrote this pass (note) and nudges inbox-wake once for each (flush)."""
+
+    def __init__(self, url, secret, post=None, clock=None):
+        self.url, self.secret = url, secret
+        self.post = post or private_post
+        self.clock = clock or time.monotonic
+        self.pending, self.not_before = set(), 0.0
+
+    def note(self, agent):
+        if agent in NUDGE_AGENTS:
+            self.pending.add(agent)
+
+    def body_for(self, agent) -> bytes:
+        return json.dumps({"by": "bus-reconciler", "lane": agent}, sort_keys=True).encode("utf-8")
+
+    def flush(self):
+        if not self.pending or self.clock() < self.not_before:
+            return
+        for agent in sorted(self.pending):
+            body = self.body_for(agent)
+            mac = hmac.new(self.secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+            try:
+                readout = self.post(self.url, body, {"Content-Type": "application/json",
+                                                     "X-GitHub-Event": NUDGE_EVENT,
+                                                     "X-Hub-Signature-256": "sha256=" + mac})
+                parsed = readout if isinstance(readout, dict) else json.loads(
+                    readout.decode("utf-8") if isinstance(readout, bytes) else readout)
+                status = str(((parsed.get("woke") or [{}])[0] or {}).get("status") or "")
+            except Exception as error:                                   # noqa: BLE001
+                log.warning("inbox-wake nudge failed (%s); retried", type(error).__name__)
+                self.not_before = self.clock() + NUDGE_RETRY_SECONDS
+                return
+            if status in NUDGE_DONE or status in NUDGE_FINAL:
+                self.pending.discard(agent)
+                if status in NUDGE_FINAL:
+                    log.warning("inbox-wake nudge not acted on (%s)", status)
+                continue
+            # A fixed word from inbox-wake's own set; a value that is not one is not logged.
+            log.warning("inbox-wake nudge unrung (%s); retried", status if re.fullmatch(r"[a-z_]{1,24}", status)
+                        else "unreadable")
+            self.not_before = self.clock() + NUDGE_RETRY_SECONDS
+            return
+
+
+def nudger_from_env(environ=None):
+    """A Nudger when INBOX_WAKE_REDIS is exactly "on" and the URL and secret are set; else None."""
+    environ = os.environ if environ is None else environ
+    if environ.get(INBOX_WAKE_REDIS) != "on":
+        return None
+    url, secret = environ.get("INBOX_WAKE_URL") or "", environ.get("INBOX_WAKE_SECRET") or ""
+    if not url or not secret:
+        log.error("INBOX_WAKE_REDIS is on but INBOX_WAKE_URL or INBOX_WAKE_SECRET is unset: no nudge")
+        return None
+    return Nudger(url, secret)
+
+
+def mirror_pass(conn, rows, relay=False, nudger=None) -> int:
+    """The live loop's mirror: the copy (with the cursor relay when asked), then the nudge for what landed."""
+    added = mirror_addressed(conn, rows, relay=relay, on_added=nudger.note if nudger is not None else None)
+    if nudger is not None:
+        nudger.flush()
     return added
 
 

@@ -221,3 +221,25 @@ canvas-publish request is answered REFUSED and no thread starts.
 
 **Rollback.** `minutes=0`, or let the window run out; `canvas-bucket.sh off` removes the variable and the
 grant. Nothing in Redis is lost (conf: items expire after 7 days).
+
+## Waking the two cloud agents: claude-api and cursor (flags off, nothing deployed)
+
+The board mirror (`BOARD_TO_REDIS`, #490) puts an addressed row on the agent's `fleet:inbox:<agent>`, and each desk
+agent's ring wakes on that lane (`docs/REDIS-RING.md`, #491). Two agents have no machine to run a ring on. These two
+flags close that gap. Each must be exactly `on`, and each does nothing unless `BOARD_TO_REDIS` is on as well.
+
+- **`INBOX_WAKE_REDIS` (claude-api).** When an entry lands on `fleet:inbox:claude-api`, the live loop sends
+  cloud/inbox-wake one signed `redis_lane` nudge, which carries no row text. inbox-wake drains the lane from its own
+  cursor and starts `claude-api-worker`; `cloud/inbox-wake/README.md` explains why this is a nudge and not a blocking
+  read there. The job also needs `INBOX_WAKE_URL` (the service's `/wake` URL), the `INBOX_WAKE_SECRET` secret as that
+  variable, and `run.invoker` on inbox-wake for its identity. Without the URL or the secret it logs one error and
+  sends nothing.
+- **`BOARD_TO_REDIS_RELAY_CURSOR` (cursor).** A row that names cursor (by name or alias; `ALL` and `fleet` are a
+  broadcast, not a dispatch) also gets one entry on `fleet:inbox:grok`. It holds the same metadata fields plus
+  `for=cursor`, and no payload text. It is written by the same `MIRROR_LUA`, under its own mark
+  `fleet:wake:relayed:<row_id>:cursor:grok`, so it is exactly once, independent of cursor's copy and of grok's own
+  copy of a row that names both. Grok's ring wakes on it; Grok reads the row on the board and dispatches Cursor.
+
+Rollback for either is the flag set to off. Tests: `tests/test_board_to_redis.py` (`TheCursorRelay`,
+`TheClaudeApiNudge`) and `tests/test_inbox_wake.py` (`TheLanePath`), with their mutants in
+`tests/mutate_board_to_redis.py`.

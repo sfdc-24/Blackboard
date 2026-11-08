@@ -38,6 +38,10 @@ class FakeRedis:
         self.deleted.append(key)
         self.store.pop(key, None)
 
+    def get(self, key):
+        found = self.store.get(key)
+        return found[0] if found else None
+
 
 class Recording:
     def __init__(self):
@@ -294,6 +298,7 @@ class TheDeployScript(unittest.TestCase):
         self.assertNotIn("allUsers", self.script)
         self.assertNotIn("--allow-unauthenticated", self.script.replace("--no-allow-unauthenticated", ""))
         self.assertIn("INBOX_WAKE_ENABLED=off,", self.script)
+        self.assertIn("INBOX_WAKE_REDIS=off,", self.script)
         self.assertIn('AGENTS="${INBOX_WAKE_AGENTS:-claude-api}"', self.script)
         self.assertIn('EGRESS="private-ranges-only"', self.script)
         self.assertIn("run jobs add-iam-policy-binding", self.script)
@@ -394,6 +399,194 @@ class SweepAndWebhook(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertFalse(payload["enabled"])
         self.assertEqual([], rec.http)
+
+
+class Lane:
+    """fleet:inbox:claude-api as read_inbox hands it over: the newest window, oldest first, each entry
+    with its stream id. add() is an XADD."""
+
+    def __init__(self):
+        self.entries, self.reads = [], 0
+
+    def add(self, by="grok", task_id=""):
+        sid = "%d-0" % (1000 + len(self.entries))
+        self.entries.append({"id": task_id or sid, "stream_id": sid, "by": by, "text": "", "at": ""})
+        return sid
+
+    def __call__(self, agent):
+        self.reads += 1
+        return list(self.entries) if agent == "claude-api" else []
+
+
+def lane_deps(on=True, run_job=None):
+    """claude-api only, the lane path on (or off), a memory cursor and a lane."""
+    d, rec = deps()
+    d.agents = frozenset({"claude-api"})
+    d.redis_wake = on
+    d.cursor = wake.MemoryCursor()
+    d.reader = lane = Lane()
+    if run_job is not None:
+        d.wakers.run_job = run_job
+    return d, rec, lane
+
+
+def nudge(d, lane="claude-api", secret="hook", signature=None):
+    body = json.dumps({"by": "bus-reconciler", "lane": lane}, sort_keys=True).encode()
+    return wake.handle("POST", "/wake", {
+        "X-GitHub-Event": wake.LANE_EVENT,
+        "X-Hub-Signature-256": signature or sign(secret, body),
+    }, body, d)
+
+
+class TheLanePath(unittest.TestCase):
+    """INBOX_WAKE_REDIS: a nudge (or the sweep) drains fleet:inbox:claude-api from its cursor. The cursor
+    moves only after the worker start succeeded, so an entry is woken at least once, and a burst once."""
+
+    def test_only_the_exact_string_on_enables_the_lane_path(self):
+        self.assertTrue(wake.redis_wake_from_env({"INBOX_WAKE_REDIS": "on"}))
+        for value in ("", "off", "ON", "true", "1", " on"):
+            self.assertFalse(wake.redis_wake_from_env({"INBOX_WAKE_REDIS": value}), value)
+        self.assertFalse(wake.redis_wake_from_env({}))
+        self.assertFalse(wake.Deps().redis_wake)
+        self.assertIsNone(wake.Deps().cursor)
+
+    def test_a_new_entry_starts_the_worker_once_and_the_cursor_moves_only_after(self):
+        cursor_at_start = []
+        d, rec, lane = lane_deps()
+        d.wakers.run_job = lambda job: (cursor_at_start.append(d.cursor.get("claude-api")),
+                                        rec.jobs.append(job))
+        sid = lane.add()
+        status, payload = nudge(d)
+        self.assertEqual(200, status)
+        self.assertEqual("woke", payload["woke"][0]["status"])
+        self.assertEqual(["claude-api-worker"], rec.jobs)
+        self.assertEqual([""], cursor_at_start, "the cursor had not moved when the worker was started")
+        self.assertEqual(sid, d.cursor.get("claude-api"))
+        status, payload = nudge(d)                  # the same lane again: nothing new
+        self.assertEqual("idle", payload["woke"][0]["status"])
+        self.assertEqual(["claude-api-worker"], rec.jobs)
+
+    def test_a_failed_start_keeps_the_cursor_and_the_next_nudge_retries(self):
+        attempts = []
+
+        def run_job(job):
+            attempts.append(job)
+            if len(attempts) == 1:
+                raise OSError("run API down")
+        d, rec, lane = lane_deps(run_job=run_job)
+        sid = lane.add()
+        status, payload = nudge(d)
+        self.assertEqual("error", payload["woke"][0]["status"])
+        self.assertEqual("", d.cursor.get("claude-api"), "a failed start does not move the cursor")
+        self.assertTrue(d.seen.claim("claude-api:" + sid), "and the claim was released")
+        d.seen.release("claude-api:" + sid)
+        status, payload = nudge(d)
+        self.assertEqual("woke", payload["woke"][0]["status"])
+        self.assertEqual(sid, d.cursor.get("claude-api"))
+        self.assertEqual(2, len(attempts))
+        self.assertEqual("idle", nudge(d)[1]["woke"][0]["status"])
+        self.assertEqual(2, len(attempts))
+
+    def test_an_unconfigured_start_keeps_the_cursor(self):
+        d, rec, lane = lane_deps()
+        d.wakers.run_job = None                     # no metadata token: the real route is Unconfigured
+        d.wakers.token_provider = None
+        lane.add()
+        self.assertEqual("unconfigured", nudge(d)[1]["woke"][0]["status"])
+        self.assertEqual("", d.cursor.get("claude-api"))
+
+    def test_a_burst_is_one_start_and_no_later_sweep_starts_it_again(self):
+        d, rec, lane = lane_deps()
+        sids = [lane.add() for _ in range(3)]
+        payload = nudge(d)[1]["woke"][0]
+        self.assertEqual(("woke", 3), (payload["status"], payload["entries"]))
+        self.assertEqual(["claude-api-worker"], rec.jobs)
+        self.assertEqual(sids[-1], d.cursor.get("claude-api"))
+        wake.sweep(d)                               # the lane path's sweep: idle
+        d.redis_wake = False                        # and the old per-entry sweep, after a rollback
+        out = wake.sweep(d)
+        self.assertEqual(["duplicate"] * 3, [item["status"] for item in out])
+        self.assertEqual(["claude-api-worker"], rec.jobs)
+
+    def test_an_entry_already_rung_by_drive_intake_is_not_started_again(self):
+        d, rec, lane = lane_deps()
+        lane.add(by="drive-intake", task_id="task-0123456789abcdef")
+        self.assertEqual("woke", wake.decide({"to": "claude-api", "id": "task-0123456789abcdef",
+                                              "by": "drive-intake"}, d)["status"])
+        payload = nudge(d)[1]["woke"][0]
+        self.assertEqual("duplicate", payload["status"])
+        self.assertEqual(["claude-api-worker"], rec.jobs)
+        self.assertEqual(lane.entries[0]["stream_id"], d.cursor.get("claude-api"))
+
+    def test_the_sweep_drains_the_lane_when_a_nudge_never_came(self):
+        d, rec, lane = lane_deps()
+        sid = lane.add()
+        lane.add()
+        out = wake.sweep(d)
+        self.assertEqual(1, len(out))
+        self.assertEqual(("woke", 2), (out[0]["status"], out[0]["entries"]))
+        self.assertEqual(["claude-api-worker"], rec.jobs)
+        self.assertNotEqual(sid, d.cursor.get("claude-api"))
+        self.assertEqual(lane.entries[-1]["stream_id"], d.cursor.get("claude-api"))
+
+    def test_the_nudge_is_signed_and_names_a_lane_this_deploy_may_wake(self):
+        d, rec, lane = lane_deps()
+        lane.add()
+        self.assertEqual(401, nudge(d, signature="sha256=dead")[0])
+        self.assertEqual(401, nudge(d, secret="not the secret")[0])
+        self.assertEqual(0, lane.reads)
+        self.assertEqual("no_lane", nudge(d, lane="grok")[1]["woke"][0]["status"])
+        self.assertEqual("no_lane", nudge(d, lane="")[1]["woke"][0]["status"])
+        d.agents = frozenset({"grok"})
+        self.assertEqual("not_allowed", nudge(d)[1]["woke"][0]["status"])
+        self.assertEqual(0, lane.reads)
+        self.assertEqual([], rec.jobs)
+        self.assertEqual("", d.cursor.get("claude-api"))
+
+    def test_the_flag_off_changes_nothing(self):
+        """Off: a nudge drains nothing and the sweep is the per-entry sweep it was, cursor untouched."""
+        d, rec, lane = lane_deps(on=False)
+        for _ in range(2):
+            lane.add()
+        payload = nudge(d)[1]["woke"][0]
+        self.assertEqual("lane_off", payload["status"])
+        self.assertEqual(0, lane.reads)
+        self.assertEqual([], rec.jobs)
+        out = wake.sweep(d)
+        self.assertEqual(["woke", "woke"], [item["status"] for item in out])
+        self.assertTrue(all("lane" not in item and "cursor" not in item for item in out))
+        self.assertEqual(["claude-api-worker"] * 2, rec.jobs)
+        self.assertEqual({}, d.cursor.ids)
+        d2, rec2, lane2 = lane_deps(on=False)
+        d2.enabled = False
+        self.assertEqual(200, nudge(d2)[0])
+        self.assertEqual([], rec2.jobs)
+
+    def test_the_redis_cursor_is_a_fleet_key_with_the_fleet_ttl(self):
+        client = FakeRedis()
+        cursor = wake.RedisCursor(client)
+        self.assertEqual("", cursor.get("claude-api"))
+        cursor.set("claude-api", "1700000000000-3")
+        self.assertEqual(("1700000000000-3", wake.SEEN_TTL), client.store["fleet:wake:cursor:claude-api"])
+        self.assertEqual("1700000000000-3", cursor.get("claude-api"))
+
+    def test_stream_ids_compare_as_numbers(self):
+        d, rec, lane = lane_deps()
+        lane.entries = [{"id": "9-0", "stream_id": "9-0", "by": "grok"},
+                        {"id": "10-0", "stream_id": "10-0", "by": "grok"}]
+        d.cursor.set("claude-api", "9-0")
+        payload = nudge(d)[1]["woke"][0]
+        self.assertEqual(("woke", 1), (payload["status"], payload["entries"]))
+        self.assertEqual("10-0", d.cursor.get("claude-api"))
+
+    def test_read_inbox_hands_over_the_stream_id(self):
+        class Client:
+            def xrevrange(self, key, count=None):
+                return [(b"1700000000002-0", {b"by": b"grok"}),
+                        (b"1700000000001-0", {b"by": b"drive-intake", b"task_id": b"task-0123456789abcdef"})]
+        out = wake.read_inbox(Client(), "claude-api")
+        self.assertEqual(["1700000000001-0", "1700000000002-0"], [e["stream_id"] for e in out])
+        self.assertEqual(["task-0123456789abcdef", "1700000000002-0"], [e["id"] for e in out])
 
 
 class DefinitionStaysOff(unittest.TestCase):
