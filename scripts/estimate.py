@@ -32,7 +32,8 @@ import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-LEDGER = Path.home() / ".claude" / "estimates.json"
+# Two sessions on one machine keep separate ledgers (ESTIMATE_LEDGER), or one save can drop the other's entry.
+LEDGER = Path(os.environ.get("ESTIMATE_LEDGER") or (Path.home() / ".claude" / "estimates.json"))
 # No default: a default once posted Codex's estimate under claude-code-cli (2026-11-08). The author must name itself.
 ME = os.environ.get("ESTIMATE_BY", "").strip()
 try:
