@@ -135,6 +135,8 @@ on:
       - "tests/test_git_requests.py"
       - "cloud/bus-reconciler/serve_requests.py"
       - "tests/test_live_mode.py"
+      - "tests/test_call_sheet_mirror.py"
+      - "tests/mutate_call_sheet_mirror.py"
       - "scripts/canvas_publish.py"
       - "tests/test_canvas_publish.py"
       - "scripts/call_bridge.py"
@@ -264,6 +266,8 @@ on:
       - "tests/test_git_requests.py"
       - "cloud/bus-reconciler/serve_requests.py"
       - "tests/test_live_mode.py"
+      - "tests/test_call_sheet_mirror.py"
+      - "tests/mutate_call_sheet_mirror.py"
       - "scripts/canvas_publish.py"
       - "tests/test_canvas_publish.py"
       - "scripts/call_bridge.py"
@@ -1130,6 +1134,18 @@ jobs:
             echo "not on this branch; skipping"
           fi
 
+      # The call-sheet projection. Each guard is deleted on a copy of the worker; a mutant that
+      # still passes is an untested claim. Offline: fake Redis, fake board, empty network namespace.
+      - name: "call sheet mirror guards are load-bearing (mutation, no network)"
+        run: |
+          set -euo pipefail
+          if [ -f tests/mutate_call_sheet_mirror.py ]; then
+            python_bin="$(command -v python3)"
+            sudo unshare -n -- "$python_bin" -B tests/mutate_call_sheet_mirror.py
+          else
+            echo "not on this branch; skipping"
+          fi
+
       # The bounded diagnostic a board request may ask for. The board has NO authenticated
       # sender, so the tests that matter are about what a FORGED request can do: it cannot
       # choose the key, the TTL or the command, a malformed flood produces no rows, and no
@@ -1163,6 +1179,7 @@ jobs:
           for pair in "test_redis_gov:scripts/redis_gov.py" \
                       "test_git_requests:scripts/git_requests.py" \
                       "test_live_mode:cloud/bus-reconciler/serve_requests.py" \
+                      "test_call_sheet_mirror:cloud/bus-reconciler/serve_requests.py" \
                       "test_canvas_publish:scripts/canvas_publish.py" \
                       "test_call_bridge:scripts/call_bridge.py" \
                       "test_call_bridge_screen:scripts/call_bridge.py" \

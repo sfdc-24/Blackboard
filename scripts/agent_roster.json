@@ -472,6 +472,29 @@
           "wake": "python scripts/agent_waker.py --agent jev, or the cloud waker job. Answers rows addressed to=jev (jev:yesno / jev:score / jev:choice specs) and marks them wakerreply=1."
         }
       ]
+    },
+    {
+      "family": "conference",
+      "name": "Conference chair",
+      "lead_role": "The conference call",
+      "responsibility": "Runs the call in Redis. The sheet record of a call is written by bus-reconciler with from=conference-chair; the chair itself stays Redis-only.",
+      "appointed": "2026-11-08",
+      "instances": [
+        {
+          "id": "conference-chair",
+          "surface": "Cloud Run service",
+          "runtime": "us-central1",
+          "gcp_identity": "conference-chair@sfdc24",
+          "rows": 0,
+          "last_seen": "n/a",
+          "state": "Redis-only; bus-requests writes its CALL_START, CALL_END and CALL_TURN rows when CALL_SHEET_MIRROR=on",
+          "in_vpc": true,
+          "redis_read": true,
+          "redis_write": true,
+          "why": "The conference chair. A sheet row signed from=conference-chair is appended by bus-requests, which already holds the board.",
+          "wake": "Cloud Run service conference-chair. Not woken by a board row."
+        }
+      ]
     }
   ]
 }
