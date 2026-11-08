@@ -14,7 +14,8 @@ The cloud-agent wake (BOARD_TO_REDIS_RELAY_CURSOR, INBOX_WAKE_REDIS) has its gua
 flag, its own mark, its for=cursor and its refusal to relay a broadcast; the nudge's claude-api-only
 scope, its signature and its retry; and in cloud/inbox-wake (run against tests/test_inbox_wake.py) the
 cursor that moves only after a start succeeds, the forward read, the start while the worker's own
-position lags the lane head (one per position), the page bound, and the lane flag itself.
+position lags the lane head (one per position, for the worker job's run time), the page bound, and the
+lane flag itself.
 
 scripts/ is copied per mutant and the edit is applied to the copy, so a bad replace cannot land
 on the real worker. An anchor that is not in the file is ANCHOR-MISS, not a pass.
@@ -213,8 +214,8 @@ MUTANTS = [
     (
         "the-cursor-moves-before-the-start",
         "cloud/inbox-wake/main.py",
-        "    if lagging:\n        result = dict(decide(",
-        "    if new:\n        deps.cursor.set(agent, new[-1][\"stream_id\"])\n    if lagging:\n        result = dict(decide(",
+        "    if lagging:\n        # The position claim",
+        "    if new:\n        deps.cursor.set(agent, new[-1][\"stream_id\"])\n    if lagging:\n        # The position claim",
         "a start that fails after the cursor moved is never retried: an entry woken zero times",
         "test_a_new_entry_starts_the_worker_once_and_the_cursor_moves_only_after",
         "tests.test_inbox_wake",
@@ -336,6 +337,25 @@ MUTANTS = [
         "test_read_progress_is_the_worker_s_own_scan_state_and_the_lane_head",
         "tests.test_inbox_wake",
     ),
+    # Codex on e828e71d: the position claim lapses after the worker job's own run time.
+    (
+        "the-scan-claim-keeps-the-30-day-ttl",
+        "cloud/inbox-wake/main.py",
+        '"by": new[-1].get("by") if new else ""}, deps, ttl=SCAN_CLAIM_TTL), lane=True)',
+        '"by": new[-1].get("by") if new else ""}, deps), lane=True)',
+        "a start the run API accepted and that then died is not retried at that position for 30 days",
+        "test_an_accepted_start_that_never_moves_is_started_again_after_the_scan_ttl_and_not_before",
+        "tests.test_inbox_wake",
+    ),
+    (
+        "the-scan-ttl-is-not-the-job-timeout",
+        "cloud/inbox-wake/main.py",
+        "SCAN_CLAIM_TTL = WORKER_TASK_TIMEOUT + SCAN_CLAIM_MARGIN\n",
+        "SCAN_CLAIM_TTL = WORKER_TASK_TIMEOUT\n",
+        "the claim lapses while the execution may still be running, and a second start doubles it",
+        "test_the_scan_claim_ttl_is_the_worker_job_timeout_plus_a_margin",
+        "tests.test_inbox_wake",
+    ),
 ]
 
 
@@ -350,6 +370,7 @@ def stage() -> Path:
                 "tests/test_board_to_redis.py",
                 "tests/test_inbox_wake.py",
                 "cloud/claude-api-worker/main.py",
+                "cloud/claude-api-worker/deploy.sh",
                 ".gcloudignore",
                 ".github/workflows/inbox-wake-sweep.yml",
                 ".github/workflows/inbox-wake-claude.yml",

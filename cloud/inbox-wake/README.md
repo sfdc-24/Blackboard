@@ -37,8 +37,11 @@ Redis and has just written the entry, so it sends the event:
 4. **The fail-safe.** With the flag on, the 15-minute sweep drains the same way. That catches a lost nudge, an entry
    from a writer that never nudges (an agent's own governed `xadd`), and a backlog left after a capped pass.
 
-So delivery is **at least once**. A failed start moves nothing and is retried by the next nudge or sweep. The cursor,
-the seen keys and the start ids are `fleet:` keys with the fleet ttl; the worker's scan state is only read. The flag off changes nothing: a nudge answers `lane_off` and reads nothing,
+So delivery is **at least once**. A failed start moves nothing and is retried by the next nudge or sweep. A start the
+run API accepted, but whose execution died before the worker moved, is retried too: the `scan:` claim lasts only
+`SCAN_CLAIM_TTL`, which is the worker job's `--task-timeout` (10 min, `--max-retries 0`) plus 5 min. Within that window
+a running execution is never doubled. The wake cursor and the entry claims keep the 30-day fleet ttl. The worker's scan
+state is only read. The flag off changes nothing: a nudge answers `lane_off` and reads nothing,
 the sweep is the per-entry sweep it was, and no cursor is written.
 
 **To turn it on (owner's decision, not done here):** `INBOX_WAKE_REDIS=on` on this service. On the bus-requests job:

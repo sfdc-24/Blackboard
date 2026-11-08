@@ -28,12 +28,21 @@ import json
 import logging
 import os
 import re
+import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PROJECT = os.environ.get("RUN_PROJECT") or "sfdc24"
 REGION = os.environ.get("RUN_REGION") or "us-central1"
 SEEN_TTL = 2592000  # fleet: ttl in scripts/redis_acl.json; no new grant
+# THE SCAN CLAIM'S TTL (Codex on e828e71d). A scan:<position>:<head> claim stands for "a start was made at
+# this worker position". If that execution stalls or dies before the worker moves, the claim must not hold
+# for SEEN_TTL, or no nudge or sweep would start the worker at that position for 30 days. It lasts the
+# worker job's own --task-timeout (cloud/claude-api-worker/deploy.sh: 10m, --max-retries 0) plus a margin:
+# within it a running execution is not doubled, after it a worker still at that position gets a new start.
+WORKER_TASK_TIMEOUT = 600
+SCAN_CLAIM_MARGIN = 300
+SCAN_CLAIM_TTL = WORKER_TASK_TIMEOUT + SCAN_CLAIM_MARGIN
 MAX_BODY = 65536
 ID_OK = re.compile(r"[A-Za-z0-9_.:-]{1,128}\Z")
 COMMENT_LINE = re.compile(r"(?m)^inbox\s+to=(\S+)\s+id=(\S+)\s+by=(\S+)\s+text=(.*)$")
@@ -124,17 +133,26 @@ def agents_from_env(environ=None) -> frozenset:
 class MemorySeen:
     """Process-local stand-in. Production uses RedisSeen; tests use this."""
 
-    def __init__(self):
+    def __init__(self, clock=None):
         self.ids = set()
+        self.clock = clock or time.monotonic
+        self.expiring = {}                  # key -> when a claim made with a ttl lapses
 
-    def claim(self, key: str) -> bool:
+    def claim(self, key: str, ttl=None) -> bool:
+        lapse = self.expiring.get(key)
+        if lapse is not None and self.clock() >= lapse:
+            self.expiring.pop(key, None)
+            self.ids.discard(key)
         if key in self.ids:
             return False
         self.ids.add(key)
+        if ttl:
+            self.expiring[key] = self.clock() + ttl
         return True
 
     def release(self, key: str) -> None:
         self.ids.discard(key)
+        self.expiring.pop(key, None)
 
 
 class RedisSeen:
@@ -143,8 +161,8 @@ class RedisSeen:
     def __init__(self, client):
         self.client = client
 
-    def claim(self, key: str) -> bool:
-        return bool(self.client.set("fleet:wake:seen:" + key, "1", nx=True, ex=SEEN_TTL))
+    def claim(self, key: str, ttl=None) -> bool:
+        return bool(self.client.set("fleet:wake:seen:" + key, "1", nx=True, ex=ttl or SEEN_TTL))
 
     def release(self, key: str) -> None:
         self.client.delete("fleet:wake:seen:" + key)
@@ -235,7 +253,7 @@ class Wakers:
         raise Unconfigured("unknown route %s" % kind)
 
 
-def decide(message: dict, deps) -> dict:
+def decide(message: dict, deps, ttl=None) -> dict:
     """One message. Disabled, unknown, duplicate, and unconfigured all wake nobody."""
     if not deps.enabled:
         return {"status": "disabled", "woke": False}
@@ -254,7 +272,7 @@ def decide(message: dict, deps) -> dict:
     if deps.seen is None:
         return {"status": "no_store", "woke": False, "to": agent, "id": mid}
     key = "%s:%s" % (agent, mid)
-    if not deps.seen.claim(key):
+    if not deps.seen.claim(key, ttl):
         return {"status": "duplicate", "woke": False, "to": agent, "id": mid}
     try:
         deps.wakers.dispatch(agent, ROUTES[agent], {
@@ -339,8 +357,9 @@ def drain(agent: str, deps) -> dict:
         log.warning("lane %s was trimmed past its wake cursor; draining from the oldest entry", agent)
     lagging = bool(_stream_key(head)) and (_stream_key(position) or (0, -1)) < _stream_key(head)
     if lagging:
+        # The position claim lapses after the worker's own run time (SCAN_CLAIM_TTL), not after 30 days.
         result = dict(decide({"to": agent, "id": "scan:%s:%s" % (position or "0", head),
-                              "by": new[-1].get("by") if new else ""}, deps), lane=True)
+                              "by": new[-1].get("by") if new else ""}, deps, ttl=SCAN_CLAIM_TTL), lane=True)
         if result["status"] not in RUNG:
             return dict(result, entries=len(new))   # nothing moves: the next nudge or sweep retries
     else:

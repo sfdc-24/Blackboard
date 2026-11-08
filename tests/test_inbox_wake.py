@@ -579,6 +579,62 @@ class TheLanePath(unittest.TestCase):
         self.assertEqual("woke", nudge(d)[1]["woke"][0]["status"])
         self.assertEqual(2, len(rec.jobs))
 
+    def test_an_accepted_start_that_never_moves_is_started_again_after_the_scan_ttl_and_not_before(self):
+        """Codex on e828e71d: the run API accepted the start, the execution died before the worker moved.
+        The position claim lapses after the job's timeout plus a margin; a 30-day claim never would."""
+        clock = {"t": 5000.0}
+        d, rec, lane = lane_deps()
+        d.seen = wake.MemorySeen(clock=lambda: clock["t"])
+        d.worker.stalled = True
+        lane.add()
+        self.assertEqual("woke", nudge(d)[1]["woke"][0]["status"])
+        for step in (60, wake.WORKER_TASK_TIMEOUT, wake.SCAN_CLAIM_TTL - 1):
+            clock["t"] = 5000.0 + step
+            self.assertEqual("duplicate", wake.sweep(d)[0]["status"], step)
+        self.assertEqual(1, len(rec.jobs), "no second start inside the window")
+        clock["t"] = 5000.0 + wake.SCAN_CLAIM_TTL
+        self.assertEqual("woke", wake.sweep(d)[0]["status"])
+        self.assertEqual(2, len(rec.jobs))
+        self.assertEqual([d.worker.starts[0][1]] * 2, [after for _job, after in d.worker.starts],
+                         "the same position, started again")
+        clock["t"] += 1
+        self.assertEqual("duplicate", wake.sweep(d)[0]["status"], "and the new claim holds its own window")
+
+    def test_progress_that_moves_is_a_new_key_and_an_immediate_start(self):
+        clock = {"t": 5000.0}
+        d, rec, lane = lane_deps(cap=1)
+        d.seen = wake.MemorySeen(clock=lambda: clock["t"])
+        lane.add()
+        lane.add()
+        self.assertEqual("woke", nudge(d)[1]["woke"][0]["status"])
+        clock["t"] += 1                             # well inside the window: the worker moved, so a new key
+        self.assertEqual("woke", wake.sweep(d)[0]["status"])
+        self.assertEqual(2, len(rec.jobs))
+        self.assertEqual("idle", wake.sweep(d)[0]["status"])
+
+    def test_the_scan_claim_ttl_is_the_worker_job_timeout_plus_a_margin(self):
+        import re
+        script = (REPO / "cloud" / "claude-api-worker" / "deploy.sh").read_text(encoding="utf-8")
+        found = re.findall(r"--task-timeout (\d+)([smh])", script)
+        self.assertEqual(1, len(found), "one job definition to read the timeout from")
+        number, unit = found[0]
+        self.assertEqual(int(number) * {"s": 1, "m": 60, "h": 3600}[unit], wake.WORKER_TASK_TIMEOUT)
+        self.assertIn("--max-retries 0", script, "no retry inside the job lengthens a run")
+        self.assertEqual(wake.WORKER_TASK_TIMEOUT + wake.SCAN_CLAIM_MARGIN, wake.SCAN_CLAIM_TTL)
+        self.assertGreater(wake.SCAN_CLAIM_MARGIN, 0)
+        self.assertLess(wake.SCAN_CLAIM_TTL, 3600, "well short of the 30-day seen ttl")
+        client = FakeRedis()
+        d, rec, lane = lane_deps()
+        d.seen = wake.RedisSeen(client)
+        lane.add()
+        nudge(d)
+        ttls = {key: ex for key, (_value, ex) in client.store.items()}
+        scan = [key for key in ttls if key.startswith("fleet:wake:seen:claude-api:scan:")]
+        self.assertEqual(1, len(scan))
+        self.assertEqual(wake.SCAN_CLAIM_TTL, ttls[scan[0]])
+        entry = "fleet:wake:seen:claude-api:" + lane.entries[0]["id"]
+        self.assertEqual(wake.SEEN_TTL, ttls[entry], "an entry claim keeps the 30-day ttl")
+
     def test_a_burst_is_one_start_and_no_later_sweep_starts_it_again(self):
         d, rec, lane = lane_deps()
         sids = [lane.add() for _ in range(3)]
@@ -672,7 +728,7 @@ class TheLanePath(unittest.TestCase):
         sids = [lane.add() for _ in range(120)]
         claims = []
         claim = d.seen.claim
-        d.seen.claim = lambda key: (claims.append(key), claim(key))[1]
+        d.seen.claim = lambda key, ttl=None: (claims.append(key), claim(key, ttl))[1]
         payload = nudge(d)[1]["woke"][0]
         self.assertEqual(("woke", 120, False), (payload["status"], payload["entries"], payload["more"]))
         self.assertEqual(["claude-api-worker"] * 2, rec.jobs, "one start for the 120")
