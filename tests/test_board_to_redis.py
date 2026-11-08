@@ -199,6 +199,23 @@ class BoardToRedis(unittest.TestCase):
         self.assertEqual(["ROW-OK"], [e["row_id"] for e in self.conn.inbox("grok")])
         self.assertNotIn(WORDS, self.conn.dumped())
 
+    def test_call_sheet_rows_are_skipped(self):
+        """CALL_SHEET_MIRROR's rows, built by its own builders, post as bus-reconciler to ALL or to
+        an agent. Copying them would fan every call event and turn out to every lane."""
+        call_id = "conf-0123456789abcdef-01234567"
+        start = sr._event_spec({"call_id": call_id, "event": "start", "epoch": "e1",
+                                "at": "2026-11-08T03:00:00Z"})
+        turn = sr._withheld_turn(call_id, {"said_at": "2026-11-08T03:00:01Z"},
+                                 "CALLTURN-1", "grok", "e1", "t1")
+        rows = []
+        for spec in (start, turn):
+            self.assertEqual("bus-reconciler", spec["source_tag"])
+            rows.append(row(spec["row_id"], spec["target_surface"], spec["payload"],
+                            source=spec["source_tag"]))
+        self.assertEqual(0, self.mirror(rows))
+        self.assertEqual({}, self.conn.streams)
+        self.assertEqual({}, self.conn.data)
+
     def test_a_row_with_no_id_or_no_agent_writes_nothing(self):
         self.mirror([
             row("", "grok", "no id"),
@@ -253,6 +270,38 @@ class BoardToRedis(unittest.TestCase):
         self.assertNotIn(WORDS, text)
         self.assertNotIn("fleet:", text)
         self.assertNotIn("sample queue flow", text)
+
+    def test_the_two_mirrors_fail_independently_of_each_other_and_the_pass(self):
+        """BOARD_TO_REDIS and CALL_SHEET_MIRROR share one pass. Either one raising costs its own
+        step only: the other still runs, and the requests are still handled."""
+        for broken in ("board", "sheet"):
+            order = []
+
+            def board_mirror(rows, _broken=broken):
+                order.append("board")
+                if _broken == "board":
+                    raise RuntimeError("fleet:inbox:grok " + WORDS)
+
+            def sheet(*args, _broken=broken, **kwargs):
+                order.append("sheet")
+                if _broken == "sheet":
+                    raise RuntimeError("conf:call " + WORDS)
+
+            def handle(rows, *args, **kwargs):
+                order.append("handle")
+                return {"answered": [], "refused": [], "capped": 0}
+
+            with mock.patch.object(sr.bus_request, "heartbeat"), \
+                    mock.patch.object(sr.bus_reconcile, "board_rows",
+                                      return_value=[row("ROW-1", "grok", WORDS)]), \
+                    mock.patch.object(sr.bus_request, "handle", side_effect=handle), \
+                    mock.patch.object(sr, "mirror_call_sheet", side_effect=sheet), \
+                    mock.patch.object(sr.log, "warning") as warning:
+                sr.one_pass(FakeRedis(), {}, "", with_git=False, quiet=True, mirror=board_mirror)
+            self.assertEqual(["board", "handle", "sheet"], order, broken)
+            text = " ".join(str(call) for call in warning.call_args_list)
+            self.assertIn("RuntimeError", text, broken)
+            self.assertNotIn(WORDS, text, broken)
 
 
 class TheFlag(unittest.TestCase):

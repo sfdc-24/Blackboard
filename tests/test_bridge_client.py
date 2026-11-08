@@ -460,7 +460,8 @@ class Outcomes(unittest.TestCase):
         self.assertEqual([], self.journalled())
 
     def test_every_op_that_is_not_a_read_is_a_write(self):
-        self.assertEqual(tuple(redis_gov.OPS_READ), bc.READS)
+        # A wait (xwait) changes nothing either, so the client counts it as a read.
+        self.assertEqual(tuple(redis_gov.OPS_READ) + tuple(redis_gov.OPS_WAIT), bc.READS)
         for op in redis_gov.OPS_WRITE + ("haudit", "anything-new"):
             if os.path.exists(self.state):
                 os.unlink(self.state)                 # each op meets a closed breaker
