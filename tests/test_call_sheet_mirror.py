@@ -237,6 +237,78 @@ class CallEvents(unittest.TestCase):
         self.assertIn("CALLSTART-" + new_id, [spec["row_id"] for spec in board.appends])
         self.assertEqual("1000-1", conn.get(sr.CALLS_CURSOR), "no read-back, so the cursor stays")
 
+    def test_the_call_code_the_end_acks_and_each_join_reach_the_board(self):
+        # conference #405 (T-02): the chair streams start with code, join per binder (first join only), end with acks.
+        conn, board = FakeRedis(), Board()
+        start_at, join_at, end_at = "2026-11-09T13:30:00Z", "2026-11-09T13:30:05Z", "2026-11-09T13:50:00Z"
+        conn.add(sr.CALLS_KEY, "1000-0", {"event": "start", "call_id": LIVE, "epoch": "7", "at": start_at,
+                                          "code": "SFDC-2026-11-09-0830"})
+        conn.add(sr.CALLS_KEY, "1000-1", {"event": "join", "call_id": LIVE, "epoch": "7", "persona": "grok",
+                                          "at": join_at})
+        conn.add(sr.CALLS_KEY, "1000-2", {"event": "join", "call_id": LIVE, "epoch": "7", "persona": "claude",
+                                          "at": join_at})
+        conn.add(sr.CALLS_KEY, "1000-3", {"event": "leave", "call_id": LIVE, "epoch": "7", "persona": "grok",
+                                          "at": end_at})
+        conn.add(sr.CALLS_KEY, "1000-4", {"event": "end", "call_id": LIVE, "epoch": "7", "at": end_at,
+                                          "reason": "hangup", "acks": "grok,claude"})
+        _run_pass(conn, board)
+        by_id = {spec["row_id"]: spec for spec in board.appends}
+        self.assertEqual(["CALLSTART-" + LIVE, "CALLJOIN-%s-grok" % LIVE, "CALLJOIN-%s-claude" % LIVE,
+                          "CALLEND-" + LIVE], list(by_id), "a leave is not a row")
+        self.assertEqual(
+            "BCB|v=1|id=CALLSTART-%s|phase=RESULT|class=CALL|from=bus-reconciler|to=ALL|"
+            "msg_type=CALL_START|call_id=%s|epoch=7|started_at=%s|code=SFDC-2026-11-09-0830|"
+            "relayer=bus-reconciler|claimed_author=conference-chair" % (LIVE, LIVE, start_at),
+            by_id["CALLSTART-" + LIVE]["payload"])
+        self.assertEqual(
+            "BCB|v=1|id=CALLJOIN-%s-grok|phase=RESULT|class=CALL|from=bus-reconciler|to=ALL|"
+            "msg_type=CALL_JOIN|call_id=%s|epoch=7|persona=grok|joined_at=%s|"
+            "relayer=bus-reconciler|claimed_author=conference-chair" % (LIVE, LIVE, join_at),
+            by_id["CALLJOIN-%s-grok" % LIVE]["payload"])
+        self.assertEqual(
+            "BCB|v=1|id=CALLEND-%s|phase=RESULT|class=CALL|from=bus-reconciler|to=ALL|"
+            "msg_type=CALL_END|call_id=%s|epoch=7|ended_at=%s|reason=hangup|acks=claude,grok|"
+            "relayer=bus-reconciler|claimed_author=conference-chair" % (LIVE, LIVE, end_at),
+            by_id["CALLEND-" + LIVE]["payload"])
+        for spec in by_id.values():
+            self.assertEqual(("bus-reconciler", "ALL", "RESULT"),
+                             (spec["source_tag"], spec["target_surface"], spec["action_type"]))
+            self.assertEqual([], signature.check(spec["source_tag"], spec["payload"]))
+            self.assertEqual([], board_row.problems(spec["payload"]))
+            self.assertEqual(sr.VERIFIED_STAMP, board.rows[spec["row_id"]]["sender"], spec["row_id"])
+        self.assertEqual("1000-4", conn.get(sr.CALLS_CURSOR), "the leave was passed, and the end read back")
+
+    def test_an_older_chair_without_code_or_acks_writes_the_rows_as_before(self):
+        start = sr._event_spec({"event": "start", "call_id": LIVE, "epoch": "7", "at": "t"})
+        end = sr._event_spec({"event": "end", "call_id": LIVE, "epoch": "7", "at": "t", "reason": "r"})
+        self.assertNotIn("code=", start["payload"])
+        self.assertNotIn("acks=", end["payload"])
+        blank = sr._event_spec({"event": "end", "call_id": LIVE, "epoch": "7", "at": "t", "reason": "r", "acks": ""})
+        self.assertEqual(end["payload"], blank["payload"], "an End with no binder present carries no acks=")
+
+    def test_a_code_or_persona_that_is_not_one_is_never_copied(self):
+        for code in ("SFDC-2026-11-09-083", "sfdc-2026-11-09-0830", "SFDC-2026-11-09-0830-1",
+                     "SFDC-2026-11-09-0830|to=grok", "SFDC-2026-11-09-0830 x", "swordfish"):
+            spec = sr._event_spec({"event": "start", "call_id": LIVE, "epoch": "7", "at": "t", "code": code})
+            self.assertNotIn("code=", spec["payload"], code)
+            self.assertNotIn("swordfish", spec["payload"])
+        spec = sr._event_spec({"event": "start", "call_id": LIVE, "epoch": "7", "at": "t",
+                               "code": "SFDC-2026-11-09-0830-2"})
+        self.assertIn("|code=SFDC-2026-11-09-0830-2|", spec["payload"], "a second call in the same minute")
+        end = sr._event_spec({"event": "end", "call_id": LIVE, "epoch": "7", "at": "t", "reason": "r",
+                              "acks": "grok,swordfish,grok, gemini ,|to=all"})
+        self.assertIn("|acks=gemini,grok|", end["payload"], "known personas only, once each, sorted")
+        self.assertNotIn("swordfish", end["payload"])
+        for persona in ("", "swordfish", "Grok", "grok|x", "owner"):
+            self.assertIsNone(sr._event_spec({"event": "join", "call_id": LIVE, "epoch": "7", "persona": persona,
+                                              "at": "t"}), persona)
+        self.assertIsNone(sr._event_spec({"event": "join", "call_id": "nope", "epoch": "7", "persona": "grok",
+                                          "at": "t"}))
+        self.assertIsNone(sr._event_spec({"event": "join", "call_id": LIVE, "epoch": "", "persona": "grok",
+                                          "at": "t"}))
+        self.assertIsNone(sr._event_spec({"event": "leave", "call_id": LIVE, "epoch": "7", "persona": "grok",
+                                          "at": "t"}))
+
     def test_a_failed_row_is_logged_by_id_and_size_not_by_its_words(self):
         conn, board = FakeRedis(), Board()
         conn.add(sr.CALLS_KEY, "1000-0", {

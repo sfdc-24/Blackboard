@@ -1076,26 +1076,63 @@ def _sheet_spec(rid, to, action, payload, gist):
             "gist": _cell(gist)[:180], "payload": payload}
 
 
+# The chair's readable call code (conference #405, T-02): SFDC-YYYY-MM-DD-HHMM in Toronto time, -2..-9 for a second
+# call in the same minute. Anything else is dropped, never copied.
+CALL_CODE_RE = re.compile(r"^SFDC-\d{4}-\d{2}-\d{2}-\d{4}(?:-[2-9])?$")
+# The binder personas the chair records joins and End acks for (conference binder_route.PERSONAS).
+CALL_PERSONAS = ("claude", "codex", "gemini", "grok")
+
+
+def _call_code(value):
+    """The call code when it is one, else "" (an older chair sends none, so the row is as before)."""
+    text = (value or "").strip()
+    return text if CALL_CODE_RE.fullmatch(text) else ""
+
+
+def _acks(value):
+    """The binders the chair saw in the room at End, as known persona names only, sorted, comma-separated."""
+    names = {name.strip() for name in str(value or "").split(",")}
+    return ",".join(sorted(name for name in names if name in CALL_PERSONAS))
+
+
 def _event_spec(fields):
-    """The sheet row for one conf:calls entry, or None when the entry is not a call we can record."""
+    """The sheet row for one conf:calls entry, or None when the entry is not a call we can record.
+    start and end are one row each per call; join is one row per binder per call (the chair streams the first join
+    only). Ids and times only: a code, persona names and times, never words. A leave is not recorded."""
     call_id = (fields.get("call_id") or "").strip()
     event = (fields.get("event") or "").strip()
     epoch = _token(fields.get("epoch"))
-    if not CALL_ID_RE.fullmatch(call_id) or event not in ("start", "end") or not epoch:
+    if not CALL_ID_RE.fullmatch(call_id) or event not in ("start", "end", "join") or not epoch:
         return None
     at = _cell(fields.get("at"))
     if event == "start":
         rid = "CALLSTART-" + call_id
+        pairs = [("v", "1"), ("id", rid), ("phase", "RESULT"), ("class", "CALL"),
+                 ("from", SHEET_SOURCE), ("to", "ALL"), ("msg_type", "CALL_START"),
+                 ("call_id", call_id), ("epoch", epoch), ("started_at", at)]
+        code = _call_code(fields.get("code"))
+        if code:
+            pairs.append(("code", code))
+        return _sheet_spec(rid, "ALL", "RESULT", _bcb(_carry(pairs)), "CALL_START " + call_id)
+    if event == "join":
+        persona = (fields.get("persona") or "").strip()
+        if persona not in CALL_PERSONAS:
+            return None
+        rid = "CALLJOIN-%s-%s" % (call_id, persona)
         payload = _bcb(_carry([("v", "1"), ("id", rid), ("phase", "RESULT"), ("class", "CALL"),
-                               ("from", SHEET_SOURCE), ("to", "ALL"), ("msg_type", "CALL_START"),
-                               ("call_id", call_id), ("epoch", epoch), ("started_at", at)]))
-        return _sheet_spec(rid, "ALL", "RESULT", payload, "CALL_START " + call_id)
+                               ("from", SHEET_SOURCE), ("to", "ALL"), ("msg_type", "CALL_JOIN"),
+                               ("call_id", call_id), ("epoch", epoch), ("persona", persona),
+                               ("joined_at", at)]))
+        return _sheet_spec(rid, "ALL", "RESULT", payload, "CALL_JOIN %s %s" % (call_id, persona))
     rid = "CALLEND-" + call_id
-    payload = _bcb(_carry([("v", "1"), ("id", rid), ("phase", "RESULT"), ("class", "CALL"),
-                           ("from", SHEET_SOURCE), ("to", "ALL"), ("msg_type", "CALL_END"),
-                           ("call_id", call_id), ("epoch", epoch), ("ended_at", at),
-                           ("reason", fields.get("reason"))]))
-    return _sheet_spec(rid, "ALL", "RESULT", payload, "CALL_END " + call_id)
+    pairs = [("v", "1"), ("id", rid), ("phase", "RESULT"), ("class", "CALL"),
+             ("from", SHEET_SOURCE), ("to", "ALL"), ("msg_type", "CALL_END"),
+             ("call_id", call_id), ("epoch", epoch), ("ended_at", at),
+             ("reason", fields.get("reason"))]
+    acks = _acks(fields.get("acks"))
+    if acks:
+        pairs.append(("acks", acks))
+    return _sheet_spec(rid, "ALL", "RESULT", _bcb(_carry(pairs)), "CALL_END " + call_id)
 
 
 def _mirror_events(conn, append, present, renew):
