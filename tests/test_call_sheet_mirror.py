@@ -530,6 +530,44 @@ class CallTurns(unittest.TestCase):
             self.assertEqual([], signature.check(spec["source_tag"], spec["payload"]))
         self.assertNotIn("CALLTURN-t-dead", by_id)
 
+    def test_a_turn_the_bound_binder_took_is_a_result_record_not_an_ask(self):
+        """B15 ONE DISPATCH: via=binder means Agent Link already carried the turn, so the row wakes no one."""
+        conn, board = FakeRedis(), Board()
+        said = "2026-11-09T13:33:00Z"
+        conn.hashes[sr.CALL_KEY % LIVE] = {
+            "state": "live", "epoch": "7", "started_at": said, "ended_at": "", "reason": ""}
+        conn.add(sr.TURNS_KEY % LIVE, "6000-0", {
+            "turn_key": "t-bound", "to": "chatgpt-codex-desktop", "epoch": "7", "said_at": said,
+            "via": "binder", "turn_class": "other", "chars": "24"})
+        conn.add(sr.TURNS_KEY % LIVE, "6000-1", {
+            "turn_key": "t-cmd-bound", "to": "grok", "epoch": "7", "said_at": said, "via": "binder",
+            "text": "hello", "turn_class": "command", "verb": "status", "target_chars": "4"})
+        conn.add(sr.TURNS_KEY % LIVE, "6000-2", {
+            "turn_key": "t-odd-via", "to": "grok", "epoch": "7", "said_at": said, "via": "sheet",
+            "turn_class": "other", "chars": "3"})
+        _mirror(conn, board)
+        by_id = {spec["row_id"]: spec for spec in board.appends}
+        withheld = (
+            "BCB|v=1|id=CALLTURN-t-bound|phase=RESULT|class=CALL|from=bus-reconciler|to=chatgpt-codex-desktop|"
+            "msg_type=CALL_TURN|call_id=%s|epoch=7|turn_key=t-bound|said_at=%s|via=binder|withheld=1|"
+            "turn_class=other|chars=24|relayer=bus-reconciler|claimed_author=conference-chair" % (LIVE, said))
+        self.assertEqual(withheld, by_id["CALLTURN-t-bound"]["payload"])
+        self.assertEqual(("RESULT", "DONE"), (by_id["CALLTURN-t-bound"]["action_type"],
+                                              by_id["CALLTURN-t-bound"]["category"]))
+        spoken = by_id["CALLTURN-t-cmd-bound"]
+        self.assertEqual("RESULT", spoken["action_type"])
+        self.assertEqual("RESULT", sr._field(spoken["payload"], "phase"))
+        self.assertEqual("binder", sr._field(spoken["payload"], "via"))
+        self.assertEqual("hello", sr._field(spoken["payload"], "text"))
+        self.assertIn("|msg_type=CALL_TURN|call_id=%s|" % LIVE, spoken["payload"], "the box's turn substring stays")
+        odd = by_id["CALLTURN-t-odd-via"]
+        self.assertEqual(("ASK", "ASK"), (odd["action_type"], sr._field(odd["payload"], "phase")),
+                         "only via=binder is a record; anything else is an ask as before")
+        self.assertNotIn("via=", odd["payload"])
+        for spec in by_id.values():
+            self.assertEqual([], board_row.problems(spec["payload"]))
+            self.assertEqual([], signature.check(spec["source_tag"], spec["payload"]))
+
     def test_the_box_reads_a_bus_reconciler_row_at_its_turn_substring(self):
         """conference#375: the box takes a turn only from a row stamped for bus-reconciler,
         and only when msg_type=CALL_TURN is immediately followed by call_id=<room>."""
