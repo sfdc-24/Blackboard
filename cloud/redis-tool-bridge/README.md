@@ -68,10 +68,16 @@ One endpoint that touches Redis: `POST /probe`, a synthetic probe — the server
 namespace, the nonce and the TTL; the caller chooses none of them (locked decision 3). Plus
 `GET /healthz`, which touches nothing at all, reads no secret and reports no configuration.
 
+`GET /readyz` (B12) answers one bit: `{"ready": true}` with 200 when a `PING` through the bridge's own
+connection path comes back, `{"ready": false}` with 503 otherwise — no latency, no error, no setting,
+no caller. At most one `PING` per 5 s, whoever asks. Every connection the bridge opens has a **2 s
+connect timeout and no retry**; every op but `xwait` also has a **2 s socket timeout** (`xwait`'s socket
+outlasts its block, or a quiet doorbell would end as a timeout).
+
 There is **no** action for `GET`, `SET`, `HSET`, `XADD`, `KEYS`, `SCAN`, `FLUSHDB`, `FLUSHALL` or
 `DEL`. Not refused — **absent**. A refusal is a line of code that can be got wrong. A test pins the
-Redis calls to exactly `setex`, `get`, `ttl`, `delete`, so a fifth is a test change and therefore a
-review.
+Redis calls to exactly `setex`, `get`, `ttl`, `delete` and `/readyz`'s `ping`, so another is a test
+change and therefore a review.
 
 ### `POST /op` — source for review, not approved, not deployed (2026-10-13)
 

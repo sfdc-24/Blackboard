@@ -193,6 +193,7 @@ class BridgeSim:
                 if name not in self.environ:
                     os.environ.pop(name, None)
             stack.enter_context(mock.patch.object(bridge_main, "connect", connect))
+            stack.enter_context(mock.patch.object(bridge_main, "connect_wait", connect))   # B12: xwait's own
             if self.principal != "file":
                 stack.enter_context(mock.patch.object(
                     bridge_op, "load_callers", lambda path=None: {self.account: self.principal}))

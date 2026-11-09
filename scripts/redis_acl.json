@@ -16,11 +16,11 @@
   },
   "principals": {
     "owner":                 {"read": ["*"], "write": ["fleet:", "conf:", "proj:"]},
-    "claude-code-cli":       {"read": ["*"], "write": ["fleet:", "conf:", "proj:"]},
-    "chatgpt-codex-desktop": {"read": ["*"], "write": ["fleet:", "conf:", "proj:"]},
+    "claude-code-cli":       {"read": ["*"], "write": ["fleet:", "conf:", "proj:", "lane:build", "lane:deploy", "lane:coordinator"]},
+    "chatgpt-codex-desktop": {"read": ["*"], "write": ["fleet:", "conf:", "proj:", "lane:test"]},
     "grok":                  {"read": ["*"], "write": ["fleet:", "conf:", "proj:"]},
-    "gemini":                {"read": ["*"], "write": ["fleet:", "conf:", "proj:"]},
-    "cursor":                {"read": ["*"], "write": ["fleet:", "conf:", "proj:"]},
+    "gemini":                {"read": ["*"], "write": ["fleet:", "conf:", "proj:", "lane:architect"]},
+    "cursor":                {"read": ["*"], "write": ["fleet:", "conf:", "proj:", "lane:build"]},
     "copilot":               {"read": ["*"], "write": ["fleet:", "conf:", "proj:"]},
     "claude-api":            {"read": ["*"], "write": ["fleet:", "conf:", "proj:"]},
     "claude-mobile":         {"read": ["*"], "write": ["fleet:", "conf:", "proj:"]},
@@ -32,6 +32,7 @@
     "conf:": 604800,
     "conf:persona:": 86400,
     "fleet:": 2592000,
+    "lane:": 2592000,
     "proj:": 2592000
   },
   "max_value_bytes": 2048,

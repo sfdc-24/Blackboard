@@ -1199,16 +1199,18 @@ def _turn_spec(call_id, fields):
         return None
     text = _turn_body(fields)
     rid = "CALLTURN-" + turn_key
+    phase = _turn_phase(fields)
     if not text:
         return _withheld_turn(call_id, fields, rid, tag, epoch, turn_key)
     shown, cut = (text, False) if len(text) <= TURN_TEXT_MAX else (text[:TURN_TEXT_MAX], True)
-    pairs = _turn_head(rid, tag, call_id) + [
-        ("epoch", epoch), ("turn_key", turn_key), ("said_at", fields.get("said_at")), ("text", shown)]
+    pairs = _turn_head(rid, tag, call_id, phase) + [
+        ("epoch", epoch), ("turn_key", turn_key), ("said_at", fields.get("said_at"))] + _via(phase) + [
+        ("text", shown)]
     if cut:
         digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
         pairs += [("truncated", "1"), ("chars", str(len(text))), ("sha256", digest)]
     pairs = _with_class(pairs, fields)
-    return _sheet_spec(rid, tag, "ASK", _bcb(_carry(pairs)), "CALL_TURN %s %d" % (turn_key, len(shown)))
+    return _sheet_spec(rid, tag, phase, _bcb(_carry(pairs)), "CALL_TURN %s %d" % (turn_key, len(shown)))
 
 
 def _with_class(pairs, fields):
@@ -1220,9 +1222,24 @@ def _with_class(pairs, fields):
     return pairs
 
 
-def _turn_head(rid, tag, call_id):
+# ONE DISPATCH (B15; Gemini's plan review GEMINI-RESULT-PLAN-REVIEW-V2-20261109T171200Z, finding 8, enforced by the
+# owner on Nov 9). The chair marks a turn via=binder when it recorded it AFTER publishing it to that persona's bound
+# binder (conference sheet_binder, ONE DISPATCH): Agent Link has already carried it to the live session. Such a turn is
+# the call's record, written phase=RESULT, so no cloud waker treats it as an ask. On Nov 9 the ASK copies made the
+# gemini waker answer turns Jemma's binder had taken and sent Grok's routine after withheld rows. A box's own Sheet
+# path does not read phase (sheet_link.ingest_sheet_row) and still dedupes on its claim ledger. A turn without via
+# (an older chair) is an ASK, exactly as before.
+def _turn_phase(fields):
+    return "RESULT" if (fields.get("via") or "").strip() == "binder" else "ASK"
+
+
+def _via(phase):
+    return [("via", "binder")] if phase == "RESULT" else []
+
+
+def _turn_head(rid, tag, call_id, phase="ASK"):
     """msg_type=CALL_TURN is immediately followed by call_id=. The box reader matches that substring."""
-    return [("v", "1"), ("id", rid), ("phase", "ASK"), ("class", "CALL"),
+    return [("v", "1"), ("id", rid), ("phase", phase), ("class", "CALL"),
             ("from", SHEET_SOURCE), ("to", tag), ("msg_type", "CALL_TURN"),
             ("call_id", call_id)]
 
@@ -1231,9 +1248,11 @@ def _withheld_turn(call_id, fields, rid, tag, epoch, turn_key):
     """No text on the entry: record turn_class and the counts, and do not invent the words.
 
     class=CALL stays the envelope class. turn_class is the chair's own field."""
-    pairs = _turn_head(rid, tag, call_id) + [
-        ("epoch", epoch), ("turn_key", turn_key), ("said_at", fields.get("said_at")), ("withheld", "1")]
-    return _sheet_spec(rid, tag, "ASK", _bcb(_carry(_with_class(pairs, fields))),
+    phase = _turn_phase(fields)
+    pairs = _turn_head(rid, tag, call_id, phase) + [
+        ("epoch", epoch), ("turn_key", turn_key), ("said_at", fields.get("said_at"))] + _via(phase) + [
+        ("withheld", "1")]
+    return _sheet_spec(rid, tag, phase, _bcb(_carry(_with_class(pairs, fields))),
                        "CALL_TURN %s withheld" % turn_key)
 
 

@@ -431,7 +431,8 @@ def parse(raw: bytes) -> tuple:
 
 
 def handle(caller: str, raw: bytes, connect, log, callers=None, gov=None, acl=None, purposes=None,
-           personas=None, rooms=None, now=None, spent=None, canvas_spent=None, waits=None) -> tuple:
+           personas=None, rooms=None, now=None, spent=None, canvas_spent=None, waits=None,
+           connect_wait=None) -> tuple:
     """(status, body) for one /op request from an ALREADY VERIFIED caller.
 
     caller   the email main.verify_caller returned: verified, and on BRIDGE_CALLERS.
@@ -439,6 +440,8 @@ def handle(caller: str, raw: bytes, connect, log, callers=None, gov=None, acl=No
              connection.
     log      a callable taking one line. No value, no key content and no body ever goes to it.
     waits    the semaphore that bounds held xwaits (CAPACITY); _WAITING unless a test gives its own.
+    connect_wait  main.connect_wait: the connection an xwait is made on, whose socket outlasts the block (B12:
+             every other op's socket times out at 2 s). Absent, an xwait uses connect, as before.
     """
     email = str(caller or "").strip().lower()
     purpose = (load_purposes() if purposes is None else purposes).get(email, FLEET)
@@ -506,8 +509,8 @@ def handle(caller: str, raw: bytes, connect, log, callers=None, gov=None, acl=No
             log("op by %s as %s: %s busy (%d waits already held)" % (caller, who, op, MAX_WAITS))
             return 429, {"error": "busy", "executed": False, "retry_after": WAIT_RETRY_SECONDS}
         try:
-            return _governed(caller, who, purpose, request, op, author, asked, canvas, connect, log, gov, acl,
-                             now, spent, canvas_spent)
+            return _governed(caller, who, purpose, request, op, author, asked, canvas, connect_wait or connect, log,
+                             gov, acl, now, spent, canvas_spent)
         finally:
             gate.release()
     return _governed(caller, who, purpose, request, op, author, asked, canvas, connect, log, gov, acl,

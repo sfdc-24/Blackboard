@@ -367,8 +367,15 @@ def reachable(host, port, seconds=PROBE_SECONDS, connector=None) -> bool:
     return True
 
 
-def client(settings, factory=None, precheck=True):
+def client(settings, factory=None, precheck=True, connect_seconds=None, socket_seconds=None,
+           no_retry=False):
     """A connected client, or None. None is an ordinary outcome, not an error.
+
+    connect_seconds, socket_seconds, no_retry: OPT-IN, and only the bridge opts in (B12: its 2 s connect
+    and socket timeouts, no retry on a failure). Left out, every caller gets exactly what it always got:
+    CONNECT_SECONDS for both timeouts and redis-py's own retry default. no_retry pins redis-py's Retry
+    to zero retries explicitly, so a library upgrade that changes the default cannot add retries
+    behind it; if that Retry cannot be built the answer is None, never a client that might retry.
 
     The redis library is NOT a dependency of this repository and is not installed on this box. That is
     deliberate: an import at module scope would make every script that touches the bus fail to start
@@ -400,8 +407,16 @@ def client(settings, factory=None, precheck=True):
     if not secret:
         return None                                     # AUTH is required on his instance
     kwargs = {"host": settings.host, "port": int(settings.port), "password": secret,
-              "socket_timeout": CONNECT_SECONDS, "socket_connect_timeout": CONNECT_SECONDS,
+              "socket_timeout": CONNECT_SECONDS if socket_seconds is None else float(socket_seconds),
+              "socket_connect_timeout": CONNECT_SECONDS if connect_seconds is None else float(connect_seconds),
               "decode_responses": True}
+    if no_retry:
+        try:
+            from redis.backoff import NoBackoff         # noqa: PLC0415 - imported where redis is
+            from redis.retry import Retry               # noqa: PLC0415
+        except ImportError:
+            return None
+        kwargs.update({"retry": Retry(NoBackoff(), 0), "retry_on_timeout": False})
     private_ca = bool(settings.tls and settings.ca_cert_path)
     if settings.tls:
         kwargs.update({"ssl": True, "ssl_cert_reqs": "required",

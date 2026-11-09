@@ -85,7 +85,8 @@ def redis_methods(source):
             and isinstance(node.func.value, ast.Name) and node.func.value.id == "conn"}
 
 
-EXPECTED_REDIS_METHODS = {"setex", "get", "ttl", "delete"}
+# The probe's four, and /readyz's PING (B12): a readiness check that writes nothing and reads no key.
+EXPECTED_REDIS_METHODS = {"setex", "get", "ttl", "delete", "ping"}
 
 
 class Defect1TheAudienceIsChecked(unittest.TestCase):
@@ -283,10 +284,10 @@ class ItCannotDoAnythingButProbe(unittest.TestCase):
     def test_the_request_body_is_read_and_discarded(self):
         self.assertIn("DISCARD", SOURCE)
 
-    def test_exactly_three_endpoints_exist(self):
-        """Was "only two" until /op (2026-10-13). The guard is now exact in BOTH directions: every
-        string main.py compares the path with, read from the syntax tree, is one of these three, so
-        a fourth endpoint fails here whatever its spelling."""
+    def test_exactly_four_endpoints_exist(self):
+        """Was "only two" until /op (2026-10-13), and three until /readyz (B12). The guard is exact in BOTH
+        directions: every string main.py compares the path with, read from the syntax tree, is one of
+        these four, so a fifth endpoint fails here whatever its spelling."""
         compared = set()
         for node in ast.walk(ast.parse(SOURCE)):
             if isinstance(node, ast.Compare) and isinstance(node.left, ast.Name) and node.left.id == "path":
@@ -294,7 +295,7 @@ class ItCannotDoAnythingButProbe(unittest.TestCase):
                     for leaf in ast.walk(right):
                         if isinstance(leaf, ast.Constant) and isinstance(leaf.value, str):
                             compared.add(leaf.value)
-        self.assertEqual({"/healthz", "/probe", "/op"}, compared)
+        self.assertEqual({"/healthz", "/readyz", "/probe", "/op"}, compared)
 
     def test_only_the_op_endpoint_keeps_its_body(self):
         flat = CODE.replace(chr(10), "")
@@ -626,9 +627,10 @@ class TheOpEndpoint(unittest.TestCase):
         self.conn = conn if conn is not None else gov_tests.FakeRedis()
         saved_env = {k: os.environ.get(k) for k in ("BRIDGE_AUDIENCE", "BRIDGE_CALLERS")}
         os.environ.update({"BRIDGE_AUDIENCE": AUD, "BRIDGE_CALLERS": admitted or AYA})
-        saved_connect = bridge.connect
+        saved_connect = bridge.connect, bridge.connect_wait
         saved_readers = bridge_op.load_callers, bridge_op.load_purposes, bridge_op.load_personas
-        bridge.connect = connect or (lambda: self.conn)
+        # B12: an xwait is made on connect_wait, every other op on connect. One fake stands in for both.
+        bridge.connect = bridge.connect_wait = connect or (lambda: self.conn)
         if callers is not None:
             bridge_op.load_callers = lambda path=None: callers
         if purposes is not None:
@@ -641,7 +643,7 @@ class TheOpEndpoint(unittest.TestCase):
                     contextlib.redirect_stderr(log):
                 handler.do_POST()
         finally:
-            bridge.connect = saved_connect
+            bridge.connect, bridge.connect_wait = saved_connect
             bridge_op.load_callers, bridge_op.load_purposes, bridge_op.load_personas = saved_readers
             for k, v in saved_env.items():
                 os.environ.pop(k, None)
@@ -1922,14 +1924,15 @@ class HeldWaitsCannotStarveTheChair(unittest.TestCase):
                 test.release.wait(10)
                 return super().xread(streams, count=count, block=block)
 
-        saved = bridge.verify_caller, bridge.connect, bridge_op.clock
+        saved = bridge.verify_caller, bridge.connect, bridge.connect_wait, bridge_op.clock
         admitted = {self.GROK, CHAIR}
         bridge.verify_caller = lambda token, aud, permitted: (token, None) if token in admitted else (None, "unauthenticated")
         bridge.connect = BlockingRedis                # a connection of the request's own, as connect() makes
+        bridge.connect_wait = BlockingRedis           # and as connect_wait() makes for an xwait (B12)
         bridge_op.clock = time.time
 
         def restore():
-            bridge.verify_caller, bridge.connect, bridge_op.clock = saved
+            bridge.verify_caller, bridge.connect, bridge.connect_wait, bridge_op.clock = saved
         self.addCleanup(restore)
         return blocked
 
@@ -2059,6 +2062,313 @@ class HeldWaitsCannotStarveTheChair(unittest.TestCase):
                 thread.join(10)
         self.assertEqual([200] * bridge_op.MAX_WAITS, [code for code, _ in waits])
         self.assertEqual(bridge_op.MAX_WAITS, self.free_slots())
+
+
+# ---------------------------------------------------------------- B12: 2 s bounds, no retry, /readyz, role lanes
+
+
+import redis_dual  # noqa: E402
+from unittest import mock  # noqa: E402
+
+
+class CapturedClient:
+    """Stands in for redis_dual.client and records what the bridge asked it for."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, settings, factory=None, precheck=True, **kwargs):
+        self.calls.append(dict(kwargs, precheck=precheck))
+        return object()
+
+
+def bridge_client_with(redis_module, which):
+    """bridge.connect() or bridge.connect_wait() through the REAL redis_dual.client against `redis_module`, with
+    test settings, a throwaway auth file and the test CA. No socket is opened: redis-py connects lazily."""
+    sys.path.insert(0, str(ROOT / "tests"))
+    import tempfile
+    import test_redis_dual as dual_tests
+    settings = redis_dual.Settings(dict(dual_tests.CONNECT_ONLY, ca_cert_path=str(dual_tests.TEST_CA)), environ={})
+    with tempfile.TemporaryDirectory() as tmp:
+        auth = pathlib.Path(tmp) / "auth"
+        auth.write_text("not-a-real-auth-string", encoding="utf-8")
+        modules = {"redis": redis_module, "redis.connection": redis_module.connection}
+        with mock.patch.dict(os.environ, {"REDIS_AUTH_FILE": str(auth)}), mock.patch.dict(sys.modules, modules), \
+                mock.patch.object(redis_dual, "Settings", lambda *a, **k: settings):
+            os.environ.pop("REDIS_TLS_CHECK_HOSTNAME", None)
+            return which()
+
+
+class B12TwoSecondBoundsAndNoRetry(unittest.TestCase):
+    """V2, Claude's lane: the bridge connects with a 2 s connect timeout and a 2 s socket timeout, and never retries
+    a failure. xwait alone keeps a socket that outlasts its block, or no quiet doorbell could end cleanly."""
+
+    def captured(self, which):
+        fake = CapturedClient()
+        with mock.patch.object(redis_dual, "client", fake):
+            which()
+        self.assertEqual(1, len(fake.calls))
+        return fake.calls[0]
+
+    def test_connect_asks_for_two_seconds_both_ways_and_no_retry(self):
+        self.assertEqual((2.0, 2.0), (bridge.CONNECT_SECONDS, bridge.SOCKET_SECONDS))
+        self.assertEqual({"precheck": False, "connect_seconds": 2.0, "socket_seconds": 2.0, "no_retry": True},
+                         self.captured(bridge.connect))
+
+    def test_the_wait_connection_keeps_the_two_second_connect_and_no_retry(self):
+        self.assertEqual({"precheck": False, "connect_seconds": 2.0, "socket_seconds": redis_dual.CONNECT_SECONDS,
+                          "no_retry": True}, self.captured(bridge.connect_wait))
+
+    def test_only_the_wait_socket_can_carry_a_wait_and_it_carries_redis_gov_s(self):
+        """Why xwait has its own connection: redis_gov refuses a wait on a 2 s socket, and sizes the block under
+        redis_dual.CONNECT_SECONDS, which is exactly the wait connection's socket timeout."""
+        self.assertIsNone(redis_gov.wait_ms(bridge.SOCKET_SECONDS))
+        block = redis_gov.wait_ms(redis_dual.CONNECT_SECONDS)
+        self.assertIsNotNone(block)
+        self.assertLess(block / 1000.0, redis_dual.CONNECT_SECONDS)
+        self.assertEqual(block, redis_gov.wait_ms())
+
+    @unittest.skipIf(REDIS_LIB is None, "redis==5.3.1 is installed in CI's bridge venv")
+    def test_the_bounds_reach_the_real_connection(self):
+        made = bridge_client_with(REDIS_LIB, bridge.connect).connection_pool.make_connection()
+        self.assertEqual((2.0, 2.0), (made.socket_connect_timeout, made.socket_timeout))
+        self.assertEqual(0, made.retry._retries)
+        self.assertIs(False, made.retry_on_timeout)
+        waiting = bridge_client_with(REDIS_LIB, bridge.connect_wait).connection_pool.make_connection()
+        self.assertEqual((2.0, redis_dual.CONNECT_SECONDS), (waiting.socket_connect_timeout, waiting.socket_timeout))
+        self.assertEqual(0, waiting.retry._retries)
+
+    @unittest.skipIf(REDIS_LIB is None, "redis==5.3.1 is installed in CI's bridge venv")
+    def test_one_attempt_even_under_a_library_whose_default_retries(self):
+        """redis-py 6 retries three times by default. The bridge pins zero, so an upgrade cannot add retries: the
+        library here is the pinned one with that default put back, and a connection that times out is tried ONCE."""
+        import socket
+        import types
+
+        class RetryingByDefault(REDIS_LIB.Redis):
+            def __init__(self, *a, **kw):
+                kw.setdefault("retry", REDIS_LIB.retry.Retry(REDIS_LIB.backoff.NoBackoff(), 3))
+                super().__init__(*a, **kw)
+        shim = types.ModuleType("redis")
+        shim.__dict__.update({k: v for k, v in REDIS_LIB.__dict__.items() if not k.startswith("__")})
+        shim.Redis = RetryingByDefault
+        attempts = []
+
+        def refused(self):
+            attempts.append(1)
+            raise socket.timeout("timed out")
+
+        conn = bridge_client_with(shim, bridge.connect)
+        with mock.patch.object(REDIS_LIB.connection.Connection, "_connect", refused):
+            with self.assertRaises(REDIS_LIB.exceptions.TimeoutError):
+                conn.ping()
+        self.assertEqual(1, len(attempts), "the bridge retried a failed connect")
+
+    def test_the_other_callers_of_client_keep_their_defaults(self):
+        """redis_dual.client is shared with bus-requests, milestones-sync and the reconciler: nothing changes for a
+        caller that does not opt in, and no_retry with no Retry to build is no client, never a retrying one."""
+        sys.path.insert(0, str(ROOT / "tests"))
+        import test_redis_dual as dual_tests
+        conn = dual_tests.connect_with(dual_tests.fake_redis_module())
+        self.assertEqual((redis_dual.CONNECT_SECONDS, redis_dual.CONNECT_SECONDS),
+                         (conn.kwargs["socket_timeout"], conn.kwargs["socket_connect_timeout"]))
+        self.assertNotIn("retry", conn.kwargs)
+        self.assertNotIn("retry_on_timeout", conn.kwargs)
+        with mock.patch.dict(sys.modules, {"redis.backoff": None, "redis.retry": None}):
+            self.assertIsNone(bridge_client_with(dual_tests.fake_redis_module(), bridge.connect))
+
+    def test_an_xwait_is_made_on_the_wait_connection_and_every_other_op_on_the_two_second_one(self):
+        from test_redis_xwait import WaitingRedis
+        cli = "fleet-claude-code-cli@sfdc24.iam.gserviceaccount.com"
+        used = []
+        short, long_ = WaitingRedis(), WaitingRedis()
+        long_.xadd("fleet:inbox:claude-code-cli", {"by": "grok", "text": "ring"})
+        saved = bridge.connect, bridge.connect_wait
+        bridge.connect = lambda: used.append("connect") or short
+        bridge.connect_wait = lambda: used.append("connect_wait") or long_
+        try:
+            for body, expected in (({"op": "xwait", "key": "fleet:inbox:claude-code-cli", "after": "0-0"},
+                                    "connect_wait"),
+                                   ({"op": "get", "key": "fleet:x"}, "connect")):
+                handler = object.__new__(bridge.Handler)
+                handler.path = "/op"
+                raw = __import__("json").dumps(body).encode("utf-8")
+                handler.headers = {"Content-Length": str(len(raw)), "Authorization": "Bearer tok"}
+                handler.rfile = io.BytesIO(raw)
+                sent = []
+                handler._send = lambda code, out: sent.append((code, out))
+                with mock.patch.dict(os.environ, {"BRIDGE_AUDIENCE": AUD, "BRIDGE_CALLERS": cli}), \
+                        Verifier({"email": cli, "email_verified": True}), contextlib.redirect_stderr(io.StringIO()):
+                    handler.do_POST()
+                self.assertEqual(200, sent[0][0], sent)
+                self.assertEqual(expected, used[-1], body["op"])
+        finally:
+            bridge.connect, bridge.connect_wait = saved
+        self.assertEqual(["connect_wait", "connect"], used)
+
+    def test_op_handle_without_a_wait_connection_waits_on_connect_as_before(self):
+        from test_redis_xwait import WaitingRedis
+        conn = WaitingRedis()
+        code, _ = bridge_op.handle("g@x", b'{"op": "xwait", "key": "fleet:inbox:grok", "after": "0-0"}',
+                                   lambda: conn, lambda line: None, callers={"g@x": "grok"},
+                                   purposes={"g@x": bridge_op.DOORBELL})
+        self.assertEqual(200, code)
+
+
+class Pong:
+    def __init__(self, answer=True):
+        self.answer, self.pings = answer, 0
+
+    def ping(self):
+        self.pings += 1
+        return self.answer
+
+
+class B12ReadinessSaysOneBit(unittest.TestCase):
+    """GET /readyz: Redis reachable through the bridge's own bounded path, or not. Unauthenticated in the app, as
+    /healthz is, so it says {"ready": true|false} and nothing else, and it cannot be used to drive Redis."""
+
+    def setUp(self):
+        saved = bridge.connect, bridge.connect_wait, dict(bridge._READY)
+        bridge._READY.update(at=None, ready=False)
+
+        def restore():
+            bridge.connect, bridge.connect_wait = saved[0], saved[1]
+            bridge._READY.clear()
+            bridge._READY.update(saved[2])
+        self.addCleanup(restore)
+        bridge.connect_wait = lambda: (_ for _ in ()).throw(AssertionError("readyz used the wait connection"))
+
+    def get(self, connect, headers=None, environ=None):
+        bridge.connect = connect
+        bridge._READY.update(at=None, ready=False)
+        handler = object.__new__(bridge.Handler)
+        handler.path = "/readyz"
+        handler.headers = headers or {}
+        sent, log = [], io.StringIO()
+        handler._send = lambda code, out: sent.append((code, out))
+        with mock.patch.dict(os.environ, environ or {}, clear=False), contextlib.redirect_stderr(log):
+            handler.do_GET()
+        self.assertEqual(1, len(sent))
+        self.log = log.getvalue()
+        return sent[0]
+
+    def test_ready_is_200_and_one_bit(self):
+        pong = Pong()
+        self.assertEqual((200, {"ready": True}), self.get(lambda: pong))
+        self.assertEqual(1, pong.pings)
+
+    def test_every_failure_is_503_and_the_same_one_bit(self):
+        def secret_failure():
+            raise ConnectionError("AUTH hunter2 refused at 10.0.0.1:6378")
+        for name, connect in (("no client", lambda: None), ("no PONG", lambda: Pong(False)),
+                              ("raised", secret_failure), ("ping raised", lambda: type("P", (), {
+                                  "ping": lambda self: secret_failure()})())):
+            code, out = self.get(connect)
+            self.assertEqual((503, {"ready": False}), (code, out), name)
+            for leak in ("hunter2", "10.0.0.1", "6378", "ConnectionError", "AUTH"):
+                self.assertNotIn(leak, repr(out), name)
+            self.assertNotIn("hunter2", self.log, "our log carries the TYPE only")
+        self.assertIn("ConnectionError", self.log)
+
+    def test_it_reveals_nothing_about_the_caller_or_the_configuration(self):
+        """With a token, without one, and on a misconfigured bridge, the body is the same one key."""
+        for headers in ({}, {"Authorization": "Bearer anything"}):
+            for environ in ({"BRIDGE_AUDIENCE": AUD, "BRIDGE_CALLERS": CALLER},
+                            {"BRIDGE_AUDIENCE": "", "BRIDGE_CALLERS": ""}):
+                code, out = self.get(lambda: Pong(), headers=headers, environ=environ)
+                self.assertEqual((200, {"ready": True}), (code, out), (headers, environ))
+                for leak in (AUD, CALLER, "anything"):
+                    self.assertNotIn(leak, repr(out))
+
+    def test_the_readyz_branch_reads_no_caller_and_no_setting(self):
+        where = SOURCE.index('path == "/readyz"')
+        block = SOURCE[where:SOURCE.index("return self._send(404", where)]
+        for forbidden in ("verify_caller", "allowlist()", "audience()", "bearer(", "headers", "synthetic_probe"):
+            self.assertNotIn(forbidden, block)
+        body = ast.parse(SOURCE)
+        ready_fn = next(n for n in body.body if isinstance(n, ast.FunctionDef) and n.name == "ready")
+        self.assertEqual({"ping"}, redis_methods(ast.unparse(ready_fn)))
+
+    def test_at_most_one_ping_per_window_whoever_asks(self):
+        pong, now = Pong(), [100.0]
+        bridge.connect = lambda: pong
+        for _ in range(20):
+            self.assertTrue(bridge.ready(clock=lambda: now[0]))
+        self.assertEqual(1, pong.pings)
+        now[0] += bridge.READY_CACHE_SECONDS
+        self.assertTrue(bridge.ready(clock=lambda: now[0]))
+        self.assertEqual(2, pong.pings)
+
+    def test_a_request_during_a_ping_gets_the_last_answer_and_opens_no_connection(self):
+        import threading
+        opened = []
+        bridge.connect = lambda: opened.append(1) or Pong()
+        bridge._READY.update(at=None, ready=True)
+        answers = []
+        bridge._READY_LOCK.acquire()                      # a PING in flight
+        try:
+            worker = threading.Thread(target=lambda: answers.append(bridge.ready()))
+            worker.start()
+            worker.join(2)
+            self.assertFalse(worker.is_alive(), "a readiness request queued behind the one in flight")
+        finally:
+            bridge._READY_LOCK.release()
+            worker.join(5)
+        self.assertEqual(([True], []), (answers, opened))
+
+
+class B12RoleLanesThroughTheBridge(unittest.TestCase):
+    """The role lanes are redis_gov's, so /op enforces them exactly as the board route does, under the VERIFIED
+    identity. On the committed callers.json only claude-code-cli is a fleet agent; the doorbells reach no lane."""
+
+    setUp = TheOpEndpoint.setUp
+    post = TheOpEndpoint.post
+    CLI = "fleet-claude-code-cli@sfdc24.iam.gserviceaccount.com"
+
+    def as_(self, email, body, conn):
+        return self.post(body, claims={"email": email, "email_verified": True}, admitted=email, committed=True,
+                         conn=conn)
+
+    @staticmethod
+    def entry(**more):
+        import base64
+        import json
+        return base64.b64encode(json.dumps(dict({"event": "release-done", "ref": "b76-train-1"}, **more))
+                                .encode("utf-8")).decode("ascii")
+
+    def test_clay_appends_to_its_lanes_and_is_refused_on_the_others(self):
+        conn = gov_tests.FakeRedis()
+        for lane in ("lane:build", "lane:deploy", "lane:coordinator"):
+            code, out = self.as_(self.CLI, {"op": "xadd", "key": lane, "val": self.entry(), "enc": "b64"}, conn)
+            self.assertEqual((200, "claude-code-cli"), (code, out.get("principal")), out)
+        for lane in ("lane:architect", "lane:test"):
+            code, out = self.as_(self.CLI, {"op": "xadd", "key": lane, "val": self.entry(), "enc": "b64"}, conn)
+            self.assertEqual((403, "refused", False), (code, out["error"], out["executed"]), out)
+            self.assertIn("does not write", out["reason"])
+            self.assertNotIn(lane, conn.data)
+        code, out = self.as_(self.CLI, {"op": "xrange", "key": "lane:deploy"}, conn)
+        self.assertEqual((200, "release-done"), (code, out["value"][0]["event"]), out)
+        self.assertEqual("bridge:" + self.CLI, conn.audit()[-1]["via"])
+
+    def test_a_doorbell_account_reaches_no_lane_even_its_own_role_s(self):
+        conn = gov_tests.FakeRedis()
+        for email, lane in (("fleet-gemini@sfdc24.iam.gserviceaccount.com", "lane:architect"),
+                            ("fleet-codex@sfdc24.iam.gserviceaccount.com", "lane:test")):
+            for body in ({"op": "xadd", "key": lane, "val": self.entry(), "enc": "b64"},
+                         {"op": "xrange", "key": lane}):
+                code, out = self.as_(email, body, conn)
+                self.assertEqual((403, "refused", False), (code, out["error"], out["executed"]), (email, body))
+        self.assertFalse(any(key.startswith("lane:") for key in conn.data))
+
+    def test_prose_on_a_lane_is_refused_through_the_bridge_too(self):
+        import base64
+        conn = gov_tests.FakeRedis()
+        prose = base64.b64encode(b"a free text sentence with spaces").decode("ascii")
+        code, out = self.as_(self.CLI, {"op": "xadd", "key": "lane:coordinator", "val": prose, "enc": "b64"}, conn)
+        self.assertEqual((403, "refused"), (code, out["error"]), out)
+        self.assertNotIn("lane:coordinator", conn.data)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

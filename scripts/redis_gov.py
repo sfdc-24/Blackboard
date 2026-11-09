@@ -87,7 +87,13 @@ AUDIT_MAXLEN = 200000
 # mirror reuses it for fleet:inbox:<agent>, so a lane it writes is held to the same cap.
 STREAM_MAXLEN = 10000
 
-PROTECTED = ("v1:bus:", "v1:agent:", "v1:conf:", "v1:synth:", "probe:", "gov:")
+PROTECTED = ("v1:bus:", "v1:agent:", "v1:conf:", "v1:synth:", "probe:", "gov:",
+             # THE CHAIR'S CALL RECORD (conference chair sheet_binder, B15 ONE DISPATCH; Codex HOLD
+             # CODEX-RESULT-RV478-20261109T1837Z). The chair writes these straight to Redis with its own connection;
+             # no governed caller ever needs to. The bus-requests mirror trusts a turn's via=binder there as proof that
+             # the bound binder already took it and writes it as a RESULT, so a governed write here could forge that
+             # and silently suppress an agent's wake. Reads stay as the ACL says.
+             "conf:calls", "conf:call:", "conf:callturns:", "conf:callcode:", "conf:spoken:")
 FORWARD_ONLY = ("fleet:cursor:",)
 
 OPS_READ = ("get", "hgetall", "xrange")
@@ -107,6 +113,39 @@ WAIT_LANE = "fleet:inbox:"
 WAIT_VIA = "bridge:"
 WAIT_MAX_COUNT = 10
 OPS = OPS_READ + OPS_WRITE + OPS_WAIT
+
+# THE FIVE ROLE LANES (the V2 test plan, Golden Rule 2: "Redis streams enforce 5 explicit role lanes").
+# Not to be confused with a caller's own inbox lane above. Five streams and no others, IN CODE like PROTECTED, so
+# no edit to the access list can add a lane, widen a lane's writers, or turn a lane into something other than
+# an append-only stream. The access list must ALSO grant each write (two gates; a test holds the two equal).
+#     lane:architect     gemini (Jemma: architecture and governance)
+#     lane:build         claude-code-cli (Clay) and cursor
+#     lane:test          chatgpt-codex-desktop (Cody)
+#     lane:deploy        claude-code-cli (Clay; by convention only from tools/release/release.py, which this
+#                        module cannot see: the bound here is the writer, not the program)
+#     lane:coordinator   claude-code-cli (Clay)
+# Reads: xrange, by any principal whose access list reads the key (every fleet agent reads "*"). Writes: xadd
+# only, by the lane's writers only. No set, hset, hput, del or xwait on a lane, by anyone: a lane's history is
+# trimmed by MAXLEN and expires by TTL, never edited. An entry is IDS AND METADATA ONLY (role_lane_entry): a
+# fixed set of members, each a short token or id with no spaces, so no prose - the owner's or anyone's - can
+# ride on a lane. Bounds: ROLE_LANE_MAXLEN entries (MAXLEN ~), and the access list's TTL for "lane:".
+ROLE_LANE_PREFIX = "lane:"
+ROLE_LANES = {
+    "lane:architect": ("gemini",),
+    "lane:build": ("claude-code-cli", "cursor"),
+    "lane:test": ("chatgpt-codex-desktop",),
+    "lane:deploy": ("claude-code-cli",),
+    "lane:coordinator": ("claude-code-cli",),
+}
+ROLE_LANE_OPS = ("xadd", "xrange")
+ROLE_LANE_MAXLEN = 1000
+ROLE_LANE_ENTRY_BYTES = 512
+_LANE_TOKEN = re.compile(r"[a-z][a-z0-9-]{1,31}")
+_LANE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:#-]{0,79}")
+_LANE_SHA = re.compile(r"[0-9a-f]{7,40}")
+# member -> its grammar. `event` is required; the rest are optional. `by` and `at` are the server's, never sent.
+ROLE_LANE_MEMBERS = {"event": _LANE_TOKEN, "ref": _LANE_ID, "thread": _LANE_ID, "task": _LANE_ID,
+                     "parent": _LANE_ID, "sha": _LANE_SHA}
 
 # Generation audit. Off unless REDIS_GOV_VERIFY is explicitly on, so a deploy of this module does
 # not answer haudit and does not change get, hgetall, xrange, or any write. The op compares
@@ -265,6 +304,14 @@ def check(acl: dict, who: str, op: str, key: str, field: str = "") -> None:
     rules = acl["principals"][who]
     if op in OPS_WAIT and key != WAIT_LANE + who:
         raise Refused("xwait waits on the caller's own lane, %s<principal>, and no other key" % WAIT_LANE)
+    if key.startswith(ROLE_LANE_PREFIX):
+        # THE ROLE LANES, before the ACL and whatever it says (ROLE_LANES).
+        if key not in ROLE_LANES:
+            raise Refused("the role lanes are %s, and no other lane: key" % ", ".join(sorted(ROLE_LANES)))
+        if op not in ROLE_LANE_OPS:
+            raise Refused("a role lane is a stream: xadd appends to it and xrange reads it; nothing else")
+        if op in OPS_WRITE and who not in ROLE_LANES[key]:
+            raise Refused("%s does not write %s" % (who, key))
     if op in OPS_WRITE:
         if any(key.startswith(p) for p in PROTECTED):
             raise Refused("that namespace is protected from writes through this path")
@@ -313,6 +360,27 @@ def decode_mapping(raw: str, enc: str, acl: dict, key: str) -> dict:
         if not _FIELD.match(name) or not isinstance(value, str):
             raise Refused("every hput field must be a field name with a string value")
     return mapping
+
+
+def role_lane_entry(text: str) -> dict:
+    """A role lane's entry from its value: a JSON object of ROLE_LANE_MEMBERS, each a string in its grammar,
+    `event` present, at most ROLE_LANE_ENTRY_BYTES. Anything else is refused whole: an unknown member, a space, a
+    sentence. Returned as the stream entry's own fields, so a reader sees the ids, not a quoted blob."""
+    if len(text.encode("utf-8")) > ROLE_LANE_ENTRY_BYTES:
+        raise Refused("a role lane entry is at most %d bytes" % ROLE_LANE_ENTRY_BYTES)
+    try:
+        entry = json.loads(text)
+    except ValueError:
+        raise Refused("a role lane entry is a JSON object of ids")
+    if not isinstance(entry, dict) or "event" not in entry:
+        raise Refused("a role lane entry is a JSON object of ids, with an event")
+    unknown = sorted(set(entry) - set(ROLE_LANE_MEMBERS))
+    if unknown:
+        raise Refused("a role lane entry takes only " + ", ".join(sorted(ROLE_LANE_MEMBERS)))
+    for name, value in entry.items():
+        if not isinstance(value, str) or not ROLE_LANE_MEMBERS[name].fullmatch(value):
+            raise Refused("a role lane entry's %s is not an id (no spaces, no prose)" % name)
+    return {name: entry[name] for name in sorted(entry)}
 
 
 def decode_value(raw: str, enc: str, acl: dict, key: str = "") -> str:
@@ -499,6 +567,8 @@ def execute(conn, acl: dict, raw_tag: str, via: str, op: str, key: str, field: s
             if wait_ms() is None:
                 raise Refused("this connection's socket timeout is too short for a wait")
         value = decode_value(raw_value, enc, acl, key) if op in ("set", "hset", "xadd") else None
+        if op == "xadd" and key in ROLE_LANES:
+            value = role_lane_entry(value)
         if op == "hset" and not field:
             raise Refused("hset needs field=")
         if op == "hput":
@@ -1518,6 +1588,9 @@ def _write(conn, acl, who, raw_tag, via, op, key, field, value, now, stated=None
     is reported only when both the write and its audit entry succeeded."""
     # A saved read cursor never expires: FORWARD_ONLY compares against what the key holds.
     ttl = None if (op == "set" and key.startswith(FORWARD_ONLY)) else ttl_for(acl, key)
+    if op == "xadd" and key in ROLE_LANES and not ttl:
+        # A lane is bounded in time as well as length; an access list that drops its TTL appends nothing.
+        raise Refused("the access list sets no TTL for the role lanes, so nothing is appended")
     pipe = conn.pipeline(transaction=True)
     try:
         pipe.watch(key)                              # immediate mode until multi()
@@ -1555,9 +1628,10 @@ def _write(conn, acl, who, raw_tag, via, op, key, field, value, now, stated=None
             old = canonical({_text(k): _text(v) for k, v in found.items()}) if found else None
         else:
             old = None                               # xadd appends; nothing is replaced
+        lane = op == "xadd" and key in ROLE_LANES              # value is role_lane_entry's dict
         entry = audit_fields(acl, who, raw_tag, via, op, key, field, True, "", old=old,
                              new=(None if op == "del" else
-                                  canonical(value) if op == "hput" else value), now=now, stated=stated)
+                                  canonical(value) if op == "hput" or lane else value), now=now, stated=stated)
         pipe.multi()
         if op == "set":
             if ttl:
@@ -1573,6 +1647,10 @@ def _write(conn, acl, who, raw_tag, via, op, key, field, value, now, stated=None
         elif op == "hput":
             pipe.delete(key)                         # replace, not merge: no field outlives its version
             pipe.hset(key, mapping=value)
+            if ttl:
+                pipe.expire(key, ttl)
+        elif lane:                                              # a role lane: its ids, then the server's two
+            pipe.xadd(key, dict(value, by=who, at=stamp(now)), maxlen=ROLE_LANE_MAXLEN, approximate=True)
             if ttl:
                 pipe.expire(key, ttl)
         else:                                                                   # xadd
