@@ -316,6 +316,28 @@ class NobodyWritesTheProtectedNamespaces(unittest.TestCase):
         # ...while the same ACL does open an ordinary key, so the test is about PROTECTED, not luck.
         self.assertTrue(run(conn, "grok", "set", "anything:else", val="ok", acl=acl)["ok"])
 
+    def test_the_chairs_call_record_cannot_be_forged_through_this_path(self):
+        """Codex HOLD CODEX-RESULT-RV478-20261109T1837Z: the mirror writes a CALL_TURN with via=binder as a RESULT, so a
+        governed xadd of a forged via=binder turn would silently suppress that agent's wake. Only the chair writes the
+        call record, with its own connection; nobody writes it through redis_gov, even with an ACL that says '*'."""
+        room = "conf-0123456789abcdef-89abcdef"
+        keys = ("conf:callturns:" + room, "conf:call:" + room, "conf:calls", "conf:callcode:SFDC-2026-11-09-1830",
+                "conf:spoken:%s:ep_1:bkev_x" % room)
+        conn = FakeRedis()
+        with tempfile.TemporaryDirectory() as tmp:
+            everything = gov.load_acl(acl_file(tmp, principals={"grok": {"read": ["*"], "write": ["*"]}}))
+        attempts = [(agent, None) for agent in ("owner", "claude-code-cli", "grok", "gemini")] + [("grok", everything)]
+        for agent, acl in attempts:
+            for key in keys:
+                for op in ("set", "del", "xadd"):
+                    kw = {"acl": acl} if acl is not None else {}
+                    out = run(conn, agent, op, key, val="via=binder", **kw)
+                    self.assertFalse(out["ok"], (agent, op, key))
+                    self.assertIn("protected", out["refused"])
+        self.assertEqual([], [k for k in conn.data if str(k).startswith("conf:call")])
+        # ...while an ordinary conf: key stays as the ACL says, so the test is about PROTECTED, not luck.
+        self.assertTrue(run(conn, "grok", "set", "conf:note:x", val="ok", acl=everything)["ok"])
+
     def test_the_audit_stream_cannot_be_edited_through_this_path(self):
         conn = FakeRedis()
         run(conn, "grok", "set", "fleet:x", val="1")

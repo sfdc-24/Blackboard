@@ -87,7 +87,13 @@ AUDIT_MAXLEN = 200000
 # mirror reuses it for fleet:inbox:<agent>, so a lane it writes is held to the same cap.
 STREAM_MAXLEN = 10000
 
-PROTECTED = ("v1:bus:", "v1:agent:", "v1:conf:", "v1:synth:", "probe:", "gov:")
+PROTECTED = ("v1:bus:", "v1:agent:", "v1:conf:", "v1:synth:", "probe:", "gov:",
+             # THE CHAIR'S CALL RECORD (conference chair sheet_binder, B15 ONE DISPATCH; Codex HOLD
+             # CODEX-RESULT-RV478-20261109T1837Z). The chair writes these straight to Redis with its own connection;
+             # no governed caller ever needs to. The bus-requests mirror trusts a turn's via=binder there as proof that
+             # the bound binder already took it and writes it as a RESULT, so a governed write here could forge that
+             # and silently suppress an agent's wake. Reads stay as the ACL says.
+             "conf:calls", "conf:call:", "conf:callturns:", "conf:callcode:", "conf:spoken:")
 FORWARD_ONLY = ("fleet:cursor:",)
 
 OPS_READ = ("get", "hgetall", "xrange")
