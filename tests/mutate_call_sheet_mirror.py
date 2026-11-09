@@ -185,10 +185,25 @@ MUTANTS = [
     ),
     (
         "drop-withheld",
-        "(\"said_at\", fields.get(\"said_at\")), (\"withheld\", \"1\")]",
-        "(\"said_at\", fields.get(\"said_at\"))]",
+        "_via(phase) + [\n        (\"withheld\", \"1\")]",
+        "_via(phase)",
         "a turn with no text is posted without withheld=1",
         "test_a_turn_without_text_records_the_class_and_withheld",
+    ),
+    (
+        # B15 ONE DISPATCH: a turn the bound binder took must not be posted as an ask.
+        "via-binder-still-asks",
+        "return \"RESULT\" if (fields.get(\"via\") or \"\").strip() == \"binder\" else \"ASK\"",
+        "return \"ASK\"",
+        "a turn the bound binder already took is posted as an ask and wakes the cloud wakers again",
+        "test_a_turn_the_bound_binder_took_is_a_result_record_not_an_ask",
+    ),
+    (
+        "any-via-is-a-record",
+        "return \"RESULT\" if (fields.get(\"via\") or \"\").strip() == \"binder\" else \"ASK\"",
+        "return \"RESULT\" if (fields.get(\"via\") or \"\").strip() else \"ASK\"",
+        "a turn with any via= value, not only binder, is posted as a record and never wakes its agent",
+        "test_a_turn_the_bound_binder_took_is_a_result_record_not_an_ask",
     ),
     (
         "command-counts-as-other",
