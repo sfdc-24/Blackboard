@@ -20,7 +20,10 @@ make actions auditable so there is governance."*
 
 Protected from writes **in code, before the ACL is consulted**, whatever the file says: `v1:bus:`
 (the board mirror), `v1:agent:` (the roster), `v1:conf:` (the chair's own projection), `v1:synth:` and
-`probe:`, and `gov:` (the audit itself). All of them can be read — including `gov:audit`.
+`probe:`, `gov:` (the audit itself), and the chair's call record: `conf:calls`, `conf:call:`, `conf:callturns:`,
+`conf:callcode:` and `conf:spoken:`. The chair writes the call record with its own direct connection; the
+bus-requests mirror trusts a turn's `via=binder` there to write it as a RESULT, so no governed caller may write it
+(Codex HOLD CODEX-RESULT-RV478-20261109T1837Z). All of them can be read where the ACL allows — including `gov:audit`.
 
 Values: 2,048 bytes (8,192 under `proj:milestones:`). TTLs the server sets: `conf:` 7 days, `fleet:`
 and `proj:` 30 days.
