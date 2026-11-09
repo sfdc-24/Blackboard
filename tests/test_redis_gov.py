@@ -1233,6 +1233,197 @@ class EndToEndThroughTheBoardWorker(unittest.TestCase):
         self.assertTrue(refused["refused"])
 
 
+LANE_ENTRY = {"event": "pr-review-pass", "ref": "conference#375", "thread": "TH-ESTIMATES",
+              "task": "B12", "parent": "T-01", "sha": "8f39c208"}
+
+
+def lane_val(entry=None):
+    return base64.b64encode(json.dumps(LANE_ENTRY if entry is None else entry).encode("utf-8")).decode("ascii")
+
+
+class StreamRecorder(FakeRedis):
+    """FakeRedis that remembers the trim each xadd asked for."""
+
+    def __init__(self):
+        super().__init__()
+        self.trims = {}
+
+    def xadd(self, key, fields, maxlen=None, approximate=None):
+        self.trims[key] = (maxlen, approximate)
+        return super().xadd(key, fields, maxlen=maxlen, approximate=approximate)
+
+
+class TheFiveRoleLanes(unittest.TestCase):
+    """B12, the V2 test plan's Golden Rule 2: five role lanes, each written by its role only, ids and metadata only,
+    bounded in length and in time. The rule is in code (ROLE_LANES) AND granted in the access list: both gates."""
+
+    WRITERS = {"lane:architect": {"gemini"}, "lane:build": {"claude-code-cli", "cursor"},
+               "lane:test": {"chatgpt-codex-desktop"}, "lane:deploy": {"claude-code-cli"},
+               "lane:coordinator": {"claude-code-cli"}}
+    # Every principal in the access list, every alias, and a stranger.
+    IDENTITIES = tuple(sorted(set(ACL["principals"]) | set(ACL["aliases"]))) + ("somebody-new",)
+
+    def test_the_lanes_and_their_writers_are_exactly_the_plan_s(self):
+        self.assertEqual(self.WRITERS, {lane: set(who) for lane, who in gov.ROLE_LANES.items()})
+
+    def test_each_lane_s_writer_appends_and_every_other_identity_is_refused_and_audited(self):
+        for lane, writers in self.WRITERS.items():
+            for tag in self.IDENTITIES:
+                with self.subTest(lane=lane, tag=tag):
+                    conn = FakeRedis()
+                    out = run(conn, tag, "xadd", lane, val=lane_val(), enc="b64")
+                    if gov.principal(ACL, tag) in writers:
+                        self.assertTrue(out["ok"], out)
+                        self.assertEqual(1, len(conn.data[lane]))
+                    else:
+                        self.assertFalse(out["ok"], out)
+                        self.assertIn("refused", out)
+                        self.assertNotIn(lane, conn.data, "a refused append wrote nothing")
+                        self.assertEqual("0", conn.audit()[-1]["ok"], "and the refusal is audited")
+
+    def test_the_owner_writes_no_lane(self):
+        for tag in ("owner", "whatsapp", "salam"):
+            for lane in self.WRITERS:
+                self.assertFalse(run(FakeRedis(), tag, "xadd", lane, val=lane_val(), enc="b64")["ok"], (tag, lane))
+
+    def test_an_access_list_that_says_write_everything_adds_no_writer(self):
+        """The careless edit again: grok with write "*" still writes no lane, because the code says who does."""
+        with tempfile.TemporaryDirectory() as tmp:
+            acl = gov.load_acl(acl_file(tmp, principals={"grok": {"read": ["*"], "write": ["*"]}}))
+        conn = FakeRedis()
+        for lane in self.WRITERS:
+            out = run(conn, "grok", "xadd", lane, val=lane_val(), enc="b64", acl=acl)
+            self.assertFalse(out["ok"], lane)
+            self.assertIn("does not write", out["refused"])
+        self.assertTrue(run(conn, "grok", "set", "anything:else", val="ok", acl=acl)["ok"],
+                        "the same access list opens an ordinary key, so this is the lane rule and not luck")
+
+    def test_the_access_list_must_also_grant_it(self):
+        """Two gates: a lane's writer that the access list does not grant is refused."""
+        data = json.loads(gov.ACL_FILE.read_text(encoding="utf-8"))
+        data["principals"]["claude-code-cli"]["write"].remove("lane:deploy")
+        with tempfile.TemporaryDirectory() as tmp:
+            acl = gov.load_acl(acl_file(tmp, principals=data["principals"]))
+        out = run(FakeRedis(), "claude-code-cli", "xadd", "lane:deploy", val=lane_val(), enc="b64", acl=acl)
+        self.assertFalse(out["ok"])
+        self.assertIn("may not write", out["refused"])
+
+    def test_the_access_list_and_the_code_name_the_same_writers(self):
+        for who, rules in ACL["principals"].items():
+            for lane, writers in gov.ROLE_LANES.items():
+                self.assertEqual(who in writers, gov._matches(lane, rules.get("write")), (who, lane))
+
+    def test_every_reader_of_star_reads_every_lane_and_the_narrow_principals_read_none(self):
+        conn = FakeRedis()
+        for lane in self.WRITERS:
+            writer = sorted(self.WRITERS[lane])[0]
+            self.assertTrue(run(conn, writer, "xadd", lane, val=lane_val(), enc="b64")["ok"])
+        for who, rules in ACL["principals"].items():
+            for lane in self.WRITERS:
+                out = run(conn, who, "xrange", lane)
+                with self.subTest(who=who, lane=lane):
+                    if "*" in rules.get("read", ()):
+                        self.assertTrue(out["ok"], out)
+                        self.assertEqual("pr-review-pass", out["value"][0]["event"])
+                    else:
+                        self.assertFalse(out["ok"], out)
+        self.assertFalse(run(conn, "somebody-new", "xrange", "lane:build")["ok"])
+
+    def test_a_lane_is_a_stream_xadd_and_xrange_and_nothing_else_even_for_its_writer(self):
+        conn = FakeRedis()
+        self.assertTrue(run(conn, "claude-code-cli", "xadd", "lane:coordinator", val=lane_val(), enc="b64")["ok"])
+        before = list(conn.data["lane:coordinator"])
+        for op, extra in (("set", {"val": "x"}), ("del", {}), ("hset", {"field": "f", "val": "x"}),
+                          ("hput", {"val": base64.b64encode(b'{"a":"b"}').decode(), "enc": "b64"}),
+                          ("get", {}), ("hgetall", {})):
+            out = run(conn, "claude-code-cli", op, "lane:coordinator", **extra)
+            self.assertFalse(out["ok"], op)
+            self.assertIn("a role lane is a stream", out["refused"], op)
+        out = gov.execute(conn, ACL, "claude-code-cli", "bridge:x", "xwait", "lane:coordinator", after="0-0")
+        self.assertFalse(out["ok"])
+        self.assertEqual(before, conn.data["lane:coordinator"], "nothing edited the lane's history")
+
+    def test_there_are_five_lanes_and_no_sixth(self):
+        conn = FakeRedis()
+        for key in ("lane:ops", "lane:build:extra", "lane:builder", "lane:", "lane:Build"):
+            for op, extra in (("xadd", {"val": lane_val(), "enc": "b64"}), ("xrange", {})):
+                out = run(conn, "claude-code-cli", op, key, **extra)
+                self.assertFalse(out["ok"], (op, key))
+                self.assertIn("the role lanes are", out["refused"], (op, key))
+        self.assertFalse(any(key.startswith("lane:") for key in conn.data))
+
+    def test_an_entry_is_ids_and_metadata_and_is_stored_as_them(self):
+        conn = FakeRedis()
+        out = run(conn, "chatgpt-codex-desktop", "xadd", "lane:test", val=lane_val(), enc="b64")
+        self.assertTrue(out["ok"], out)
+        stored = conn.data["lane:test"][0][1]
+        self.assertEqual(dict(LANE_ENTRY, by="chatgpt-codex-desktop"), {k: v for k, v in stored.items() if k != "at"})
+        self.assertTrue(stored["at"].endswith("Z"))
+        self.assertEqual(gov.preview(gov.canonical(LANE_ENTRY)), conn.audit()[-1]["new"])
+        # Unencoded JSON is the same entry: the grammar is the JSON's, not the transport's.
+        self.assertTrue(run(conn, "chatgpt-codex-desktop", "xadd", "lane:test",
+                            val=json.dumps({"event": "run-done"}))["ok"])
+
+    def test_prose_and_anything_but_the_members_is_refused_whole(self):
+        too_long = "a" * 81
+        for bad in ("a free text sentence with spaces in it",
+                    json.dumps("just a string"),
+                    json.dumps(["event", "x"]),
+                    json.dumps({"ref": "conference#375"}),                         # no event
+                    json.dumps({"event": "said", "note": "free text here"}),       # not a member
+                    json.dumps({"event": "said", "ref": "two words"}),             # a space
+                    json.dumps({"event": "Ship It"}),
+                    json.dumps({"event": "x"}),                                    # under two characters
+                    json.dumps({"event": "said", "ref": too_long}),
+                    json.dumps({"event": "said", "sha": "not-hex!"}),
+                    json.dumps({"event": "said", "task": 7}),
+                    json.dumps({"event": "said", "thread": {"nested": "x"}}),
+                    json.dumps({"event": "said", "by": "gemini"}),                 # the server's, never sent
+                    json.dumps({"event": "said", "ref": "https://example.invalid"})):
+            conn = FakeRedis()
+            out = run(conn, "gemini", "xadd", "lane:architect",
+                      val=base64.b64encode(bad.encode("utf-8")).decode("ascii"), enc="b64")
+            self.assertFalse(out["ok"], bad)
+            self.assertIn("role lane entry", out["refused"], bad)
+            self.assertNotIn("lane:architect", conn.data, bad)
+
+    def test_the_largest_entry_the_grammar_admits_fits_the_byte_bound(self):
+        biggest = {"event": "e" * 32, "ref": "r" * 80, "thread": "t" * 80, "task": "k" * 80,
+                   "parent": "p" * 80, "sha": "a" * 40}
+        self.assertLessEqual(len(json.dumps(biggest).encode("utf-8")), gov.ROLE_LANE_ENTRY_BYTES)
+        self.assertTrue(run(FakeRedis(), "cursor", "xadd", "lane:build", val=lane_val(biggest), enc="b64")["ok"])
+
+    def test_a_lane_is_bounded_in_length_and_in_time(self):
+        conn = StreamRecorder()
+        out = run(conn, "claude-code-cli", "xadd", "lane:deploy", val=lane_val(), enc="b64")
+        self.assertTrue(out["ok"], out)
+        self.assertEqual((gov.ROLE_LANE_MAXLEN, True), conn.trims["lane:deploy"])
+        self.assertLess(gov.ROLE_LANE_MAXLEN, gov.STREAM_MAXLEN)
+        self.assertEqual(ACL["ttl_seconds"]["lane:"], conn.ttls["lane:deploy"])
+        self.assertEqual(ACL["ttl_seconds"]["lane:"], out["ttl"])
+        # An ordinary stream keeps its own trim: the lane bound is the lane's.
+        run(conn, "claude-code-cli", "xadd", "fleet:log", val="x")
+        self.assertEqual((gov.STREAM_MAXLEN, True), conn.trims["fleet:log"])
+
+    def test_an_access_list_without_a_lane_ttl_appends_nothing(self):
+        ttls = {k: v for k, v in ACL["ttl_seconds"].items() if k != "lane:"}
+        with tempfile.TemporaryDirectory() as tmp:
+            acl = gov.load_acl(acl_file(tmp, ttl_seconds=ttls))
+        conn = FakeRedis()
+        out = run(conn, "claude-code-cli", "xadd", "lane:deploy", val=lane_val(), enc="b64", acl=acl)
+        self.assertFalse(out["ok"])
+        self.assertIn("no TTL", out["refused"])
+        self.assertNotIn("lane:deploy", conn.data)
+
+    def test_the_board_summary_of_a_lane_read_is_ids_only(self):
+        conn = FakeRedis()
+        run(conn, "gemini", "xadd", "lane:architect", val=lane_val(), enc="b64")
+        line = gov.summarise(run(conn, "grok", "xrange", "lane:architect"))
+        self.assertTrue(line.startswith("OK xrange lane:architect"), line)
+        self.assertIn("conference#375", line)
+        self.assertNotIn("|", line)
+
+
 class NothingLeaks(unittest.TestCase):
     def test_a_store_error_reports_the_type_not_the_message(self):
         class Broken(FakeRedis):

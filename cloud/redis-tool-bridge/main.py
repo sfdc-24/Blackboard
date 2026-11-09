@@ -62,6 +62,21 @@ TWO DEFECTS IN THE FIRST VERSION OF THIS FILE, found by aya and Codex in PR 341 
   - log_message carried a comment saying "no request line" and then formatted `fmt % args` anyway -
     and the inherited log_request passes the request line, query string and all. It now emits nothing;
     the probe's own outcome lines are written explicitly.
+
+B12 (the V2 test plan, Claude's lane): 2 s TIMEOUTS, NO RETRY, AND A READINESS PROBE
+  - Every connection this bridge opens has a 2 s connect timeout and no retry on a failure (redis_dual.client's
+    opt-in arguments; every other caller of client() keeps its own defaults). Every op that answers at once
+    also has a 2 s socket timeout. ONE op cannot: xwait is an XREAD BLOCK whose reply legitimately takes up to
+    redis_gov.wait_ms(), sized under redis_dual.CONNECT_SECONDS, so its connection (connect_wait) keeps that
+    socket timeout and the same 2 s connect and no retry. A 2 s socket there would make every quiet doorbell a
+    socket timeout, and redis_gov refuses a wait whose socket is too short for one.
+  - GET /readyz answers ONE BIT: {"ready": true} with 200, or {"ready": false} with 503. Nothing else, ever: no
+    latency, no error type, no host, no setting, no caller. It is unauthenticated in this file for the same
+    reason /healthz is (a platform probe carries no token; Cloud Run's IAM still admits only the invokers),
+    which is exactly why it says no more than whether a PING through the bridge's own connection path came
+    back. The reason it did not goes to OUR log, as a type. And it cannot be used to drive Redis: one PING
+    at most per READY_CACHE_SECONDS, and a request that arrives while one is in flight gets the last answer
+    rather than a second connection.
 """
 from __future__ import annotations
 
@@ -70,6 +85,7 @@ import json
 import os
 import secrets
 import sys
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -81,6 +97,13 @@ MAX_BODY_BYTES = 4096
 # /op's own bound. Kept equal to op.MAX_BODY_BYTES by tests/test_redis_tool_bridge.py; restated here
 # so the size check runs before op (and redis_gov behind it) is imported at all.
 OP_MAX_BODY_BYTES = 16384
+# B12. The bridge's own bounds, passed to redis_dual.client explicitly: never inherited from its defaults.
+CONNECT_SECONDS = 2.0
+SOCKET_SECONDS = 2.0
+# /readyz: at most one PING per this many seconds, whoever asks and however often.
+READY_CACHE_SECONDS = 5.0
+_READY_LOCK = threading.Lock()
+_READY = {"at": None, "ready": False}   # the last answer and when it was measured (time.monotonic)
 
 # Required configuration. EVERY ONE OF THESE IS FAIL-CLOSED: unset means the service refuses, never
 # that the check is skipped. Defect 1 shipped because an absent audience meant "verify nothing".
@@ -150,9 +173,52 @@ def connect():
     latency guard is right on a hot path, where a fast no beats a slow yes, and WRONG here. A cold
     container whose Direct VPC interface is still coming up needs longer than 1.5 s, and a process
     whose whole job is to connect should let the connect itself be the authority. That guard turned
-    into a false `reachable: false` on 2026-10-06 and cost a run."""
+    into a false `reachable: false` on 2026-10-06 and cost a run.
+
+    B12: the connect itself is the authority, and it is now a BOUNDED one - CONNECT_SECONDS to connect,
+    SOCKET_SECONDS for every reply, and no retry. A Redis that does not answer is a fast, honest failure
+    (503 "redis unreachable", or 502 "outcome unknown" for a write already sent), never a request held
+    while the library tries again."""
     import redis_dual
-    return redis_dual.client(redis_dual.Settings(), precheck=False)
+    return redis_dual.client(redis_dual.Settings(), precheck=False, connect_seconds=CONNECT_SECONDS,
+                             socket_seconds=SOCKET_SECONDS, no_retry=True)
+
+
+def connect_wait():
+    """The connection for xwait ONLY (op.handle's connect_wait). The same 2 s connect and no retry; the socket
+    timeout is redis_dual.CONNECT_SECONDS, the one redis_gov.wait_ms() sizes the block under, so a quiet lane
+    ends as an empty answer, never as a socket timeout. Every other op uses connect()."""
+    import redis_dual
+    return redis_dual.client(redis_dual.Settings(), precheck=False, connect_seconds=CONNECT_SECONDS,
+                             socket_seconds=redis_dual.CONNECT_SECONDS, no_retry=True)
+
+
+def ready(clock=time.monotonic) -> bool:
+    """Is Redis reachable through the bridge's own connection path, within its bounds? One bit.
+
+    One PING at most per READY_CACHE_SECONDS. A request that arrives while a PING is in flight does not wait for
+    it and does not open a second connection: it gets the last answer (False before the first). What went wrong
+    goes to our log as a TYPE, never out."""
+    now = clock()
+    if not _READY_LOCK.acquire(blocking=False):
+        return bool(_READY["ready"])
+    try:
+        if _READY["at"] is not None and now - _READY["at"] < READY_CACHE_SECONDS:
+            return bool(_READY["ready"])
+        ok, why = False, "no connection"
+        try:
+            conn = connect()
+            if conn is not None:
+                ok = conn.ping() is True
+                why = "" if ok else "no PONG"
+        except Exception as error:  # noqa: BLE001 - the TYPE only: a client's message can quote a secret
+            ok, why = False, type(error).__name__
+        if not ok:
+            sys.stderr.write("%s readyz: not ready (%s)\n" % (stamp(), why))
+        _READY.update(at=clock(), ready=ok)
+        return ok
+    finally:
+        _READY_LOCK.release()
 
 
 def synthetic_probe(conn) -> dict:
@@ -213,6 +279,10 @@ class Handler(BaseHTTPRequestHandler):
             # UNAUTHENTICATED BY DESIGN AND IT TOUCHES NOTHING. It does not connect to Redis, read a
             # secret, or report configuration - a health check that reveals state is a disclosure.
             return self._send(200, {"ok": True, "at": stamp()})
+        if path == "/readyz":
+            # B12. UNAUTHENTICATED AS /healthz IS, SO IT SAYS ONE BIT AND NOTHING ELSE (ready(), above).
+            ok = ready()
+            return self._send(200 if ok else 503, {"ready": ok})
         return self._send(404, {"error": "no such endpoint"})
 
     def do_POST(self) -> None:
@@ -256,7 +326,8 @@ class Handler(BaseHTTPRequestHandler):
             # rather than every request.
             import op
             code, body = op.handle(principal, raw, connect,
-                                   lambda line: sys.stderr.write("%s %s\n" % (stamp(), line)))
+                                   lambda line: sys.stderr.write("%s %s\n" % (stamp(), line)),
+                                   connect_wait=connect_wait)
             return self._send(code, dict(body, at=stamp()))
 
         result = synthetic_probe(connect())

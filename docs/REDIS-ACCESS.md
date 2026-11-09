@@ -25,6 +25,14 @@ Protected from writes **in code, before the ACL is consulted**, whatever the fil
 Values: 2,048 bytes (8,192 under `proj:milestones:`). TTLs the server sets: `conf:` 7 days, `fleet:`
 and `proj:` 30 days.
 
+**The five role lanes** (B12), also **in code** (`redis_gov.ROLE_LANES`) and granted in the ACL, both
+required: `lane:architect` (gemini), `lane:build` (claude-code-cli, cursor), `lane:test`
+(chatgpt-codex-desktop), `lane:deploy` and `lane:coordinator` (claude-code-cli). Only `xadd` by the
+lane's writers and `xrange` by anyone who reads `*`; no other `lane:` key and no other op. An entry is
+ids only: base64 of a JSON object with `event` (a lower-case token) and optionally `ref`, `thread`,
+`task`, `parent` (ids, no spaces) and `sha` (hex) — e.g. `{"event":"review-pass","ref":"conference#375"}`.
+The server adds `by` and `at`. At most 1,000 entries per lane, 30 days' TTL.
+
 ## How: one board row in, one board row back
 
 The instance has a **private address** inside the VPC. No agent outside it can open a socket to it, so
