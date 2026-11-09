@@ -83,6 +83,9 @@ from pathlib import Path
 ACL_FILE = Path(__file__).resolve().parent / "redis_acl.json"
 AUDIT_STREAM = "gov:audit"
 AUDIT_MAXLEN = 200000
+# A governed xadd trims its stream to about this many entries (MAXLEN ~). The bus-requests board
+# mirror reuses it for fleet:inbox:<agent>, so a lane it writes is held to the same cap.
+STREAM_MAXLEN = 10000
 
 PROTECTED = ("v1:bus:", "v1:agent:", "v1:conf:", "v1:synth:", "probe:", "gov:")
 FORWARD_ONLY = ("fleet:cursor:",)
@@ -95,7 +98,15 @@ OPS_READ = ("get", "hgetall", "xrange")
 # so a field dropped from a new version does not survive from the old one.
 OPS_WRITE = ("set", "del", "hset", "hput", "xadd")
 MAX_PUT_FIELDS = 50
-OPS = OPS_READ + OPS_WRITE
+# xwait: the doorbell (the owner, 2026-11-08: "Redis is the always-on signal so every agent wakes on event
+# instead of polling"). XREAD BLOCK on the caller's OWN lane, fleet:inbox:<principal>, after a cursor, and
+# only through the bridge: a block on the board route would hold the shared bus-requests loop. It returns
+# the moment an entry lands, or empty when the wait ends. It is a read and it is audited like one.
+OPS_WAIT = ("xwait",)
+WAIT_LANE = "fleet:inbox:"
+WAIT_VIA = "bridge:"
+WAIT_MAX_COUNT = 10
+OPS = OPS_READ + OPS_WRITE + OPS_WAIT
 
 # Generation audit. Off unless REDIS_GOV_VERIFY is explicitly on, so a deploy of this module does
 # not answer haudit and does not change get, hgetall, xrange, or any write. The op compares
@@ -252,6 +263,8 @@ def check(acl: dict, who: str, op: str, key: str, field: str = "") -> None:
     if field and not _FIELD.match(field):
         raise Refused("the field is not a field name")
     rules = acl["principals"][who]
+    if op in OPS_WAIT and key != WAIT_LANE + who:
+        raise Refused("xwait waits on the caller's own lane, %s<principal>, and no other key" % WAIT_LANE)
     if op in OPS_WRITE:
         if any(key.startswith(p) for p in PROTECTED):
             raise Refused("that namespace is protected from writes through this path")
@@ -474,10 +487,17 @@ def execute(conn, acl: dict, raw_tag: str, via: str, op: str, key: str, field: s
         stated = said(claimed_author, request_id)
         check(acl, who, op, key, field)
         after = (after or "").strip()
-        if after and op != "xrange":
-            raise Refused("after= is for xrange only")
+        if after and op not in ("xrange",) + OPS_WAIT:
+            raise Refused("after= is for xrange only, and for xwait")
         if after and not stream_id_ok(after):
             raise Refused("after= must be a stream entry id, <ms>-<seq>")
+        if op in OPS_WAIT:
+            if not str(via or "").startswith(WAIT_VIA):
+                raise Refused("xwait is for the bridge only; the board route never blocks")
+            if not after:
+                raise Refused("xwait needs after=, the last entry id this caller has seen")
+            if wait_ms() is None:
+                raise Refused("this connection's socket timeout is too short for a wait")
         value = decode_value(raw_value, enc, acl, key) if op in ("set", "hset", "xadd") else None
         if op == "hset" and not field:
             raise Refused("hset needs field=")
@@ -488,7 +508,7 @@ def execute(conn, acl: dict, raw_tag: str, via: str, op: str, key: str, field: s
         if op == VERIFY_OP:
             return _audit_generation(conn, acl, who, raw_tag, via, key, field, raw_value, enc,
                                      echoed_generation, echoed_correlation, (head or "").strip(), now)
-        if op in OPS_READ:
+        if op in OPS_READ or op in OPS_WAIT:
             return _read(conn, acl, who, raw_tag, via, op, key, count, now, after, stated)
         return _write(conn, acl, who, raw_tag, via, op, key, field, value, now, stated)
     except Refused as why:
@@ -630,7 +650,38 @@ def entry_view(entry_id, fields) -> dict:
     return view
 
 
+WAIT_MIN_MS = 1000
+WAIT_MARGIN_MS = 2000
+
+
+def wait_ms(connect_seconds=None):
+    """How long one xwait may block, or None when this connection cannot wait safely.
+
+    25 s at most, and always WAIT_MARGIN_MS under the connection's socket timeout
+    (redis_dual.CONNECT_SECONDS), so a quiet lane ends as an empty answer, never as a socket timeout.
+    A socket timeout too short to leave WAIT_MIN_MS of wait under that margin is None: the op is refused,
+    it never blocks as long as the socket waits (Codex on sfdc-24/Blackboard#482)."""
+    if connect_seconds is None:
+        try:
+            import redis_dual
+            connect_seconds = redis_dual.CONNECT_SECONDS
+        except Exception:                   # noqa: BLE001 - no settings module: today's default
+            connect_seconds = 10.0
+    block = min(25000, int(float(connect_seconds) * 1000) - WAIT_MARGIN_MS)
+    return block if block >= WAIT_MIN_MS else None
+
+
 def _read(conn, acl, who, raw_tag, via, op, key, count, now, after="", stated=None) -> dict:
+    if op == "xwait":
+        n = max(1, min(int(count or WAIT_MAX_COUNT), WAIT_MAX_COUNT))
+        found = conn.xread({key: after}, count=n, block=wait_ms()) or []   # never None: checked above
+        entries = [entry for _name, batch in found for entry in batch][:n]
+        out = {"ok": True, "op": op, "key": key, "entries": len(entries), "after": after,
+               "last": str(entries[-1][0]) if entries else after,
+               "value": [entry_view(i, f) for i, f in entries]}
+        _audit_alone(conn, audit_fields(acl, who, raw_tag, via, op, key, "", True, "", now=now, stated=stated))
+        out["audit"] = "ok"
+        return out
     if op == "get":
         value = conn.get(key)
         out = {"ok": True, "op": op, "key": key, "found": value is not None, "value": preview(value)}
@@ -1525,7 +1576,7 @@ def _write(conn, acl, who, raw_tag, via, op, key, field, value, now, stated=None
             if ttl:
                 pipe.expire(key, ttl)
         else:                                                                   # xadd
-            pipe.xadd(key, {"text": value, "by": who, "at": stamp(now)}, maxlen=10000,
+            pipe.xadd(key, {"text": value, "by": who, "at": stamp(now)}, maxlen=STREAM_MAXLEN,
                       approximate=True)
             if ttl:
                 pipe.expire(key, ttl)

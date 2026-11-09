@@ -1,0 +1,402 @@
+"""xwait, the Redis doorbell: an agent waits on its own lane through the bridge and wakes on the entry.
+
+The owner, 2026-11-08: "Redis is the always-on signal so every agent wakes on event instead of polling."
+No network: FakeRedis gains XREAD, the bridge client and the doorbell are driven with fakes.
+"""
+import io
+import json
+import pathlib
+import sys
+import tempfile
+import unittest
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
+sys.path.insert(0, str(ROOT / "tests"))
+
+import bridge_client  # noqa: E402
+import redis_doorbell  # noqa: E402
+import redis_gov as gov  # noqa: E402
+from test_redis_gov import ACL, FakeRedis  # noqa: E402
+
+BRIDGE = "bridge:fleet-claude-code-cli@sfdc24.iam.gserviceaccount.com"
+
+
+class WaitingRedis(FakeRedis):
+    """FakeRedis with XREAD: the entries after the given id, and the block it was asked for."""
+
+    def __init__(self):
+        super().__init__()
+        self.blocks = []
+
+    def xread(self, streams, count=None, block=None):
+        self.blocks.append(block)
+        found = []
+        for key, after in streams.items():
+            entries = self.xrange(key, min="(" + after, count=count)
+            if entries:
+                found.append([key, entries])
+        return found
+
+
+def wait(conn, tag="claude-code-cli", key="fleet:inbox:claude-code-cli", after="0-0", via=BRIDGE, count=10):
+    return gov.execute(conn, ACL, tag, via, "xwait", key, after=after, count=count)
+
+
+class TheGovernedOp(unittest.TestCase):
+    def test_an_agent_wakes_on_the_entries_after_its_cursor_in_its_own_lane(self):
+        conn = WaitingRedis()
+        for text in ("one", "two", "three"):
+            conn.xadd("fleet:inbox:claude-code-cli", {"by": "grok", "text": text})
+        got = wait(conn, after="1-0")
+        self.assertTrue(got["ok"], got)
+        self.assertEqual(["two", "three"], [entry["text"] for entry in got["value"]])
+        self.assertEqual(["2-0", "3-0"], [entry["id"] for entry in got["value"]])
+        self.assertEqual("3-0", got["last"])
+        self.assertEqual([gov.wait_ms()], conn.blocks, "it blocks for the server's wait, not the caller's")
+        self.assertEqual("xwait", conn.audit()[-1]["op"], "a wait is audited like a read")
+
+    def test_a_quiet_lane_is_an_empty_answer_and_the_cursor_stays(self):
+        conn = WaitingRedis()
+        got = wait(conn, after="5-0")
+        self.assertTrue(got["ok"], got)
+        self.assertEqual((0, "5-0"), (got["entries"], got["last"]))
+
+    def test_another_agents_lane_or_any_other_key_is_refused(self):
+        conn = WaitingRedis()
+        conn.xadd("fleet:inbox:grok", {"by": "x", "text": "not yours"})
+        for key in ("fleet:inbox:grok", "fleet:inbox:claude-code-cli-2", "conf:side:20261108", "gov:audit"):
+            with self.subTest(key=key):
+                got = wait(conn, key=key)
+                self.assertFalse(got["ok"])
+                self.assertIn("own lane", got["refused"])
+        self.assertEqual([], conn.blocks, "no refused wait reaches Redis")
+
+    def test_the_board_route_never_blocks(self):
+        conn = WaitingRedis()
+        got = wait(conn, via="REQ-1")
+        self.assertFalse(got["ok"])
+        self.assertIn("bridge only", got["refused"])
+        self.assertEqual([], conn.blocks)
+
+    def test_a_wait_needs_a_real_cursor(self):
+        conn = WaitingRedis()
+        for after in ("", "latest", "$", "1-x"):
+            with self.subTest(after=after):
+                self.assertFalse(wait(conn, after=after)["ok"])
+        self.assertEqual([], conn.blocks)
+
+    def test_at_most_ten_entries_come_back(self):
+        conn = WaitingRedis()
+        for n in range(15):
+            conn.xadd("fleet:inbox:claude-code-cli", {"by": "grok", "text": str(n)})
+        got = wait(conn, count=50)
+        self.assertEqual(10, got["entries"])
+        self.assertEqual("10-0", got["last"])
+
+    def test_the_wait_stays_strictly_under_the_connections_socket_timeout(self):
+        # Codex on sfdc-24/Blackboard#482: a 1 s socket timeout gave a 1 s block, which times out.
+        self.assertEqual(8000, gov.wait_ms(10))
+        self.assertEqual(25000, gov.wait_ms(30))
+        self.assertEqual(25000, gov.wait_ms(300))
+        self.assertEqual(1000, gov.wait_ms(3))
+        for seconds in (2.9, 2, 1, 0.5, 0):
+            with self.subTest(seconds=seconds):
+                self.assertIsNone(gov.wait_ms(seconds))
+        for seconds in (3, 4.5, 10, 26, 27, 30):
+            with self.subTest(seconds=seconds):
+                self.assertLessEqual(gov.wait_ms(seconds), seconds * 1000 - gov.WAIT_MARGIN_MS)
+
+    def test_a_connection_too_short_to_wait_refuses_and_never_blocks(self):
+        import redis_dual
+        conn = WaitingRedis()
+        saved = redis_dual.CONNECT_SECONDS
+        redis_dual.CONNECT_SECONDS = 1.0
+        try:
+            got = wait(conn)
+        finally:
+            redis_dual.CONNECT_SECONDS = saved
+        self.assertFalse(got["ok"])
+        self.assertIn("too short", got["refused"])
+        self.assertEqual([], conn.blocks)
+
+    def test_after_on_another_op_is_still_refused(self):
+        conn = WaitingRedis()
+        got = gov.execute(conn, ACL, "claude-code-cli", BRIDGE, "get", "fleet:x", after="1-0")
+        self.assertFalse(got["ok"])
+        self.assertIn("xrange only", got["refused"])
+
+
+class TheClient(unittest.TestCase):
+    def test_a_wait_is_a_read_and_has_a_longer_request_timeout(self):
+        self.assertIn("xwait", bridge_client.READS)
+        self.assertGreater(bridge_client.WAIT_HTTP_TIMEOUT, 25)
+        seen = []
+
+        class Opener:
+            def open(self, req, timeout=None):
+                seen.append((json.loads(req.data)["op"], timeout))
+                raise bridge_client.urllib.error.URLError("stop here")
+
+        for op in ("xwait", "get"):
+            try:
+                bridge_client.call("https://bridge.invalid", "tok", {"op": op, "key": "k"}, opener=Opener())
+            except Exception:  # noqa: BLE001 - only the timeout it asked for is under test
+                pass
+        self.assertEqual([("xwait", bridge_client.WAIT_HTTP_TIMEOUT), ("get", bridge_client.HTTP_TIMEOUT)], seen)
+
+
+class ABusyBridgeIsABackoffNotAFallback(unittest.TestCase):
+    """CAPACITY (Gemini, GEMINI-ARCH-REDIS-DOORBELL-20261108T1645Z): the bridge holds at most eight waits and answers
+    a ninth with a 429 "busy". The client must wait and ask again: not a refusal, not a breaker failure, and never
+    the board route."""
+
+    @staticmethod
+    def answering(status, body):
+        class Opener:
+            def open(self, req, timeout=None):
+                raw = json.dumps(body).encode("utf-8") if body is not None else b"<html>Rate exceeded</html>"
+                raise bridge_client.urllib.error.HTTPError(req.full_url, status, "", {}, io.BytesIO(raw))
+        return Opener()
+
+    def test_a_429_busy_or_any_429_on_a_wait_is_busy_with_a_bounded_retry(self):
+        busy = {"error": "busy", "executed": False, "retry_after": 5}
+        cases = ((busy, "xwait", 5.0),
+                 (None, "xwait", float(bridge_client.BUSY_RETRY_SECONDS)),      # the platform's own 429
+                 (dict(busy, retry_after=0), "xwait", 1.0),
+                 (dict(busy, retry_after=86400), "xwait", float(bridge_client.BUSY_RETRY_MAX)),
+                 (dict(busy, retry_after="soon"), "xwait", float(bridge_client.BUSY_RETRY_SECONDS)),
+                 (dict(busy, retry_after="nan"), "xwait", float(bridge_client.BUSY_RETRY_SECONDS)))
+        for body, op, seconds in cases:
+            with self.subTest(body=body):
+                with self.assertRaises(bridge_client.Busy) as raised:
+                    bridge_client.call("https://bridge.invalid", "tok", {"op": op, "key": "k"},
+                                       opener=self.answering(429, body))
+                self.assertEqual(seconds, raised.exception.retry_after)
+
+    def test_the_chair_s_quota_429_on_a_write_is_unchanged(self):
+        with self.assertRaises(bridge_client.Unknown):
+            bridge_client.call("https://bridge.invalid", "tok", {"op": "set", "key": "k"},
+                               opener=self.answering(429, {"error": "quota", "executed": False}))
+
+    def attempt(self, tmp, raised, write=False):
+        import os
+        said = []
+        environ = {"REDIS_BRIDGE": "on", "REDIS_BRIDGE_URL": "https://bridge.invalid",
+                   "REDIS_BRIDGE_IMPERSONATE": "fleet-grok@sfdc24.iam.gserviceaccount.com"}
+
+        def caller(url, token, request):
+            raise raised
+
+        with self.assertRaises(bridge_client.Busy):
+            bridge_client.attempt("xadd" if write else "xwait", "fleet:inbox:grok", me="grok",
+                                  value="v" if write else None, after=None if write else "1-0",
+                                  environ=environ, state_path=os.path.join(tmp, "s.json"),
+                                  journal_path=os.path.join(tmp, "j.jsonl"),
+                                  callers={"fleet-grok@sfdc24.iam.gserviceaccount.com": "grok"},
+                                  say=said.append, minter=lambda url, sa: "tok", caller=caller,
+                                  announce=lambda line: said.append("ANNOUNCED " + line))
+        return said
+
+    def test_attempt_raises_busy_and_neither_falls_back_nor_counts_it_against_the_bridge(self):
+        import os
+        with tempfile.TemporaryDirectory() as tmp:
+            state = os.path.join(tmp, "s.json")
+            bridge_client.save_state({"failures": 2, "open_until": 0.0}, state)
+            for _ in range(5):
+                said = self.attempt(tmp, bridge_client.Busy(5))
+                self.assertFalse([line for line in said if "board route" in line or "ANNOUNCED" in line], said)
+            self.assertEqual({"failures": 2, "open_until": 0.0}, bridge_client.load_state(state),
+                             "five busy answers neither tripped the breaker nor reset it")
+
+    def test_a_busy_write_closes_its_journal_line_as_not_executed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            import os
+            self.attempt(tmp, bridge_client.Busy(5), write=True)
+            self.assertEqual([], bridge_client.pending(os.path.join(tmp, "j.jsonl")),
+                             "a write the bridge turned away is not left UNKNOWN")
+
+    def test_the_doorbell_sleeps_on_busy_and_waits_again_and_never_takes_the_board(self):
+        cursor = pathlib.Path(tempfile.mkdtemp()) / "cursor"
+        redis_doorbell.write_cursor(cursor, "6-0")
+        calls, slept = [], []
+
+        def attempt(op, key, *, me, after, count):
+            calls.append(op)
+            if len(calls) <= 2:
+                raise bridge_client.Busy(5)
+            return {"ok": True, "value": [{"id": "7-0", "text": "hello"}], "last": "7-0"}
+
+        out = io.StringIO()
+        code = redis_doorbell.ring("grok", attempt=attempt, out=out, cursor_file=cursor, rounds=5,
+                                   sleep=slept.append)
+        self.assertEqual(0, code, "busy is neither exit 2 (refused) nor exit 3 (use the board doorbell)")
+        self.assertEqual(["xwait"] * 3, calls)
+        self.assertEqual(2, len(slept))
+        for pause in slept:
+            self.assertTrue(5 <= pause <= 6, pause)
+        self.assertEqual("7-0", cursor.read_text(encoding="utf-8"))
+        self.assertEqual("hello", json.loads(out.getvalue().splitlines()[0])["text"])
+
+    def test_the_doorbell_on_the_real_client_backs_off_on_the_bridge_s_429(self):
+        import os
+        cursor = pathlib.Path(tempfile.mkdtemp()) / "cursor"
+        redis_doorbell.write_cursor(cursor, "6-0")
+        answers = [(429, {"error": "busy", "executed": False, "retry_after": 5}),
+                   (200, {"ok": True, "principal": "grok", "value": [{"id": "8-0"}], "last": "8-0"})]
+
+        class Answer:
+            def __init__(self, raw):
+                self.status, self.raw = 200, raw
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self, n=-1):
+                return self.raw
+
+        class Opener:
+            def open(self, req, timeout=None):
+                status, body = answers.pop(0)
+                raw = json.dumps(body).encode("utf-8")
+                if status != 200:
+                    raise bridge_client.urllib.error.HTTPError(req.full_url, status, "", {}, io.BytesIO(raw))
+                return Answer(raw)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            environ = {"REDIS_BRIDGE": "on", "REDIS_BRIDGE_URL": "https://bridge.invalid",
+                       "REDIS_BRIDGE_IMPERSONATE": "fleet-grok@sfdc24.iam.gserviceaccount.com"}
+            said, slept = [], []
+
+            def attempt(op, key, **kw):
+                return bridge_client.attempt(
+                    op, key, environ=environ, state_path=os.path.join(tmp, "s.json"),
+                    journal_path=os.path.join(tmp, "j.jsonl"), say=said.append, minter=lambda url, sa: "tok",
+                    callers={"fleet-grok@sfdc24.iam.gserviceaccount.com": "grok"},
+                    caller=lambda url, token, request: bridge_client.call(url, token, request, opener=Opener()), **kw)
+
+            code = redis_doorbell.ring("grok", attempt=attempt, out=io.StringIO(), cursor_file=cursor, rounds=3,
+                                       sleep=slept.append)
+            self.assertEqual(0, code)
+            self.assertEqual(1, len(slept))
+            self.assertEqual([], answers, "it asked the bridge again after the busy answer")
+            self.assertFalse([line for line in said if "board route" in line or "FAILED" in line], said)
+            self.assertEqual("8-0", cursor.read_text(encoding="utf-8"))
+
+
+class TheDoorbell(unittest.TestCase):
+    def setUp(self):
+        self.cursor = pathlib.Path(tempfile.mkdtemp()) / "cursor"
+
+    def test_it_prints_the_new_entries_and_moves_its_cursor_after_printing(self):
+        calls = []
+
+        def attempt(op, key, *, me, after, count):
+            calls.append((op, key, me, after))
+            if len(calls) == 1:
+                return {"ok": True, "value": [], "last": after}
+            return {"ok": True, "value": [{"id": "7-0", "fields": {"text": "hello"}}], "last": "7-0"}
+
+        redis_doorbell.write_cursor(self.cursor, "6-0")
+        out = io.StringIO()
+        code = redis_doorbell.ring("claude-code-cli", attempt=attempt, out=out, cursor_file=self.cursor, rounds=3)
+        self.assertEqual(0, code)
+        self.assertEqual([("xwait", "fleet:inbox:claude-code-cli", "claude-code-cli", "6-0")] * 2, calls)
+        self.assertEqual("hello", json.loads(out.getvalue().splitlines()[0])["fields"]["text"])
+        self.assertEqual("7-0", self.cursor.read_text(encoding="utf-8"))
+
+    def test_peek_leaves_the_cursor(self):
+        redis_doorbell.write_cursor(self.cursor, "6-0")
+        redis_doorbell.ring("claude-code-cli", out=io.StringIO(), cursor_file=self.cursor, peek=True, rounds=1,
+                            attempt=lambda *a, **k: {"value": [{"id": "7-0", "fields": {}}], "last": "7-0"})
+        self.assertEqual("6-0", self.cursor.read_text(encoding="utf-8"))
+
+    def governed(self, conn):
+        def attempt(op, key, *, me, after=None, count=None):
+            return gov.execute(conn, ACL, me, BRIDGE, op, key, after=after or "", count=count or 10)
+        return attempt
+
+    def test_a_first_run_starts_at_the_lanes_own_newest_entry_and_misses_nothing_after_it(self):
+        # Codex on sfdc-24/Blackboard#482: a clock-made "<ms>-0" start skips an entry added in that same
+        # millisecond (XREAD's start is exclusive). The start is the lane's own newest id, read from Redis.
+        conn = WaitingRedis()
+        for text in ("old-1", "old-2"):
+            conn.xadd("fleet:inbox:claude-code-cli", {"by": "grok", "text": text})
+        governed = self.governed(conn)
+
+        def attempt(op, key, **kw):
+            result = governed(op, key, **kw)
+            if op == "xrange":                           # the race: an entry lands right after the start is read
+                conn.xadd("fleet:inbox:claude-code-cli", {"by": "grok", "text": "same-moment"})
+            return result
+
+        import time as clock
+        real = clock.time
+        clock.time = lambda: (_ for _ in ()).throw(AssertionError("the start must not come from the clock"))
+        try:
+            out = io.StringIO()
+            code = redis_doorbell.ring("claude-code-cli", attempt=attempt, out=out, cursor_file=self.cursor,
+                                       rounds=2)
+        finally:
+            clock.time = real
+        self.assertEqual(0, code)
+        self.assertEqual(["same-moment"], [json.loads(line)["text"] for line in out.getvalue().splitlines()])
+        self.assertEqual("3-0", self.cursor.read_text(encoding="utf-8"))
+
+    def test_a_first_run_that_saw_nothing_keeps_its_start_so_the_next_run_misses_nothing(self):
+        conn = WaitingRedis()
+        conn.xadd("fleet:inbox:claude-code-cli", {"by": "grok", "text": "before"})
+        attempt = self.governed(conn)
+        quiet = redis_doorbell.ring("claude-code-cli", attempt=attempt, out=io.StringIO(),
+                                    cursor_file=self.cursor, rounds=1)
+        self.assertEqual(0, quiet)
+        self.assertEqual("1-0", self.cursor.read_text(encoding="utf-8"), "the start is kept")
+        conn.xadd("fleet:inbox:claude-code-cli", {"by": "grok", "text": "between runs"})
+        out = io.StringIO()
+        redis_doorbell.ring("claude-code-cli", attempt=attempt, out=out, cursor_file=self.cursor, rounds=1)
+        self.assertEqual(["between runs"], [json.loads(line)["text"] for line in out.getvalue().splitlines()])
+
+    def test_a_first_run_on_an_empty_lane_starts_at_the_beginning(self):
+        conn = WaitingRedis()
+        self.assertEqual("0-0", redis_doorbell.lane_position("claude-code-cli", self.governed(conn)))
+        self.assertIsNone(redis_doorbell.lane_position("claude-code-cli", lambda *a, **k: None))
+
+    def test_a_cursor_that_exists_but_cannot_be_used_stops_and_is_never_overwritten(self):
+        # Codex on sfdc-24/Blackboard#482 R2: only a missing file is a first run.
+        def attempt(*a, **k):
+            raise AssertionError("an unreadable cursor must not reach the bridge")
+
+        for content in (b"", b"latest", b"7-x", b"\xff\xfe\x00garbage"):
+            with self.subTest(content=content):
+                self.cursor.write_bytes(content)
+                code = redis_doorbell.ring("claude-code-cli", attempt=attempt, out=io.StringIO(),
+                                           cursor_file=self.cursor, rounds=1)
+                self.assertEqual(4, code)
+                self.assertEqual(content, self.cursor.read_bytes(), "the saved state is left as it was")
+        self.cursor.unlink()
+        self.cursor.mkdir()                                 # exists, but reading it is an OSError
+        self.assertEqual(4, redis_doorbell.ring("claude-code-cli", attempt=attempt, out=io.StringIO(),
+                                                cursor_file=self.cursor, rounds=1))
+        self.assertTrue(self.cursor.is_dir())
+
+    def test_only_a_missing_cursor_is_a_first_run(self):
+        self.assertIsNone(redis_doorbell.read_cursor(self.cursor))
+        redis_doorbell.write_cursor(self.cursor, "9-1")
+        self.assertEqual("9-1", redis_doorbell.read_cursor(self.cursor))
+
+    def test_no_bridge_says_so_and_a_refusal_stops(self):
+        self.assertEqual(3, redis_doorbell.ring("claude-code-cli", out=io.StringIO(), cursor_file=self.cursor,
+                                                attempt=lambda *a, **k: None, rounds=1))
+
+        def refused(*a, **k):
+            raise bridge_client.Refused("not yours")
+
+        self.assertEqual(2, redis_doorbell.ring("claude-code-cli", out=io.StringIO(), cursor_file=self.cursor,
+                                                attempt=refused, rounds=1))
+
+
+if __name__ == "__main__":
+    unittest.main()

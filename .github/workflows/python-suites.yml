@@ -135,6 +135,10 @@ on:
       - "tests/test_git_requests.py"
       - "cloud/bus-reconciler/serve_requests.py"
       - "tests/test_live_mode.py"
+      - "tests/test_board_to_redis.py"
+      - "tests/mutate_board_to_redis.py"
+      - "tests/test_call_sheet_mirror.py"
+      - "tests/mutate_call_sheet_mirror.py"
       - "scripts/canvas_publish.py"
       - "tests/test_canvas_publish.py"
       - "scripts/call_bridge.py"
@@ -153,6 +157,10 @@ on:
       - "tests/test_redis_archive.py"
       - "scripts/redis_inbox.py"
       - "tests/test_redis_inbox.py"
+      - "scripts/redis_ring.py"
+      - "scripts/redis_doorbell.py"
+      - "tests/test_redis_ring.py"
+      - "tests/mutate_redis_ring.py"
       - "scripts/bridge_client.py"
       - "tests/test_bridge_client.py"
       - "cloud/redis-tool-bridge/callers.json"
@@ -264,6 +272,10 @@ on:
       - "tests/test_git_requests.py"
       - "cloud/bus-reconciler/serve_requests.py"
       - "tests/test_live_mode.py"
+      - "tests/test_board_to_redis.py"
+      - "tests/mutate_board_to_redis.py"
+      - "tests/test_call_sheet_mirror.py"
+      - "tests/mutate_call_sheet_mirror.py"
       - "scripts/canvas_publish.py"
       - "tests/test_canvas_publish.py"
       - "scripts/call_bridge.py"
@@ -282,6 +294,10 @@ on:
       - "tests/test_redis_archive.py"
       - "scripts/redis_inbox.py"
       - "tests/test_redis_inbox.py"
+      - "scripts/redis_ring.py"
+      - "scripts/redis_doorbell.py"
+      - "tests/test_redis_ring.py"
+      - "tests/mutate_redis_ring.py"
       - "scripts/bridge_client.py"
       - "tests/test_bridge_client.py"
       - "cloud/redis-tool-bridge/callers.json"
@@ -1130,6 +1146,33 @@ jobs:
             echo "not on this branch; skipping"
           fi
 
+      # The NX mark and the call-text withhold, each deleted on purpose. A survivor means a
+      # re-read can double an inbox entry, or the owner's call words can ride into the lane.
+      - name: "board-to-redis: NX dedupe and call-text withhold are load-bearing (mutation, no network)"
+        run: |
+          set -euo pipefail
+          if [ -f tests/mutate_board_to_redis.py ]; then
+            python_bin="$(command -v python3)"
+            sudo unshare -n -- "$python_bin" -B tests/mutate_board_to_redis.py
+          elif [ -f cloud/bus-reconciler/serve_requests.py ]; then
+            echo "::error::serve_requests.py is on this branch but tests/mutate_board_to_redis.py is not"
+            exit 1
+          else
+            echo "not on this branch; skipping"
+          fi
+
+      # The call-sheet projection. Each guard is deleted on a copy of the worker; a mutant that
+      # still passes is an untested claim. Offline: fake Redis, fake board, empty network namespace.
+      - name: "call sheet mirror guards are load-bearing (mutation, no network)"
+        run: |
+          set -euo pipefail
+          if [ -f tests/mutate_call_sheet_mirror.py ]; then
+            python_bin="$(command -v python3)"
+            sudo unshare -n -- "$python_bin" -B tests/mutate_call_sheet_mirror.py
+          else
+            echo "not on this branch; skipping"
+          fi
+
       # The bounded diagnostic a board request may ask for. The board has NO authenticated
       # sender, so the tests that matter are about what a FORGED request can do: it cannot
       # choose the key, the TTL or the command, a malformed flood produces no rows, and no
@@ -1163,6 +1206,8 @@ jobs:
           for pair in "test_redis_gov:scripts/redis_gov.py" \
                       "test_git_requests:scripts/git_requests.py" \
                       "test_live_mode:cloud/bus-reconciler/serve_requests.py" \
+                      "test_board_to_redis:cloud/bus-reconciler/serve_requests.py" \
+                      "test_call_sheet_mirror:cloud/bus-reconciler/serve_requests.py" \
                       "test_canvas_publish:scripts/canvas_publish.py" \
                       "test_call_bridge:scripts/call_bridge.py" \
                       "test_call_bridge_screen:scripts/call_bridge.py" \
@@ -1172,6 +1217,7 @@ jobs:
                       "test_wake_ack:scripts/wake_ack.py" \
                       "test_redis_archive:cloud/bus-reconciler/redis_archive.py" \
                       "test_redis_inbox:scripts/redis_inbox.py" \
+                      "test_redis_ring:scripts/redis_ring.py" \
                       "test_bridge_client:scripts/bridge_client.py"; do
             suite="${pair%%:*}"; code="${pair#*:}"
             if [ -f "tests/${suite}.py" ]; then
@@ -1183,6 +1229,22 @@ jobs:
               echo "tests/${suite}.py and ${code} are both absent on this branch; skipping"
             fi
           done
+
+      # The Redis ring (2026-11-08): the cursor moves only after the wake exits 0, a 401 or a missing
+      # bridge env exits with no board fallback, a 429 backs off. Each guard is broken on a copy and
+      # the test that claims it must fail. Offline: fake bridge, fake clock, empty network namespace.
+      - name: "redis ring: cursor-after-wake and no-fallback are load-bearing (mutation, no network)"
+        run: |
+          set -euo pipefail
+          if [ -f tests/mutate_redis_ring.py ]; then
+            python_bin="$(command -v python3)"
+            sudo unshare -n -- "$python_bin" -B tests/mutate_redis_ring.py
+          elif [ -f scripts/redis_ring.py ]; then
+            echo "::error::scripts/redis_ring.py is on this branch but tests/mutate_redis_ring.py is not"
+            exit 1
+          else
+            echo "not on this branch; skipping"
+          fi
 
       # Generation digest audit. Flag off, synthetic hashes only: no Redis, no network.
       # A stored string must not come back; missing, extra, changed, movement, partial

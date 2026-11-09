@@ -21,8 +21,10 @@ RUNTIME_SA="redis-tool-bridge@${PROJECT}.iam.gserviceaccount.com"   # exists alr
 IMAGE="us-central1-docker.pkg.dev/${PROJECT}/cloud-run-source-deploy/${SERVICE}:reviewed"
 
 # WHO MAY CALL IT. Named service accounts, never allUsers and never allAuthenticatedUsers.
-# aya-runtime is the only invoker on the running service today, read back from its IAM policy.
-INVOKERS=("serviceAccount:aya-runtime@${PROJECT}.iam.gserviceaccount.com")
+# aya-runtime and conference-chair were read back from the running service's IAM policy on
+# 2026-11-08 (00003-j9j); fleet-claude-code-cli, and the doorbell accounts fleet-grok, fleet-codex and
+# fleet-gemini, are the owner's 2026-11-08 additions (callers.json says what each is for).
+INVOKERS=("serviceAccount:aya-runtime@${PROJECT}.iam.gserviceaccount.com" "serviceAccount:conference-chair@${PROJECT}.iam.gserviceaccount.com" "serviceAccount:fleet-claude-code-cli@${PROJECT}.iam.gserviceaccount.com" "serviceAccount:fleet-grok@${PROJECT}.iam.gserviceaccount.com" "serviceAccount:fleet-codex@${PROJECT}.iam.gserviceaccount.com" "serviceAccount:fleet-gemini@${PROJECT}.iam.gserviceaccount.com")
 
 usage() {
   cat <<'TXT'
@@ -44,6 +46,35 @@ build() {
   echo "ran. 'bus-reconciler:v1' is shared by eight jobs and rebuilding it re-pointed all of them."
 }
 
+# A host is a dotted IPv4 address (four numbers 0-255) or a DNS name: 1 to 253 characters, labels of
+# 1 to 63 letters, digits or dashes that neither start nor end with a dash, and no empty label.
+valid_host() {
+  local host="$1" label count=0 numeric=0
+  [[ "${host}" =~ ^[A-Za-z0-9.-]{1,253}$ ]] || return 1
+  [[ "${host}" != .* && "${host}" != *. && "${host}" != *..* ]] || return 1
+  local -a labels
+  IFS=. read -r -a labels <<< "${host}"
+  for label in "${labels[@]}"; do
+    [[ "${label}" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]] || return 1
+    count=$((count + 1))
+    if [[ "${label}" =~ ^[0-9]+$ ]]; then
+      numeric=$((numeric + 1))
+    fi
+  done
+  if [ "${numeric}" -eq "${count}" ]; then
+    # All numbers: it is an IPv4 address or nothing.
+    [ "${count}" -eq 4 ] || return 1
+    for label in "${labels[@]}"; do
+      [[ "${label}" =~ ^(0|[1-9][0-9]{0,2})$ ]] && [ "${label}" -le 255 ] || return 1
+    done
+  fi
+  return 0
+}
+
+valid_port() {
+  [[ "$1" =~ ^[1-9][0-9]{0,4}$ ]] && [ "$1" -le 65535 ]
+}
+
 deploy_cmds() {
   # BRIDGE_AUDIENCE must be the service's own https URL. Chicken-and-egg on a FIRST deploy: the URL
   # is not known until the service exists. It is known here, because the service already exists, and
@@ -56,6 +87,16 @@ deploy_cmds() {
     echo "refusing: set REDIS_HOST in the environment (the instance's private address)" >&2
     return 1
   fi
+  # THE OPERATOR'S VALUES ARE CHECKED BEFORE THEY ARE WRITTEN INTO A SCRIPT (Codex on #477, R2 and R3):
+  # they go inside a single-quoted word that bash then runs, so a quote in them would end the word.
+  if ! valid_host "${REDIS_HOST}"; then
+    echo "refusing: REDIS_HOST must be an IPv4 address or a DNS name" >&2
+    return 1
+  fi
+  if ! valid_port "${REDIS_PORT:-6378}"; then
+    echo "refusing: REDIS_PORT must be a number from 1 to 65535" >&2
+    return 1
+  fi
   local url
   url="$(gcloud run services describe "${SERVICE}" --project="${PROJECT}" --region="${REGION}" \
           --format='value(status.url)')"
@@ -64,6 +105,13 @@ deploy_cmds() {
   # survived, and the service would have started with no audience, no host and no CA path. It would then
   # have refused every request with 503, which is the fail-closed behaviour working, on a deploy that was
   # simply wrong.
+  # THE GENERATED SCRIPT STOPS AT ITS FIRST FAILURE (Codex on #477): an IAM binding must never run after
+  # a deploy that did not happen, where its green output would hide the failure.
+  # CAPACITY (Gemini, GEMINI-ARCH-REDIS-DOORBELL-20261108T1645Z): an xwait holds its request slot for its whole
+  # wait, so at 4 slots four waiting agents left nothing for the chair. 32 slots, of which op.py lets xwait hold
+  # at most MAX_WAITS (8); main.py is a ThreadingHTTPServer, so the slots are real threads. ONE instance still:
+  # take() counts the chair's hour in memory, and two instances would be two ceilings.
+  echo 'set -euo pipefail'
   cat <<CMD
 gcloud run deploy ${SERVICE} \\
   --project=${PROJECT} --region=${REGION} \\
@@ -71,10 +119,10 @@ gcloud run deploy ${SERVICE} \\
   --service-account=${RUNTIME_SA} \\
   --no-allow-unauthenticated \\
   --ingress=all \\
-  --min-instances=0 --max-instances=1 --concurrency=4 \\
+  --min-instances=0 --max-instances=1 --concurrency=32 \\
   --network=default --subnet=default --vpc-egress=private-ranges-only \\
   --set-secrets=/secrets/auth/redis-auth=REDIS_AUTH_STRING:2,/secrets/ca/redis-ca.pem=REDIS_CA_CERT:1 \\
-  --set-env-vars=REDIS_HOST=${REDIS_HOST},REDIS_PORT=${REDIS_PORT:-6378},REDIS_AUTH_FILE=/secrets/auth/redis-auth,REDIS_CA_CERT_PATH=/secrets/ca/redis-ca.pem,BRIDGE_AUDIENCE=${url},BRIDGE_CALLERS=aya-runtime@${PROJECT}.iam.gserviceaccount.com
+  '--set-env-vars=^;^REDIS_HOST=${REDIS_HOST};REDIS_PORT=${REDIS_PORT:-6378};REDIS_AUTH_FILE=/secrets/auth/redis-auth;REDIS_CA_CERT_PATH=/secrets/ca/redis-ca.pem;BRIDGE_AUDIENCE=${url};BRIDGE_CALLERS=aya-runtime@${PROJECT}.iam.gserviceaccount.com,conference-chair@${PROJECT}.iam.gserviceaccount.com,fleet-claude-code-cli@${PROJECT}.iam.gserviceaccount.com,fleet-grok@${PROJECT}.iam.gserviceaccount.com,fleet-codex@${PROJECT}.iam.gserviceaccount.com,fleet-gemini@${PROJECT}.iam.gserviceaccount.com'
 CMD
   # --no-allow-unauthenticated is the platform half of defect 3. The application allowlist
   # (BRIDGE_CALLERS) is the half this repository can review. Both, independently.
@@ -106,7 +154,7 @@ readback() {
 case "${1:-}" in
   build)    build ;;
   plan)     deploy_cmds ;;
-  deploy)   deploy_cmds | bash -s ;;
+  deploy)   deploy_cmds | bash -euo pipefail -s ;;
   readback) readback ;;
   *)        usage; exit 2 ;;
 esac

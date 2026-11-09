@@ -93,6 +93,17 @@ governed ops, after the source is verified"). **D1 has not been given. Nothing h
   `actor`, and both come back in the answer. They are claims and are named as claims: nothing reads either as an
   identity. A fleet agent that states either member gets a 400. (Conference
   `docs/PERSONA-WRITE-CONFIRMATION-A1.md`.)
+- **A doorbell caller (`"for": "doorbell"`) acts as its principal on its own lane and nothing else**: `xwait` on
+  `fleet:inbox:<principal>`, and `xrange` there with count 1 and no `after` (the first cursor
+  `scripts/redis_doorbell.py` reads). Any other op or key, or a field, value or encoding, is a 403 `refused` from
+  the door before any connection (`op.py`, `doorbell_refusal`), and `author`/`request` are a 400 as for a fleet
+  agent. Grok, Codex (`chatgpt-codex-desktop`) and Gemini are doorbell callers; claude-code-cli is a fleet agent.
+- **Capacity: held waits never starve the chair** (Gemini, GEMINI-ARCH-REDIS-DOORBELL-20261108T1645Z). The
+  service serves 32 requests at once on one instance (`--concurrency=32`, one thread a request), and at most 8 of
+  them may be held `xwait`s (`op.py`, `MAX_WAITS`). A ninth wait is not queued: it is a 429 `busy` at once, with
+  `"executed": false` and `retry_after` in seconds. `scripts/bridge_client.py` raises `Busy` for it, and
+  `scripts/redis_doorbell.py` sleeps and waits again: it is not a refusal, not a breaker failure and never a
+  reason to use the board. No other op touches the limit.
 - **The pilot (section 12 of that page): the chair is the only caller of `/op`.** It may `get` and `set` one key a
   day for one listed persona, `conf:persona:<yyyymmdd>:<persona>`, the day being today or yesterday in UTC and
   the persona one of those in its own line of `callers.json` (today: `claude`). Its principal may read and write

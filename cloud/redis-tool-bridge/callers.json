@@ -1,6 +1,6 @@
 {
-  "why": "Who a VERIFIED bridge caller acts as, and what it is FOR. The key is the email of the OIDC token main.verify_caller accepted. `for` is one of three. `probe`: admitted to the service for /probe and refused on /op; it acts as nobody. `fleet-agent`: acts as `principal` on /op and may not state an author. `chair`: the conference chair; it must state an author and a request on every op, and `personas` lists the only authors it may name. A caller must ALSO be on the service's BRIDGE_CALLERS allowlist and hold run.invoker on the service: three independent gates, and this is the one that decides whose name goes in gov:audit.",
-  "how_to_change": "Change one line, in a reviewed PR, AFTER the service account exists and the owner has approved it (docs/REDIS-PRIMARY.md, D2). tests/test_redis_tool_bridge.py holds each line to LEAST PRIVILEGE: a probe account acts as nobody; a fleet agent's principal must be able to write fleet: and conf:; the chair's must be able to read and write conf:persona: and NOTHING else. It also refuses a deploy allowlist that names a caller with no line here.",
+  "why": "Who a VERIFIED bridge caller acts as, and what it is FOR. The key is the email of the OIDC token main.verify_caller accepted. `for` is one of four. `probe`: admitted to the service for /probe and refused on /op; it acts as nobody. `fleet-agent`: acts as `principal` on /op and may not state an author. `chair`: the conference chair; it must state an author and a request on every op, and `personas` lists the only authors it may name. `doorbell`: acts as `principal` on /op for its own lane and nothing else: xwait on fleet:inbox:<principal>, and xrange there with count 1 and no after (the doorbell's first cursor); every other op and key is refused before any connection, and it may not state an author (op.py, doorbell_refusal). A caller must ALSO be on the service's BRIDGE_CALLERS allowlist and hold run.invoker on the service: three independent gates, and this is the one that decides whose name goes in gov:audit.",
+  "how_to_change": "Change one line, in a reviewed PR, AFTER the service account exists and the owner has approved it (docs/REDIS-PRIMARY.md, D2). tests/test_redis_tool_bridge.py holds each line to LEAST PRIVILEGE: a probe account acts as nobody; a fleet agent's principal must be able to write fleet: and conf:; a doorbell caller's principal must be able to read its own lane; the chair's must be able to read and write conf:persona: and NOTHING else. It also refuses a deploy allowlist that names a caller with no line here.",
   "callers": {
     "aya-runtime@sfdc24.iam.gserviceaccount.com": {
       "principal": "chatgpt-codex-desktop",
@@ -15,7 +15,23 @@
       "rooms": [
         "workshop"
       ]
+    },
+    "fleet-claude-code-cli@sfdc24.iam.gserviceaccount.com": {
+      "principal": "claude-code-cli",
+      "for": "fleet-agent"
+    },
+    "fleet-codex@sfdc24.iam.gserviceaccount.com": {
+      "principal": "chatgpt-codex-desktop",
+      "for": "doorbell"
+    },
+    "fleet-gemini@sfdc24.iam.gserviceaccount.com": {
+      "principal": "gemini",
+      "for": "doorbell"
+    },
+    "fleet-grok@sfdc24.iam.gserviceaccount.com": {
+      "principal": "grok",
+      "for": "doorbell"
     }
   },
-  "pilot": "THE PILOT (conference docs/PERSONA-WRITE-CONFIRMATION-A1.md, section 12): the chair is the ONLY /op caller, for get and set of conf:persona:<day>:<persona> for the personas listed. Aya's runtime account keeps what it had before /op existed: the probe. THE BRIDGE TRUSTS THE CHAIR'S IDENTITY AND DOES NOT ENFORCE THE OWNER'S CONFIRMATION; that is checked in the chair alone. Putting a fleet agent on /op, or another persona on the chair's list, is its own reviewed decision. THE CANVAS (the owner, directly, 2026-10-20): the chair may also hset its own slot conf:canvas:<room>:chair, one text or diagram item of at most 512 bytes with no link, at most 20 posts an hour (op.py, canvas_refusal). The owner named the conference room Workshop (Abdus, 2026-10-23); rooms lists the only room, workshop."
+  "pilot": "THE PILOT (conference docs/PERSONA-WRITE-CONFIRMATION-A1.md, section 12): the chair is the ONLY /op caller, for get and set of conf:persona:<day>:<persona> for the personas listed. Aya's runtime account keeps what it had before /op existed: the probe. THE BRIDGE TRUSTS THE CHAIR'S IDENTITY AND DOES NOT ENFORCE THE OWNER'S CONFIRMATION; that is checked in the chair alone. Putting a fleet agent on /op, or another persona on the chair's list, is its own reviewed decision. THE CANVAS (the owner, directly, 2026-10-20): the chair may also hset its own slot conf:canvas:<room>:chair, one text or diagram item of at most 512 bytes with no link, at most 20 posts an hour (op.py, canvas_refusal). The owner named the conference room Workshop (Abdus, 2026-10-23); rooms lists the only room, workshop. FLEET AGENTS (the owner, directly, 2026-11-08: \"merge PR 400 to enable VPC for Redis\", then PR 401's flag): claude-code-cli is the first fleet-agent caller, as itself, by fleet-claude-code-cli@, which holds no key and is impersonated by the owner's login. Each further agent is its own line here. THE DOORBELLS (the owner, directly, 2026-11-08: Grok may reach its own Redis doorbell through the bridge, and the doorbell is to work for every agent, not Grok alone): each machine-resident agent other than claude-code-cli is a doorbell caller, as itself, by its own keyless account, impersonated by the login on that agent's machine: grok by fleet-grok@, chatgpt-codex-desktop (Codex) by fleet-codex@, gemini by fleet-gemini@. Each may xwait on its own fleet:inbox:<principal>, the lane the board-to-Redis mirror writes, and read that lane's newest entry id, and nothing else. claude-code-cli's fleet-agent line already covers its own doorbell. Anything wider for a doorbell caller is its own reviewed decision."
 }
