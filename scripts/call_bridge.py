@@ -620,6 +620,14 @@ def asks_in(fields: dict) -> list:
     return agents
 
 
+def held_agents(fields: dict) -> frozenset:
+    """The agents of the personas a turn.started names as held for their binders (`held`, comma-separated persona
+    ids). Only an owner turn's own field counts; unknown names are ignored."""
+    if fields.get("kind") != "turn.started" or fields.get("actor_id") in ("", None, "chair"):
+        return frozenset()
+    return frozenset(AGENT_OF[p.strip()] for p in str(fields.get("held") or "").split(",") if p.strip() in AGENT_OF)
+
+
 def follow_up(fields: dict) -> bool:
     """An owner turn that went to the voice holding the floor (continuity), with a task word and no name in it."""
     if fields.get("kind") != "turn.started" or fields.get("actor_id") in ("", None, "chair"):
@@ -1825,6 +1833,16 @@ class Bridge:
             record.update(actor=actor, epoch=epoch)        # who asked, so a read-back proposal binds the caller
         self.conn.set(ASKED_KEY % room, json.dumps(record, sort_keys=True), ex=ASKED_SECONDS)
 
+    def _held(self, room, entry_id):
+        """The fleet agents whose binder holds the owner turn at entry_id: the chair's `held` personas on its
+        turn.started (conference chair session.owner_said, comma-separated), mapped to agents. Empty when the event
+        names none (a chair before the field, or no binder bound): the claim goes on as before. None when the event
+        cannot be read at all (trimmed or gone): the caller claims nothing."""
+        for got, raw in self.conn.xrange("v1:conf:%s:events" % room, min=entry_id, max=entry_id, count=1) or ():
+            if _text(got) == entry_id:
+                return held_agents(_fields(raw))
+        return None
+
     def _said(self, room, entry_id) -> str:
         """His words at entry_id, read again from the room's own stream (the read-back keeps no copy), or ""."""
         for got, raw in self.conn.xrange("v1:conf:%s:events" % room, min=entry_id, max=entry_id, count=1) or ():
@@ -2122,6 +2140,18 @@ class Bridge:
             return None
         if self.conn.get(ROUTED_KEY % (entry_id, agent)):
             return None                  # this event went to the agent's living card; it is never a new claim
+        held = self._held(room, entry_id)
+        if held is None:
+            # FAIL CLOSED (Codex HOLD on 56c457bf): the turn's own event can no longer be read, so whether a binder
+            # has it is unknown; a claim could be the second dispatch. Nothing is claimed.
+            self.log.info("call bridge: the turn's event is gone; %s not claimed", agent)
+            return None
+        if agent in held:
+            # ONE DISPATCH (the owner's S1 call, 2026-11-09 18:38 ET): the chair handed this turn to the agent's own
+            # binder, which answers it in the room. A claim on top rang Codex with a card job for the same words, and
+            # Codex (one session) worked it while the binder's ask expired. Never a second dispatch.
+            self.log.info("call bridge: %s's binder has this turn; not claimed", agent)
+            return None
         def inbox(source_text):
             fields = {"by": BY, "text": inbox_text(ask, agent, self.canvas_room, source_text, now),
                       "at": stamp(now), "task_id": ask, "ask": ask,
