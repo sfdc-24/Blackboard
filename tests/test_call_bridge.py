@@ -385,6 +385,28 @@ class Claim(unittest.TestCase):
         self.assertEqual([], bridge(shut).tick(), "another room's window is not this one")
         self.assertNotIn("fleet:inbox:chatgpt-codex-desktop", self.conn.streams)
 
+    def test_a_turn_the_agent_s_binder_holds_is_never_claimed(self):
+        # The owner's S1 call (2026-11-09 18:38 ET): the chair handed the turn to Cody's binder and the bridge claimed
+        # it as well, ringing Codex with a card job while the binder's ask expired.
+        turn(self.conn, "Codex, draft the queue flow.", held="codex")
+        self.assertEqual([], bridge(self.conn).tick())
+        self.assertNotIn("fleet:inbox:chatgpt-codex-desktop", self.conn.streams)
+        turn(self.conn, "Grok, list the risks.", seconds_ago=5, held="codex")
+        self.assertEqual(1, len(bridge(self.conn).tick()), "only the held agent is skipped: Grok is still claimed")
+        self.assertIn("fleet:inbox:grok", self.conn.streams)
+        self.assertNotIn("fleet:inbox:chatgpt-codex-desktop", self.conn.streams)
+
+    def test_no_held_field_claims_as_before(self):
+        turn(self.conn, "Codex, draft the queue flow.", held="")
+        self.assertEqual(1, len(bridge(self.conn).tick()))
+
+    def test_what_is_held(self):
+        f = {"kind": "turn.started", "actor_id": "owner-1"}
+        self.assertEqual({"chatgpt-codex-desktop", "grok"}, cb.held_agents(dict(f, held="codex, grok,nobody")))
+        self.assertEqual(frozenset(), cb.held_agents(dict(f)))
+        self.assertEqual(frozenset(), cb.held_agents(dict(f, actor_id="chair", held="codex")), "a chair turn holds none")
+        self.assertEqual(frozenset(), cb.held_agents(dict(f, kind="floor.granted", held="codex")))
+
     def test_a_lease_lost_mid_pass_writes_nothing_more(self):
         turn(self.conn, "Codex, draft the queue flow.", seconds_ago=20)
         turn(self.conn, "Grok, list the risks.", seconds_ago=10)
