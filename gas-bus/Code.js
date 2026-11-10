@@ -148,6 +148,11 @@ function handleAppend_(body, cfg) {
     return jsonOut_({ ok: false, error: 'Could not acquire the lock within 20s — another append is in progress. Retry.' }, 423);
   }
 
+  // `response` is set on every path below instead of returning directly, and `ringRow` is set
+  // only when a sheetRow actually landed on the sheet. Both are read AFTER the finally block, so
+  // the W1 grok ring (below) runs strictly after lock.releaseLock() — see maybeRingGrok_.
+  let response;
+  let ringRow = null;
   try {
     const file = resolveFile_(body, cfg.folderId);
     const mime = file.getMimeType();
@@ -160,37 +165,105 @@ function handleAppend_(body, cfg) {
         docBody.appendParagraph(line);
       });
       doc.saveAndClose();
+      response = jsonOut_({ ok: true, fileId: file.getId(), title: file.getName(), appendedAt: nowStamp_() });
     } else if (mime === MimeType.GOOGLE_SHEETS) {
       const ss = SpreadsheetApp.openById(file.getId());
       const sheet = body.sheetName ? ss.getSheetByName(body.sheetName) : ss.getSheets()[0];
-      if (!sheet) return jsonOut_({ ok: false, error: 'Sheet tab not found: ' + body.sheetName }, 400);
-      const row = sender ? stampSender_(body.sheetRow, sender.stamp) : (body.sheetRow || [nowStamp_(), body.text || '']);
-      // PY-01: checked UNDER THE LOCK, so two racing retries cannot both pass the check.
-      const dup = Array.isArray(body.sheetRow) ? findDuplicate_(sheet, body.sheetRow) : null;
-      if (dup) {
-        return jsonOut_({ ok: false, error: 'DUPLICATE', duplicate: dup.kind, id: dup.id,
-                          existing_row: dup.row }, 409);
-      }
-      sheet.appendRow(row);
-      if (Array.isArray(body.sheetRow)) {
-        const trigger = maybeTriggerWorker_(body.sheetRow);
-        if (trigger !== 'off' && trigger !== 'not-a-request') {
-          return jsonOut_({ ok: true, fileId: file.getId(), title: file.getName(), appendedAt: nowStamp_(),
-                            worker: trigger, sender: sender ? sender.stamp : undefined });
+      if (!sheet) {
+        response = jsonOut_({ ok: false, error: 'Sheet tab not found: ' + body.sheetName }, 400);
+      } else {
+        const row = sender ? stampSender_(body.sheetRow, sender.stamp) : (body.sheetRow || [nowStamp_(), body.text || '']);
+        // PY-01: checked UNDER THE LOCK, so two racing retries cannot both pass the check.
+        const dup = Array.isArray(body.sheetRow) ? findDuplicate_(sheet, body.sheetRow) : null;
+        if (dup) {
+          response = jsonOut_({ ok: false, error: 'DUPLICATE', duplicate: dup.kind, id: dup.id,
+                            existing_row: dup.row }, 409);
+        } else {
+          sheet.appendRow(row);
+          if (Array.isArray(body.sheetRow)) ringRow = row;
+          if (Array.isArray(body.sheetRow)) {
+            const trigger = maybeTriggerWorker_(body.sheetRow);
+            if (trigger !== 'off' && trigger !== 'not-a-request') {
+              response = jsonOut_({ ok: true, fileId: file.getId(), title: file.getName(), appendedAt: nowStamp_(),
+                                worker: trigger, sender: sender ? sender.stamp : undefined });
+            }
+          }
+          if (!response && sender) {
+            response = jsonOut_({ ok: true, fileId: file.getId(), title: file.getName(), appendedAt: nowStamp_(),
+                              sender: sender.stamp });
+          }
+          if (!response) {
+            response = jsonOut_({ ok: true, fileId: file.getId(), title: file.getName(), appendedAt: nowStamp_() });
+          }
         }
       }
-      if (sender) {
-        return jsonOut_({ ok: true, fileId: file.getId(), title: file.getName(), appendedAt: nowStamp_(),
-                          sender: sender.stamp });
-      }
     } else {
-      return jsonOut_({ ok: false, error: 'Unsupported file type for append: ' + mime }, 400);
+      response = jsonOut_({ ok: false, error: 'Unsupported file type for append: ' + mime }, 400);
     }
-
-    return jsonOut_({ ok: true, fileId: file.getId(), title: file.getName(), appendedAt: nowStamp_() });
   } finally {
     lock.releaseLock();
   }
+
+  // W1 / Option A (owner GO 2026-11-10 16:28 ET, CLAUDE-MOBILE-OWNER-RULING-W1-OPTION-A): ring
+  // grok's webhook on the write itself instead of waiting for the next fleet_ring poll. Deliberately
+  // outside the lock above — see maybeRingGrok_ for why — and never allowed to change `response`.
+  if (ringRow) {
+    try { maybeRingGrok_(ringRow); } catch (err) { /* the append already succeeded; never surface this */ }
+  }
+
+  return response;
+}
+
+// ---- W1 / OPTION A: RING GROK'S WEBHOOK ON WRITE --------------------------------------------
+//
+// fleet_ring polls the board every 120s; measured giving grok 53-201s wake latency for rows
+// addressed to him (GROK-NOTE-W1-TEST-3-RECEIPT-20261110T1737Z). This rings his webhook right on
+// the append that names him, instead of waiting for the next poll. Box-only pushring_watcher and
+// fleet_ring both stay running as backstops — this is additive, not a replacement.
+//
+// Called from handleAppend_ strictly AFTER lock.releaseLock(): Apps Script's UrlFetchApp has no
+// shorter-than-default timeout, so a slow or unreachable webhook held under the shared lock would
+// stall every other writer on the fleet. Keeping it off the lock is the only real way to bound
+// that risk - the fetch can still be slow, but only this one row's trigger pays for it, not the
+// whole board.
+//
+// Scope exactly as ruled (CLAUDE-MOBILE-OWNER-RULING-W1-OPTION-A-20261110T2129Z):
+//   - GROK_WEBHOOK_URL / GROK_WEBHOOK_KEY live ONLY in Script Properties, set by the owner's own
+//     hand in the Apps Script editor (Project Settings > Script Properties). Never written here,
+//     never logged, never echoed in a response. Absent either one, this does nothing - so Option A
+//     can deploy before the owner pastes the key with zero behavior change until he does.
+//   - rings only when the row's Target_Surface (column D) or the payload's cc= names grok.
+//   - never for grok's own rows (from=grok), never for an info-phase row - the same set
+//     fleet_ring / fleet_doorbell already treat as not worth waking him for.
+const GROK_RING_INFO_PHASES = ['RESULT', 'AYA_RESULT', 'DONE', 'ACK', 'RECEIPT', 'AYA_RECEIPT'];
+
+function maybeRingGrok_(row) {
+  const props = PropertiesService.getScriptProperties();
+  const url = props.getProperty('GROK_WEBHOOK_URL');
+  const key = props.getProperty('GROK_WEBHOOK_KEY');
+  if (!url || !key) return;
+
+  const payload = String(row[5] == null ? '' : row[5]);
+  const from = cleanTag_(bcbField_(payload, 'from')) || cleanTag_(row[2]);
+  if (from === 'grok') return;
+
+  const phase = String(bcbField_(payload, 'phase') || '').trim().toUpperCase();
+  if (GROK_RING_INFO_PHASES.indexOf(phase) !== -1) return;
+
+  // Split BEFORE cleaning: cleanTag_ strips ';' and ',', which is exactly what separates
+  // multiple recipients in Target_Surface ("grok;codex") and cc= alike.
+  const to = String(row[3] == null ? '' : row[3]);
+  const cc = bcbField_(payload, 'cc');
+  const names = (to + ';' + cc).split(/[;,]/).map(function (s) { return cleanTag_(s); });
+  if (names.indexOf('grok') === -1) return;
+
+  UrlFetchApp.fetch(url, {
+    method: 'post',
+    contentType: 'application/json',
+    payload: JSON.stringify({ row_id: row[0], sent_at: new Date().toISOString() }),
+    headers: { Authorization: 'Bearer ' + key },
+    muteHttpExceptions: true,
+  });
 }
 
 // ---- PY-01: NO ROW TWICE ---------------------------------------------
