@@ -396,6 +396,20 @@ class Claim(unittest.TestCase):
         self.assertIn("fleet:inbox:grok", self.conn.streams)
         self.assertNotIn("fleet:inbox:chatgpt-codex-desktop", self.conn.streams)
 
+    def test_a_turn_whose_event_is_gone_by_the_claim_is_not_claimed(self):
+        # Codex HOLD on 56c457bf: the event read in the scan, then removed before _claim reads it again.
+        entry = turn(self.conn, "Codex, draft the queue flow.")
+        b = bridge(self.conn)
+        real = self.conn.xrange
+
+        def gone(key, min="-", max="+", count=None):
+            if min == max == entry:
+                return []                                   # trimmed between the scan and the claim
+            return real(key, min=min, max=max, count=count)
+        self.conn.xrange = gone
+        self.assertEqual([], b.tick())
+        self.assertNotIn("fleet:inbox:chatgpt-codex-desktop", self.conn.streams)
+
     def test_no_held_field_claims_as_before(self):
         turn(self.conn, "Codex, draft the queue flow.", held="")
         self.assertEqual(1, len(bridge(self.conn).tick()))
