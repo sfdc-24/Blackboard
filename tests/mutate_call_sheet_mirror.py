@@ -229,9 +229,10 @@ MUTANTS = [
     (
         "split-the-box-substring",
         "            (\"from\", SHEET_SOURCE), (\"to\", tag), (\"msg_type\", \"CALL_TURN\"),\n"
-        "            (\"call_id\", call_id)]",
+        "            (\"call_id\", call_id), (\"thread_id\", _call_thread(call_id))]",
         "            (\"from\", SHEET_SOURCE), (\"to\", tag), (\"msg_type\", \"CALL_TURN\"),\n"
-        "            (\"epoch\", \"0\"), (\"call_id\", call_id)]  # MUTANT: call_id is not next",
+        "            (\"epoch\", \"0\"), (\"call_id\", call_id), (\"thread_id\", _call_thread(call_id))]"
+        "  # MUTANT: call_id is not next",
         "msg_type=CALL_TURN is no longer immediately followed by call_id=",
         "test_the_box_reads_a_bus_reconciler_row_at_its_turn_substring",
     ),

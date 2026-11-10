@@ -206,12 +206,12 @@ class CallEvents(unittest.TestCase):
         start, end = by_id["CALLSTART-" + LIVE], by_id["CALLEND-" + LIVE]
         self.assertEqual(
             "BCB|v=1|id=CALLSTART-%s|phase=RESULT|class=CALL|from=bus-reconciler|to=ALL|"
-            "msg_type=CALL_START|call_id=%s|epoch=7|started_at=%s|"
-            "relayer=bus-reconciler|claimed_author=conference-chair" % (LIVE, LIVE, start_at), start["payload"])
+            "msg_type=CALL_START|call_id=%s|thread_id=TH-CALL-%s|epoch=7|started_at=%s|"
+            "relayer=bus-reconciler|claimed_author=conference-chair" % (LIVE, LIVE, LIVE, start_at), start["payload"])
         self.assertEqual(
             "BCB|v=1|id=CALLEND-%s|phase=RESULT|class=CALL|from=bus-reconciler|to=ALL|"
-            "msg_type=CALL_END|call_id=%s|epoch=7|ended_at=%s|reason=hangup|"
-            "relayer=bus-reconciler|claimed_author=conference-chair" % (LIVE, LIVE, end_at), end["payload"])
+            "msg_type=CALL_END|call_id=%s|thread_id=TH-CALL-%s|epoch=7|ended_at=%s|reason=hangup|"
+            "relayer=bus-reconciler|claimed_author=conference-chair" % (LIVE, LIVE, LIVE, end_at), end["payload"])
         for spec in (start, end):
             self.assertEqual(("bus-reconciler", "ALL", "RESULT"),
                              (spec["source_tag"], spec["target_surface"], spec["action_type"]))
@@ -257,19 +257,23 @@ class CallEvents(unittest.TestCase):
                           "CALLEND-" + LIVE], list(by_id), "a leave is not a row")
         self.assertEqual(
             "BCB|v=1|id=CALLSTART-%s|phase=RESULT|class=CALL|from=bus-reconciler|to=ALL|"
-            "msg_type=CALL_START|call_id=%s|epoch=7|started_at=%s|code=SFDC-2026-11-09-0830|"
-            "relayer=bus-reconciler|claimed_author=conference-chair" % (LIVE, LIVE, start_at),
+            "msg_type=CALL_START|call_id=%s|thread_id=TH-CALL-%s|epoch=7|started_at=%s|"
+            "code=SFDC-2026-11-09-0830|relayer=bus-reconciler|claimed_author=conference-chair"
+            % (LIVE, LIVE, LIVE, start_at),
             by_id["CALLSTART-" + LIVE]["payload"])
         self.assertEqual(
             "BCB|v=1|id=CALLJOIN-%s-grok|phase=RESULT|class=CALL|from=bus-reconciler|to=ALL|"
-            "msg_type=CALL_JOIN|call_id=%s|epoch=7|persona=grok|joined_at=%s|"
-            "relayer=bus-reconciler|claimed_author=conference-chair" % (LIVE, LIVE, join_at),
+            "msg_type=CALL_JOIN|call_id=%s|thread_id=TH-CALL-%s|epoch=7|persona=grok|joined_at=%s|"
+            "relayer=bus-reconciler|claimed_author=conference-chair" % (LIVE, LIVE, LIVE, join_at),
             by_id["CALLJOIN-%s-grok" % LIVE]["payload"])
         self.assertEqual(
             "BCB|v=1|id=CALLEND-%s|phase=RESULT|class=CALL|from=bus-reconciler|to=ALL|"
-            "msg_type=CALL_END|call_id=%s|epoch=7|ended_at=%s|reason=hangup|acks=claude,grok|"
-            "relayer=bus-reconciler|claimed_author=conference-chair" % (LIVE, LIVE, end_at),
+            "msg_type=CALL_END|call_id=%s|thread_id=TH-CALL-%s|epoch=7|ended_at=%s|reason=hangup|"
+            "acks=claude,grok|relayer=bus-reconciler|claimed_author=conference-chair"
+            % (LIVE, LIVE, LIVE, end_at),
             by_id["CALLEND-" + LIVE]["payload"])
+        for spec in by_id.values():
+            self.assertIn("|thread_id=TH-CALL-%s|" % LIVE, spec["payload"], spec["row_id"])
         for spec in by_id.values():
             self.assertEqual(("bus-reconciler", "ALL", "RESULT"),
                              (spec["source_tag"], spec["target_surface"], spec["action_type"]))
@@ -277,6 +281,22 @@ class CallEvents(unittest.TestCase):
             self.assertEqual([], board_row.problems(spec["payload"]))
             self.assertEqual(sr.VERIFIED_STAMP, board.rows[spec["row_id"]]["sender"], spec["row_id"])
         self.assertEqual("1000-4", conn.get(sr.CALLS_CURSOR), "the leave was passed, and the end read back")
+
+    def test_every_call_row_carries_the_same_thread_id_derived_from_call_id(self):
+        # Rule 9 (owner mandate, 2026-11-10): a call mirror row has no conversation to inherit a
+        # thread_id from, so every builder derives the same one from the one field they all share.
+        start = sr._event_spec({"event": "start", "call_id": LIVE, "epoch": "7", "at": "t"})
+        join = sr._event_spec({"event": "join", "call_id": LIVE, "epoch": "7", "persona": "grok", "at": "t"})
+        end = sr._event_spec({"event": "end", "call_id": LIVE, "epoch": "7", "at": "t", "reason": "r"})
+        turn = sr._withheld_turn(LIVE, {"said_at": "t"}, "CALLTURN-x", "grok", "7", "turn-x")
+        other = sr._event_spec({"event": "start", "call_id": ENDED, "epoch": "7", "at": "t"})
+        expect = "TH-CALL-" + LIVE
+        for spec in (start, join, end, turn):
+            self.assertEqual(expect, sr._field(spec["payload"], "thread_id"), spec["row_id"])
+        self.assertEqual("TH-CALL-" + ENDED, sr._field(other["payload"], "thread_id"),
+                         "a different call gets a different thread, not a shared one")
+        self.assertIn("|msg_type=CALL_TURN|call_id=%s|" % LIVE, turn["payload"],
+                      "thread_id lands after call_id, so the box's own match substring is untouched")
 
     def test_an_older_chair_without_code_or_acks_writes_the_rows_as_before(self):
         start = sr._event_spec({"event": "start", "call_id": LIVE, "epoch": "7", "at": "t"})
@@ -503,18 +523,18 @@ class CallTurns(unittest.TestCase):
         self.assertEqual(["CALLTURN-t-other", "CALLTURN-t-cmd", "CALLTURN-t-said"], list(by_id))
         other = (
             "BCB|v=1|id=CALLTURN-t-other|phase=ASK|class=CALL|from=bus-reconciler|to=grok|"
-            "msg_type=CALL_TURN|call_id=%s|epoch=7|turn_key=t-other|said_at=%s|withheld=1|"
-            "turn_class=other|chars=40|relayer=bus-reconciler|claimed_author=conference-chair" % (LIVE, said))
+            "msg_type=CALL_TURN|call_id=%s|thread_id=TH-CALL-%s|epoch=7|turn_key=t-other|said_at=%s|withheld=1|"
+            "turn_class=other|chars=40|relayer=bus-reconciler|claimed_author=conference-chair" % (LIVE, LIVE, said))
         command = (
             "BCB|v=1|id=CALLTURN-t-cmd|phase=ASK|class=CALL|from=bus-reconciler|to=gemini|"
-            "msg_type=CALL_TURN|call_id=%s|epoch=7|turn_key=t-cmd|said_at=%s|withheld=1|"
+            "msg_type=CALL_TURN|call_id=%s|thread_id=TH-CALL-%s|epoch=7|turn_key=t-cmd|said_at=%s|withheld=1|"
             "turn_class=command|verb=status|target_chars=12|"
-            "relayer=bus-reconciler|claimed_author=conference-chair" % (LIVE, said))
+            "relayer=bus-reconciler|claimed_author=conference-chair" % (LIVE, LIVE, said))
         said_row = (
             "BCB|v=1|id=CALLTURN-t-said|phase=ASK|class=CALL|from=bus-reconciler|to=grok|"
-            "msg_type=CALL_TURN|call_id=%s|epoch=7|turn_key=t-said|said_at=%s|text=hello|"
+            "msg_type=CALL_TURN|call_id=%s|thread_id=TH-CALL-%s|epoch=7|turn_key=t-said|said_at=%s|text=hello|"
             "turn_class=command|verb=status|target_chars=4|"
-            "relayer=bus-reconciler|claimed_author=conference-chair" % (LIVE, said))
+            "relayer=bus-reconciler|claimed_author=conference-chair" % (LIVE, LIVE, said))
         self.assertEqual(other, by_id["CALLTURN-t-other"]["payload"])
         self.assertEqual(command, by_id["CALLTURN-t-cmd"]["payload"])
         self.assertEqual(said_row, by_id["CALLTURN-t-said"]["payload"])
@@ -549,8 +569,9 @@ class CallTurns(unittest.TestCase):
         by_id = {spec["row_id"]: spec for spec in board.appends}
         withheld = (
             "BCB|v=1|id=CALLTURN-t-bound|phase=RESULT|class=CALL|from=bus-reconciler|to=chatgpt-codex-desktop|"
-            "msg_type=CALL_TURN|call_id=%s|epoch=7|turn_key=t-bound|said_at=%s|via=binder|withheld=1|"
-            "turn_class=other|chars=24|relayer=bus-reconciler|claimed_author=conference-chair" % (LIVE, said))
+            "msg_type=CALL_TURN|call_id=%s|thread_id=TH-CALL-%s|epoch=7|turn_key=t-bound|said_at=%s|via=binder|"
+            "withheld=1|turn_class=other|chars=24|relayer=bus-reconciler|claimed_author=conference-chair"
+            % (LIVE, LIVE, said))
         self.assertEqual(withheld, by_id["CALLTURN-t-bound"]["payload"])
         self.assertEqual(("RESULT", "DONE"), (by_id["CALLTURN-t-bound"]["action_type"],
                                               by_id["CALLTURN-t-bound"]["category"]))
