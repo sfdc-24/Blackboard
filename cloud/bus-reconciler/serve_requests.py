@@ -1095,6 +1095,14 @@ def _acks(value):
     return ",".join(sorted(name for name in names if name in CALL_PERSONAS))
 
 
+def _call_thread(call_id):
+    """Rule 9 (owner mandate, 2026-11-10): every row needs a thread_id. A call mirror row has no
+    conversation to carry one from, so it gets one derived from the one thing it always has - the
+    call_id, which already names the room. Stable per call, so every row a call produces lands on
+    the same thread."""
+    return "TH-CALL-" + call_id
+
+
 def _event_spec(fields):
     """The sheet row for one conf:calls entry, or None when the entry is not a call we can record.
     start and end are one row each per call; join is one row per binder per call (the chair streams the first join
@@ -1105,11 +1113,12 @@ def _event_spec(fields):
     if not CALL_ID_RE.fullmatch(call_id) or event not in ("start", "end", "join") or not epoch:
         return None
     at = _cell(fields.get("at"))
+    thread_id = _call_thread(call_id)
     if event == "start":
         rid = "CALLSTART-" + call_id
         pairs = [("v", "1"), ("id", rid), ("phase", "RESULT"), ("class", "CALL"),
                  ("from", SHEET_SOURCE), ("to", "ALL"), ("msg_type", "CALL_START"),
-                 ("call_id", call_id), ("epoch", epoch), ("started_at", at)]
+                 ("call_id", call_id), ("thread_id", thread_id), ("epoch", epoch), ("started_at", at)]
         code = _call_code(fields.get("code"))
         if code:
             pairs.append(("code", code))
@@ -1121,13 +1130,13 @@ def _event_spec(fields):
         rid = "CALLJOIN-%s-%s" % (call_id, persona)
         payload = _bcb(_carry([("v", "1"), ("id", rid), ("phase", "RESULT"), ("class", "CALL"),
                                ("from", SHEET_SOURCE), ("to", "ALL"), ("msg_type", "CALL_JOIN"),
-                               ("call_id", call_id), ("epoch", epoch), ("persona", persona),
-                               ("joined_at", at)]))
+                               ("call_id", call_id), ("thread_id", thread_id), ("epoch", epoch),
+                               ("persona", persona), ("joined_at", at)]))
         return _sheet_spec(rid, "ALL", "RESULT", payload, "CALL_JOIN %s %s" % (call_id, persona))
     rid = "CALLEND-" + call_id
     pairs = [("v", "1"), ("id", rid), ("phase", "RESULT"), ("class", "CALL"),
              ("from", SHEET_SOURCE), ("to", "ALL"), ("msg_type", "CALL_END"),
-             ("call_id", call_id), ("epoch", epoch), ("ended_at", at),
+             ("call_id", call_id), ("thread_id", thread_id), ("epoch", epoch), ("ended_at", at),
              ("reason", fields.get("reason"))]
     acks = _acks(fields.get("acks"))
     if acks:
@@ -1238,10 +1247,11 @@ def _via(phase):
 
 
 def _turn_head(rid, tag, call_id, phase="ASK"):
-    """msg_type=CALL_TURN is immediately followed by call_id=. The box reader matches that substring."""
+    """msg_type=CALL_TURN is immediately followed by call_id=. The box reader matches that substring,
+    so thread_id goes after call_id, never between them."""
     return [("v", "1"), ("id", rid), ("phase", phase), ("class", "CALL"),
             ("from", SHEET_SOURCE), ("to", tag), ("msg_type", "CALL_TURN"),
-            ("call_id", call_id)]
+            ("call_id", call_id), ("thread_id", _call_thread(call_id))]
 
 
 def _withheld_turn(call_id, fields, rid, tag, epoch, turn_key):
