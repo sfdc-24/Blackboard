@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -77,16 +78,47 @@ def _sha(data: bytes) -> str:
     return hashlib.sha256(data.replace(b"\r\n", b"\n")).hexdigest()
 
 
+# Cloudflare's email obfuscation rewrites every mailto link on www with a fresh
+# random key on each request and injects its decoder script, so the served page
+# never equals main byte for byte even when Pages serves main exactly. Undo only
+# that rewrite before comparing; any other difference still fails.
+_CF_HREF = re.compile(rb'href="/cdn-cgi/l/email-protection#([0-9a-fA-F]+)"')
+_CF_SPAN = re.compile(rb'<span class="__cf_email__" data-cfemail="([0-9a-fA-F]+)">\[email&#160;protected\]</span>')
+_CF_SCRIPT = re.compile(rb'<script data-cfasync="false" src="/cdn-cgi/scripts/[0-9a-f]+/cloudflare-static/'
+                        rb'email-decode\.min\.js"></script>')
+# Cloudflare Web Analytics adds its beacon as one line before </body> for some visitors. Only that
+# exact tag is dropped: Cloudflare's host and versioned path, an integrity hash, the beacon's own
+# settings object and crossorigin, in that order, and nothing else. A changed URL or any extra
+# attribute (an onload, say) does not match, so the page still fails.
+_CF_BEACON = re.compile(rb'<script type="module" src="https://static\.cloudflareinsights\.com/beacon\.min\.js/'
+                        rb'v[0-9a-f]+" integrity="sha512-[A-Za-z0-9+/]+={0,2}" '
+                        rb'data-cf-beacon=\'\{"version":"[0-9.]+","token":"[0-9a-f]{32}"(?:,"[a-z]+":[0-9]+)*\}\' '
+                        rb'crossorigin="anonymous"></script>\r?\n?')
+
+
+def _cf_decode(hexed: bytes) -> bytes:
+    """Cloudflare's encoding: the first byte is a key, every later byte is XORed with it."""
+    raw = bytes.fromhex(hexed.decode("ascii"))
+    return bytes(b ^ raw[0] for b in raw[1:])
+
+
+def undo_cloudflare_email(html: bytes) -> bytes:
+    html = _CF_HREF.sub(lambda m: b'href="mailto:' + _cf_decode(m.group(1)) + b'"', html)
+    html = _CF_SPAN.sub(lambda m: _cf_decode(m.group(1)), html)
+    html = _CF_SCRIPT.sub(b"", html)
+    return _CF_BEACON.sub(b"", html)
+
+
 # ---------------------------------------------------------------- checks --
 # Each check takes the injected readers and returns (status, evidence).
 
 def check_pages_serves_main(get=http_get, **_):
-    """PASS: www's index.html is byte-identical (line endings aside) to main's."""
+    """PASS: www's index.html is byte-identical (line endings and Cloudflare's email rewrite aside) to main's."""
     s1, live = get(WWW + "/?acceptance=%d" % int(time.time()))
     s2, main = get(MAIN_INDEX)
     if s1 != 200 or s2 != 200:
         return UNKNOWN, "could not read both (www %s, main %s)" % (s1, s2)
-    a, b = _sha(live), _sha(main)
+    a, b = _sha(undo_cloudflare_email(live)), _sha(main)
     if a == b:
         return PASS, "www index.html == main (%s)" % a[:12]
     return FAIL, "www %s != main %s (Pages behind main, or a failed build)" % (a[:12], b[:12])
