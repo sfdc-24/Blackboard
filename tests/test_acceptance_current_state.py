@@ -57,13 +57,27 @@ class Pages(unittest.TestCase):
         live = self._served(b"studio@example.com", 0x2A, body=b"<p>stale</p>")
         self.assertEqual(acc.FAIL, acc.check_pages_serves_main(get=pages(live, self.MAIN))[0])
 
+    BEACON = (b'<script type="module" src="https://static.cloudflareinsights.com/beacon.min.js/vce7018a" '
+              b'integrity="sha512-UKNk8Gb+/x==" data-cf-beacon=\'{"version":"2024.11.0","token":"'
+              + b"0123456789abcdef" * 2 + b'","r":1,"spa":2}\' crossorigin="anonymous"></script>\n')
+
+    def _with(self, line: bytes):
+        return acc.check_pages_serves_main(get=pages(b"<p>a</p>\n" + line + b"</body>\n", b"<p>a</p>\n</body>\n"))[0]
+
     def test_the_analytics_beacon_line_is_ignored_but_another_script_is_not(self):
-        beacon = (b'<script type="module" src="https://static.cloudflareinsights.com/beacon.min.js/v123" '
-                  b'integrity="sha512-x" data-cf-beacon=\'{"token": "t"}\' crossorigin="anonymous"></script>\n')
-        main = b"<p>a</p>\n</body>\n"
-        self.assertEqual(acc.PASS, acc.check_pages_serves_main(get=pages(b"<p>a</p>\n" + beacon + b"</body>\n", main))[0])
-        other = b'<script src="https://evil.example/x.js"></script>\n'
-        self.assertEqual(acc.FAIL, acc.check_pages_serves_main(get=pages(b"<p>a</p>\n" + other + b"</body>\n", main))[0])
+        self.assertEqual(acc.PASS, self._with(self.BEACON))
+        self.assertEqual(acc.FAIL, self._with(b'<script src="https://evil.example/x.js"></script>\n'))
+
+    def test_an_altered_beacon_is_not_ignored(self):
+        altered = {
+            "another host": self.BEACON.replace(b"static.cloudflareinsights.com", b"static.cloudflareinsights.com.evil.example"),
+            "another path": self.BEACON.replace(b"beacon.min.js/vce7018a", b"beacon.min.js/../x.js"),
+            "an onload": self.BEACON.replace(b' crossorigin="anonymous">', b' crossorigin="anonymous" onload="alert(1)">'),
+            "an attribute before": self.BEACON.replace(b'<script type="module"', b'<script onerror="x()" type="module"'),
+            "script in the settings": self.BEACON.replace(b',"spa":2}', b',"spa":2,"x":"</script><script>"}'),
+        }
+        for why, line in altered.items():
+            self.assertEqual(acc.FAIL, self._with(line), why)
 
     def test_the_address_is_decoded_not_dropped(self):
         live = self._served(b"someone@example.com", 0x2A)

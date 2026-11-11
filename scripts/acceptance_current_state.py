@@ -86,9 +86,14 @@ _CF_HREF = re.compile(rb'href="/cdn-cgi/l/email-protection#([0-9a-fA-F]+)"')
 _CF_SPAN = re.compile(rb'<span class="__cf_email__" data-cfemail="([0-9a-fA-F]+)">\[email&#160;protected\]</span>')
 _CF_SCRIPT = re.compile(rb'<script data-cfasync="false" src="/cdn-cgi/scripts/[0-9a-f]+/cloudflare-static/'
                         rb'email-decode\.min\.js"></script>')
-# Cloudflare Web Analytics adds its beacon as one line before </body> for some visitors.
+# Cloudflare Web Analytics adds its beacon as one line before </body> for some visitors. Only that
+# exact tag is dropped: Cloudflare's host and versioned path, an integrity hash, the beacon's own
+# settings object and crossorigin, in that order, and nothing else. A changed URL or any extra
+# attribute (an onload, say) does not match, so the page still fails.
 _CF_BEACON = re.compile(rb'<script type="module" src="https://static\.cloudflareinsights\.com/beacon\.min\.js/'
-                        rb'[^"\s]*"[^\n]*?></script>\r?\n?')
+                        rb'v[0-9a-f]+" integrity="sha512-[A-Za-z0-9+/]+={0,2}" '
+                        rb'data-cf-beacon=\'\{"version":"[0-9.]+","token":"[0-9a-f]{32}"(?:,"[a-z]+":[0-9]+)*\}\' '
+                        rb'crossorigin="anonymous"></script>\r?\n?')
 
 
 def _cf_decode(hexed: bytes) -> bytes:
