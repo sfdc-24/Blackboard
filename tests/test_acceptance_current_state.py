@@ -33,6 +33,42 @@ class Pages(unittest.TestCase):
         self.assertEqual(acc.FAIL, acc.check_pages_serves_main(get=pages(b"old", b"new"))[0])
         self.assertEqual(acc.UNKNOWN, acc.check_pages_serves_main(get=pages(b"", b"new", s1=503))[0])
 
+    @staticmethod
+    def _cf(email: bytes, key: int) -> bytes:
+        return bytes([key]).hex().encode() + bytes(b ^ key for b in email).hex().encode()
+
+    def _served(self, email: bytes, key: int, body: bytes = b"<p>same</p>") -> bytes:
+        enc = self._cf(email, key)
+        return (b'<a href="/cdn-cgi/l/email-protection#' + enc + b'">Write</a>' + body
+                + b'<a href="/cdn-cgi/l/email-protection#' + enc + b'"><span class="__cf_email__" data-cfemail="'
+                + enc + b'">[email&#160;protected]</span></a>'
+                + b'<script data-cfasync="false" src="/cdn-cgi/scripts/5c5dd728/cloudflare-static/'
+                  b'email-decode.min.js"></script><script src="x.js"></script>')
+
+    MAIN = (b'<a href="mailto:studio@example.com">Write</a><p>same</p>'
+            b'<a href="mailto:studio@example.com">studio@example.com</a><script src="x.js"></script>')
+
+    def test_cloudflare_email_rewrite_with_any_key_still_passes(self):
+        for key in (0x0F, 0x55, 0xE6):
+            live = self._served(b"studio@example.com", key)
+            self.assertEqual(acc.PASS, acc.check_pages_serves_main(get=pages(live, self.MAIN))[0], hex(key))
+
+    def test_a_real_change_under_the_rewrite_still_fails(self):
+        live = self._served(b"studio@example.com", 0x2A, body=b"<p>stale</p>")
+        self.assertEqual(acc.FAIL, acc.check_pages_serves_main(get=pages(live, self.MAIN))[0])
+
+    def test_the_analytics_beacon_line_is_ignored_but_another_script_is_not(self):
+        beacon = (b'<script type="module" src="https://static.cloudflareinsights.com/beacon.min.js/v123" '
+                  b'integrity="sha512-x" data-cf-beacon=\'{"token": "t"}\' crossorigin="anonymous"></script>\n')
+        main = b"<p>a</p>\n</body>\n"
+        self.assertEqual(acc.PASS, acc.check_pages_serves_main(get=pages(b"<p>a</p>\n" + beacon + b"</body>\n", main))[0])
+        other = b'<script src="https://evil.example/x.js"></script>\n'
+        self.assertEqual(acc.FAIL, acc.check_pages_serves_main(get=pages(b"<p>a</p>\n" + other + b"</body>\n", main))[0])
+
+    def test_the_address_is_decoded_not_dropped(self):
+        live = self._served(b"someone@example.com", 0x2A)
+        self.assertEqual(acc.FAIL, acc.check_pages_serves_main(get=pages(live, self.MAIN))[0])
+
     def test_a_missing_asset_fails_by_name(self):
         status, evidence = acc.check_site_paths(get=lambda url: (404 if url.endswith("prototype-canvas.js") else 200, b""))
         self.assertEqual(acc.FAIL, status)
