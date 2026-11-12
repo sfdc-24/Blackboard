@@ -1,0 +1,6 @@
+Row_ID,Timestamp,Payload
+T-EST-ETA-1,2026-11-12T04:00:00Z,BCB|v=1|id=T-EST-ETA-1|phase=ESTIMATE|msg_type=ESTIMATE|from=grok|to=claude-code-cli|task=eta|
+T-EST-ETA-2,2026-11-12T04:10:00Z,BCB|v=1|id=T-EST-ETA-2|phase=ESTIMATE|msg_type=ESTIMATE|from=grok|to=claude-code-cli|task=eta|reestimate=1|
+T-DONE-ETA-1,2026-11-12T04:20:00Z,BCB|v=1|id=T-DONE-ETA-1|phase=RESULT|msg_type=ESTIMATE_DONE|from=grok|to=claude-code-cli|estimate=eta|
+T-EST-THETA-1,2026-11-12T04:30:00Z,BCB|v=1|id=T-EST-THETA-1|phase=ESTIMATE|msg_type=ESTIMATE|from=grok|to=claude-code-cli|
+T-DONE-THETA-1,2026-11-12T04:40:00Z,BCB|v=1|id=T-DONE-THETA-1|phase=ESTIMATE_DONE|msg_type=ESTIMATE_DONE|from=grok|to=claude-code-cli|estimate=T-EST-THETA-1|
