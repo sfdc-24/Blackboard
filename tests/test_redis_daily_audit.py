@@ -27,7 +27,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DAY = datetime.date(2026, 11, 7)
 _MISSING = object()
 START, END = audit.day_bounds(DAY)
-SECRET = "OWNER SAID THE SECRET PHRASE ABOUT THE BRIDGE"
+SECRET = "EXAMPLE FIXTURE TEXT 0001"
 NOW = datetime.datetime(2026, 11, 8, 6, 10, tzinfo=datetime.timezone.utc)
 
 
