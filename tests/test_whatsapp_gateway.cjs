@@ -242,3 +242,78 @@ test('multiple human messages retain separate jobs and correctly correlated repl
   await assert.rejects(renderer.run.call({ job: jobs[0], modelText: ' ' }), /blank/);
   await assert.rejects(renderer.run.call({ job: jobs[0], modelText: 'x'.repeat(4096) }), /limit/);
 });
+
+function modelJob() {
+  return {
+    wamid: 'wamid.fixture',
+    callModel: true,
+    system: 'Answer from the provided board records only.',
+    input: { board: { fetchedAt: '2026-09-06T17:00:00Z' }, message: { text: 'Project status', wamid: 'wamid.fixture' } },
+    responseIdentity: { instance: 'gateway/claude', to: OPERATOR, replyTo: 'wamid.fixture' },
+  };
+}
+
+function modelTurn(hooks = {}) {
+  const andon = [], responses = [];
+  const env = { MODEL_TIMEOUT_MS: String(hooks.timeoutMs || 30) };
+  const context = load('pipedream_wa_model.js', env);
+  const postAndon = hooks.postAndon || (async payload => { andon.push(payload); });
+  return {
+    andon, responses,
+    async run(job = modelJob()) {
+      return context.component.run.call({ job, callModel: hooks.callModel, postAndon }, { $: {
+        respond: async value => { responses.push(plain(value)); },
+        export: () => {},
+      } });
+    },
+  };
+}
+
+async function rejected(run) {
+  try {
+    await run();
+  } catch (err) {
+    return err;
+  }
+  throw new assert.AssertionError({ message: 'expected the model turn to fail', actual: undefined, expected: 'rejection' });
+}
+
+test('a successful model turn returns HTTP 200 and posts no ANDON row', async () => {
+  const turn = modelTurn({ callModel: async () => '  Current status is green.  ' });
+  const result = plain(await turn.run());
+  assert.deepEqual(result, { status: 200, modelText: 'Current status is green.' });
+  assert.deepEqual(turn.responses, [{ status: 200, body: 'ok' }]);
+  assert.equal(turn.andon.length, 0);
+});
+
+test('a model error returns HTTP 502 and posts an ANDON row', async () => {
+  const turn = modelTurn({ callModel: async () => { throw new Error('provider rejected the request'); } });
+  const err = await rejected(() => turn.run());
+  assert.match(String(err && err.message), /model turn failed \(502\)/);
+  assert.equal(err.status, 502);
+  assert.equal(err.andonPosted, true);
+  assert.deepEqual(turn.responses, [{ status: 502, body: 'model turn failed' }]);
+  assert.equal(turn.andon.length, 1);
+  assert.match(turn.andon[0], /^ANDON\|v=1\|phase=ANDON\|source=whatsapp-gateway\|kind=model_error\|status=502\|wamid=wamid.fixture\|lane=claude\|error=provider rejected the request$/);
+});
+
+test('a model timeout returns HTTP 504 and posts an ANDON row', async () => {
+  const turn = modelTurn({
+    timeoutMs: 20,
+    callModel: (_job, { signal }) => new Promise((_, reject) => {
+      const fail = () => reject(signal.reason || new Error('aborted'));
+      if (signal.aborted) {
+        fail();
+        return;
+      }
+      signal.addEventListener('abort', fail, { once: true });
+    }),
+  });
+  const err = await rejected(() => turn.run());
+  assert.match(String(err && err.message), /model turn failed \(504\)/);
+  assert.equal(err.status, 504);
+  assert.equal(err.andonPosted, true);
+  assert.deepEqual(turn.responses, [{ status: 504, body: 'model turn timed out' }]);
+  assert.equal(turn.andon.length, 1);
+  assert.match(turn.andon[0], /^ANDON\|v=1\|phase=ANDON\|source=whatsapp-gateway\|kind=model_timeout\|status=504\|wamid=wamid.fixture\|lane=claude\|error=model turn timed out$/);
+});
