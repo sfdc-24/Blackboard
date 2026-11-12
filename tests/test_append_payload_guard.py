@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Tests for the BCB payload-ambiguity guard in scripts/append.py.
+"""Tests for the guards in scripts/append.py: ambiguous BCB keys, and citations.
+
+A pull-request number has to be the repo name then the number. A work-order id
+has to carry the prefix "TASK ID:". Both are refused here, at the writer.
 
 WHAT IS ON TRIAL
   BCB-1 is pipe-delimited with NO escaping, so a `|` inside a value is
@@ -165,6 +168,174 @@ finally:
     sys.argv = old_argv
     os.unlink(long_path)
 check("a hidden conflict was not appended", not attempts, attempts)
+
+print("")
+print("== a pull-request number names its repository ==")
+# Qualified forms this fleet already writes, including a list and the owner prefix.
+# A number with no repo name in front of it is the row the owner keeps sending back.
+QUALIFIED = [
+    ("a list of two qualified numbers",
+     "BCB|v=1|id=X|from=a|to=b|text=conference #427, conference #429"),
+    ("Blackboard then the number",
+     "BCB|v=1|id=X|from=a|to=b|text=see Blackboard #484"),
+    ("sfdc24-site then the number",
+     "BCB|v=1|id=X|from=a|to=b|text=sfdc24-site #391"),
+    ("the owner prefix and a space",
+     "BCB|v=1|id=X|from=a|to=b|text=sfdc-24/conference #428"),
+    ("the owner prefix and no space",
+     "BCB|v=1|id=X|from=a|to=b|text=sfdc-24/Blackboard#484 and sfdc-24/sfdc24-site#12"),
+    ("the repo name with no space before the number",
+     "BCB|v=1|id=X|from=a|to=b|text=Blackboard#297"),
+    ("the repo name in either case",
+     "BCB|v=1|id=X|from=a|to=b|text=Conference #428"),
+    ("a pull URL has no hash-number",
+     "BCB|v=1|id=X-3|from=a|to=b|pr=https://github.com/sfdc-24/Blackboard/pull/40"),
+]
+for why, payload in QUALIFIED:
+    check("accepts " + why, not ap._citation_problems(payload), ap._citation_problems(payload))
+
+for why, payload in GOOD:
+    check("ambiguity fixture still has no citation fault: " + why,
+          not ap._citation_problems(payload), ap._citation_problems(payload))
+
+print("")
+print("== a work-order id carries the prefix, a row id does not need it ==")
+# Shapes taken from rows and comments already in the tree. One-digit labels
+# (G2, R2, P0), doctrine ids (D-18, L-82) and linter codes (E402) are not
+# work-order ids. A row id that merely contains one is not one either.
+ACCEPTED_IDS = [
+    ("TASK ID: G30 and TASK ID: C77 and TASK ID: CL-RG1",
+     "BCB|v=1|id=X|from=a|to=b|text=TASK ID: G30, TASK ID: C77, TASK ID: CL-RG1"),
+    ("the prefix with no space",
+     "BCB|v=1|id=X|from=a|to=b|text=TASK ID:C77"),
+    ("id= value is a row id even when it is the work-order shape",
+     "BCB|v=1|id=C77|from=a|to=b|text=row id field only"),
+    ("answers= and req= values",
+     "BCB|v=1|id=X|answers=C77;G30|req=CL-RG1|from=a|to=b|text=done"),
+    ("a row id that contains a work-order id and a timestamp",
+     "BCB|v=1|id=GROK-ACK-C77-RESULT-20261112T1647Z|from=a|to=b|"
+     "text=see GROK-ACK-C77-RESULT-20261112T1647Z"),
+    ("the same row-id shape quoted outside the id= field, no clock",
+     "BCB|v=1|id=X|from=a|to=b|text=CODEX-RESULT-RV-BB478-NOTES"),
+    ("a hex SHA and a compact timestamp",
+     "BCB|v=1|id=X|from=a|to=b|text=head 9a0d8f85abc and 4933cac at 20261112T1647Z"),
+    ("an ISO timestamp",
+     "BCB|v=1|id=X|from=a|to=b|text=landed 2026-11-12T16:47:00.000Z"),
+    ("section numbers and doctrine ids that are not work-order ids",
+     "BCB|v=1|id=X|from=a|to=b|text=G2 on the bus, R2 unowned, P0 gate, D-18, L-82, T-02"),
+    ("a three-digit linter code",
+     "BCB|v=1|id=X|from=a|to=b|text=noqa E402 and camera C922"),
+    ("request ids already on rows",
+     "BCB|v=1|id=X|answers=WRK-3cd5f324|from=a|to=b|text=WRK-TEST01 REQ-HAUD01 REQ-B4TQX9"),
+]
+for why, payload in ACCEPTED_IDS:
+    check("accepts " + why, not ap._citation_problems(payload), ap._citation_problems(payload))
+
+print("")
+print("== and the bare forms are refused, by name ==")
+REFUSED = [
+    ("a bare number",
+     "BCB|v=1|id=X|from=a|to=b|text=see #420",
+     ["#420"]),
+    ("two bare numbers with no space",
+     "BCB|v=1|id=X|from=a|to=b|text=#484,#485",
+     ["#484", "#485"]),
+    ("the second number in a list was left bare",
+     "BCB|v=1|id=X|from=a|to=b|text=conference #427, #429",
+     ["#429"]),
+    ("a slash does not carry the repo name onto the next number",
+     "BCB|v=1|id=X|from=a|to=b|text=Blackboard #297/#298",
+     ["#298"]),
+    ("a bare work-order id",
+     "BCB|v=1|id=X|from=a|to=b|text=owner asked for C77",
+     ["C77"]),
+    ("the hyphenated work-order shape",
+     "BCB|v=1|id=X|from=a|to=b|text=CL-RG1 is open",
+     ["CL-RG1"]),
+    ("the prefix covers the next id only",
+     "BCB|v=1|id=X|from=a|to=b|text=TASK ID: C77, G30",
+     ["G30"]),
+    ("a lowercase prefix is not the prefix",
+     "BCB|v=1|id=X|from=a|to=b|text=task id: C77",
+     ["C77"]),
+    ("the same shape in parentheses",
+     "BCB|v=1|id=X|from=a|to=b|text=lanes (B12)",
+     ["B12"]),
+]
+for why, payload, tokens in REFUSED:
+    found = ap._citation_problems(payload)
+    text = "\n".join(found)
+    check("refuses " + why, bool(found), found)
+    for token in tokens:
+        check("names " + token, token in text, text)
+    # A qualified neighbour is not reported as if it were bare.
+    if "#297" in payload and "#298" in payload:
+        check("does not blame the qualified number", "#297" not in text, text)
+    if "conference #427" in payload and "#429" in payload:
+        check("does not blame the qualified list entry", "#427" not in text, text)
+
+# The writer exits before the bus sees it. Same proof as the ambiguity guard:
+# fetch records any attempt, and an attempt is a failure.
+attempts.clear()
+bare = {"row_id": "T-BARE", "source_tag": "claude-code-cli",
+        "payload": "BCB|v=1|id=GROK-ACK-C77-RESULT-20261112T1647Z|phase=RESULT|"
+                   "from=claude-code-cli|to=codex|text=see #420 and C77"}
+with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as fh:
+    _json.dump(bare, fh)
+    bare_path = fh.name
+sys.argv = ["append.py", bare_path]
+try:
+    ap.main()
+    check("main() refuses a bare number and a bare work-order id", False, "it returned normally")
+except SystemExit as e:
+    msg = str(e)
+    check("main() refuses a bare number and a bare work-order id", "CITATION_REFUSED" in msg, msg)
+    check("main() names #420", "#420" in msg, msg)
+    check("main() names C77", "'C77'" in msg, msg)
+finally:
+    sys.argv = old_argv
+    os.unlink(bare_path)
+check("a refused citation was not appended", not attempts, attempts)
+
+# A qualified payload is not stopped by this guard. Signature is stubbed so the
+# only new refusal that could fire is the citation one; the bus stub records
+# that the writer got past it.
+saved_check = ap.signature.check
+saved_fetch = ap.fetch
+saved_read = ap.read_rows
+try:
+    ap.signature.check = lambda *a, **k: []
+    ap.read_rows = lambda *a, **k: {"rows": []}
+    attempts.clear()
+
+    def noting_fetch(*a, **k):
+        attempts.append("fetch")
+        return "ok"
+
+    ap.fetch = noting_fetch
+    good = {"row_id": "T-GOOD", "source_tag": "claude-code-cli",
+            "payload": "BCB|v=1|id=GROK-ACK-C77-RESULT-20261112T1647Z|phase=RESULT|"
+                       "from=claude-code-cli|to=codex|"
+                       "text=conference #427, conference #429. TASK ID: C77"}
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as fh:
+        _json.dump(good, fh)
+        good_path = fh.name
+    sys.argv = ["append.py", good_path]
+    try:
+        ap.main()
+        check("main() does not citation-refuse a qualified payload", True)
+    except SystemExit as e:
+        msg = str(e)
+        check("main() does not citation-refuse a qualified payload",
+              "CITATION_REFUSED" not in msg, msg)
+    finally:
+        sys.argv = old_argv
+        os.unlink(good_path)
+    check("a qualified payload was allowed to reach the bus", attempts == ["fetch"], attempts)
+finally:
+    ap.signature.check = saved_check
+    ap.fetch = saved_fetch
+    ap.read_rows = saved_read
 
 print("")
 print("{0} passed, {1} failed".format(PASS, FAIL))

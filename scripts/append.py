@@ -36,6 +36,118 @@ def _conflicting_keys(payload):
     return bad
 
 
+# Repo names a pull-request number may follow. The owner prefix is optional:
+# "Blackboard #484" and "sfdc-24/Blackboard #484" are the same citation.
+_REPO_NAMES = ("sfdc24-site", "conference", "Blackboard")
+_PR_NUMBER = re.compile(r"#(\d{1,6})\b")
+_REPO_PREFIX = re.compile(
+    r"(?<![A-Za-z0-9-])(?:sfdc-24/)?"
+    r"(?:%s)\s*$" % "|".join(re.escape(name) for name in _REPO_NAMES),
+    re.IGNORECASE)
+# Work-order ids, measured against the ids this repo actually writes.
+#   TASK ID: G30 and TASK ID: C77 are one letter and exactly two digits.
+#   TASK ID: CL-RG1 is two or three letters, a hyphen, two or three letters, then digits.
+# One-digit labels are not this shape. G2, R2, P0, T0 fill the docs and the
+# rows as section numbers; a matcher that caught them would refuse ordinary
+# status rows. Doctrine ids are letter, hyphen, digits (D-18, L-82, T-02) and
+# linter codes run to three digits (E402). Neither is a work-order id.
+# A row id is a longer hyphenated token (GROK-ACK-C77-...-20261112T1647Z,
+# CODEX-RESULT-RV-BB478-20261108T0146Z). The hyphen is part of that token, so
+# the C77 inside it is not a bare work-order id. id=, answers= and req= values
+# are those row ids even when the value is short. A hex SHA (7 or more hex
+# characters) and a timestamp are not work-order ids either.
+_WORK_ORDER = re.compile(
+    r"(?<![A-Za-z0-9-])([A-Z]\d{2}|[A-Z]{2,3}-[A-Z]{2,3}\d{1,4})(?![A-Za-z0-9-])")
+_TASK_PREFIX = re.compile(r"TASK ID:\s*$")
+_ID_FIELD = re.compile(r"(?:^|\|)(?:id|answers|req)=([^|]*)", re.IGNORECASE)
+_ID_CHAR = re.compile(r"[A-Za-z0-9._-]")
+_SHA = re.compile(r"[0-9a-fA-F]{7,64}\Z")
+_TIMESTAMP = re.compile(
+    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?"
+    r"|\d{8}T\d{4,6}Z")
+
+
+def _exempt_spans(payload):
+    """id=, answers= and req= values. A row id lives there, whatever shape it has."""
+    return [(m.start(1), m.end(1)) for m in _ID_FIELD.finditer(payload or "")]
+
+
+def _inside(spans, start, end):
+    return any(s <= start and end <= e for s, e in spans)
+
+
+def _enclosing_token(payload, start, end):
+    """The identifier token that contains [start, end), hyphen included."""
+    i, j = start, end
+    while i > 0 and _ID_CHAR.fullmatch(payload[i - 1]):
+        i -= 1
+    while j < len(payload) and _ID_CHAR.fullmatch(payload[j]):
+        j += 1
+    return payload[i:j], i, j
+
+
+def _row_id_token(token):
+    """A row id, a hex SHA, or a timestamp. Not a work-order id and not a PR number."""
+    if not token:
+        return False
+    if _SHA.fullmatch(token):
+        return True
+    if _TIMESTAMP.search(token):
+        return True
+    # GROK-ACK-C77-RESULT-20261112T1647Z and the same shape without a clock:
+    # several segments, longer than CL-RG1. The clock case is already caught above.
+    parts = [p for p in token.split("-") if p]
+    return len(parts) >= 3 and len(token) >= 12
+
+
+def _citation_problems(payload):
+    """Bare PR numbers and bare work-order ids. Empty means the payload may be appended.
+
+    Each string names the offending token. Checked on the original payload, before fit()
+    shortens it, for the same reason as _conflicting_keys: a violation past the summary
+    cutoff would otherwise ride out in the spill while the posted row looked clean.
+    """
+    payload = payload or ""
+    exempt = _exempt_spans(payload)
+    problems = []
+    seen = set()
+
+    def add(code, token, detail):
+        key = (code, token)
+        if key in seen:
+            return
+        seen.add(key)
+        problems.append("%s: %s" % (code, detail))
+
+    for match in _PR_NUMBER.finditer(payload):
+        if _inside(exempt, match.start(), match.end()):
+            continue
+        # The '#' is the citation, not part of a row id. "Blackboard#484" has the
+        # repo name immediately before it; "notes#484" does not. Both are decided
+        # by the prefix, so a longer token on the left must not hide the number.
+        if _REPO_PREFIX.search(payload[:match.start()]):
+            continue
+        shown = match.group(0)
+        add("PR_REFERENCE_BARE", shown,
+            "'%s' names a pull request without its repository. Write the repo "
+            "name then the number (conference %s, Blackboard %s, sfdc24-site %s)."
+            % (shown, shown, shown, shown))
+
+    for match in _WORK_ORDER.finditer(payload):
+        if _inside(exempt, match.start(), match.end()):
+            continue
+        token, i, j = _enclosing_token(payload, match.start(), match.end())
+        if i < match.start() or j > match.end() or _row_id_token(token):
+            continue
+        if _TASK_PREFIX.search(payload[:match.start()]):
+            continue
+        shown = match.group(1)
+        add("WORK_ORDER_BARE", shown,
+            "'%s' is a work-order id without the prefix 'TASK ID:'. "
+            "Write 'TASK ID: %s'." % (shown, shown))
+    return problems
+
+
 def main(require_sender_identity=False):
     if len(sys.argv) < 2:
         raise SystemExit(
@@ -94,6 +206,15 @@ def main(require_sender_identity=False):
             "far as any reader is concerned. Rewrite the value without pipes "
             "(say 'v=1 then v=999' rather than 'v=1|v=999'). Refusing to append."
         )
+    # A pull-request number is the repo name then the number (conference #428,
+    # Blackboard #484, sfdc24-site #391). A work-order id carries the prefix
+    # "TASK ID:" (TASK ID: G30, TASK ID: C77). One poster already writes that
+    # way; the others reach this function, so the refusal has to live here.
+    # Same rule as the ambiguity guard: the original payload, before fit().
+    citations = _citation_problems(payload)
+    if citations:
+        raise SystemExit(
+            "CITATION_REFUSED: refusing to append.\n  - " + "\n  - ".join(citations))
     # WHO WROTE THIS, AND HOW DID IT GET HERE.
     #
     # Mr Salam, 2026-10-06: "signs should reflect who its from; claude mobile or claude code cli

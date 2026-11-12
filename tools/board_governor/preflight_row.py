@@ -15,10 +15,12 @@ WHY THIS EXISTS
 WHAT IT CHECKS
   1. append.py's own _conflicting_keys: an authority key written twice with
      different values.
-  2. A literal '|' inside any VALUE. BCB-1 has no escaping, so that silently
+  2. append.py's own _citation_problems: a pull-request number without its
+     repo name, or a work-order id without the prefix "TASK ID:".
+  3. A literal '|' inside any VALUE. BCB-1 has no escaping, so that silently
      starts a new key.
-  3. The payload starts with 'BCB|' (append.py requires it).
-  4. Required fields present; the resolved 10-cell row printed for eyeballing.
+  4. The payload starts with 'BCB|' (append.py requires it).
+  5. Required fields present; the resolved 10-cell row printed for eyeballing.
 
 USAGE
   python preflight_row.py <row.json> [--scripts <dir holding append.py>]
@@ -54,7 +56,7 @@ def main(argv):
 
     sys.path.insert(0, str(scripts))
     try:
-        from append import AUTHORITY_KEYS, _conflicting_keys  # noqa: E402
+        from append import AUTHORITY_KEYS, _citation_problems, _conflicting_keys  # noqa: E402
     except Exception as exc:  # noqa: BLE001
         raise SystemExit(
             "cannot import append.py from {}: {}\n"
@@ -78,6 +80,9 @@ def main(argv):
     if conflicts:
         problems.append("authority keys written twice with DIFFERENT values: "
                         + ", ".join(conflicts))
+
+    if isinstance(payload, str):
+        problems.extend(_citation_problems(payload))
 
     # A '|' inside a value is indistinguishable from a new key. Detect it by
     # checking every pipe-separated segment after the first: a segment with no
