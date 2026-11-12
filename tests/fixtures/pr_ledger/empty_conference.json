@@ -1,0 +1,15 @@
+{
+  "repos": {
+    "sfdc-24/conference": {
+      "open_pulls": [],
+      "closed_pulls": {},
+      "refs": {
+        "cursor/": [],
+        "grok/": [],
+        "claude-code-cli/": []
+      },
+      "commits": {},
+      "compares": {}
+    }
+  }
+}

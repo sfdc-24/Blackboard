@@ -1,0 +1,551 @@
+{
+  "repos": {
+    "sfdc-24/conference": {
+      "open_pulls": [
+        {
+          "number": 10,
+          "state": "open",
+          "merged_at": null,
+          "head": {
+            "ref": "cursor/open-one",
+            "sha": "a111111111111111111111111111111111111111",
+            "label": "sfdc-24:cursor/open-one",
+            "repo": {
+              "full_name": "sfdc-24/conference"
+            }
+          },
+          "base": {
+            "ref": "main",
+            "repo": {
+              "full_name": "sfdc-24/conference"
+            }
+          }
+        },
+        {
+          "number": 11,
+          "state": "open",
+          "merged_at": null,
+          "head": {
+            "ref": "some/other-branch",
+            "sha": "b222222222222222222222222222222222222222",
+            "label": "sfdc-24:some/other-branch",
+            "repo": {
+              "full_name": "sfdc-24/conference"
+            }
+          },
+          "base": {
+            "ref": "main",
+            "repo": {
+              "full_name": "sfdc-24/conference"
+            }
+          }
+        }
+      ],
+      "closed_pulls": {
+        "sfdc-24:grok/merged-pr": [
+          {
+            "number": 12,
+            "state": "closed",
+            "merged_at": "2026-11-10T15:00:00Z",
+            "head": {
+              "ref": "grok/merged-pr",
+              "sha": "c333333333333333333333333333333333333333",
+              "label": "sfdc-24:grok/merged-pr",
+              "repo": {
+                "full_name": "sfdc-24/conference"
+              }
+            },
+            "base": {
+              "ref": "main",
+              "repo": {
+                "full_name": "sfdc-24/conference"
+              }
+            }
+          }
+        ]
+      },
+      "refs": {
+        "cursor/": [
+          {
+            "ref": "refs/heads/cursor/open-one",
+            "object": {
+              "sha": "a111111111111111111111111111111111111111",
+              "type": "commit"
+            }
+          }
+        ],
+        "grok/": [
+          {
+            "ref": "refs/heads/grok/merged-pr",
+            "object": {
+              "sha": "c333333333333333333333333333333333333333",
+              "type": "commit"
+            }
+          },
+          {
+            "ref": "refs/heads/grok/on-main",
+            "object": {
+              "sha": "d444444444444444444444444444444444444444",
+              "type": "commit"
+            }
+          },
+          {
+            "ref": "refs/heads/grok/superseded-by-open",
+            "object": {
+              "sha": "e555555555555555555555555555555555555555",
+              "type": "commit"
+            }
+          },
+          {
+            "ref": "refs/heads/grok/orphan-one",
+            "object": {
+              "sha": "f666666666666666666666666666666666666666",
+              "type": "commit"
+            }
+          },
+          {
+            "ref": "refs/heads/grok/old-branch",
+            "object": {
+              "sha": "0111111111111111111111111111111111111111",
+              "type": "commit"
+            }
+          },
+          {
+            "ref": "refs/heads/grok/on-since-date",
+            "object": {
+              "sha": "0333333333333333333333333333333333333333",
+              "type": "commit"
+            }
+          },
+          {
+            "ref": "refs/heads/grok/before-since",
+            "object": {
+              "sha": "0444444444444444444444444444444444444444",
+              "type": "commit"
+            }
+          }
+        ],
+        "claude-code-cli/": [
+          {
+            "ref": "refs/heads/claude-code-cli/tooling",
+            "object": {
+              "sha": "0222222222222222222222222222222222222222",
+              "type": "commit"
+            }
+          }
+        ]
+      },
+      "commits": {
+        "a111111111111111111111111111111111111111": {
+          "sha": "a111111111111111111111111111111111111111",
+          "commit": {
+            "author": {
+              "date": "2026-11-10T12:00:00Z"
+            },
+            "committer": {
+              "date": "2026-11-10T12:00:00Z"
+            }
+          }
+        },
+        "b222222222222222222222222222222222222222": {
+          "sha": "b222222222222222222222222222222222222222",
+          "commit": {
+            "author": {
+              "date": "2026-11-10T12:00:00Z"
+            },
+            "committer": {
+              "date": "2026-11-10T12:00:00Z"
+            }
+          }
+        },
+        "c333333333333333333333333333333333333333": {
+          "sha": "c333333333333333333333333333333333333333",
+          "commit": {
+            "author": {
+              "date": "2026-11-10T14:00:00Z"
+            },
+            "committer": {
+              "date": "2026-11-10T14:00:00Z"
+            }
+          }
+        },
+        "d444444444444444444444444444444444444444": {
+          "sha": "d444444444444444444444444444444444444444",
+          "commit": {
+            "author": {
+              "date": "2026-11-10T14:00:00Z"
+            },
+            "committer": {
+              "date": "2026-11-10T14:00:00Z"
+            }
+          }
+        },
+        "e555555555555555555555555555555555555555": {
+          "sha": "e555555555555555555555555555555555555555",
+          "commit": {
+            "author": {
+              "date": "2026-11-10T14:00:00Z"
+            },
+            "committer": {
+              "date": "2026-11-10T14:00:00Z"
+            }
+          }
+        },
+        "f666666666666666666666666666666666666666": {
+          "sha": "f666666666666666666666666666666666666666",
+          "commit": {
+            "author": {
+              "date": "2026-11-10T14:00:00Z"
+            },
+            "committer": {
+              "date": "2026-11-10T14:00:00Z"
+            }
+          }
+        },
+        "0111111111111111111111111111111111111111": {
+          "sha": "0111111111111111111111111111111111111111",
+          "commit": {
+            "author": {
+              "date": "2026-11-01T12:00:00Z"
+            },
+            "committer": {
+              "date": "2026-11-01T12:00:00Z"
+            }
+          }
+        },
+        "0222222222222222222222222222222222222222": {
+          "sha": "0222222222222222222222222222222222222222",
+          "commit": {
+            "author": {
+              "date": "2026-11-11T09:00:00Z"
+            },
+            "committer": {
+              "date": "2026-11-11T09:00:00Z"
+            }
+          }
+        },
+        "0333333333333333333333333333333333333333": {
+          "sha": "0333333333333333333333333333333333333333",
+          "commit": {
+            "author": {
+              "date": "2026-11-09T00:00:00Z"
+            },
+            "committer": {
+              "date": "2026-11-09T00:00:00Z"
+            }
+          }
+        },
+        "0444444444444444444444444444444444444444": {
+          "sha": "0444444444444444444444444444444444444444",
+          "commit": {
+            "author": {
+              "date": "2026-11-08T23:59:59Z"
+            },
+            "committer": {
+              "date": "2026-11-08T23:59:59Z"
+            }
+          }
+        }
+      },
+      "compares": {
+        "main...a111111111111111111111111111111111111111": {
+          "status": "ahead",
+          "ahead_by": 3,
+          "behind_by": 0,
+          "total_commits": 3
+        },
+        "main...b222222222222222222222222222222222222222": {
+          "status": "ahead",
+          "ahead_by": 1,
+          "behind_by": 0,
+          "total_commits": 1
+        },
+        "main...c333333333333333333333333333333333333333": {
+          "status": "diverged",
+          "ahead_by": 2,
+          "behind_by": 4,
+          "total_commits": 2
+        },
+        "main...d444444444444444444444444444444444444444": {
+          "status": "behind",
+          "ahead_by": 0,
+          "behind_by": 5,
+          "total_commits": 0
+        },
+        "main...e555555555555555555555555555555555555555": {
+          "status": "diverged",
+          "ahead_by": 2,
+          "behind_by": 1,
+          "total_commits": 2
+        },
+        "main...f666666666666666666666666666666666666666": {
+          "status": "ahead",
+          "ahead_by": 3,
+          "behind_by": 0,
+          "total_commits": 3
+        },
+        "main...0111111111111111111111111111111111111111": {
+          "status": "ahead",
+          "ahead_by": 1,
+          "behind_by": 0,
+          "total_commits": 1
+        },
+        "main...0222222222222222222222222222222222222222": {
+          "status": "ahead",
+          "ahead_by": 4,
+          "behind_by": 0,
+          "total_commits": 4
+        },
+        "main...0333333333333333333333333333333333333333": {
+          "status": "ahead",
+          "ahead_by": 1,
+          "behind_by": 0,
+          "total_commits": 1
+        },
+        "main...0444444444444444444444444444444444444444": {
+          "status": "ahead",
+          "ahead_by": 1,
+          "behind_by": 0,
+          "total_commits": 1
+        },
+        "a111111111111111111111111111111111111111...e555555555555555555555555555555555555555": {
+          "status": "behind",
+          "ahead_by": 0,
+          "behind_by": 2,
+          "total_commits": 0
+        },
+        "b222222222222222222222222222222222222222...e555555555555555555555555555555555555555": {
+          "status": "ahead",
+          "ahead_by": 2,
+          "behind_by": 0,
+          "total_commits": 2
+        },
+        "a111111111111111111111111111111111111111...f666666666666666666666666666666666666666": {
+          "status": "ahead",
+          "ahead_by": 2,
+          "behind_by": 0,
+          "total_commits": 2
+        },
+        "b222222222222222222222222222222222222222...f666666666666666666666666666666666666666": {
+          "status": "ahead",
+          "ahead_by": 3,
+          "behind_by": 0,
+          "total_commits": 3
+        },
+        "a111111111111111111111111111111111111111...0222222222222222222222222222222222222222": {
+          "status": "ahead",
+          "ahead_by": 4,
+          "behind_by": 0,
+          "total_commits": 4
+        },
+        "b222222222222222222222222222222222222222...0222222222222222222222222222222222222222": {
+          "status": "ahead",
+          "ahead_by": 1,
+          "behind_by": 0,
+          "total_commits": 1
+        },
+        "a111111111111111111111111111111111111111...0333333333333333333333333333333333333333": {
+          "status": "ahead",
+          "ahead_by": 1,
+          "behind_by": 0,
+          "total_commits": 1
+        },
+        "b222222222222222222222222222222222222222...0333333333333333333333333333333333333333": {
+          "status": "ahead",
+          "ahead_by": 1,
+          "behind_by": 0,
+          "total_commits": 1
+        }
+      }
+    },
+    "sfdc-24/Blackboard": {
+      "open_pulls": [
+        {
+          "number": 20,
+          "state": "open",
+          "merged_at": null,
+          "head": {
+            "ref": "cursor/bb-open",
+            "sha": "aa10101010101010101010101010101010101010",
+            "label": "sfdc-24:cursor/bb-open",
+            "repo": {
+              "full_name": "sfdc-24/Blackboard"
+            }
+          },
+          "base": {
+            "ref": "main",
+            "repo": {
+              "full_name": "sfdc-24/Blackboard"
+            }
+          }
+        }
+      ],
+      "closed_pulls": {
+        "sfdc-24:grok/bb-merged": [
+          {
+            "number": 21,
+            "state": "closed",
+            "merged_at": "2026-11-10T18:00:00Z",
+            "head": {
+              "ref": "grok/bb-merged",
+              "sha": "bb20202020202020202020202020202020202020",
+              "label": "sfdc-24:grok/bb-merged",
+              "repo": {
+                "full_name": "sfdc-24/Blackboard"
+              }
+            },
+            "base": {
+              "ref": "main",
+              "repo": {
+                "full_name": "sfdc-24/Blackboard"
+              }
+            }
+          }
+        ]
+      },
+      "refs": {
+        "cursor/": [
+          {
+            "ref": "refs/heads/cursor/bb-open",
+            "object": {
+              "sha": "aa10101010101010101010101010101010101010",
+              "type": "commit"
+            }
+          },
+          {
+            "ref": "refs/heads/cursor/bb-ancient",
+            "object": {
+              "sha": "ee50505050505050505050505050505050505050",
+              "type": "commit"
+            }
+          }
+        ],
+        "grok/": [
+          {
+            "ref": "refs/heads/grok/bb-merged",
+            "object": {
+              "sha": "bb20202020202020202020202020202020202020",
+              "type": "commit"
+            }
+          },
+          {
+            "ref": "refs/heads/grok/bb-contained",
+            "object": {
+              "sha": "cc30303030303030303030303030303030303030",
+              "type": "commit"
+            }
+          },
+          {
+            "ref": "refs/heads/grok/bb-orphan",
+            "object": {
+              "sha": "dd40404040404040404040404040404040404040",
+              "type": "commit"
+            }
+          }
+        ],
+        "claude-code-cli/": []
+      },
+      "commits": {
+        "aa10101010101010101010101010101010101010": {
+          "sha": "aa10101010101010101010101010101010101010",
+          "commit": {
+            "author": {
+              "date": "2026-11-10T12:00:00Z"
+            },
+            "committer": {
+              "date": "2026-11-10T12:00:00Z"
+            }
+          }
+        },
+        "bb20202020202020202020202020202020202020": {
+          "sha": "bb20202020202020202020202020202020202020",
+          "commit": {
+            "author": {
+              "date": "2026-11-10T16:00:00Z"
+            },
+            "committer": {
+              "date": "2026-11-10T16:00:00Z"
+            }
+          }
+        },
+        "cc30303030303030303030303030303030303030": {
+          "sha": "cc30303030303030303030303030303030303030",
+          "commit": {
+            "author": {
+              "date": "2026-11-10T16:00:00Z"
+            },
+            "committer": {
+              "date": "2026-11-10T16:00:00Z"
+            }
+          }
+        },
+        "dd40404040404040404040404040404040404040": {
+          "sha": "dd40404040404040404040404040404040404040",
+          "commit": {
+            "author": {
+              "date": "2026-11-11T08:00:00Z"
+            },
+            "committer": {
+              "date": "2026-11-11T08:00:00Z"
+            }
+          }
+        },
+        "ee50505050505050505050505050505050505050": {
+          "sha": "ee50505050505050505050505050505050505050",
+          "commit": {
+            "author": {
+              "date": "2026-10-01T12:00:00Z"
+            },
+            "committer": {
+              "date": "2026-10-01T12:00:00Z"
+            }
+          }
+        }
+      },
+      "compares": {
+        "main...aa10101010101010101010101010101010101010": {
+          "status": "ahead",
+          "ahead_by": 5,
+          "behind_by": 0,
+          "total_commits": 5
+        },
+        "main...bb20202020202020202020202020202020202020": {
+          "status": "ahead",
+          "ahead_by": 1,
+          "behind_by": 0,
+          "total_commits": 1
+        },
+        "main...cc30303030303030303030303030303030303030": {
+          "status": "ahead",
+          "ahead_by": 2,
+          "behind_by": 0,
+          "total_commits": 2
+        },
+        "main...dd40404040404040404040404040404040404040": {
+          "status": "ahead",
+          "ahead_by": 5,
+          "behind_by": 0,
+          "total_commits": 5
+        },
+        "main...ee50505050505050505050505050505050505050": {
+          "status": "ahead",
+          "ahead_by": 1,
+          "behind_by": 0,
+          "total_commits": 1
+        },
+        "aa10101010101010101010101010101010101010...cc30303030303030303030303030303030303030": {
+          "status": "behind",
+          "ahead_by": 0,
+          "behind_by": 3,
+          "total_commits": 0
+        },
+        "aa10101010101010101010101010101010101010...dd40404040404040404040404040404040404040": {
+          "status": "ahead",
+          "ahead_by": 5,
+          "behind_by": 0,
+          "total_commits": 5
+        }
+      }
+    }
+  }
+}
