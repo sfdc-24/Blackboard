@@ -2,13 +2,15 @@
 # as the current user, only while that user is logged on (no stored password).
 #
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\register_compliance_runner.ps1
-#   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\register_compliance_runner.ps1 -Python C:\Python314\python.exe
+#   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\register_compliance_runner.ps1 -Python C:\Python314\pythonw.exe
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\register_compliance_runner.ps1 -Unregister
 #
 # The runner reads the bus credentials the way scripts/bus.py does (<repo>\.env, or BLACKBOARD_ENV), so register
 # it from the checkout that holds the .env. Its state and log live in %USERPROFILE%\.claude\compliance-runner.
+# It runs under pythonw.exe so no console window opens; the runner starts its own children with no window.
+# The 14-minute limit is a backstop: the runner stops posting after 10 minutes and saves state after each post.
 param(
-    [string]$Python = "C:\Python314\python.exe",
+    [string]$Python = "C:\Python314\pythonw.exe",
     [string]$Script = (Join-Path $PSScriptRoot "compliance_runner.py"),
     [string]$TaskName = "SFDC24-ComplianceRunner",
     [int]$EveryMinutes = 15,

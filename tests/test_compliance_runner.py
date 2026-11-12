@@ -6,7 +6,9 @@ Run: python -m unittest tests.test_compliance_runner -v     (or: python tests/te
 import importlib.util
 import json
 import os
+import re
 import shutil
+import subprocess
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -73,14 +75,26 @@ class PrNames(unittest.TestCase):
     def test_repo_named_not_flagged(self):
         for t in ("merged sfdc-24/conference #428", "merged conference #428", "Blackboard PR #497 ok",
                   "sfdc24-site #12 deployed", "no numbers here", "Case 00009999 open",
-                  "conference #427 and #428 merged", "Blackboard 2 open (#484,#485)", "conference #427/#428",
-                  "never write '#428' bare"):
+                  "conference #427 and conference #428 merged", "conference: #428", "Blackboard PRs #484",
+                  "never write '#428' bare", "never write '#427/#428' bare"):
             self.assertEqual(self.flagged(t), [], t)
 
     def test_list_after_a_bare_number_still_flagged(self):
         self.assertEqual(rules(self.flagged("merged #427 and #428")), ["R-PR"])
         self.assertEqual(cr.bare_pr_refs("merged #427 and #428"), ["427", "428"])
         self.assertEqual(cr.bare_pr_refs("conference #427, later #430"), ["430"])
+
+    def test_strict_each_number_needs_its_repo(self):
+        for t in ("conference #427 and #428 merged", "Blackboard 2 open (#484,#485)", "conference #427/#428",
+                  "sfdc-24/conference is at 3 open PRs (#420)", "pushed to grok/g21-x #428",
+                  "cursor/c35-on-main (#428"):
+            self.assertEqual(rules(self.flagged(t)), ["R-PR"], t)
+        self.assertEqual(cr.bare_pr_refs("conference #427/#428"), ["428"])
+
+    def test_owner_words_not_judged(self):
+        p = "BCB|v=1|id=FAKE-OWN|phase=RESULT|class=LOG|from=gemini|to=owner|thread_id=TH-GEMINI-OWNER-20261111|fake #428"
+        self.assertEqual(cr.detect_pr_names(rows(cells("FAKE-OWN", 5, "gemini", p)), NOW), [])
+        self.assertEqual(self.flagged("fake #428", "|msg_type=PROMPT"), [])
 
     def test_ids_not_flagged(self):
         self.assertEqual(self.flagged("see FAKE-PR428-ROW", "|answers=FAKE-CLI-PR428-20261112T0100Z"), [])
@@ -245,7 +259,7 @@ class Cycle(unittest.TestCase):
         p = self.rings()[0]["payload"]
         self.assertNotIn("|", p.split("|text=", 1)[1])
         self.assertLessEqual(len(p), cr.MAX_ROW_CHARS)
-        for part in ("phase=ASK", "class=COMPLIANCE", "to=grok", "thread_id=TH-COMPLIANCE", "answers=FAKE-ASK-00",
+        for part in ("phase=ASK", "class=COMPLIANCE", "to=grok", "thread_id=TH-COMPLIANCE", "gap_row=FAKE-ASK-00",
                      "from=claude-code-cli"):
             self.assertIn(part, p)
 
@@ -334,6 +348,263 @@ class Cycle(unittest.TestCase):
         cr.run_cycle(d, NOW, out=lambda *_: None)
         cr.run_cycle(d, NOW + timedelta(minutes=15), out=lambda *_: None)
         self.assertEqual(len(self.rings()), 2)
+
+
+class Hardening(unittest.TestCase):
+    """The reviewed failure modes, each on fake rows."""
+
+    def test_hybrid_pipe_values_and_prose_fields(self):
+        p = ("|id=FAKE-H1| thread_id=TH-ESTIMATES| msg_type=ESTIMATE_DONE| task=G1| what=refuse to=gemini rows "
+             "that expect an answer unless phase=ASK, with a flag| by=grok|")
+        r = rows(cells("u-h1", 5, "grok", p))[0]
+        self.assertEqual(r.msg_type, "ESTIMATE_DONE")
+        self.assertEqual(r.phase, "")
+        self.assertNotIn("to", r.f)
+        r = rows(cells("u-h2", 5, "grok", "|id=FAKE-H2| msg_type=ESTIMATE_DONE| TASK ID: G15"))[0]
+        self.assertEqual(r.msg_type, "ESTIMATE_DONE")
+
+    def test_sender_from_commit_falls_back_to_source(self):
+        r = rows(cells("u-s", 5, "grok", "|id=FAKE-S1| thread_id=TH-FAKE from=1234abcd -> new branch text=x"))[0]
+        self.assertEqual(r.sender, "grok")
+        self.assertIn("grok", r.who)
+
+    def test_hybrid_ask_rows_are_asks(self):
+        a1 = cells("u-a1", 30, "grok", "|id=GROK-ASK-FAKE-ONE-20261112T0200Z| thread=TH-FAKE text=fake",
+                   target="claude-code-cli")
+        a2 = cells("u-a2", 30, "grok", "|id=FAKE-MT-1| thread_id=TH-FAKE msg_type=ASK Owner (fake) text=fake",
+                   target="gemini")
+        f = cr.detect_acks(rows(a1, a2), NOW)
+        self.assertEqual(sorted((x["row_id"], x["agent"]) for x in f),
+                         [("FAKE-MT-1", "gemini"), ("GROK-ASK-FAKE-ONE-20261112T0200Z", "claude-code-cli")])
+        notask = bcbrow("GROK-RESULT-FAKE-ASK-X", 30, "grok", to="gemini", phase="RESULT")
+        self.assertEqual(cr.detect_acks(rows(notask), NOW), [])
+
+    def test_late_ack_is_a_late_finding(self):
+        a = bcbrow("FAKE-AL", 60, "claude-code-cli", to="chatgpt-codex-desktop", phase="ASK")
+        k = bcbrow("FAKE-KL", 35, "chatgpt-codex-desktop", "|answers=FAKE-AL", phase="ACK")
+        f = cr.detect_acks(rows(a, k), NOW)
+        self.assertEqual(len(f), 1)
+        self.assertTrue(f[0]["historic"])
+        self.assertIn("25 min", f[0]["missing"])
+
+    def test_machine_asks_skipped_and_grok_answers_for_cursor(self):
+        m = bcbrow("FAKE-WAKE", 30, "bus-reconciler", to="grok", phase="ASK")
+        self.assertEqual(cr.detect_acks(rows(m), NOW), [])
+        a = bcbrow("FAKE-AC", 30, "gemini", to="grok,cursor", phase="ASK")
+        k = bcbrow("FAKE-KC", 25, "grok", "|answers=FAKE-AC", phase="ACK")
+        self.assertEqual(cr.detect_acks(rows(a, k), NOW), [])
+
+    def test_own_ring_never_answers_the_ask(self):
+        ask = bcbrow("FAKE-AS", 40, "gemini", to="claude-code-cli;grok", phase="ASK")
+        first = cr.detect_acks(rows(ask), NOW)[0]
+        ring = cr.ring_spec(first, NOW - timedelta(minutes=20), 1)
+        self.assertNotIn("|answers=", ring["payload"])
+        forged = ring["payload"].replace("gap_row=", "answers=")
+        rr = rows(ask, cells(ring["row_id"], 20, "claude-code-cli", forged))
+        self.assertEqual(len(cr.detect_acks(rr, NOW)), 2)
+
+    def test_r9_times_from_said_at(self):
+        said = ts(70)[:19] + "Z"
+        p = bcbrow("FAKE-P9", 30, "grok", "|msg_type=PROMPT|said_at=%s" % said, thread="TH-GROK-OWNER-20261111")
+        r = bcbrow("FAKE-R9", 29, "grok", "|msg_type=PROMPT_RESPONSE|reply_to=FAKE-P9|said_at=%s" % said,
+                   thread="TH-GROK-OWNER-20261111")
+        f = cr.detect_owner_log(rows(p, r), NOW)
+        self.assertEqual([x["key"] for x in f], ["R9-LAG:grok:20261111"])
+        self.assertTrue(f[0]["historic"])
+        p2 = bcbrow("FAKE-P10", 60, "grok", "|msg_type=PROMPT", thread="TH-GROK-OWNER-20261111")
+        r2 = bcbrow("FAKE-R10", 30, "grok", "|msg_type=PROMPT_RESPONSE|reply_to=FAKE-P10",
+                    thread="TH-GROK-OWNER-20261111")
+        f = cr.detect_owner_log(rows(p2, r2), NOW)
+        self.assertEqual([(x["key"], x.get("historic")) for x in f], [("R9:FAKE-P10", True)])
+
+    def test_r9_thread_label_and_untyped_owner_log(self):
+        p = bcbrow("FAKE-PL", 5, "grok", "|msg_type=PROMPT", thread="TH-CLI-OWNER-20261111")
+        self.assertEqual([x["key"] for x in cr.detect_owner_log(rows(p), NOW)], ["R9-THREAD:grok:20261111"])
+        u = cells("FAKE-U", 30, "gemini", "BCB|v=1|id=FAKE-U|phase=RESULT|class=LOG|from=gemini|to=owner|"
+                  "thread_id=TH-GEMINI-OWNER-20261111|fake words")
+        keys = sorted(x["key"] for x in cr.detect_owner_log(rows(u), NOW))
+        self.assertEqual(keys, ["R9-TYPE:gemini:20261111", "R9:FAKE-U"])
+
+    def test_estimate_task_key_supersede_and_id_match(self):
+        def est(rid, ago, task, done_in):
+            done = (NOW - timedelta(minutes=ago) + timedelta(minutes=done_in)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            return bcbrow(rid, ago, "grok", "|msg_type=ESTIMATE|task=%s|est_done=%s" % (task, done),
+                          thread="TH-ESTIMATES")
+        done = bcbrow("FAKE-ESTIMATE-DONE-C9", 50, "grok", "|task=C9", thread="TH-ESTIMATES")
+        self.assertEqual(cr.detect_estimates(rows(est("FAKE-E9", 60, "c9-fake-name", 20), done), NOW), [])
+        sup = bcbrow("FAKE-SUP", 55, "grok", "|msg_type=ESTIMATE_SUPERSEDED|supersedes=FAKE-E8",
+                     thread="TH-ESTIMATES")
+        self.assertEqual(cr.detect_estimates(rows(est("FAKE-E8", 60, "free text task", 5), sup), NOW), [])
+        self.assertEqual(rules(cr.detect_estimates(rows(sup), NOW)), [])
+        byid = cells("u-d7", 40, "grok", "|id=FAKE-ESTDONE-7| thread_id=TH-ESTIMATES task=other estimate=FAKE-E7")
+        self.assertEqual(cr.detect_estimates(rows(est("FAKE-E7", 60, "draft notes", 30), byid), NOW), [])
+        late = bcbrow("FAKE-ESTIMATE-DONE-C6", 5, "grok", "|task=C6", thread="TH-ESTIMATES")
+        f = cr.detect_estimates(rows(est("FAKE-E6", 60, "C6", 10), late), NOW)
+        self.assertEqual([(x["key"], x.get("historic")) for x in f], [("R10a:FAKE-E6", True)])
+
+    def test_pr_gap_needs_ring_ack_or_correction(self):
+        bad = bcbrow("FAKE-PRB", 10, "grok", text="merged #428")
+        f = cr.detect_pr_names(rows(bad), NOW)[0]
+        reply = rows(bad, bcbrow("FAKE-RE", 5, "grok", "|reply_to=FAKE-PRB", text="more"))
+        self.assertFalse(cr.ack_cleared(f, reply, []))
+        corr = rows(bad, bcbrow("FAKE-CO", 5, "grok", "|msg_type=CORRECTION|answers=FAKE-PRB",
+                                text="conference #428"))
+        self.assertTrue(cr.ack_cleared(f, corr, []))
+
+
+class CycleHardening(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        os.environ["COMPLIANCE_STATE_DIR"] = self.dir
+        self.posted, self.notes = [], []
+
+    def tearDown(self):
+        os.environ.pop("COMPLIANCE_STATE_DIR", None)
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def deps(self, board, **over):
+        d = {"read_rows": lambda: board, "pr_lists": lambda: {}, "free_ram": lambda: 8 * GB,
+             "cmdlines": lambda: ALL_PROCS, "post": lambda s: self.posted.append(s) or "ok",
+             "notify": lambda t: self.notes.append(t) or True, "state_path": os.path.join(self.dir, "state.json")}
+        d.update(over)
+        return d
+
+    def state(self):
+        with open(os.path.join(self.dir, "state.json"), encoding="utf-8") as fh:
+            return json.load(fh)
+
+    def asks(self, n, to, prefix="FAKE-ASK"):
+        return [bcbrow("%s-%s-%02d" % (prefix, to.upper()[:4], i), 40, "gemini", to=to, phase="ASK")
+                for i in range(n)]
+
+    def test_other_agents_and_severe_rules_ring_first(self):
+        board = (self.asks(6, "claude-code-cli") + self.asks(2, "grok")
+                 + [bcbrow("FAKE-PR-%d" % i, 10, "chatgpt-codex-desktop", text="merged #4%d2" % i)
+                    for i in range(3)])
+        cr.run_cycle(self.deps(board), NOW, out=lambda *_: None)
+        rings = [s for s in self.posted if "RING-R" in s["row_id"]]
+        tos = [re.search(r"\|to=([^|]+)", s["payload"]).group(1) for s in rings]
+        self.assertEqual(tos[:5], ["grok", "grok", "chatgpt-codex-desktop", "chatgpt-codex-desktop",
+                                   "chatgpt-codex-desktop"])
+        self.assertEqual(tos[5:], ["claude-code-cli"] * 3)
+        summ = [s for s in self.posted if "RING-SUMMARY" in s["row_id"]]
+        self.assertEqual(len(summ), 1)
+        self.assertIn("|to=claude-code-cli|", summ[0]["payload"])
+        self.assertIn("|gaps=", summ[0]["payload"])
+
+    def test_summary_records_only_what_fits(self):
+        long = "FAKE-" + "X" * 60
+        board = [bcbrow("%s-%02d" % (long, i), 40, "gemini", to="grok", phase="ASK") for i in range(40)]
+        cr.run_cycle(self.deps(board), NOW, out=lambda *_: None)
+        summ = [s for s in self.posted if "RING-SUMMARY" in s["row_id"]]
+        self.assertEqual(len(summ), 1)
+        self.assertLessEqual(len(summ[0]["payload"]), cr.MAX_ROW_CHARS)
+        carried = re.search(r"\|gaps=([^|]+)", summ[0]["payload"]).group(1).split(";")
+        st = self.state()
+        self.assertEqual(len(st["gaps"]), 8 + len(carried))
+        self.assertLess(len(st["gaps"]), 40)
+        for k in carried:
+            self.assertIn(k, st["gaps"])
+        board2 = board + [cells(s["row_id"], 0, "claude-code-cli", s["payload"]) for s in self.posted]
+        on_board = cr.board_rings(cr.parse_rows(board2))
+        for k in carried:
+            self.assertIn(k, on_board)
+
+    def test_failed_source_clears_nothing_and_no_second_escalation(self):
+        board = [bcbrow("FAKE-KEEP", 10, "grok", text="x")]
+        free = {"v": 2 * GB}
+
+        def ram():
+            if free["v"] is None:
+                raise OSError("fake probe failure")
+            return free["v"]
+        d = self.deps(board, free_ram=ram)
+        for i in range(3):
+            cr.run_cycle(d, NOW + timedelta(minutes=15 * i), out=lambda *_: None)
+        self.assertEqual(len(self.notes), 1)
+        free["v"] = None
+        cr.run_cycle(d, NOW + timedelta(minutes=45), out=lambda *_: None)
+        self.assertIn("R-HEALTH:ram", self.state()["gaps"])
+        free["v"] = 8 * GB
+        cr.run_cycle(d, NOW + timedelta(minutes=60), out=lambda *_: None)
+        self.assertNotIn("R-HEALTH:ram", self.state()["gaps"])
+        free["v"] = 2 * GB
+        for i in range(5, 9):
+            cr.run_cycle(d, NOW + timedelta(minutes=15 * i), out=lambda *_: None)
+        self.assertEqual(len(self.notes), 1)
+
+    def test_empty_board_read_clears_nothing(self):
+        cr.run_cycle(self.deps(self.asks(1, "grok")), NOW, out=lambda *_: None)
+        cr.run_cycle(self.deps([]), NOW + timedelta(minutes=15), out=lambda *_: None)
+        self.assertEqual(len(self.state()["gaps"]), 1)
+
+    def test_notify_timeout_counts_as_escalated(self):
+        def boom(text):
+            self.notes.append(text)
+            raise subprocess.TimeoutExpired("wa", 120)
+        d = self.deps(self.asks(1, "grok"), notify=boom)
+        for i in range(5):
+            cr.run_cycle(d, NOW + timedelta(minutes=15 * i), out=lambda *_: None)
+        self.assertEqual(len(self.notes), 1)
+        g = list(self.state()["gaps"].values())[0]
+        self.assertTrue(g["escalated"] and g["escalation_uncertain"])
+
+    def test_failed_notify_retries_after_an_hour_not_every_cycle(self):
+        d = self.deps(self.asks(1, "grok"), notify=lambda t: self.notes.append(t) or "failed")
+        for i in range(7):
+            cr.run_cycle(d, NOW + timedelta(minutes=15 * i), out=lambda *_: None)
+        self.assertEqual(len(self.notes), 2)          # cycle 2, then cycle 6 (60 min later)
+
+    def test_late_findings_ring_but_never_escalate(self):
+        board = [bcbrow("FAKE-AL2", 60, "claude-code-cli", to="grok", phase="ASK"),
+                 bcbrow("FAKE-KL2", 35, "grok", "|answers=FAKE-AL2", phase="ACK")]
+        for i in range(4):
+            cr.run_cycle(self.deps(board), NOW + timedelta(minutes=15 * i), out=lambda *_: None)
+        self.assertEqual(len([s for s in self.posted if "RING-R-ACK" in s["row_id"]]), 1)
+        self.assertEqual(self.notes, [])
+
+    def test_state_saved_after_each_post(self):
+        n = {"c": 0}
+
+        def post(s):
+            n["c"] += 1
+            if n["c"] == 2:
+                raise KeyboardInterrupt("fake kill mid-cycle")
+            self.posted.append(s)
+            return "ok"
+        try:
+            cr.run_cycle(self.deps(self.asks(3, "grok"), post=post), NOW, out=lambda *_: None)
+        except KeyboardInterrupt:
+            pass
+        self.assertEqual(len(self.state()["gaps"]), 1)
+
+    def test_budget_stops_posting(self):
+        t = {"v": 0.0}
+
+        def clock():
+            t["v"] += 400.0
+            return t["v"]
+        cr.run_cycle(self.deps(self.asks(4, "grok"), clock=clock), NOW, out=lambda *_: None)
+        self.assertLess(len(self.posted), 4)
+
+    def test_lock(self):
+        path = os.path.join(self.dir, "lock")
+        cr.take_lock(path)
+        with self.assertRaises(cr.Busy):
+            cr.take_lock(path)
+        cr.take_lock(path, now_s=os.path.getmtime(path) + cr.LOCK_STALE_S + 1)
+        rc = cr.main([], deps=self.deps(self.asks(1, "grok")), now=NOW)
+        self.assertEqual((rc, self.posted), (0, []))
+        cr.drop_lock(path)
+        self.assertFalse(os.path.exists(path))
+
+    def test_ring_ids_have_seconds(self):
+        cr.run_cycle(self.deps(self.asks(1, "grok")), NOW, out=lambda *_: None)
+        self.assertRegex(self.posted[0]["row_id"], r"^CLAUDE-CLI-COMPLIANCE-RING-R-ACK-\d{8}T\d{6}Z-01$")
+
+    def test_escalation_text_dedupes_ids(self):
+        t = cr.escalation_text([{"agent": "grok", "rule": "R-ACK", "ring_id": "FAKE-S", "key": "a"}] * 3)
+        self.assertEqual(t.splitlines()[2], "Rings on TH-COMPLIANCE: FAKE-S.")
 
 
 if __name__ == "__main__":
