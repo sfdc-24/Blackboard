@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - 'scripts/pipedream_wa_*.js'
+      - 'scripts/wa_dead_letter.js'
       - 'tests/test_whatsapp_gateway.cjs'
       - 'tests/helpers/pipedream_loader.cjs'
       - '.github/workflows/whatsapp-gateway-tests.yml'
@@ -11,6 +12,7 @@ on:
     branches: [main]
     paths:
       - 'scripts/pipedream_wa_*.js'
+      - 'scripts/wa_dead_letter.js'
       - 'tests/test_whatsapp_gateway.cjs'
       - 'tests/helpers/pipedream_loader.cjs'
       - '.github/workflows/whatsapp-gateway-tests.yml'

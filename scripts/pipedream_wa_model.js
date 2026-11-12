@@ -10,6 +10,67 @@
 
 const DEFAULT_TIMEOUT_MS = 30000;
 
+// G16 dead-letter helpers (keep in sync with scripts/wa_dead_letter.js).
+// Inlined so this Pipedream step is a single file. Tests inject the module.
+const _DLQ_META = 'dlq:__meta__';
+function _sanitizeForLog(value, prose) {
+  let msg = String((value && value.message) || value || '');
+  msg = msg.replace(/Bearer\s+\S+/gi, 'Bearer [redacted]');
+  msg = msg.replace(/(api[_-]?key|secret|token|password|authorization)[=:]\s*\S+/gi, '$1=[redacted]');
+  msg = msg.replace(/\bsk-[A-Za-z0-9_-]+/g, '[redacted]');
+  msg = msg.replace(/\bAIza[A-Za-z0-9_-]+/g, '[redacted]');
+  for (const raw of prose || []) {
+    const snippet = String(raw || '');
+    if (snippet.trim().length < 3) continue;
+    const escaped = snippet.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    msg = msg.replace(new RegExp(escaped, 'g'), '[redacted]');
+  }
+  msg = msg.replace(/\|/g, '/').replace(/\s+/g, ' ').trim().slice(0, 200);
+  return msg || 'failed turn';
+}
+function _safeLog(log, fields) {
+  const allowed = ['wamid', 'kind', 'status', 'retryCount', 'lane', 'error', 'event'];
+  const row = {};
+  for (const key of allowed) {
+    if (fields[key] != null && fields[key] !== '') {
+      row[key] = key === 'error' ? _sanitizeForLog(fields[key]) : fields[key];
+    }
+  }
+  const line = Object.keys(row).map(k => k + '=' + row[k]).join(' ');
+  if (typeof log === 'function') log(line);
+  return line;
+}
+function _p0Payload(record) {
+  return [
+    'P0', 'v=1', 'phase=P0', 'class=ALERT', 'source=whatsapp-gateway', 'kind=dlq_first',
+    'wamid=' + record.wamid, 'retry_count=' + record.retryCount, 'status=' + record.status,
+    'error=' + _sanitizeForLog(record.error),
+  ].join('|');
+}
+async function _enqueueDeadLetter(store, entry) {
+  const record = {
+    wamid: entry.wamid, kind: entry.kind, status: entry.status, lane: entry.lane || null,
+    error: _sanitizeForLog(entry.error, entry.prose), retryCount: 1,
+    failedAt: entry.failedAt || new Date().toISOString(), stored: false, firstEntry: false,
+  };
+  if (!store || typeof store.get !== 'function' || typeof store.set !== 'function') return record;
+  const key = 'dlq:' + record.wamid;
+  const prev = await store.get(key);
+  record.retryCount = ((prev && prev.retryCount) || 0) + 1;
+  const meta = (await store.get(_DLQ_META)) || { entries: 0, p0Posted: false };
+  record.firstEntry = meta.entries === 0;
+  await store.set(key, {
+    wamid: record.wamid, kind: record.kind, status: record.status, lane: record.lane,
+    error: record.error, retryCount: record.retryCount, failedAt: record.failedAt,
+  });
+  if (!prev) meta.entries += 1;
+  if (record.firstEntry) meta.p0Posted = true;
+  await store.set(_DLQ_META, meta);
+  record.stored = true;
+  return record;
+}
+
+
 function isTimeout(err) {
   if (!err || typeof err !== 'object') return false;
   if (err.code === 'MODEL_TIMEOUT' || err.name === 'TimeoutError') return true;
@@ -17,9 +78,12 @@ function isTimeout(err) {
   return false;
 }
 
-function safeError(err) {
+function safeError(err, prose) {
+  if (typeof sanitizeForLog === 'function') return sanitizeForLog(err, prose);
   let msg = String((err && err.message) || err || 'model turn failed');
   msg = msg.replace(/Bearer\s+\S+/gi, 'Bearer [redacted]');
+  msg = msg.replace(/(api[_-]?key|secret|token|password|authorization)[=:]\s*\S+/gi, '$1=[redacted]');
+  msg = msg.replace(/\bsk-[A-Za-z0-9_-]+/g, '[redacted]');
   msg = msg.replace(/\|/g, '/').replace(/\s+/g, ' ').trim().slice(0, 200);
   return msg || 'model turn failed';
 }
@@ -97,7 +161,7 @@ async function defaultPostAndon(payload) {
   }
 }
 
-function andonPayload({ kind, status, job, error }) {
+function andonPayload({ kind, status, job, error, prose }) {
   return [
     'ANDON',
     'v=1',
@@ -107,7 +171,7 @@ function andonPayload({ kind, status, job, error }) {
     'status=' + status,
     'wamid=' + job.wamid,
     'lane=' + laneOf(job),
-    'error=' + safeError(error),
+    'error=' + safeError(error, prose),
   ].join('|');
 }
 
@@ -145,12 +209,23 @@ export default defineComponent({
     // network occurs.
     callModel: { type: 'object', optional: true, description: 'Optional model-call hook; defaults to MODEL_URL fetch' },
     postAndon: { type: 'object', optional: true, description: 'Optional ANDON hook; defaults to the board append' },
+    postP0: { type: 'object', optional: true, description: 'Optional P0 hook; defaults to the board append' },
+    deadLetterStore: { type: 'object', optional: true, description: 'Optional dead-letter get/set store' },
+    log: { type: 'object', optional: true, description: 'Optional P5-safe logger' },
   },
   async run({ $ }) {
     const job = this.job;
     assertJob(job);
     const callModel = typeof this.callModel === 'function' ? this.callModel : defaultCallModel;
     const postAndon = typeof this.postAndon === 'function' ? this.postAndon : defaultPostAndon;
+    const postP0 = typeof this.postP0 === 'function' ? this.postP0 : defaultPostAndon;
+    const log = typeof this.log === 'function' ? this.log : () => {};
+    const enqueue = typeof enqueueDeadLetter === 'function' ? enqueueDeadLetter : _enqueueDeadLetter;
+    const p0 = typeof p0Payload === 'function' ? p0Payload : _p0Payload;
+    const slog = typeof safeLog === 'function' ? safeLog : _safeLog;
+    const prose = [];
+    const msgText = job?.input?.message?.text;
+    if (typeof msgText === 'string' && msgText.trim()) prose.push(msgText);
 
     let modelText;
     try {
@@ -165,17 +240,40 @@ export default defineComponent({
       const kind = timeout ? 'model_timeout' : 'model_error';
       let andonPosted = false;
       try {
-        await postAndon(andonPayload({ kind, status, job, error: err }));
+        await postAndon(andonPayload({ kind, status, job, error: err, prose }));
         andonPosted = true;
       } catch {
         andonPosted = false;
       }
+      let dlq = null;
+      let p0Posted = false;
+      if (enqueue) {
+        try {
+          dlq = await enqueue(this.deadLetterStore, {
+            wamid: job.wamid, kind, status, lane: laneOf(job), error: err, prose,
+          });
+          slog(log, { event: 'dlq', wamid: dlq.wamid, kind: dlq.kind, status: dlq.status,
+            retryCount: dlq.retryCount, lane: dlq.lane, error: dlq.error });
+          if (dlq.firstEntry && p0) {
+            try {
+              await postP0(p0(dlq));
+              p0Posted = true;
+            } catch {
+              p0Posted = false;
+            }
+          }
+        } catch {
+          dlq = dlq || { stored: false };
+        }
+      }
       if (typeof $?.respond === 'function') {
         await $.respond({ status, body: timeout ? 'model turn timed out' : 'model turn failed' });
       }
-      const failure = new Error(`model turn failed (${status}): ${safeError(err)}`);
+      const failure = new Error(`model turn failed (${status}): ${safeError(err, prose)}`);
       failure.status = status;
       failure.andonPosted = andonPosted;
+      failure.dlq = dlq;
+      failure.p0Posted = p0Posted;
       throw failure;
     }
 

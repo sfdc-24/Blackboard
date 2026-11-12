@@ -93,13 +93,115 @@ function headerValue(headers, wantedName) {
   return Array.isArray(value) && value.length === 1 ? value[0] : value;
 }
 
+
+// G16 dead-letter helpers (keep in sync with scripts/wa_dead_letter.js).
+// Inlined so this Pipedream step is a single file. Tests inject the module.
+const _DLQ_META = 'dlq:__meta__';
+function _sanitizeForLog(value, prose) {
+  let msg = String((value && value.message) || value || '');
+  msg = msg.replace(/Bearer\s+\S+/gi, 'Bearer [redacted]');
+  msg = msg.replace(/(api[_-]?key|secret|token|password|authorization)[=:]\s*\S+/gi, '$1=[redacted]');
+  msg = msg.replace(/\bsk-[A-Za-z0-9_-]+/g, '[redacted]');
+  msg = msg.replace(/\bAIza[A-Za-z0-9_-]+/g, '[redacted]');
+  for (const raw of prose || []) {
+    const snippet = String(raw || '');
+    if (snippet.trim().length < 3) continue;
+    const escaped = snippet.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    msg = msg.replace(new RegExp(escaped, 'g'), '[redacted]');
+  }
+  msg = msg.replace(/\|/g, '/').replace(/\s+/g, ' ').trim().slice(0, 200);
+  return msg || 'failed turn';
+}
+function _safeLog(log, fields) {
+  const allowed = ['wamid', 'kind', 'status', 'retryCount', 'lane', 'error', 'event'];
+  const row = {};
+  for (const key of allowed) {
+    if (fields[key] != null && fields[key] !== '') {
+      row[key] = key === 'error' ? _sanitizeForLog(fields[key]) : fields[key];
+    }
+  }
+  const line = Object.keys(row).map(k => k + '=' + row[k]).join(' ');
+  if (typeof log === 'function') log(line);
+  return line;
+}
+function _p0Payload(record) {
+  return [
+    'P0', 'v=1', 'phase=P0', 'class=ALERT', 'source=whatsapp-gateway', 'kind=dlq_first',
+    'wamid=' + record.wamid, 'retry_count=' + record.retryCount, 'status=' + record.status,
+    'error=' + _sanitizeForLog(record.error),
+  ].join('|');
+}
+async function _enqueueDeadLetter(store, entry) {
+  const record = {
+    wamid: entry.wamid, kind: entry.kind, status: entry.status, lane: entry.lane || null,
+    error: _sanitizeForLog(entry.error, entry.prose), retryCount: 1,
+    failedAt: entry.failedAt || new Date().toISOString(), stored: false, firstEntry: false,
+  };
+  if (!store || typeof store.get !== 'function' || typeof store.set !== 'function') return record;
+  const key = 'dlq:' + record.wamid;
+  const prev = await store.get(key);
+  record.retryCount = ((prev && prev.retryCount) || 0) + 1;
+  const meta = (await store.get(_DLQ_META)) || { entries: 0, p0Posted: false };
+  record.firstEntry = meta.entries === 0;
+  await store.set(key, {
+    wamid: record.wamid, kind: record.kind, status: record.status, lane: record.lane,
+    error: record.error, retryCount: record.retryCount, failedAt: record.failedAt,
+  });
+  if (!prev) meta.entries += 1;
+  if (record.firstEntry) meta.p0Posted = true;
+  await store.set(_DLQ_META, meta);
+  record.stored = true;
+  return record;
+}
+
+async function defaultPostP0(payload) {
+  const url = process.env.ALPHA_URL;
+  const secret = process.env.ALPHA_SECRET;
+  if (!url || !secret) throw new Error('ALPHA_URL / ALPHA_SECRET env vars missing');
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      secret,
+      source_tag: "whatsapp",
+      target_surface: "Blackboard Alpha DB",
+      action_type: "APPEND",
+      payload,
+    }),
+    signal: AbortSignal.timeout(30000),
+  });
+  let reply;
+  try { reply = await res.json(); }
+  catch { throw new Error('P0 append returned invalid JSON'); }
+  if (!res.ok || reply?.result !== 'success' || reply.error ||
+      typeof reply.rowId !== 'string' || !/^WRK-[A-Za-z0-9-]+$/.test(reply.rowId)) {
+    throw new Error('P0 append was not acknowledged');
+  }
+}
+
 export default defineComponent({
   props: {
     // Pipedream rejects optional:true on data_store props ("UserError: optional
     // not supported for prop db", found in step-test 2026-09-01) -- required.
-    db: { type: "data_store" }, // wamid dedup store (Doctrine #3: Meta retries -> dupes without it)
+    db: { type: "data_store" }, // wamid dedup + G16 dead-letter store
+    postP0: { type: "object", optional: true, description: "Optional P0 hook; defaults to the board append" },
+    log: { type: "object", optional: true, description: "Optional P5-safe logger (no secrets, no raw prose)" },
   },
   async run({ steps, $ }) {
+    // G16 helpers: provided by scripts/wa_dead_letter.js in tests; inlined fallbacks below for Pipedream.
+    const enqueue = typeof enqueueDeadLetter === 'function' ? enqueueDeadLetter : _enqueueDeadLetter;
+    const p0 = typeof p0Payload === 'function' ? p0Payload : _p0Payload;
+    const slog = typeof safeLog === 'function' ? safeLog : _safeLog;
+    const postP0 = typeof this.postP0 === 'function' ? this.postP0 : defaultPostP0;
+    const log = typeof this.log === 'function' ? this.log : () => {};
+    let responded = false;
+    const respond = async (status, body) => {
+      if (responded) return;
+      responded = true;
+      if (typeof $?.respond === 'function') {
+        await $.respond({ status, body });
+      }
+    };
     const event = steps.trigger.event;
 
     // Boolean-only env presence check — never the values (D-18).
@@ -132,18 +234,25 @@ export default defineComponent({
       return $.flow.exit(`unsupported method ${event.method}`);
     }
 
-    // Meta requires a response in ~5s and disables the webhook after repeated
-    // failures — ACK before doing the slow Apps Script work.
-    await $.respond({ immediate: true, status: 200, body: "EVENT_RECEIVED" });
-
+    // G16 / Case 00001052: persist the inbound turn BEFORE the ACK.
+    // A 200 before persist was a masked success: Meta would not retry, and the
+    // turn was lost. Meta may retry if we exceed its window; wamid dedup handles that.
     const url = process.env.ALPHA_URL;
     const secret = process.env.ALPHA_SECRET;
     if (!url || !secret) {
-      throw new Error("ALPHA_URL / ALPHA_SECRET env vars missing (D-18: secrets live in env, never in code)");
+      const err = new Error("ALPHA_URL / ALPHA_SECRET env vars missing (D-18: secrets live in env, never in code)");
+      err.status = 500;
+      await respond(500, "inbound persist failed");
+      throw err;
     }
     if (!this.db || typeof this.db.get !== 'function' || typeof this.db.set !== 'function') {
-      throw new Error('WhatsApp deduplication Data Store is not configured');
+      const err = new Error('WhatsApp deduplication Data Store is not configured');
+      err.status = 500;
+      await respond(500, "inbound persist failed");
+      throw err;
     }
+
+    try {
 
     // Signature validation (plan Phase 1): enable by setting META_APP_SECRET.
     // Header names are case-insensitive. Uses the raw body when the trigger
@@ -210,10 +319,20 @@ export default defineComponent({
           });
           let gatewayReply;
           try { gatewayReply = await res.json(); }
-          catch { throw new Error('board append returned invalid JSON; read back before replay'); }
+          catch {
+            const err = new Error('board append returned invalid JSON; read back before replay');
+            err.status = 503;
+            err.wamid = wamid;
+            err.dlqEntry = { wamid, kind: 'persist_failed', status: 503, error: err, prose: [message.text] };
+            throw err;
+          }
           if (!res.ok || gatewayReply?.result !== 'success' || gatewayReply.error ||
               typeof gatewayReply.rowId !== 'string' || !/^WRK-[A-Za-z0-9-]+$/.test(gatewayReply.rowId)) {
-            throw new Error('board append was not acknowledged; read back before replay');
+            const err = new Error('board append was not acknowledged; read back before replay');
+            err.status = 503;
+            err.wamid = wamid;
+            err.dlqEntry = { wamid, kind: 'persist_failed', status: 503, error: err, prose: [message.text] };
+            throw err;
           }
 
           await this.db.set(wamid, { rowId: gatewayReply.rowId, acceptedAt: new Date().toISOString() });
@@ -222,6 +341,9 @@ export default defineComponent({
         }
       }
     }
+
+    // Persist succeeded (or there was nothing new to persist). ACK now, not before.
+    await respond(200, "EVENT_RECEIVED");
 
     // D-4 caveat, encoded: the gateway reply is NOT proof the row landed.
     // Read-back on the sheet remains the arbiter; this export is diagnostics.
@@ -234,5 +356,26 @@ export default defineComponent({
       messages,
       results,
     });
+    } catch (err) {
+      const status = Number(err && err.status) || (String(err && err.message || '').includes('Signature') ||
+        String(err && err.message || '').includes('signature') ||
+        String(err && err.message || '').includes('unsigned') ? 403 : 500);
+      const failedStatus = err.status || (status === 403 ? 403 : (String(err && err.message || '').includes('acknowledged') ||
+        String(err && err.message || '').includes('invalid JSON') ? 503 : status));
+      if (err && err.dlqEntry) {
+        const record = await enqueue(this.db, err.dlqEntry);
+        slog(log, { event: 'dlq', wamid: record.wamid, kind: record.kind, status: record.status,
+          retryCount: record.retryCount, error: record.error });
+        if (record.firstEntry) {
+          try { await postP0(p0(record)); }
+          catch { /* P0 is best-effort; the non-200 and DLQ still stand */ }
+        }
+        err.dlq = record;
+      } else {
+        slog(log, { event: 'inbound_failed', status: failedStatus, error: err, wamid: err && err.wamid });
+      }
+      await respond(failedStatus, failedStatus === 403 ? "Forbidden" : "inbound persist failed");
+      throw err;
+    }
   },
 });

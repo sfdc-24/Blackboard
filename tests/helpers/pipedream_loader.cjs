@@ -3,12 +3,18 @@ const path = require('node:path');
 const vm = require('node:vm');
 const crypto = require('node:crypto');
 
+const dlq = require('../../scripts/wa_dead_letter.js');
+
 module.exports = function load(name, env = {}, fetch = () => { throw new Error('unexpected network access'); }) {
   const source = fs.readFileSync(path.join(__dirname, '../../scripts', name), 'utf8')
     .replace(/^import crypto from "crypto";\r?\n/m, '')
     .replace('export default defineComponent(', 'globalThis.component = defineComponent(');
-  const context = vm.createContext({ crypto, process: { env }, fetch, AbortSignal,
-    Buffer, defineComponent: value => value });
+  const context = vm.createContext({
+    crypto, process: { env }, fetch, AbortSignal, Buffer,
+    defineComponent: value => value,
+    // G16 shared helpers (also unit-tested via the module itself)
+    ...dlq,
+  });
   vm.runInContext(source, context, { filename: name });
   return context;
 };

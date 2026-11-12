@@ -7,18 +7,23 @@ const OPERATOR = '15550001234';
 const textMessage = (text = 'Project status', id = 'wamid.fixture') => ({ id, from: OPERATOR, type: 'text', text: { body: text } });
 const plain = value => JSON.parse(JSON.stringify(value));
 
-function inbound() {
-  const requests = [], saved = new Map(), exports = {};
+function inbound(hooks = {}) {
+  const requests = [], saved = new Map(), exports = {}, responses = [], p0s = [], logs = [], timeline = [];
   let response = { ok: true, json: async () => ({ result: 'success', rowId: 'WRK-fixture' }) };
-  const env = { ALPHA_URL: 'https://example.invalid/board', ALPHA_SECRET: 'fixture',
+  const env = { ALPHA_URL: 'https://example.invalid/board', ALPHA_SECRET: 'fixture-secret-value',
     META_VERIFY_TOKEN: 'mock-verify-token', META_APP_SECRET: 'mock-app-secret' };
   const context = load('pipedream_wa_inbound.js', env, async (_url, options) => {
+    timeline.push({ kind: 'persist', requests: requests.length });
     requests.push(JSON.parse(options.body));
     return response;
   });
-  const props = { db: { get: async id => saved.get(id), set: async (id, value) => saved.set(id, value) } };
+  const props = {
+    db: { get: async id => saved.get(id), set: async (id, value) => saved.set(id, value) },
+    postP0: hooks.postP0 || (async payload => { p0s.push(payload); }),
+    log: hooks.log || (line => { logs.push(line); }),
+  };
   return {
-    requests, saved, exports, context,
+    requests, saved, exports, context, responses, p0s, logs, timeline,
     setResponse: value => { response = value; },
     async run(messages, extraValue = {}, mutateEvent = () => {}) {
       const body = { entry: [{ changes: [{ value: { ...extraValue, messages } }] }] };
@@ -27,7 +32,11 @@ function inbound() {
       const event = { method: 'POST', body, raw_body, headers: { 'x-hub-signature-256': signature } };
       mutateEvent(event);
       await context.component.run.call(props, { steps: { trigger: { event } }, $: {
-        respond: async () => {}, export: (name, value) => { exports[name] = plain(value); },
+        respond: async value => {
+          responses.push(plain(value));
+          timeline.push({ kind: 'respond', status: value && value.status, requests: requests.length });
+        },
+        export: (name, value) => { exports[name] = plain(value); },
       } });
       return exports.summary;
     },
@@ -117,7 +126,7 @@ test('HTTP and application append failures cannot mark a wamid as processed', as
     const a = inbound();
     a.setResponse(response);
     await assert.rejects(a.run([textMessage()]), /read back before replay/);
-    assert.equal(a.saved.size, 0);
+    assert.equal(a.saved.get('wamid.fixture'), undefined); // no processed receipt
   }
 });
 
@@ -253,15 +262,25 @@ function modelJob() {
   };
 }
 
+function memoryStore() {
+  const m = new Map();
+  return { _m: m, get: async k => m.get(k), set: async (k, v) => { m.set(k, v); } };
+}
+
 function modelTurn(hooks = {}) {
-  const andon = [], responses = [];
+  const andon = [], responses = [], p0s = [], logs = [];
+  const store = hooks.store || memoryStore();
   const env = { MODEL_TIMEOUT_MS: String(hooks.timeoutMs || 30) };
   const context = load('pipedream_wa_model.js', env);
   const postAndon = hooks.postAndon || (async payload => { andon.push(payload); });
+  const postP0 = hooks.postP0 || (async payload => { p0s.push(payload); });
   return {
-    andon, responses,
+    andon, responses, p0s, logs, store,
     async run(job = modelJob()) {
-      return context.component.run.call({ job, callModel: hooks.callModel, postAndon }, { $: {
+      return context.component.run.call({
+        job, callModel: hooks.callModel, postAndon, postP0,
+        deadLetterStore: store, log: hooks.log || (line => { logs.push(line); }),
+      }, { $: {
         respond: async value => { responses.push(plain(value)); },
         export: () => {},
       } });
@@ -316,4 +335,126 @@ test('a model timeout returns HTTP 504 and posts an ANDON row', async () => {
   assert.deepEqual(turn.responses, [{ status: 504, body: 'model turn timed out' }]);
   assert.equal(turn.andon.length, 1);
   assert.match(turn.andon[0], /^ANDON\|v=1\|phase=ANDON\|source=whatsapp-gateway\|kind=model_timeout\|status=504\|wamid=wamid.fixture\|lane=claude\|error=model turn timed out$/);
+});
+
+const dlq = require('../scripts/wa_dead_letter.js');
+
+test('G16: a successful inbound persist completes before the 200 ACK', async () => {
+  const a = inbound();
+  await a.run([textMessage()]);
+  assert.equal(a.requests.length, 1);
+  assert.deepEqual(a.responses, [{ status: 200, body: 'EVENT_RECEIVED' }]);
+  const kinds = a.timeline.map(e => e.kind);
+  assert.deepEqual(kinds, ['persist', 'respond']);
+  assert.equal(a.timeline[1].status, 200);
+  assert.equal(a.timeline[1].requests, 1);
+  assert.equal(a.p0s.length, 0);
+});
+
+test('G16: a persist failure returns non-200, writes a DLQ entry, and posts P0 on the first entry', async () => {
+  const a = inbound();
+  a.setResponse({ ok: false, json: async () => ({ result: 'success', rowId: 'WRK-fake' }) });
+  const err = await rejected(() => a.run([textMessage('Project status')]));
+  assert.match(String(err && err.message), /read back before replay/);
+  assert.equal(a.saved.get('wamid.fixture'), undefined);
+  assert.ok(a.responses.every(r => r.status !== 200), a.responses);
+  assert.equal(a.responses[0].status, 503);
+  const record = err.dlq;
+  assert.equal(record.wamid, 'wamid.fixture');
+  assert.equal(record.kind, 'persist_failed');
+  assert.equal(record.retryCount, 1);
+  assert.equal(record.firstEntry, true);
+  assert.equal(a.p0s.length, 1);
+  assert.match(a.p0s[0], /^P0\|v=1\|phase=P0\|class=ALERT\|source=whatsapp-gateway\|kind=dlq_first\|wamid=wamid.fixture\|retry_count=1\|status=503\|/);
+});
+
+test('G16: a later DLQ entry increments retry count and does not post a second P0', async () => {
+  const a = inbound();
+  a.setResponse({ ok: false, json: async () => ({ result: 'error', rowId: 'WRK-fake' }) });
+  const first = await rejected(() => a.run([textMessage()]));
+  assert.equal(first.dlq.retryCount, 1);
+  assert.equal(a.p0s.length, 1);
+  const second = await rejected(() => a.run([textMessage()]));
+  assert.equal(second.dlq.retryCount, 2);
+  assert.equal(second.dlq.firstEntry, false);
+  assert.equal(a.p0s.length, 1);
+});
+
+test('G16: a failed model turn goes to the DLQ with a retry count and returns non-200', async () => {
+  const turn = modelTurn({ callModel: async () => { throw new Error('provider rejected the request'); } });
+  const err = await rejected(() => turn.run());
+  assert.equal(err.status, 502);
+  assert.equal(err.dlq.retryCount, 1);
+  assert.equal(err.dlq.kind, 'model_error');
+  assert.equal(err.dlq.lane, 'claude');
+  assert.equal(err.p0Posted, true);
+  assert.equal(turn.p0s.length, 1);
+  assert.match(turn.p0s[0], /kind=dlq_first/);
+  assert.deepEqual(turn.responses, [{ status: 502, body: 'model turn failed' }]);
+});
+
+test('G16: the first model DLQ entry posts P0; a retry of the same turn does not', async () => {
+  const store = memoryStore();
+  const turn = modelTurn({
+    store,
+    callModel: async () => { throw new Error('provider rejected the request'); },
+  });
+  const first = await rejected(() => turn.run());
+  assert.equal(first.dlq.retryCount, 1);
+  assert.equal(first.p0Posted, true);
+  const second = await rejected(() => turn.run());
+  assert.equal(second.dlq.retryCount, 2);
+  assert.equal(second.dlq.firstEntry, false);
+  assert.equal(second.p0Posted, false);
+  assert.equal(turn.p0s.length, 1);
+});
+
+test('G16 P5: logs, DLQ and P0 contain no secret values and no raw message prose', async () => {
+  const prose = 'please review the quarterly forecast for next week';
+  const secret = 'sk-FIXTURESECRETVALUE';
+  const turn = modelTurn({
+    callModel: async () => { throw new Error('provider rejected: ' + prose + ' token=' + secret); },
+  });
+  const job = modelJob();
+  job.input.message.text = prose;
+  const err = await rejected(() => turn.run(job));
+  const blobs = [
+    JSON.stringify(err.dlq),
+    turn.p0s.join('\n'),
+    turn.logs.join('\n'),
+    turn.andon.join('\n'),
+    JSON.stringify(turn.responses),
+  ].join('\n');
+  assert.equal(blobs.includes(prose), false, blobs);
+  assert.equal(blobs.includes(secret), false, blobs);
+  assert.equal(blobs.includes('FIXTURESECRETVALUE'), false, blobs);
+  assert.equal(blobs.includes('fixture-secret-value'), false, blobs);
+  assert.match(err.dlq.error, /\[redacted\]/);
+});
+
+test('G16 P5: inbound logs and P0 rows omit secrets and raw prose', async () => {
+  const prose = 'please review the quarterly forecast for next week';
+  const a = inbound();
+  a.setResponse({ ok: false, json: async () => ({ result: 'error' }) });
+  const err = await rejected(() => a.run([textMessage(prose)]));
+  const blobs = [JSON.stringify(err.dlq), a.p0s.join('\n'), a.logs.join('\n')].join('\n');
+  assert.equal(blobs.includes(prose), false, blobs);
+  assert.equal(blobs.includes('fixture-secret-value'), false, blobs);
+  // The persist request body is the board append (not a log) and is not asserted here.
+});
+
+test('G16: dead-letter helper retry count and first-entry flag', async () => {
+  const store = memoryStore();
+  const a = await dlq.enqueueDeadLetter(store, { wamid: 'wamid.a', kind: 'model_error', status: 502, error: 'x' });
+  assert.equal(a.retryCount, 1);
+  assert.equal(a.firstEntry, true);
+  const b = await dlq.enqueueDeadLetter(store, { wamid: 'wamid.a', kind: 'model_error', status: 502, error: 'x' });
+  assert.equal(b.retryCount, 2);
+  assert.equal(b.firstEntry, false);
+  const c = await dlq.enqueueDeadLetter(store, { wamid: 'wamid.b', kind: 'model_timeout', status: 504, error: 't' });
+  assert.equal(c.retryCount, 1);
+  assert.equal(c.firstEntry, false);
+  const payload = dlq.p0Payload(a);
+  assert.match(payload, /^P0\|v=1\|phase=P0\|class=ALERT\|source=whatsapp-gateway\|kind=dlq_first/);
+  assert.equal(payload.includes('|'), true);
 });
