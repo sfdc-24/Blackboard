@@ -888,6 +888,215 @@ def test_fence_migration(server_py, tmp):
             stop(proc)
 
 
+
+def test_busdb_wal_writer_leases(server_py, tmp):
+    """WAL, 5000ms busy_timeout, and 60s BEGIN IMMEDIATE writer leases.
+
+    Concurrent appenders (including two processes on one bus.db) must all
+    land, with no lost rows and no 'database is locked' errors.
+    """
+    import concurrent.futures
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("busdb_wal_bus", server_py)
+    bus = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bus)
+
+    check("writer lease constant is 60 seconds", bus.WRITER_LEASE_SECONDS == 60)
+    check("busy_timeout constant is 5000 ms", bus.BUSY_TIMEOUT_MS == 5000)
+
+    pragma_db = os.path.join(tmp, "wal-pragmas.db")
+    conn = bus.db_connect(pragma_db)
+    try:
+        mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        timeout = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+        check("db_connect enables WAL journal_mode", str(mode).lower() == "wal", mode)
+        check("db_connect sets busy_timeout to 5000ms", int(timeout) == 5000, timeout)
+    finally:
+        conn.close()
+
+    # A held reserved lock is waited out for the lease window, not raised
+    # immediately as 'database is locked'. Initialize the schema first so the
+    # waiter does not run CREATE TABLE while the holder has the reserved lock.
+    lease_db = os.path.join(tmp, "wal-lease.db")
+    ready = bus.db_connect(lease_db)
+    ready.close()
+    holder = sqlite3.connect(lease_db)
+    holder.execute("PRAGMA journal_mode=WAL")
+    holder.execute("BEGIN IMMEDIATE")
+    acquired = {"ok": False, "error": None}
+    started = threading.Event()
+
+    def take_lease():
+        # SQLite connections are thread-local; open the waiter in this thread.
+        waiter = sqlite3.connect(lease_db, timeout=0.05)
+        started.set()
+        try:
+            bus.begin_immediate_lease(waiter, lease_seconds=2)
+            acquired["ok"] = True
+            waiter.rollback()
+        except Exception as exc:  # noqa: BLE001 - the test records the failure
+            acquired["error"] = exc
+        finally:
+            waiter.close()
+
+    thread = threading.Thread(target=take_lease)
+    thread.start()
+    started.wait(timeout=2)
+    time.sleep(0.2)
+    check("BEGIN IMMEDIATE waiter is blocked while another writer holds the lease",
+          thread.is_alive() and not acquired["ok"], acquired["error"])
+    holder.commit()
+    thread.join(timeout=5)
+    check("BEGIN IMMEDIATE waiter acquires the lease after the holder commits",
+          acquired["ok"] and acquired["error"] is None, acquired["error"])
+    holder.close()
+
+    # If the holder never releases, the lease expires with 'database is locked'.
+    expire_db = os.path.join(tmp, "wal-lease-expire.db")
+    ready = bus.db_connect(expire_db)
+    ready.close()
+    holder = sqlite3.connect(expire_db)
+    holder.execute("PRAGMA journal_mode=WAL")
+    holder.execute("BEGIN IMMEDIATE")
+    waiter = sqlite3.connect(expire_db, timeout=0.05)
+    t0 = time.monotonic()
+    expired = None
+    try:
+        bus.begin_immediate_lease(waiter, lease_seconds=0.4)
+    except sqlite3.OperationalError as exc:
+        expired = exc
+    elapsed = time.monotonic() - t0
+    check("expired writer lease raises database is locked",
+          expired is not None and "database is locked" in str(expired).lower(),
+          expired)
+    check("expired writer lease waits about the lease length, not the 60s default",
+          0.3 <= elapsed < 2.0, "elapsed=%.3f" % elapsed)
+    holder.rollback()
+    holder.close()
+    waiter.close()
+
+    # Two server processes, one database, concurrent sheet and doc appends.
+    race_db = os.path.join(tmp, "wal-race.db")
+    processes = []
+
+    def stop(proc):
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+        proc.stderr.close()
+
+    def start():
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        base = f"http://127.0.0.1:{port}/"
+        env = dict(os.environ, BUS_SECRET=SECRET, BUS_PORT=str(port),
+                   BUS_BIND="127.0.0.1", BUS_DB=race_db)
+        proc = subprocess.Popen([sys.executable, server_py, "--db", race_db, "serve"],
+                                env=env, stderr=subprocess.PIPE)
+        processes.append(proc)
+        for _ in range(50):
+            if proc.poll() is not None:
+                raise RuntimeError("wal race server exited during startup")
+            try:
+                code, health = call(method="GET", base=base)
+                if code == 200 and health.get("service") == "sfdc24-blackboard-bus":
+                    return proc, base
+            except Exception:
+                pass
+            time.sleep(0.1)
+        raise RuntimeError("wal race server never came up")
+
+    def post(body, base):
+        raw = json.dumps(dict(body, secret=SECRET)).encode()
+        req = urllib.request.Request(base, data=raw,
+                                     headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return resp.status, json.load(resp)
+        except urllib.error.HTTPError as err:
+            try:
+                parsed = json.load(err)
+            except Exception:
+                parsed = {"error": err.reason if hasattr(err, "reason") else ""}
+            return err.code, parsed
+        except Exception as exc:  # noqa: BLE001
+            return 0, {"error": str(exc)}
+
+    try:
+        _proc_a, base_a = start()
+        _proc_b, base_b = start()
+        code, created = post({"action": "create", "title": "race sheet", "kind": "sheet",
+                              "header": BOARD_HEADER}, base_a)
+        check("create race sheet on shared bus.db", code == 200, created)
+        n_appenders = 16
+        payloads = [f"race-row-{i:02d}" for i in range(n_appenders)]
+        locked = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n_appenders) as pool:
+            futs = []
+            for i, text in enumerate(payloads):
+                base = base_a if i % 2 == 0 else base_b
+                row = ["grok", "ALL", "APPEND", text, "OPEN", "Blackboard", "gist", "sub"]
+                futs.append(pool.submit(post, {"action": "append", "title": "race sheet",
+                                               "sheetRow": row}, base))
+            results = [fut.result() for fut in futs]
+        for code, body in results:
+            err = str(body.get("error", ""))
+            if "database is locked" in err.lower() or "database is locked" in str(body).lower():
+                locked.append(body)
+        check("concurrent sheet appenders all return 200",
+              all(code == 200 for code, _ in results),
+              results)
+        check("concurrent sheet appenders never return database is locked",
+              not locked, locked)
+        code, read = post({"action": "read", "title": "race sheet"}, base_b)
+        rows = read.get("rows") or []
+        bodies = [row[5] if len(row) > 5 else "" for row in rows[1:]]
+        missing = [text for text in payloads if text not in bodies]
+        check("concurrent sheet appenders lose no rows",
+              code == 200 and len(rows) == n_appenders + 1 and not missing,
+              "count=%s missing=%s" % (len(rows), missing))
+        nums = []
+        with sqlite3.connect(race_db) as dbc:
+            nums = [row[0] for row in dbc.execute(
+                "SELECT n FROM sheet_rows ORDER BY n")]
+        check("concurrent sheet appenders get unique sequential n",
+              nums == list(range(1, n_appenders + 1)), nums)
+
+        code, created = post({"action": "create", "title": "race doc", "kind": "doc"}, base_b)
+        check("create race doc on shared bus.db", code == 200, created)
+        doc_payloads = [f"doc-entry-{i:02d}" for i in range(n_appenders)]
+        locked = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n_appenders) as pool:
+            futs = []
+            for i, text in enumerate(doc_payloads):
+                base = base_a if i % 2 == 0 else base_b
+                futs.append(pool.submit(post, {"action": "append", "title": "race doc",
+                                               "text": text}, base))
+            results = [fut.result() for fut in futs]
+        for code, body in results:
+            err = str(body.get("error", ""))
+            if "database is locked" in err.lower():
+                locked.append(body)
+        check("concurrent doc appenders all return 200",
+              all(code == 200 for code, _ in results), results)
+        check("concurrent doc appenders never return database is locked",
+              not locked, locked)
+        code, read = post({"action": "read", "title": "race doc"}, base_a)
+        body = read.get("body") or ""
+        missing = [text for text in doc_payloads if text not in body]
+        check("concurrent doc appenders lose no rows",
+              code == 200 and not missing, "missing=%s body=%r" % (missing, body[:200]))
+    finally:
+        for proc in processes:
+            stop(proc)
+
+
 def main():
     server_py = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
         os.path.dirname(__file__), "..", "src", "bus_server.py")
@@ -1153,6 +1362,7 @@ def main():
         test_complete_replay(server_py, tmp)
         test_durable_claim_fencing(server_py, tmp)
         test_fence_migration(server_py, tmp)
+        test_busdb_wal_writer_leases(server_py, tmp)
 
         print(f"\n{PASS} passed, {FAIL} failed")
         if FAILURES:

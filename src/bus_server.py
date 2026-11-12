@@ -39,6 +39,7 @@ import secrets
 import sqlite3
 import sys
 import threading
+import time
 import urllib.request
 import urllib.error
 import uuid
@@ -54,6 +55,12 @@ EVENT_TYPES = {"CREATE", "CLAIM", "PROGRESS", "BLOCK", "RELEASE",
 STATUSES = {"OPEN", "CLAIMED", "RUNNING", "BLOCKED", "REVIEW", "DONE", "CANCELLED"}
 PROJECTS = {"Blackboard", "Zoom Agent", "X-Ray", "Access Haiti", "Akatia", "Sales"}
 MAX_LEASE_HOURS = 4
+# bus.db writer policy: WAL so readers do not block writers, a 5000ms SQLite
+# busy timeout per attempt, and BEGIN IMMEDIATE leases that retry up to 60s
+# so concurrent appenders wait for the reserved lock instead of losing rows
+# or surfacing 'database is locked'.
+BUSY_TIMEOUT_MS = 5000
+WRITER_LEASE_SECONDS = 60
 # NOTE/FINDING are observations: their caller-supplied status, assignment, and
 # lease are stored as evidence but never reduce the work item's effective state.
 # Every actual post-CLAIM transition is fenced. CANCEL is operator-authored, so
@@ -81,6 +88,36 @@ HUMAN_DATE = re.compile(
     r"\s+\d{1,2},\s+\d{4}")
 
 WRITE_LOCK = threading.Lock()
+
+
+def _is_sqlite_locked(exc):
+    msg = str(exc).lower()
+    return "database is locked" in msg or "database is busy" in msg
+
+
+def begin_immediate_lease(conn, lease_seconds=WRITER_LEASE_SECONDS):
+    """Reserve the SQLite writer with BEGIN IMMEDIATE.
+
+    Retries 'database is locked' until lease_seconds elapses. Each attempt
+    waits at most BUSY_TIMEOUT_MS, then the remaining lease, so a holder
+    that commits in time is waited out instead of failing the caller.
+    """
+    deadline = time.monotonic() + lease_seconds
+    try:
+        while True:
+            remaining_ms = int((deadline - time.monotonic()) * 1000)
+            if remaining_ms <= 0:
+                raise sqlite3.OperationalError("database is locked")
+            conn.execute(
+                "PRAGMA busy_timeout=%d" % min(BUSY_TIMEOUT_MS, max(remaining_ms, 1)))
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                return
+            except sqlite3.OperationalError as exc:
+                if not _is_sqlite_locked(exc) or time.monotonic() >= deadline:
+                    raise
+    finally:
+        conn.execute("PRAGMA busy_timeout=%d" % BUSY_TIMEOUT_MS)
 
 
 def now_iso():
@@ -186,7 +223,7 @@ def migrate_schema(conn):
         # rediscover that fact.
         return
 
-    conn.execute("BEGIN IMMEDIATE")
+    begin_immediate_lease(conn)
     try:
         # Re-read after acquiring the cross-process writer reservation: another
         # freshly upgraded process may have completed the migration while this
@@ -346,9 +383,9 @@ def migrate_schema(conn):
 
 
 def db_connect(path):
-    conn = sqlite3.connect(path, timeout=10)
+    conn = sqlite3.connect(path, timeout=BUSY_TIMEOUT_MS / 1000)
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=10000")
+    conn.execute("PRAGMA busy_timeout=%d" % BUSY_TIMEOUT_MS)
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(SCHEMA_SQL)
     migrate_schema(conn)
@@ -402,6 +439,7 @@ class Store:
 
     def create_file(self, title, kind, header=None):
         with WRITE_LOCK, self.conn:
+            begin_immediate_lease(self.conn)
             return self._create_file(title, kind, header)
 
     def _create_file(self, title, kind, header=None):
@@ -498,6 +536,7 @@ class Store:
             # Concatenate IN SQL under the lock: a read-modify-write in Python
             # would let two concurrent appends silently drop one (lost update).
             with WRITE_LOCK, self.conn:
+                begin_immediate_lease(self.conn)
                 self.conn.execute(
                     "UPDATE files SET body = CASE WHEN body IS NULL OR body = '' THEN ? "
                     "ELSE body || char(10) || char(10) || ? END, "
@@ -571,6 +610,7 @@ class Store:
             cells = cells + [""] * pad
         ts = now_iso()
         with WRITE_LOCK, self.conn:
+            begin_immediate_lease(self.conn)
             n = self.conn.execute(
                 "SELECT COALESCE(MAX(n), 0) + 1 FROM sheet_rows WHERE file_id = ?",
                 (f["file_id"],)).fetchone()[0]
@@ -594,6 +634,7 @@ class Store:
             raise BusError(400, f"{f['title']!r} is a sheet; replace works on docs only - sheets are append-only.")
         ts = now_iso()
         with WRITE_LOCK, self.conn:
+            begin_immediate_lease(self.conn)
             self.conn.execute(
                 "UPDATE files SET body = ?, revision = revision + 1, updated_ts = ? WHERE file_id = ?",
                 (body, ts, f["file_id"]))
@@ -722,7 +763,7 @@ class Store:
         # Invalid input never waits for the writer. Valid input reserves the DB
         # before lookup: WRITE_LOCK alone cannot serialize separate processes.
         with WRITE_LOCK, self.conn:
-            self.conn.execute("BEGIN IMMEDIATE")
+            begin_immediate_lease(self.conn)
             # A different process may have held SQLite's writer until a lease
             # expired. Authorization must use the time after that wait, not the
             # stale pre-lock validation timestamp.
@@ -1075,6 +1116,7 @@ def _import_rows(store, title, rows):
     # The destination and its history are one commit. A failed import must not
     # leave an empty title behind that prevents a corrected retry.
     with WRITE_LOCK, store.conn:
+        begin_immediate_lease(store.conn)
         created = store._create_file(title, "sheet", header)
         fid = created["fileId"]
         for i, row in enumerate(rows[1:], start=1):
