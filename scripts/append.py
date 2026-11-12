@@ -12,6 +12,7 @@ import re
 import sys
 
 import board_row
+import gemini_ask_guard
 import signature
 from bus import fetch, load_env, read_rows, with_sender_token
 
@@ -36,21 +37,45 @@ def _conflicting_keys(payload):
     return bad
 
 
+USAGE = (
+    "usage: python scripts/append.py [--allow-gemini-non-ask] <row.json>\n"
+    "The JSON object needs: row_id, source_tag, payload, and optionally\n"
+    "target_surface, action_type, category, project_tag, gist, subgist.\n"
+    "--allow-gemini-non-ask overrides the Gemini ASK-phase guard "
+    "(scripts/gemini_ask_guard.py)."
+)
+
+
+def parse_argv(argv):
+    """Return (row_path, allow_gemini_non_ask). Flag may precede or follow the file."""
+    allow = False
+    path = None
+    for arg in argv[1:]:
+        if arg == "--allow-gemini-non-ask":
+            allow = True
+            continue
+        if arg in ("-h", "--help"):
+            raise SystemExit(USAGE)
+        if arg.startswith("-"):
+            raise SystemExit("unknown option: %s\n%s" % (arg, USAGE))
+        if path is not None:
+            raise SystemExit(USAGE)
+        path = arg
+    if not path:
+        raise SystemExit(USAGE)
+    return path, allow
+
+
 def main(require_sender_identity=False):
-    if len(sys.argv) < 2:
-        raise SystemExit(
-            "usage: python scripts/append.py <row.json>\n"
-            "The JSON object needs: row_id, source_tag, payload, and optionally\n"
-            "target_surface, action_type, category, project_tag, gist, subgist."
-        )
+    row_path, allow_gemini_non_ask = parse_argv(sys.argv)
     env = load_env()
-    with open(sys.argv[1], encoding="utf-8") as fh:
+    with open(row_path, encoding="utf-8") as fh:
         spec = json.load(fh)
     if not isinstance(spec, dict):
-        raise SystemExit(f"{sys.argv[1]} must contain one JSON object")
+        raise SystemExit(f"{row_path} must contain one JSON object")
     for required in ("row_id", "source_tag", "payload"):
         if not isinstance(spec.get(required), str) or not spec[required].strip():
-            raise SystemExit(f"{sys.argv[1]} needs non-empty string field: {required}")
+            raise SystemExit(f"{row_path} needs non-empty string field: {required}")
     ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     row = [
         spec["row_id"],
@@ -112,6 +137,16 @@ def main(require_sender_identity=False):
         raise SystemExit(
             "ROW_ATTRIBUTION_UNCLEAR: refusing to append.\n  - "
             + "\n  - ".join(signature_problems))
+    # Gemini questions must use phase=ASK (scripts/gemini_ask_guard.py). Checked
+    # on the original payload, before fit(), so a question hiding past the
+    # summary cutoff cannot slip through. Nothing is posted on refusal.
+    gemini_msg = gemini_ask_guard.refusal_message(payload)
+    if gemini_msg:
+        if allow_gemini_non_ask:
+            print("GEMINI_ASK_OVERRIDE: " + gemini_msg)
+        else:
+            print(gemini_msg)
+            raise SystemExit(gemini_msg)
     # NEVER TRIM SILENTLY (scripts/board_row.py). write=False only names the spill object. The
     # bytes go out in commit(), after the append below, so the store is not on the post.
     spill = board_row.store_spill()
