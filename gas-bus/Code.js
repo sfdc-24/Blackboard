@@ -68,7 +68,10 @@ function doGet(e) {
   const action = params.action || 'ping';
 
   if (action === 'ping') {
-    return jsonOut_({ ok: true, service: 'sfdc24-blackboard-bus', time: nowStamp_() });
+    // build: the commit this deployment was stamped with (gas-bus/Build.js). Not a secret; a read-back compares it to
+    // the deploying commit so a web-editor republish of an old version is caught (case 00001051).
+    return jsonOut_({ ok: true, service: 'sfdc24-blackboard-bus', time: nowStamp_(),
+                      build: (typeof BUILD_SHA === 'string' ? BUILD_SHA : 'unset') });
   }
 
   const cfg = getConfig_();
