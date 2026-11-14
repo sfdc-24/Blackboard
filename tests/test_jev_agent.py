@@ -170,6 +170,54 @@ class TheCall(unittest.TestCase):
         self.assertIn("no JEV_API_KEY", reason)
 
 
+class TheProgrammaticCalls(unittest.TestCase):
+    """ask_yesno/ask_choice: the J1/J2/J3 tools' calling convention - explicit
+    (state, question[, options]), not a jev:spec parsed out of an addressed row."""
+
+    def setUp(self):
+        self.env = mock.patch.dict("os.environ", {"JEV_API_KEY": "k-test"})
+        self.env.start()
+        self.addCleanup(self.env.stop)
+
+    def test_ask_yesno_returns_the_raw_probability(self):
+        def fake(request, timeout=None):
+            return FakeResponse({"answers": {"q": {"type": "noul", "noul": 0.72}}})
+        with mock.patch.object(jev_agent.urllib.request, "urlopen", fake):
+            p, error = jev_agent.ask_yesno("some row text", "is this bare?")
+        self.assertEqual(0.72, p)
+        self.assertIsNone(error)
+
+    def test_ask_yesno_fails_closed_with_no_key(self):
+        with mock.patch.dict("os.environ", {"JEV_API_KEY": ""}):
+            with mock.patch.object(jev_agent, "ENV", "does-not-exist"):
+                p, error = jev_agent.ask_yesno("x", "q?")
+        self.assertIsNone(p)
+        self.assertIn("no JEV_API_KEY", error)
+
+    def test_ask_yesno_reports_an_http_error_without_leaking_the_key(self):
+        def fake(request, timeout=None):
+            raise urllib.error.HTTPError(jev_agent.SYSTEMONE, 500, "boom", {}, BytesIO(b"server error"))
+        with mock.patch.object(jev_agent.urllib.request, "urlopen", fake):
+            p, error = jev_agent.ask_yesno("x", "q?")
+        self.assertIsNone(p)
+        self.assertIn("HTTP 500", error)
+        self.assertNotIn("k-test", error)
+
+    def test_ask_choice_returns_the_choice_and_confidence(self):
+        def fake(request, timeout=None):
+            return FakeResponse({"answers": {"q": {"type": "choice", "choice": "needs-action",
+                                                   "confidence": 0.81}}})
+        with mock.patch.object(jev_agent.urllib.request, "urlopen", fake):
+            result, error = jev_agent.ask_choice("row text", "classify", ["needs-action", "info"])
+        self.assertEqual(("needs-action", 0.81), result)
+        self.assertIsNone(error)
+
+    def test_ask_choice_rejects_a_single_option(self):
+        result, error = jev_agent.ask_choice("x", "q?", ["only-one"])
+        self.assertIsNone(result)
+        self.assertIn("bad options", error)
+
+
 class TheRegistry(unittest.TestCase):
     def test_jev_is_registered_with_a_wake_filter_and_no_context_attachments(self):
         entry = agent_waker.AGENTS["jev"]
