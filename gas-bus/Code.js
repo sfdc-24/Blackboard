@@ -254,9 +254,13 @@ function maybeRingGrok_(row) {
 
   // Split BEFORE cleaning: cleanTag_ strips ';' and ',', which is exactly what separates
   // multiple recipients in Target_Surface ("grok;codex") and cc= alike.
+  // The payload's own to= counts too: most writers put ALL in Target_Surface and name the recipient
+  // only in the BCB to= field, so a ring that read column D alone never fired for them (measured
+  // 2026-11-14: a to=grok row with Target_Surface ALL did not ring; Target_Surface grok rang in 4 s).
   const to = String(row[3] == null ? '' : row[3]);
+  const toField = bcbField_(payload, 'to');
   const cc = bcbField_(payload, 'cc');
-  const names = (to + ';' + cc).split(/[;,]/).map(function (s) { return cleanTag_(s); });
+  const names = (to + ';' + toField + ';' + cc).split(/[;,]/).map(function (s) { return cleanTag_(s); });
   if (names.indexOf('grok') === -1) return;
 
   UrlFetchApp.fetch(url, {

@@ -164,6 +164,29 @@ const tests = {
     assert.deepStrictEqual([out.ok, out.worker], [true, 'start-failed']);
     assert.strictEqual(w.rows.length, 1);
   },
+  'W1 ring: a row whose BCB to= names grok rings even when Target_Surface is ALL'() {
+    const props = { GROK_WEBHOOK_URL: 'https://hook.example/w', GROK_WEBHOOK_KEY: 'k' };
+    const rings = (payload, target = 'ALL', from = 'claude-code-cli') => {
+      const w = world(props);
+      const r = row('G1', payload, 'APPEND', target);
+      r[2] = from;
+      w.post(r);
+      return w.fetches.filter((f) => f.url === 'https://hook.example/w').length;
+    };
+    assert.strictEqual(rings('BCB|v=1|id=G1|phase=ASK|from=claude-code-cli|to=grok'), 1, 'to=grok');
+    assert.strictEqual(rings('BCB|v=1|id=G1|phase=ASK|from=claude-code-cli|to=grok;gemini'), 1, 'to=grok;gemini');
+    assert.strictEqual(rings('BCB|v=1|id=G1|phase=ASK|from=claude-code-cli|to=gemini|cc=grok'), 1, 'cc=grok');
+    assert.strictEqual(rings('BCB|v=1|id=G1|phase=ASK|from=claude-code-cli|to=gemini', 'grok'), 1, 'column D grok');
+    assert.strictEqual(rings('BCB|v=1|id=G1|phase=ASK|from=claude-code-cli|to=gemini'), 0, 'not for grok');
+    assert.strictEqual(rings('BCB|v=1|id=G1|phase=ASK|from=claude-code-cli|to=grokker'), 0, 'a longer name is not grok');
+    assert.strictEqual(rings('BCB|v=1|id=G1|phase=RESULT|from=claude-code-cli|to=grok'), 0, 'info phase');
+    assert.strictEqual(rings('BCB|v=1|id=G1|phase=ASK|from=grok|to=grok', 'ALL', 'grok'), 0, 'grok own row');
+  },
+  'W1 ring: without both Script Properties nothing rings'() {
+    const w = world({ GROK_WEBHOOK_URL: 'https://hook.example/w' });
+    w.post(row('G1', 'BCB|v=1|id=G1|phase=ASK|from=claude-code-cli|to=grok'));
+    assert.strictEqual(w.fetches.length, 0);
+  },
   'a job name the property cannot smuggle a path through'() {
     const w = world({ WORKER_TRIGGER: 'on', WORKER_JOB: 'projects/x/locations/y/jobs/z/../../other' });
     const out = w.post(row('Q1', 'BCB|v=1|id=Q1|req=Q1|do=redis-op', 'AYA_REQ', 'bus-reconciler'));
