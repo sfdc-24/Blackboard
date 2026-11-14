@@ -400,13 +400,22 @@ def hold_lifecycle(hold_id, hold_pr, hold_when, hold_from, hold_head, rows):
     """
     if not hold_id:
         return ACTIVE, ""
+    if hold_when is None:
+        # FAIL CLOSED (Codex, PR 502 review): `(hold_when and when <= hold_when)`
+        # is False whenever hold_when is falsy, so a hold with no parseable
+        # placement timestamp let ANY later, correctly-authorised clearing row
+        # through with no "strictly later than the hold" check at all - the
+        # one ordering guarantee the docstring above promises. A hold whose own
+        # timestamp cannot be read stays ACTIVE and cannot be cleared by
+        # anyone, rather than being clearable by construction.
+        return ACTIVE, "hold timestamp unreadable; ACTIVE and cannot be cleared"
     rejected = ""
     for r in rows:
         payload = cell(r, COL_PAYLOAD)
         if not is_canonical_bcb(payload):
             continue                     # prose that mentions an id is not a clear
         when = parse_ts(cell(r, COL_TS))
-        if when is None or (hold_when and when <= hold_when):
+        if when is None or when <= hold_when:
             continue
         row_from = field(payload, "from")
         row_tag = cell(r, COL_SOURCE)

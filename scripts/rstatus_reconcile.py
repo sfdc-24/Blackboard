@@ -305,6 +305,14 @@ def compute_ask_status(ask, index, now, previous=None):
         if due is not None:
             if now > due:
                 status, closed_by, updated = "EXPIRED", "reconciler:expired_past_due", now
+        elif ask["ts"] is None:
+            # FAIL CLOSED (Codex, PR 502 review): `now - ask["ts"]` raised
+            # TypeError for any row whose own column-B timestamp parse_ts
+            # cannot read, aborting reconcile_all for the WHOLE board on one
+            # bad row. With no due= and no age to measure, this ask cannot be
+            # auto-expired - it stays whatever the event loop above already
+            # left it (commonly OPEN), never silently backfilled or crashed.
+            pass
         else:
             # No due= at all: a pre-R-STATUS row. Backfill by the ask's own age,
             # exactly the doc's three buckets (docs/BOARD-STATUS-FRAMEWORK.md,

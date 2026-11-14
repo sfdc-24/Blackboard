@@ -328,6 +328,23 @@ check("a clear written BEFORE the hold does not lift it",
       r_early["active_holds"] == ["CODEX-G1-HOLD"], r_early["active_holds"])
 
 print("")
+print("== a hold with an UNREADABLE timestamp cannot be cleared (fail closed) ==")
+# Codex, PR 502 review: `when is None or (hold_when and when <= hold_when)` is
+# False whenever hold_when is falsy, so a hold placed with a timestamp
+# parse_ts cannot read let ANY later, correctly-authorised clearing row
+# through - the "strictly later than the hold" ordering check this function's
+# own docstring promises never ran at all. hold_lifecycle() now returns
+# ACTIVE outright whenever hold_when is None, before it even looks at rows.
+GARBAGE_TS_HOLD = ("BCB|v=1|id=GARBAGE-TS-HOLD|phase=RESULT|from=codex|to=claude-code-cli"
+                   "|hold=unreadable placement time")
+r_garbage = ofm.hold_lifecycle("GARBAGE-TS-HOLD", None, None, "codex", "",
+                               [row("2026-09-09T16:00:00Z", "codex", EXPLICIT.replace(
+                                   "CODEX-G1-HOLD", "GARBAGE-TS-HOLD"), "DONE")])
+check("hold_lifecycle refuses to clear a hold whose own timestamp is unreadable",
+      r_garbage[0] == ofm.ACTIVE, r_garbage)
+check("and says why", "unreadable" in r_garbage[1].lower(), r_garbage)
+
+print("")
 print("== a GO only supersedes on a DIFFERENT exact head, from the placer ==")
 # REAL SHA LENGTHS. These fixtures used to say exact_head=4ccb and 8230 - four
 # characters, shorter than git's own shortest unambiguous default. That made

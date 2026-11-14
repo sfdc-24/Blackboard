@@ -259,6 +259,28 @@ class TheExpiry(unittest.TestCase):
         self.assertEqual("EXPIRED", result["status"])
         self.assertEqual("reconciler:expired_past_due", result["closed_by"])
 
+    def test_a_garbage_row_timestamp_with_no_due_fails_closed_not_crashes(self):
+        # Codex, PR 502 review: `now - ask["ts"]` raised TypeError for any ask
+        # with no due= whose OWN column-B timestamp parse_ts cannot read,
+        # aborting reconcile_all for the whole board on one bad row. It must
+        # instead leave the ask exactly where the event loop put it (OPEN,
+        # here) - never auto-expired on an age it cannot measure.
+        rows = [row("not-a-timestamp-at-all", bcb("A", "ASK"))]
+        result = rs.reconcile_all(rows, now=NOW)["A"]
+        self.assertEqual("OPEN", result["status"])
+        self.assertIsNone(result["due_utc"])
+
+    def test_a_garbage_row_timestamp_never_auto_expires_even_with_many_other_rows(self):
+        # The crash this guards against took down reconcile_all for every row
+        # on the board, not just the bad one - prove it alongside normal rows.
+        rows = [
+            row("2026-11-14T00:00:00Z", bcb("GOOD", "ASK", due="2026-11-20T00:00:00Z")),
+            row("garbage", bcb("A", "ASK")),
+        ]
+        results = rs.reconcile_all(rows, now=NOW)
+        self.assertEqual("OPEN", results["GOOD"]["status"])
+        self.assertEqual("OPEN", results["A"]["status"])
+
     def test_acked_past_due_with_no_result_still_expires(self):
         rows = [
             row("2026-11-14T00:00:00Z", bcb("A", "ASK", due="2026-11-14T01:00:00Z")),
