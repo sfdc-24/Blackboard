@@ -127,6 +127,17 @@ rc, out = run_main([bcb.COLUMNS[:-1] + ["Renamed", "", ""], GOOD10 + ["", ""]])
 check("a RENAMED column still raises the schema NOTE",
       "differs from expected schema" in out, out.strip()[:200])
 
+# Finding #18: once scripts/status_sheet_setup.py has named M1:R1, every run
+# printed the schema NOTE for a header that was not actually drifted.
+status_header = bcb.COLUMNS + ["", ""] + bcb.STATUS_HEADER_NAMES
+rc, out = run_main([status_header, GOOD10 + ["", ""] + ["OPEN", "", "", "", "", ""]])
+check("a header with the real M1:R1 Status names raises NO schema NOTE",
+      "differs from expected schema" not in out, out.strip()[:200])
+
+rc, out = run_main([bcb.COLUMNS + ["", "", "NotStatus", "", "", "", "", ""], GOOD10 + ["", ""]])
+check("a header with wrong text in the Status columns still raises the schema NOTE",
+      "differs from expected schema" in out, out.strip()[:200])
+
 rc, out = run_main([padded_header, GOOD10 + ["leaked", ""]])
 check("a board whose padding carries content outside the tolerated range lints RED",
       rc == 1 and "MALFORMED rows     : 1" in out, out.strip()[-300:])

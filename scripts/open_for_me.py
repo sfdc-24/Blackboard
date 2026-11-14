@@ -56,6 +56,9 @@ PRIORITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "NORMAL": 2, "LOW": 3, "": 4}
 # Board columns, by position. A short row shifts every field left (REQ-B4TQX9),
 # so every access here is bounds-checked rather than trusting the width.
 COL_ROWID, COL_TS, COL_SOURCE, COL_PAYLOAD, COL_CATEGORY, COL_GIST = 0, 1, 2, 5, 6, 8
+# R-STATUS's Status column (M), once scripts/status_sheet_setup.py has run. Blank
+# on a row the reconciler has not reached yet (pre-R-STATUS history, or this cycle).
+COL_STATUS = 12
 
 MAX_GIST = 160          # characters of board text ever echoed
 MAX_ROWS = 200          # rows rendered or serialised, in text AND json
@@ -490,7 +493,16 @@ def open_for(rows, tag, include_cc=False, include_all=False, min_priority=None, 
         # constraint it declared was not - so it is surfaced on the strength of
         # carrying a hold, whatever its Category says.
         is_hold = bool(field(payload, "hold"))
-        if not is_hold and cell(r, COL_CATEGORY).strip().upper() != "OPEN":
+        # Decide "open" from the reconciler's own Status column when it has
+        # reached this row, falling back to Category when it has not
+        # (adversarial review, finding #14: Category alone stopped matching
+        # "open" the moment R-STATUS started defaulting it to "" for phases
+        # like REVIEW/ORDER/HANDOFF/BATON that this reader still treats as
+        # ask-like work; Status is the column Rule 5 makes authoritative).
+        status_cell = cell(r, COL_STATUS).strip().upper()
+        is_open_like = (status_cell in ("OPEN", "ACKED")) if status_cell else (
+            cell(r, COL_CATEGORY).strip().upper() == "OPEN")
+        if not is_hold and not is_open_like:
             continue
         # A row this tag WROTE is not work for this tag.
         if cell(r, COL_SOURCE) == tag or field(payload, "from") == tag:

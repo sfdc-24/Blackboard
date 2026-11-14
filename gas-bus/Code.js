@@ -798,22 +798,26 @@ function handleStatusSetup_(body, cfg) {
     headerRange.setValues([STATUS_HEADER_NAMES]);
     report.headers = true;
 
-    // Data validation on column M, every data row seen so far (generous: at
-    // least one row below the header even on an empty sheet).
-    const lastRow = Math.max(sheet.getLastRow(), 2);
+    // Data validation on column M, the WHOLE column (row 2 to the sheet's last
+    // row, open-ended A1 notation) - not a snapshot of today's row count.
+    // Finding #17: a range fixed at setup time (2..getLastRow()) left every
+    // row the bus appends afterwards - the live asks the validation and the
+    // "Open asks" view exist for - with no Status validation at all.
+    const statusColumnLetter = columnLetter_(STATUS_FIRST_COL);
     const rule = SpreadsheetApp.newDataValidation()
       .requireValueInList(STATUS_VALUES, true).setAllowInvalid(false).build();
-    sheet.getRange(2, STATUS_FIRST_COL, lastRow - 1, 1).setDataValidation(rule);
+    sheet.getRange(statusColumnLetter + '2:' + statusColumnLetter).setDataValidation(rule);
     report.validation = true;
 
-    // Protected range on A:L, WARNING ONLY - this guards against an accidental
-    // manual edit, not against another writer holding the shared secret (this
-    // gateway's own action dispatch is already that boundary). Idempotent: a
-    // protection with this exact description is never added twice.
+    // Protected range on A:L, WARNING ONLY, the WHOLE columns for the same
+    // reason - this guards against an accidental manual edit, not against
+    // another writer holding the shared secret (this gateway's own action
+    // dispatch is already that boundary). Idempotent: a protection with this
+    // exact description is never added twice.
     const already = sheet.getProtections(SpreadsheetApp.ProtectionType.RANGE)
       .filter(function (p) { return p.getDescription() === PROTECTED_RANGE_DESCRIPTION; });
     if (already.length === 0) {
-      const protectedRange = sheet.getRange(1, 1, sheet.getMaxRows(), 12); // A:L
+      const protectedRange = sheet.getRange('A:L');
       const protection = protectedRange.protect().setDescription(PROTECTED_RANGE_DESCRIPTION);
       protection.setWarningOnly(true);
       report.protection = true;
@@ -824,10 +828,17 @@ function handleStatusSetup_(body, cfg) {
     // Filter view "Open asks" - the Advanced Sheets service only; this Apps
     // Script project may not have it enabled, and setup must not fail outright
     // over a feature it does not need for the columns and validation above.
+    // Idempotent (finding #12): a second --live call used to add a second
+    // "Open asks" view every time; now it checks for one with this exact
+    // title on this sheet first.
     if (typeof Sheets !== 'undefined' && Sheets.Spreadsheets && Sheets.Spreadsheets.batchUpdate) {
       try {
-        addOpenAsksFilterView_(file.getId(), sheet.getSheetId());
-        report.filter_view = true;
+        if (openAsksFilterViewExists_(file.getId(), sheet.getSheetId())) {
+          report.filter_view = 'already present';
+        } else {
+          addOpenAsksFilterView_(file.getId(), sheet.getSheetId());
+          report.filter_view = true;
+        }
       } catch (err) {
         report.filter_view_skipped_reason = 'Advanced Sheets call failed: ' + String(err);
       }
@@ -840,12 +851,22 @@ function handleStatusSetup_(body, cfg) {
   return jsonOut_({ ok: true, report: report });
 }
 
+const OPEN_ASKS_FILTER_TITLE = 'Open asks';
+
+function openAsksFilterViewExists_(fileId, sheetId) {
+  const spreadsheet = Sheets.Spreadsheets.get(fileId, { fields: 'sheets(properties.sheetId,filterViews.title)' });
+  const sheet = (spreadsheet.sheets || []).filter(function (s) {
+    return s.properties && s.properties.sheetId === sheetId;
+  })[0];
+  return !!(sheet && (sheet.filterViews || []).some(function (fv) { return fv.title === OPEN_ASKS_FILTER_TITLE; }));
+}
+
 function addOpenAsksFilterView_(fileId, sheetId) {
   const request = {
     requests: [{
       addFilterView: {
         filter: {
-          title: 'Open asks',
+          title: OPEN_ASKS_FILTER_TITLE,
           range: { sheetId: sheetId, startColumnIndex: 0 },
           criteria: {
             12: { condition: { type: 'ONE_OF_LIST', values: [
@@ -863,7 +884,8 @@ function addOpenAsksFilterView_(fileId, sheetId) {
 // has no `module`, so this is a no-op there and changes nothing in production.
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
-    validateStatusUpdates_, statusRangeA1_, columnLetter_,
+    validateStatusUpdates_, statusRangeA1_, columnLetter_, handleStatusWrite_,
+    openAsksFilterViewExists_, OPEN_ASKS_FILTER_TITLE,
     STATUS_FIRST_COL, STATUS_LAST_COL, STATUS_COLS, STATUS_WRITE_MAX_ROWS,
     STATUS_HEADER_NAMES, STATUS_VALUES,
   };

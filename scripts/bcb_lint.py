@@ -50,6 +50,13 @@ COLUMNS = [
 TOLERATED_CONTENT_FROM = 11   # L
 TOLERATED_CONTENT_TO = 17     # R
 
+# The same six names, for the HEADER row specifically (finding #18): once
+# scripts/status_sheet_setup.py has run, M1:R1 hold these, and every run
+# printed the schema-drift NOTE for a header that is not actually drifted -
+# which also meant a REAL rename of A-J could no longer be told apart from it.
+STATUS_HEADER_NAMES = ["Status", "Expected_From", "Expected_Response", "Due_UTC",
+                       "Closed_By", "Status_Updated_UTC"]
+
 ISO_TS = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})$")
 UUID_ID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 WRK_ID = re.compile(r"^WRK-[0-9a-f]{8}$")
@@ -241,7 +248,12 @@ def main():
     named = [str(c).strip() for c in header]
     while named and not named[-1]:
         named.pop()          # trailing blanks are used-range padding, not columns
-    if named != COLUMNS:
+    first_ten = named[:len(COLUMNS)]
+    tail = named[len(COLUMNS):]
+    status_cells = tail[2:2 + len(STATUS_HEADER_NAMES)]
+    other_cells = tail[:2] + tail[2 + len(STATUS_HEADER_NAMES):]
+    status_ok = not any(status_cells) or status_cells == STATUS_HEADER_NAMES
+    if first_ten != COLUMNS or any(other_cells) or not status_ok:
         print(f"NOTE: header row differs from expected schema: {header}")
 
     malformed_rows, warned_rows = [], []

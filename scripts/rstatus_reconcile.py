@@ -24,11 +24,34 @@ LIFECYCLE (the doc's own diagram):
               a HELD row stays HELD until ITS OWN placer clears it - clears=<that row's id>,
               supersedes=<that row's id>, or a later GO/MERGED by the same placer naming a
               different full head - exactly scripts/open_for_me.hold_lifecycle, reused here
-              rather than reimplemented.
+              rather than reimplemented. hold=none (a GO row explicitly declaring no hold) is
+              not a hold.
 
 ASK_PHASES (Gemini's ruling, 2026-11-14): ASK, REQUEST, DISPATCH, REVIEW_REQUEST, TASK -
 imported from ask_phases.py, the one constant every writer, the lint rule and this module
 share.
+
+RULE 4 - only Expected_From or the asker may ack/answer/close/reopen an ask (adversarial
+review, 2026-11-14): checked against ask["expect_from"] and the ask's own placer whenever
+expect_from is set. A pre-Rule-1 ask with no expect_from= has nobody to check an event's
+sender against, so it keeps the backfill's original fail-open reading (any linked answer
+counts) - that is the whole point of the backfill table's 1,728-row ANSWERED count, measured
+with no identity check at all. ACK is narrower still: only Expected_From itself may ACK (the
+asker acking its own ask is not in the spec), and only with eta=.
+
+IDENTITY: every row is keyed by its OWN sheet Row_ID (board column A), not its BCB id=
+(adversarial review, 2026-11-14: status_write matches column A, and 6,186 of 20,163 real BCB
+ids are not themselves a Row_ID - keying by id= made 31% of rows permanently unwritable,
+re-sent on every run). BCB id= is still what answers=/closes=/reopen=/hold= reference - the
+link index is built on id=, the OUTPUT dict is keyed on Row_ID.
+
+IDEMPOTENCE: a result's status_updated_utc only moves when (status, due_utc, closed_by)
+actually changed from the previous cycle (adversarial review: 1,321 EXPIRED rows and the
+"due in 24h" backfill due were both being restamped to `now` on every 5-minute run,
+rewriting thousands of unchanged rows and never letting the 24h backfill due arrive).
+reconcile_all() takes `previous` - the sheet's own current M/P/Q/R values, read back by the
+caller - so a cycle whose answer hasn't changed carries the old due/updated forward instead
+of inventing a new one.
 
 REASON STRINGS for Closed_By, where it is not simply "the row id that closed it"
 (blackboard-5e's rulings, 2026-11-14):
@@ -50,6 +73,13 @@ STATUSES = ("INFO", "OPEN", "ACKED", "ANSWERED", "CLOSED", "EXPIRED", "HELD")
 OWNER_REASON_MARKERS = ("MR_SALAM", "OWNER", "PRODUCT_DECISION")
 
 _FIELD_RE_CACHE = {}
+_LIST_SEP = re.compile(r"[,;\s]+")
+
+# Minute precision allowed (the fleet's own due= values are frequently
+# "2026-11-14T15:00Z", 16 characters, no seconds) - adversarial review finding #3:
+# the old >=19-character/full-HH:MM:SS rule rejected every real due= on the board.
+_TS_RE = re.compile(
+    r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?(?:\.(\d{1,9}))?(Z|[+-]\d{2}:?\d{2})?$")
 
 
 def cell(row, i):
@@ -67,34 +97,69 @@ def field(payload, name):
     return m.group(1).strip() if m else None
 
 
+def tokens(value):
+    """A list-valued field (answers=/closes=/reopen=), split the same way
+    open_for_me.tokens() splits clears=/supersedes= - comma, semicolon or
+    whitespace separated, empties dropped. A batch close/answer is a list on
+    the real board (923 of 8,943 answers= values; adversarial review #5), and
+    treating it as one opaque string matched nothing."""
+    return [t for t in (p.strip() for p in _LIST_SEP.split(value or "")) if t]
+
+
 def parse_ts(value):
-    """An aware datetime, or None when this cell is not an ISO instant - never a
-    lexical string compare (scripts/_board_latest.py's own history: "Open" and
-    "Friday, ..." both sort ahead of a real timestamp under one)."""
+    """An aware datetime, or None when this cell is not an ISO instant (never a
+    lexical string compare - scripts/_board_latest.py's own history: "Open" and
+    "Friday, ..." both sort ahead of a real timestamp under one). Seconds are
+    optional (see _TS_RE); a non-ISO form such as "2026-11-10 10:45 pm ET" or
+    free text still correctly returns None rather than a guess."""
     text = str(value or "").strip()
-    if not text or len(text) < 19 or text[4] != "-":
+    m = _TS_RE.match(text)
+    if not m:
         return None
+    year, month, day, hour, minute, second, frac, offset = m.groups()
+    second = int(second) if second else 0
+    micro = int((frac or "0").ljust(6, "0")[:6])
+    if offset in (None, "Z"):
+        tz = timezone.utc
+    else:
+        sign = 1 if offset[0] == "+" else -1
+        body = offset[1:].replace(":", "")
+        try:
+            delta = timedelta(hours=int(body[:2]), minutes=int(body[2:4]))
+        except ValueError:
+            return None
+        if delta >= timedelta(hours=24):
+            return None
+        tz = timezone(sign * delta)
     try:
-        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        moment = datetime(int(year), int(month), int(day), int(hour), int(minute), second, micro, tz)
     except ValueError:
         return None
-    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    return moment.astimezone(timezone.utc)
 
 
 def parse_row(index, row):
     """One board row -> a dict of what this module needs, or None when the row
     carries no BCB id (nothing to reconcile - stays whatever Category already
-    says, this module has no opinion on a non-BCB row)."""
+    says, this module has no opinion on a non-BCB row). `row_id` is the
+    sheet's OWN Row_ID (column A) - the identity status_write matches on,
+    never the BCB id= (see the module docstring, IDENTITY)."""
     payload = cell(row, 5)
     rid = field(payload, "id")
     if not rid:
         return None
+    row_id = cell(row, 0).strip()
+    if not row_id:
+        return None
     ts = parse_ts(cell(row, 1))
     phase = (field(payload, "phase") or "").strip().upper()
     source_tag = cell(row, 2)
+    hold = field(payload, "hold")
+    if hold and hold.strip().lower() == "none":
+        hold = None   # a GO row explicitly declaring no hold is not a hold (finding #16)
     return {
-        "index": index, "id": rid, "ts": ts, "phase": phase, "payload": payload,
-        "row": row, "source_tag": source_tag,
+        "index": index, "id": rid, "row_id": row_id, "ts": ts, "phase": phase,
+        "payload": payload, "row": row, "source_tag": source_tag,
         "placer": source_tag or field(payload, "from"),
         "expect_from": field(payload, "expect_from"),
         "expect": field(payload, "expect"),
@@ -103,13 +168,14 @@ def parse_row(index, row):
         "answers": field(payload, "answers"),
         "closes": field(payload, "closes"),
         "reopen": field(payload, "reopen"),
-        "hold": field(payload, "hold"),
+        "hold": hold,
+        "eta": field(payload, "eta"),
         "pr": field(payload, "pr"),
     }
 
 
 def parse_rows(rows):
-    """parse_row() over every row, skipping the ones with no BCB id."""
+    """parse_row() over every row, skipping the ones with no BCB id or no Row_ID."""
     out = []
     for i, row in enumerate(rows):
         parsed = parse_row(i, row)
@@ -119,11 +185,12 @@ def parse_rows(rows):
 
 
 def build_link_index(parsed_rows):
-    """target ask id -> list of (ts, parsed_row) events referencing it, one list
-    per link type, each sorted oldest first. A row missing a timestamp is
+    """target BCB id -> list of (ts, parsed_row) events referencing it, one
+    list per link type, each sorted oldest first. A row missing a timestamp is
     dropped from the index - it cannot be placed in the replay order, and
     guessing where it goes is exactly the defect class this fleet keeps
     finding (an unparseable timestamp is skipped, never silently sorted).
+    List-valued fields (finding #5) register the row under EVERY token.
 
     hold= is deliberately NOT indexed here - blackboard-5e's ruling, 2026-11-14:
     HELD is the status of the row that carries hold=, never a link to some
@@ -133,8 +200,7 @@ def build_link_index(parsed_rows):
         if r["ts"] is None:
             continue
         for kind in index:
-            target = r[kind]
-            if target:
+            for target in tokens(r[kind]):
                 index[kind].setdefault(target, []).append((r["ts"], r))
     for kind in index:
         for target in index[kind]:
@@ -144,38 +210,63 @@ def build_link_index(parsed_rows):
     # still be told apart from an ACK of the same ask.
     acks = {}
     for r in parsed_rows:
-        if r["ts"] is not None and r["phase"] == "ACK" and r["answers"]:
-            acks.setdefault(r["answers"], []).append((r["ts"], r))
+        if r["ts"] is not None and r["phase"] == "ACK":
+            for target in tokens(r["answers"]):
+                acks.setdefault(target, []).append((r["ts"], r))
     for target in acks:
         acks[target].sort(key=lambda pair: pair[0])
     index["acks"] = acks
-    # Pure "answered, not ACK" events: answers= on a non-ACK row.
-    answers_not_ack = {}
+    # "Answered" per the spec's own words - "Expected_From posts THE RESULT with
+    # answers=" (finding #8): only a phase=RESULT row counts. An ASK/REQUEST/
+    # DISPATCH/REVIEW_REQUEST/NOTE that merely carries answers= (a follow-up
+    # question, a passing mention) is not an answer.
+    answers_result = {}
     for target, events in index["answers"].items():
-        filtered = [(ts, r) for ts, r in events if r["phase"] != "ACK"]
+        filtered = [(ts, r) for ts, r in events if r["phase"] == "RESULT"]
         if filtered:
-            answers_not_ack[target] = filtered
-    index["answers_not_ack"] = answers_not_ack
+            answers_result[target] = filtered
+    index["answers_result"] = answers_result
     return index
 
 
-def compute_ask_status(ask, index, now):
+def _authorized(event_row, ask, require_expect_from_only=False):
+    """Rule 4: only Expected_From or the asker may act on an ask - except a
+    pre-Rule-1 ask with no expect_from= at all, which has no identity to check
+    an event against and keeps the backfill's original fail-open reading (any
+    linked event counts; this is what the spec's own 1,728-row ANSWERED
+    backfill count was measured against). `require_expect_from_only` is for
+    ACK: the spec never says the asker may ACK its own ask, only
+    Expected_From."""
+    if not ask["expect_from"]:
+        return True
+    placer = event_row["placer"]
+    if not placer:
+        return False
+    if require_expect_from_only:
+        return placer == ask["expect_from"]
+    return placer in (ask["expect_from"], ask["placer"])
+
+
+def compute_ask_status(ask, index, now, previous=None):
     """One ask-type row's (status, expected_from, expected_response, due_utc,
     closed_by, status_updated_utc). `ask` is a parsed row whose phase is in
     ASK_PHASES and that is not itself currently HELD (compute_hold_status() is
     checked first by reconcile_all() - see there). `index` is
     build_link_index()'s result over the WHOLE board - an ask can be
     acked/answered/closed/reopened by rows anywhere in time after it, not
-    just immediately after."""
+    just immediately after. `previous` is this SAME row's last-written result
+    (by Row_ID), or None on a row's first cycle - see the module docstring,
+    IDEMPOTENCE."""
     status = "OPEN"
     closed_by = None
     updated = ask["ts"]
     due = ask["due"]
+    reopened = False
 
     events = []
     for ts, r in index["acks"].get(ask["id"], []):
         events.append((ts, "ack", r))
-    for ts, r in index["answers_not_ack"].get(ask["id"], []):
+    for ts, r in index["answers_result"].get(ask["id"], []):
         events.append((ts, "answer", r))
     for ts, r in index["closes"].get(ask["id"], []):
         events.append((ts, "close", r))
@@ -185,14 +276,30 @@ def compute_ask_status(ask, index, now):
 
     for ts, kind, r in events:
         if kind == "ack":
+            if not _authorized(r, ask, require_expect_from_only=True) or not r["eta"]:
+                continue   # Rule 4 + "an ACK without an eta is incomplete"
             status, updated = "ACKED", ts
         elif kind == "answer":
+            if not _authorized(r, ask):
+                continue
             status, closed_by, updated = "ANSWERED", r["id"], ts
         elif kind == "close":
+            if not _authorized(r, ask):
+                continue
             status, closed_by, updated = "CLOSED", r["id"], ts
         elif kind == "reopen":
-            status, closed_by, updated = "OPEN", None, ts
-            due = r["due"] or due   # a new due= on the reopen row, else the ask keeps its own
+            if not _authorized(r, ask):
+                continue
+            status, closed_by, updated, reopened = "OPEN", None, ts, True
+            due = r["due"] or due   # a new due= on the reopen row, else filled in below
+
+    if reopened and due is None:
+        # Rule 3: "the ask returns to OPEN with a new due time" - a reopen with
+        # no due= of its own is a fresh grace window, not a re-entry into the
+        # backfill's age-bucket classification (finding #6: the ask's ORIGINAL
+        # age, often 30+ days, was making a just-reopened ask EXPIRED on the
+        # same run it was reopened).
+        due = now + timedelta(hours=24)
 
     if status in ("OPEN", "ACKED"):
         if due is not None:
@@ -208,7 +315,19 @@ def compute_ask_status(ask, index, now):
             elif age_days >= 7:
                 status, closed_by, updated = "EXPIRED", "backfill:expired7-30d", now
             elif status == "OPEN":
-                due = now + timedelta(hours=24)   # "due in 24 hours" - the backfill's own words
+                if previous and previous.get("due_utc"):
+                    # Stamped once, carried forward (finding #7): recomputing
+                    # now+24h on every 5-minute run meant it never arrived.
+                    due = previous["due_utc"]
+                else:
+                    due = now + timedelta(hours=24)   # "due in 24 hours" - the backfill's own words
+
+    if (previous and previous.get("status") == status and previous.get("due_utc") == due
+            and previous.get("closed_by") == closed_by):
+        # Finding #9 (generalised to every status, not only EXPIRED): R moves
+        # only when M, P or Q actually changed - "When the reconciler last set
+        # M to Q", not "when the reconciler last ran".
+        updated = previous.get("status_updated_utc") or updated
 
     return {"status": status, "expected_from": ask["expect_from"],
             "expected_response": _expected_response(ask), "due_utc": due,
@@ -277,28 +396,35 @@ def _expected_response(ask):
     return expect or done_when or None
 
 
-def reconcile_all(rows, now=None):
-    """Every row's M-R result, keyed by BCB id. Checked in order per row:
+def reconcile_all(rows, now=None, previous=None):
+    """Every row's M-R result, keyed by the row's OWN sheet Row_ID (column A -
+    see the module docstring, IDENTITY), not its BCB id=. Checked in order
+    per row:
     1. hold= present and still ACTIVE -> HELD (of the row itself).
     2. else an ask-type phase -> the ack/answer/close/reopen/expire machine.
     3. else INFO (never OPEN) - Rule 5: "Category stays a free label. Status
        comes only from column M."
-    Rows with no BCB id at all are skipped (nothing for this module to say)."""
+    Rows with no BCB id or no Row_ID are skipped (nothing for this module to
+    say). `previous`: {row_id: {"status", "due_utc", "closed_by",
+    "status_updated_utc"}} - the sheet's own current M/P/Q/R values, parsed -
+    for the idempotence rule (see IDEMPOTENCE); omit on a row's first cycle."""
     now = now or datetime.now(timezone.utc)
+    previous = previous or {}
     parsed = parse_rows(rows)
     index = build_link_index(parsed)
     timeline = _sorted_timeline(parsed, rows)
     results = {}
     for r in parsed:
+        prev = previous.get(r["row_id"])
         held = compute_hold_status(r, timeline) if r["hold"] else None
         if held is not None:
-            results[r["id"]] = held
+            results[r["row_id"]] = held
         elif r["phase"] in ASK_PHASES:
-            results[r["id"]] = compute_ask_status(r, index, now)
+            results[r["row_id"]] = compute_ask_status(r, index, now, previous=prev)
         else:
-            results[r["id"]] = {"status": "INFO", "expected_from": None,
-                                "expected_response": None, "due_utc": None,
-                                "closed_by": None, "status_updated_utc": r["ts"] or now}
+            results[r["row_id"]] = {"status": "INFO", "expected_from": None,
+                                    "expected_response": None, "due_utc": None,
+                                    "closed_by": None, "status_updated_utc": r["ts"] or now}
     return results
 
 
@@ -336,10 +462,10 @@ def holds_for_reverification(rows, now=None, min_age_days=7):
 
 
 def newly_expired(old_statuses, new_results):
-    """Ask ids that are EXPIRED in new_results but were not EXPIRED (or did not
+    """Row ids that are EXPIRED in new_results but were not EXPIRED (or did not
     exist) in old_statuses - the escalation list the compliance ring rings the
     owing agent from. Posting it is out of scope here; this only computes it.
-    old_statuses: {id: previous Status string or None}."""
+    old_statuses: {row_id: previous Status string or None}."""
     out = []
     for rid, result in new_results.items():
         if result["status"] != "EXPIRED":
