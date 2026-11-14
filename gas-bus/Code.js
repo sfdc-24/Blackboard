@@ -103,6 +103,8 @@ function doPost(e) {
     if (action === 'append') return handleAppend_(body, cfg);
     if (action === 'read') return handleRead_(body, cfg);
     if (action === 'time') return jsonOut_({ ok: true, time: nowStamp_(), iso: new Date().toISOString() });
+    if (action === 'status_write') return handleStatusWrite_(body, cfg);
+    if (action === 'status_setup') return handleStatusSetup_(body, cfg);
     return jsonOut_({ ok: false, error: 'Unknown action: ' + action }, 400);
   } catch (err) {
     return jsonOut_({ ok: false, error: String(err) }, 500);
@@ -148,6 +150,11 @@ function handleAppend_(body, cfg) {
     return jsonOut_({ ok: false, error: 'Could not acquire the lock within 20s — another append is in progress. Retry.' }, 423);
   }
 
+  // `response` is set on every path below instead of returning directly, and `ringRow` is set
+  // only when a sheetRow actually landed on the sheet. Both are read AFTER the finally block, so
+  // the W1 grok ring (below) runs strictly after lock.releaseLock() — see maybeRingGrok_.
+  let response;
+  let ringRow = null;
   try {
     const file = resolveFile_(body, cfg.folderId);
     const mime = file.getMimeType();
@@ -160,37 +167,105 @@ function handleAppend_(body, cfg) {
         docBody.appendParagraph(line);
       });
       doc.saveAndClose();
+      response = jsonOut_({ ok: true, fileId: file.getId(), title: file.getName(), appendedAt: nowStamp_() });
     } else if (mime === MimeType.GOOGLE_SHEETS) {
       const ss = SpreadsheetApp.openById(file.getId());
       const sheet = body.sheetName ? ss.getSheetByName(body.sheetName) : ss.getSheets()[0];
-      if (!sheet) return jsonOut_({ ok: false, error: 'Sheet tab not found: ' + body.sheetName }, 400);
-      const row = sender ? stampSender_(body.sheetRow, sender.stamp) : (body.sheetRow || [nowStamp_(), body.text || '']);
-      // PY-01: checked UNDER THE LOCK, so two racing retries cannot both pass the check.
-      const dup = Array.isArray(body.sheetRow) ? findDuplicate_(sheet, body.sheetRow) : null;
-      if (dup) {
-        return jsonOut_({ ok: false, error: 'DUPLICATE', duplicate: dup.kind, id: dup.id,
-                          existing_row: dup.row }, 409);
-      }
-      sheet.appendRow(row);
-      if (Array.isArray(body.sheetRow)) {
-        const trigger = maybeTriggerWorker_(body.sheetRow);
-        if (trigger !== 'off' && trigger !== 'not-a-request') {
-          return jsonOut_({ ok: true, fileId: file.getId(), title: file.getName(), appendedAt: nowStamp_(),
-                            worker: trigger, sender: sender ? sender.stamp : undefined });
+      if (!sheet) {
+        response = jsonOut_({ ok: false, error: 'Sheet tab not found: ' + body.sheetName }, 400);
+      } else {
+        const row = sender ? stampSender_(body.sheetRow, sender.stamp) : (body.sheetRow || [nowStamp_(), body.text || '']);
+        // PY-01: checked UNDER THE LOCK, so two racing retries cannot both pass the check.
+        const dup = Array.isArray(body.sheetRow) ? findDuplicate_(sheet, body.sheetRow) : null;
+        if (dup) {
+          response = jsonOut_({ ok: false, error: 'DUPLICATE', duplicate: dup.kind, id: dup.id,
+                            existing_row: dup.row }, 409);
+        } else {
+          sheet.appendRow(row);
+          if (Array.isArray(body.sheetRow)) ringRow = row;
+          if (Array.isArray(body.sheetRow)) {
+            const trigger = maybeTriggerWorker_(body.sheetRow);
+            if (trigger !== 'off' && trigger !== 'not-a-request') {
+              response = jsonOut_({ ok: true, fileId: file.getId(), title: file.getName(), appendedAt: nowStamp_(),
+                                worker: trigger, sender: sender ? sender.stamp : undefined });
+            }
+          }
+          if (!response && sender) {
+            response = jsonOut_({ ok: true, fileId: file.getId(), title: file.getName(), appendedAt: nowStamp_(),
+                              sender: sender.stamp });
+          }
+          if (!response) {
+            response = jsonOut_({ ok: true, fileId: file.getId(), title: file.getName(), appendedAt: nowStamp_() });
+          }
         }
       }
-      if (sender) {
-        return jsonOut_({ ok: true, fileId: file.getId(), title: file.getName(), appendedAt: nowStamp_(),
-                          sender: sender.stamp });
-      }
     } else {
-      return jsonOut_({ ok: false, error: 'Unsupported file type for append: ' + mime }, 400);
+      response = jsonOut_({ ok: false, error: 'Unsupported file type for append: ' + mime }, 400);
     }
-
-    return jsonOut_({ ok: true, fileId: file.getId(), title: file.getName(), appendedAt: nowStamp_() });
   } finally {
     lock.releaseLock();
   }
+
+  // W1 / Option A (owner GO 2026-11-10 16:28 ET, CLAUDE-MOBILE-OWNER-RULING-W1-OPTION-A): ring
+  // grok's webhook on the write itself instead of waiting for the next fleet_ring poll. Deliberately
+  // outside the lock above — see maybeRingGrok_ for why — and never allowed to change `response`.
+  if (ringRow) {
+    try { maybeRingGrok_(ringRow); } catch (err) { /* the append already succeeded; never surface this */ }
+  }
+
+  return response;
+}
+
+// ---- W1 / OPTION A: RING GROK'S WEBHOOK ON WRITE --------------------------------------------
+//
+// fleet_ring polls the board every 120s; measured giving grok 53-201s wake latency for rows
+// addressed to him (GROK-NOTE-W1-TEST-3-RECEIPT-20261110T1737Z). This rings his webhook right on
+// the append that names him, instead of waiting for the next poll. Box-only pushring_watcher and
+// fleet_ring both stay running as backstops — this is additive, not a replacement.
+//
+// Called from handleAppend_ strictly AFTER lock.releaseLock(): Apps Script's UrlFetchApp has no
+// shorter-than-default timeout, so a slow or unreachable webhook held under the shared lock would
+// stall every other writer on the fleet. Keeping it off the lock is the only real way to bound
+// that risk - the fetch can still be slow, but only this one row's trigger pays for it, not the
+// whole board.
+//
+// Scope exactly as ruled (CLAUDE-MOBILE-OWNER-RULING-W1-OPTION-A-20261110T2129Z):
+//   - GROK_WEBHOOK_URL / GROK_WEBHOOK_KEY live ONLY in Script Properties, set by the owner's own
+//     hand in the Apps Script editor (Project Settings > Script Properties). Never written here,
+//     never logged, never echoed in a response. Absent either one, this does nothing - so Option A
+//     can deploy before the owner pastes the key with zero behavior change until he does.
+//   - rings only when the row's Target_Surface (column D) or the payload's cc= names grok.
+//   - never for grok's own rows (from=grok), never for an info-phase row - the same set
+//     fleet_ring / fleet_doorbell already treat as not worth waking him for.
+const GROK_RING_INFO_PHASES = ['RESULT', 'AYA_RESULT', 'DONE', 'ACK', 'RECEIPT', 'AYA_RECEIPT'];
+
+function maybeRingGrok_(row) {
+  const props = PropertiesService.getScriptProperties();
+  const url = props.getProperty('GROK_WEBHOOK_URL');
+  const key = props.getProperty('GROK_WEBHOOK_KEY');
+  if (!url || !key) return;
+
+  const payload = String(row[5] == null ? '' : row[5]);
+  const from = cleanTag_(bcbField_(payload, 'from')) || cleanTag_(row[2]);
+  if (from === 'grok') return;
+
+  const phase = String(bcbField_(payload, 'phase') || '').trim().toUpperCase();
+  if (GROK_RING_INFO_PHASES.indexOf(phase) !== -1) return;
+
+  // Split BEFORE cleaning: cleanTag_ strips ';' and ',', which is exactly what separates
+  // multiple recipients in Target_Surface ("grok;codex") and cc= alike.
+  const to = String(row[3] == null ? '' : row[3]);
+  const cc = bcbField_(payload, 'cc');
+  const names = (to + ';' + cc).split(/[;,]/).map(function (s) { return cleanTag_(s); });
+  if (names.indexOf('grok') === -1) return;
+
+  UrlFetchApp.fetch(url, {
+    method: 'post',
+    contentType: 'application/json',
+    payload: JSON.stringify({ row_id: row[0], sent_at: new Date().toISOString() }),
+    headers: { Authorization: 'Bearer ' + key },
+    muteHttpExceptions: true,
+  });
 }
 
 // ---- PY-01: NO ROW TWICE ---------------------------------------------
@@ -578,4 +653,240 @@ function jsonOut_(obj, code) {
   obj._httpStatus = code || 200;
   return ContentService.createTextOutput(JSON.stringify(obj))
     .setMimeType(ContentService.MimeType.JSON);
+}
+
+// ---- R-STATUS: status_write / status_setup ----------------------------------------
+//
+// docs/BOARD-STATUS-FRAMEWORK.md. The reconciler (cloud/status-reconciler, a Cloud Run
+// job) is the only writer of columns M to R. blackboard-5e's ruling, 2026-11-14: these
+// two gateway actions, not a Sheets-API service account - the gateway can enforce ON
+// ITS OWN SIDE that a status write touches only M to R, which is a stronger boundary
+// than a credential with edit rights on the whole sheet, and it needs no new owner
+// permission (sharing the sheet with a new account). Authenticated exactly like every
+// other action: the shared secret, checked once in doPost/doGet before dispatch.
+//
+// The column arithmetic and the update-shape guard are PURE functions (no
+// SpreadsheetApp, no PropertiesService) so they can be required and tested under
+// plain Node (gas-bus/test_status_write.js) without an Apps Script runtime - there is
+// no existing JS test harness in this repo to plug into instead.
+
+const STATUS_FIRST_COL = 13;   // M, 1-based
+const STATUS_LAST_COL = 18;    // R, 1-based
+const STATUS_COLS = 6;         // R - M + 1
+const STATUS_WRITE_MAX_ROWS = 500;
+const STATUS_HEADER_NAMES = ['Status', 'Expected_From', 'Expected_Response', 'Due_UTC',
+                              'Closed_By', 'Status_Updated_UTC'];
+const STATUS_VALUES = ['INFO', 'OPEN', 'ACKED', 'ANSWERED', 'CLOSED', 'EXPIRED', 'HELD'];
+const PROTECTED_RANGE_DESCRIPTION = 'R-STATUS: columns A to L, warning only';
+
+// One update: {row_id, values: [Status, Expected_From, Expected_Response, Due_UTC,
+// Closed_By, Status_Updated_UTC]}. Refuses an empty/oversized batch, a missing
+// row_id, or a `values` array that is not exactly the six M-R cells - a caller
+// cannot touch any OTHER column through this action, by construction, not by trust.
+function validateStatusUpdates_(updates) {
+  if (!Array.isArray(updates) || updates.length === 0) {
+    return { ok: false, error: 'updates must be a non-empty array' };
+  }
+  if (updates.length > STATUS_WRITE_MAX_ROWS) {
+    return { ok: false, error: 'updates has ' + updates.length + ' rows, max ' +
+                              STATUS_WRITE_MAX_ROWS + ' per call' };
+  }
+  for (let i = 0; i < updates.length; i++) {
+    const u = updates[i];
+    if (!u || typeof u.row_id !== 'string' || !u.row_id.trim()) {
+      return { ok: false, error: 'updates[' + i + '] is missing a non-empty row_id' };
+    }
+    if (!Array.isArray(u.values) || u.values.length !== STATUS_COLS) {
+      return { ok: false, error: 'updates[' + i + '] (row_id ' + u.row_id + ') needs exactly ' +
+                                  STATUS_COLS + ' values (M to R), got ' +
+                                  (Array.isArray(u.values) ? u.values.length : typeof u.values) };
+    }
+  }
+  return { ok: true };
+}
+
+// The A1 range for one sheet row's M:R cells - the only column arithmetic this
+// feature has, so "outside M to R" cannot happen by a typo somewhere else.
+function statusRangeA1_(sheetRowNumber) {
+  if (!Number.isInteger(sheetRowNumber) || sheetRowNumber < 1) {
+    throw new Error('sheetRowNumber must be a positive integer, got ' + sheetRowNumber);
+  }
+  return 'M' + sheetRowNumber + ':R' + sheetRowNumber;
+}
+
+// 1-based column number -> its A1 letter(s). Used only for an error message
+// (which existing header cell was already something else).
+function columnLetter_(col) {
+  let letter = '';
+  while (col > 0) {
+    const rem = (col - 1) % 26;
+    letter = String.fromCharCode(65 + rem) + letter;
+    col = Math.floor((col - 1) / 26);
+  }
+  return letter;
+}
+
+function handleStatusWrite_(body, cfg) {
+  if (!body.title) return jsonOut_({ ok: false, error: 'title is required.' }, 400);
+  const check = validateStatusUpdates_(body.updates);
+  if (!check.ok) return jsonOut_({ ok: false, error: check.error }, 400);
+
+  const lock = LockService.getScriptLock();
+  const gotLock = lock.tryLock(20000);
+  if (!gotLock) {
+    return jsonOut_({ ok: false, error: 'Could not acquire the lock within 20s - another status write is in progress. Retry.' }, 423);
+  }
+  let written = 0;
+  const misses = [];
+  try {
+    const file = resolveFile_(body, cfg.folderId);
+    const ss = SpreadsheetApp.openById(file.getId());
+    const sheet = body.sheetName ? ss.getSheetByName(body.sheetName) : ss.getSheets()[0];
+    if (!sheet) return jsonOut_({ ok: false, error: 'Sheet tab not found: ' + body.sheetName }, 400);
+
+    // Match by Row_ID in column A, never by sheet row number alone - the sheet
+    // can gain rows between the reconciler's read and its write, and a write by
+    // position alone would then land on the wrong row's M:R cells.
+    const last = sheet.getLastRow();
+    const rowByRowId = {};
+    if (last >= 1) {
+      const idColumn = sheet.getRange(1, 1, last, 1).getValues();
+      for (let r = 0; r < idColumn.length; r++) {
+        const v = idColumn[r][0];
+        if (v) rowByRowId[String(v)] = r + 1;
+      }
+    }
+    body.updates.forEach(function (u) {
+      const sheetRow = rowByRowId[u.row_id];
+      if (!sheetRow) { misses.push(u.row_id); return; }
+      sheet.getRange(statusRangeA1_(sheetRow)).setValues([u.values]);
+      written++;
+    });
+  } finally {
+    lock.releaseLock();
+  }
+  return jsonOut_({ ok: true, written: written, misses: misses });
+}
+
+function handleStatusSetup_(body, cfg) {
+  if (!body.title) return jsonOut_({ ok: false, error: 'title is required.' }, 400);
+  const lock = LockService.getScriptLock();
+  const gotLock = lock.tryLock(20000);
+  if (!gotLock) {
+    return jsonOut_({ ok: false, error: 'Could not acquire the lock within 20s. Retry.' }, 423);
+  }
+  const report = { headers: false, validation: false, protection: false,
+                   filter_view: false, filter_view_skipped_reason: null };
+  try {
+    const file = resolveFile_(body, cfg.folderId);
+    const ss = SpreadsheetApp.openById(file.getId());
+    const sheet = body.sheetName ? ss.getSheetByName(body.sheetName) : ss.getSheets()[0];
+    if (!sheet) return jsonOut_({ ok: false, error: 'Sheet tab not found: ' + body.sheetName }, 400);
+
+    // Headers - idempotent: a blank header cell is set, a cell that already
+    // matches is left alone, and a cell holding anything ELSE refuses the
+    // whole call rather than overwriting a column this setup does not own.
+    const headerRange = sheet.getRange(1, STATUS_FIRST_COL, 1, STATUS_COLS);
+    const existing = headerRange.getValues()[0];
+    const mismatchAt = existing.findIndex(function (v, i) {
+      return v && v !== STATUS_HEADER_NAMES[i];
+    });
+    if (mismatchAt !== -1) {
+      return jsonOut_({ ok: false, error: 'Column ' + columnLetter_(STATUS_FIRST_COL + mismatchAt) +
+                        '1 already holds ' + JSON.stringify(existing[mismatchAt]) + ', refusing to overwrite' }, 409);
+    }
+    headerRange.setValues([STATUS_HEADER_NAMES]);
+    report.headers = true;
+
+    // Data validation on column M, the WHOLE column (row 2 to the sheet's last
+    // row, open-ended A1 notation) - not a snapshot of today's row count.
+    // Finding #17: a range fixed at setup time (2..getLastRow()) left every
+    // row the bus appends afterwards - the live asks the validation and the
+    // "Open asks" view exist for - with no Status validation at all.
+    const statusColumnLetter = columnLetter_(STATUS_FIRST_COL);
+    const rule = SpreadsheetApp.newDataValidation()
+      .requireValueInList(STATUS_VALUES, true).setAllowInvalid(false).build();
+    sheet.getRange(statusColumnLetter + '2:' + statusColumnLetter).setDataValidation(rule);
+    report.validation = true;
+
+    // Protected range on A:L, WARNING ONLY, the WHOLE columns for the same
+    // reason - this guards against an accidental manual edit, not against
+    // another writer holding the shared secret (this gateway's own action
+    // dispatch is already that boundary). Idempotent: a protection with this
+    // exact description is never added twice.
+    const already = sheet.getProtections(SpreadsheetApp.ProtectionType.RANGE)
+      .filter(function (p) { return p.getDescription() === PROTECTED_RANGE_DESCRIPTION; });
+    if (already.length === 0) {
+      const protectedRange = sheet.getRange('A:L');
+      const protection = protectedRange.protect().setDescription(PROTECTED_RANGE_DESCRIPTION);
+      protection.setWarningOnly(true);
+      report.protection = true;
+    } else {
+      report.protection = 'already present';
+    }
+
+    // Filter view "Open asks" - the Advanced Sheets service only; this Apps
+    // Script project may not have it enabled, and setup must not fail outright
+    // over a feature it does not need for the columns and validation above.
+    // Idempotent (finding #12): a second --live call used to add a second
+    // "Open asks" view every time; now it checks for one with this exact
+    // title on this sheet first.
+    if (typeof Sheets !== 'undefined' && Sheets.Spreadsheets && Sheets.Spreadsheets.batchUpdate) {
+      try {
+        if (openAsksFilterViewExists_(file.getId(), sheet.getSheetId())) {
+          report.filter_view = 'already present';
+        } else {
+          addOpenAsksFilterView_(file.getId(), sheet.getSheetId());
+          report.filter_view = true;
+        }
+      } catch (err) {
+        report.filter_view_skipped_reason = 'Advanced Sheets call failed: ' + String(err);
+      }
+    } else {
+      report.filter_view_skipped_reason = 'Advanced Sheets service not enabled on this Apps Script project';
+    }
+  } finally {
+    lock.releaseLock();
+  }
+  return jsonOut_({ ok: true, report: report });
+}
+
+const OPEN_ASKS_FILTER_TITLE = 'Open asks';
+
+function openAsksFilterViewExists_(fileId, sheetId) {
+  const spreadsheet = Sheets.Spreadsheets.get(fileId, { fields: 'sheets(properties.sheetId,filterViews.title)' });
+  const sheet = (spreadsheet.sheets || []).filter(function (s) {
+    return s.properties && s.properties.sheetId === sheetId;
+  })[0];
+  return !!(sheet && (sheet.filterViews || []).some(function (fv) { return fv.title === OPEN_ASKS_FILTER_TITLE; }));
+}
+
+function addOpenAsksFilterView_(fileId, sheetId) {
+  const request = {
+    requests: [{
+      addFilterView: {
+        filter: {
+          title: OPEN_ASKS_FILTER_TITLE,
+          range: { sheetId: sheetId, startColumnIndex: 0 },
+          criteria: {
+            12: { condition: { type: 'ONE_OF_LIST', values: [
+              { userEnteredValue: 'OPEN' }, { userEnteredValue: 'ACKED' },
+            ] } },
+          },
+        },
+      },
+    }],
+  };
+  Sheets.Spreadsheets.batchUpdate(request, fileId);
+}
+
+// Node can require() this file for gas-bus/test_status_write.js; Apps Script
+// has no `module`, so this is a no-op there and changes nothing in production.
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = {
+    validateStatusUpdates_, statusRangeA1_, columnLetter_, handleStatusWrite_,
+    openAsksFilterViewExists_, OPEN_ASKS_FILTER_TITLE,
+    STATUS_FIRST_COL, STATUS_LAST_COL, STATUS_COLS, STATUS_WRITE_MAX_ROWS,
+    STATUS_HEADER_NAMES, STATUS_VALUES,
+  };
 }

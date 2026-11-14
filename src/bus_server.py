@@ -48,6 +48,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 VERSION = "1.1.0"
 SERVICE = "sfdc24-blackboard-bus"
 
+# R-STATUS (docs/BOARD-STATUS-FRAMEWORK.md), columns M to R once
+# scripts/status_sheet_setup.py has run.
+STATUS_HEADER_NAMES = ["Status", "Expected_From", "Expected_Response", "Due_UTC",
+                       "Closed_By", "Status_Updated_UTC"]
+
 # ---- closed vocabularies (LEDGER SCHEMA v1, sections 1 and 5) ----
 EVENT_TYPES = {"CREATE", "CLAIM", "PROGRESS", "BLOCK", "RELEASE",
                "COMPLETE", "CANCEL", "NOTE", "FINDING"}
@@ -425,7 +430,18 @@ class Store:
             named = len(header)
             while named and not header[named - 1].strip():
                 named -= 1
-            if not all(c.strip() for c in header[:named]):
+            # R-STATUS (docs/BOARD-STATUS-FRAMEWORK.md): columns K and L are
+            # blank padding (K unused, L is bus.py's sender=... stamp, a
+            # per-row value never a header name) directly followed by the six
+            # named Status columns, M1:R1 - a real board header, not a hole
+            # between named columns. Tolerated the same way
+            # scripts/open_for_me.py and scripts/bcb_lint.py now do (finding
+            # #11: this check refused to import exactly that header).
+            blanks_before_status = (
+                len(header) >= 18 and header[10:12] == ["", ""]
+                and header[12:18] == STATUS_HEADER_NAMES)
+            checked = header[:10] + header[18:named] if blanks_before_status else header[:named]
+            if not all(c.strip() for c in checked):
                 raise BusError(400, "create kind=sheet requires header: blank column names are allowed "
                                     "only as trailing padding, not between named columns.")
             if named < 3:

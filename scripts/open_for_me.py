@@ -56,6 +56,9 @@ PRIORITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "NORMAL": 2, "LOW": 3, "": 4}
 # Board columns, by position. A short row shifts every field left (REQ-B4TQX9),
 # so every access here is bounds-checked rather than trusting the width.
 COL_ROWID, COL_TS, COL_SOURCE, COL_PAYLOAD, COL_CATEGORY, COL_GIST = 0, 1, 2, 5, 6, 8
+# R-STATUS's Status column (M), once scripts/status_sheet_setup.py has run. Blank
+# on a row the reconciler has not reached yet (pre-R-STATUS history, or this cycle).
+COL_STATUS = 12
 
 MAX_GIST = 160          # characters of board text ever echoed
 MAX_ROWS = 200          # rows rendered or serialised, in text AND json
@@ -397,13 +400,22 @@ def hold_lifecycle(hold_id, hold_pr, hold_when, hold_from, hold_head, rows):
     """
     if not hold_id:
         return ACTIVE, ""
+    if hold_when is None:
+        # FAIL CLOSED (Codex, PR 502 review): `(hold_when and when <= hold_when)`
+        # is False whenever hold_when is falsy, so a hold with no parseable
+        # placement timestamp let ANY later, correctly-authorised clearing row
+        # through with no "strictly later than the hold" check at all - the
+        # one ordering guarantee the docstring above promises. A hold whose own
+        # timestamp cannot be read stays ACTIVE and cannot be cleared by
+        # anyone, rather than being clearable by construction.
+        return ACTIVE, "hold timestamp unreadable; ACTIVE and cannot be cleared"
     rejected = ""
     for r in rows:
         payload = cell(r, COL_PAYLOAD)
         if not is_canonical_bcb(payload):
             continue                     # prose that mentions an id is not a clear
         when = parse_ts(cell(r, COL_TS))
-        if when is None or (hold_when and when <= hold_when):
+        if when is None or when <= hold_when:
             continue
         row_from = field(payload, "from")
         row_tag = cell(r, COL_SOURCE)
@@ -490,7 +502,16 @@ def open_for(rows, tag, include_cc=False, include_all=False, min_priority=None, 
         # constraint it declared was not - so it is surfaced on the strength of
         # carrying a hold, whatever its Category says.
         is_hold = bool(field(payload, "hold"))
-        if not is_hold and cell(r, COL_CATEGORY).strip().upper() != "OPEN":
+        # Decide "open" from the reconciler's own Status column when it has
+        # reached this row, falling back to Category when it has not
+        # (adversarial review, finding #14: Category alone stopped matching
+        # "open" the moment R-STATUS started defaulting it to "" for phases
+        # like REVIEW/ORDER/HANDOFF/BATON that this reader still treats as
+        # ask-like work; Status is the column Rule 5 makes authoritative).
+        status_cell = cell(r, COL_STATUS).strip().upper()
+        is_open_like = (status_cell in ("OPEN", "ACKED")) if status_cell else (
+            cell(r, COL_CATEGORY).strip().upper() == "OPEN")
+        if not is_hold and not is_open_like:
             continue
         # A row this tag WROTE is not work for this tag.
         if cell(r, COL_SOURCE) == tag or field(payload, "from") == tag:
@@ -661,6 +682,12 @@ def render(result):
 # blank padding cells on every row (REQ-B4TQX9), which are transport, not data.
 BOARD_HEADER = ("Row_ID", "Timestamp", "Source_Tag", "Target_Surface", "Action_Type",
                 "Payload", "Category", "Project Tag", "Gist", "Sub-Gist")
+# R-STATUS (docs/BOARD-STATUS-FRAMEWORK.md): columns M to R, once
+# scripts/status_sheet_setup.py has named them. K (padding) and L (bus.py's
+# sender=... stamp, a per-ROW value, never a header name) stay blank in the
+# header row either way.
+STATUS_HEADER_NAMES = ("Status", "Expected_From", "Expected_Response", "Due_UTC",
+                        "Closed_By", "Status_Updated_UTC")
 MAX_BOARD_ROWS = 100000     # refuse an input that is not plausibly this board
 MAX_ROW_CELLS = 64
 MAX_CELL_CHARS = 100000
@@ -732,7 +759,16 @@ def load_board(data, expect_title=BOARD_TITLE):
             "the first row is not the BCB-1 header, so column positions cannot "
             "be trusted. Expected " + ", ".join(BOARD_HEADER) + " but found "
             + ", ".join(named[:len(BOARD_HEADER)] or ["<empty>"]))
-    if any(str(c).strip() for c in header[len(BOARD_HEADER):]):
+    # Past the ten named columns: K (blank padding) and L (bus.py's sender stamp
+    # is per-row, never a header name) must stay blank; M-R (the R-STATUS
+    # Status columns) must be either all blank (not set up yet) or exactly
+    # STATUS_HEADER_NAMES - anything else past column J is still a genuine
+    # surprise, same principle as scripts/bcb_lint.py's tolerance for data rows.
+    tail = [str(c).strip() for c in header[len(BOARD_HEADER):]]
+    status_cells = tail[2:2 + len(STATUS_HEADER_NAMES)]
+    other_cells = tail[:2] + tail[2 + len(STATUS_HEADER_NAMES):]
+    status_ok = not any(status_cells) or tuple(status_cells) == STATUS_HEADER_NAMES
+    if any(other_cells) or not status_ok:
         raise BoardError("the header has content past its {0} named columns".format(
             len(BOARD_HEADER)))
 
