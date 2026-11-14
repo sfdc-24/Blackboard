@@ -1,6 +1,7 @@
 """cloud/status-reconciler/main.py's pure helpers: the previous-state read, the
 current-state read, the diff that decides what actually needs a write, and
 that --dry makes no write/StatusClient call at all."""
+import importlib.util
 import io
 import json
 import sys
@@ -9,10 +10,23 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "cloud" / "status-reconciler"))
-import main as recon_main  # noqa: E402
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO / "scripts"))
 import rstatus_reconcile as rs  # noqa: E402
+
+# A bare `import main` would collide with every OTHER cloud job's main.py that
+# some other test file has already imported under that same top-level name
+# (sys.modules caches by name, not by path) - confirmed under
+# `unittest discover`: test_status_reconciler_main's own tests failed with
+# "module 'main' has no attribute ..." because an earlier-discovered test had
+# already cached a DIFFERENT cloud job's main.py as "main". The established,
+# collision-safe convention in this repo (test_board_watcher.py,
+# test_drive_intake.py, test_wa_outbox_cloud.py, ...) is spec_from_file_location
+# with a unique name.
+_spec = importlib.util.spec_from_file_location(
+    "status_reconciler_main", REPO / "cloud" / "status-reconciler" / "main.py")
+recon_main = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(recon_main)
 
 
 def row(rid, payload, status_tail=None):

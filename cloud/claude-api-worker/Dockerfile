@@ -18,6 +18,7 @@ COPY scripts/redis_dual.py /app/redis_dual.py
 COPY scripts/redis_dual.settings.json /app/redis_dual.settings.json
 COPY scripts/bus.py /app/bus.py
 COPY scripts/append.py /app/append.py
+COPY scripts/ask_phases.py /app/ask_phases.py
 COPY scripts/signature.py /app/signature.py
 COPY scripts/board_row.py /app/board_row.py
 COPY scripts/agent_roster.json /app/agent_roster.json
