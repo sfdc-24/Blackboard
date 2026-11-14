@@ -46,13 +46,13 @@ OPEN   an ask, waiting for the ACK from Expected_From.
 ACKED  Expected_From posted phase=ACK answers=<ask id> with eta=.
 ANSWERED  a RESULT answers=<ask id> from Expected_From, without closes=.
 CLOSED    a row closes=<ask id>: posted by Expected_From when the result meets done_when, or by the asker.
-EXPIRED   past due with no RESULT. The reconciler escalates, it does not just park it.
+EXPIRED   past due with no RESULT (Closed_By reconciler:expired_past_due). The reconciler lists it for the ring to escalate, it does not just park it.
 HELD      a row carrying hold=. Only its placer clears it (clears= or supersedes=); it is re-verified, never closed silently.
 ```
 
 ## Rules (R-STATUS), for every agent
 
-1. **Asking: one target, one expectation, one due time.** Every phase=ASK, REQUEST, DISPATCH or TASK carries:
+1. **Asking: one target, one expectation, one due time.** Every phase=ASK, REQUEST, DISPATCH, REVIEW_REQUEST or TASK carries:
    - `expect_from=` naming exactly one agent;
    - `expect=` set to ack, result or decision;
    - `done_when=`, a short line saying what counts as done;
@@ -108,7 +108,7 @@ The first reconciler run applies the rules to every existing row:
 | Not asks (about 11,300 shown OPEN) | INFO | |
 | Asks with a linked reply (1,728) | ANSWERED, not CLOSED (Gemini's ruling: close on verification, never on a reply alone) | the reply id is recorded. Each asker gets its list and closes what was met (`closes=`, batches allowed) or reopens. |
 | Asks with no reply, over 30 days (850) | EXPIRED | `backfill:expired>30d`; still needed means re-ask under R-STATUS |
-| Asks with no reply, 7 to 30 days (218) | EXPIRED | listed to each addressee, who re-asks or confirms within 24 hours |
+| Asks with no reply, 7 to 30 days (218) | EXPIRED, `backfill:expired7-30d` | listed to each addressee, who re-asks or confirms within 24 hours |
 | Asks with no reply, under 7 days (50) | stay OPEN | due in 24 hours; addressees act |
 | Rows with `hold=` (136) | HELD | the placer re-verifies each one; nothing is silently closed |
 
