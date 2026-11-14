@@ -661,6 +661,12 @@ def render(result):
 # blank padding cells on every row (REQ-B4TQX9), which are transport, not data.
 BOARD_HEADER = ("Row_ID", "Timestamp", "Source_Tag", "Target_Surface", "Action_Type",
                 "Payload", "Category", "Project Tag", "Gist", "Sub-Gist")
+# R-STATUS (docs/BOARD-STATUS-FRAMEWORK.md): columns M to R, once
+# scripts/status_sheet_setup.py has named them. K (padding) and L (bus.py's
+# sender=... stamp, a per-ROW value, never a header name) stay blank in the
+# header row either way.
+STATUS_HEADER_NAMES = ("Status", "Expected_From", "Expected_Response", "Due_UTC",
+                        "Closed_By", "Status_Updated_UTC")
 MAX_BOARD_ROWS = 100000     # refuse an input that is not plausibly this board
 MAX_ROW_CELLS = 64
 MAX_CELL_CHARS = 100000
@@ -732,7 +738,16 @@ def load_board(data, expect_title=BOARD_TITLE):
             "the first row is not the BCB-1 header, so column positions cannot "
             "be trusted. Expected " + ", ".join(BOARD_HEADER) + " but found "
             + ", ".join(named[:len(BOARD_HEADER)] or ["<empty>"]))
-    if any(str(c).strip() for c in header[len(BOARD_HEADER):]):
+    # Past the ten named columns: K (blank padding) and L (bus.py's sender stamp
+    # is per-row, never a header name) must stay blank; M-R (the R-STATUS
+    # Status columns) must be either all blank (not set up yet) or exactly
+    # STATUS_HEADER_NAMES - anything else past column J is still a genuine
+    # surprise, same principle as scripts/bcb_lint.py's tolerance for data rows.
+    tail = [str(c).strip() for c in header[len(BOARD_HEADER):]]
+    status_cells = tail[2:2 + len(STATUS_HEADER_NAMES)]
+    other_cells = tail[:2] + tail[2 + len(STATUS_HEADER_NAMES):]
+    status_ok = not any(status_cells) or tuple(status_cells) == STATUS_HEADER_NAMES
+    if any(other_cells) or not status_ok:
         raise BoardError("the header has content past its {0} named columns".format(
             len(BOARD_HEADER)))
 

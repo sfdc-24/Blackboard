@@ -92,6 +92,7 @@ import threading
 
 import canvas_publish
 import call_lifecycle
+from ask_phases import default_category_for_phase
 import projects
 
 STREAM_MATCH = "v1:conf:*:events"
@@ -857,7 +858,8 @@ def wake_row(ask: str, agent: str, room: str, claimed_at) -> dict:
             "fleet:inbox:%s." % (NAME_OF[agent], eastern(claimed_at), room, agent, ask, ask, agent))
     row_id = safe(WAKE_PREFIX + ask)[:120]
     return {"row_id": row_id, "source_tag": "bus-reconciler", "target_surface": agent, "action_type": "ASK",
-            "category": "OPEN", "project_tag": "Blackboard", "gist": safe("Call ask for %s" % NAME_OF[agent]),
+            "category": default_category_for_phase("ASK"), "project_tag": "Blackboard",
+            "gist": safe("Call ask for %s" % NAME_OF[agent]),
             "payload": "BCB|v=1|id=%s|phase=ASK|from=bus-reconciler|to=%s|ask=%s|text=%s" % (
                 row_id, agent, safe(ask), safe(text))}
 

@@ -59,6 +59,7 @@ import time
 
 import canvas_publish
 import redis_gov
+from ask_phases import default_category_for_phase
 
 # The board's ten cells, as scripts/append.py writes them.
 ROW_ID, TS, SOURCE, TARGET, ACTION, PAYLOAD, CATEGORY, PROJECT, GIST, SUBGIST = range(10)
@@ -421,7 +422,7 @@ def row_for(kind, req, text, gist) -> dict:
         "source_tag": WORKER_TAG,
         "target_surface": target,
         "action_type": kind,
-        "category": "OPEN",
+        "category": default_category_for_phase(kind),
         "project_tag": "Blackboard",
         "gist": safe(gist),
         "payload": "BCB*v=1*id=%s*phase=%s*from=%s*to=%s*answers=%s*evidence=MEASURED*text=%s".replace(

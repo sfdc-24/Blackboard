@@ -13,6 +13,7 @@ import sys
 
 import board_row
 import signature
+from ask_phases import default_category
 from bus import fetch, load_env, read_rows, with_sender_token
 
 TITLE = "Blackboard - Alpha DB"
@@ -59,7 +60,7 @@ def main(require_sender_identity=False):
         spec.get("target_surface", "ALL"),
         spec.get("action_type", "APPEND"),
         spec["payload"],
-        spec.get("category", "OPEN"),
+        spec["category"] if "category" in spec else default_category(spec["payload"]),
         spec.get("project_tag", ""),
         spec.get("gist", ""),
         spec.get("subgist", ""),

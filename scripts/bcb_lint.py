@@ -29,11 +29,26 @@ import re
 import sys
 import urllib.request
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ask_phases import ASK_PHASES  # noqa: E402
+
 EXPECTED_COLS = 10
 COLUMNS = [
     "Row_ID", "Timestamp", "Source_Tag", "Target_Surface", "Action_Type",
     "Payload", "Category", "Project Tag", "Gist", "Sub-Gist",
 ]
+
+# Columns past the 10 named ones (0-based indices) that the fleet has since put real,
+# intentional content in. Column K (index 10) stays genuine padding - nothing writes
+# there. Column L (index 11, bus.py's SENDER_COLUMN) has carried a sender=... stamp on
+# every row since 2026-11-03, and this check did not learn about it: on the live board
+# it misclassified 11,286 of 21,227 rows (mostly "column 12 ... is not empty") as
+# MALFORMED, which is not a defect, it is the gateway doing exactly what it was built
+# to do. Columns M-R (indices 12-17) are the R-STATUS reconciler's Status columns,
+# live since 2026-11-14 (docs/BOARD-STATUS-FRAMEWORK.md) - the same kind of addition,
+# caught here before it repeats that mistake.
+TOLERATED_CONTENT_FROM = 11   # L
+TOLERATED_CONTENT_TO = 17     # R
 
 ISO_TS = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})$")
 UUID_ID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
@@ -85,15 +100,16 @@ def validate_row(index, row):
         # Google Sheets returns every row at the width of the sheet's USED range, so
         # a board widened past its ten named columns pads all of them. Empty padding
         # is the transport and not a defect - calling it malformed condemned all 1882
-        # live rows and buried the 322 rows with real findings. A padding cell that
-        # carries CONTENT is a genuine schema change and stays malformed. Same
-        # contract as the ORDER worker (PR46) and the bus.
+        # live rows and buried the 322 rows with real findings. Same contract as the
+        # ORDER worker (PR46) and the bus. A cell outside the tolerated range (K, or
+        # past R) that carries content is still a genuine schema surprise.
         extra = cells[EXPECTED_COLS:]
-        first = next((i for i, c in enumerate(extra) if c.strip()), None)
+        first = next((i for i, c in enumerate(extra) if c.strip()
+                      and not (TOLERATED_CONTENT_FROM <= EXPECTED_COLS + i <= TOLERATED_CONTENT_TO)), None)
         if first is not None:
             malformed.append(f"row has {len(cells)} columns and column "
-                             f"{EXPECTED_COLS + first + 1}, past the {EXPECTED_COLS}-column "
-                             f"schema, is not empty")
+                             f"{EXPECTED_COLS + first + 1}, outside the tolerated K / L / "
+                             f"M-R range, is not empty")
         cells = cells[:EXPECTED_COLS]
     elif len(cells) < EXPECTED_COLS:
         malformed.append(f"row has {len(cells)} columns, expected {EXPECTED_COLS}")
@@ -158,6 +174,17 @@ def validate_row(index, row):
         author = fields.get("by") if phase in ("VIEWPORT", "VERIFY") else fields.get("from")
         if author and source and author != source:
             warnings.append(f"Source_Tag {source!r} != BCB author {author!r} (fails R)")
+
+        # R-STATUS Rule 1: an ask-type row (ASK_PHASES = ASK, REQUEST, DISPATCH,
+        # REVIEW_REQUEST, TASK) must carry expect_from=, expect=, done_when= and due=,
+        # so the reconciler can compute Status without guessing. Warn-only for now
+        # (the doc says refuse later - this is not that yet).
+        if phase.upper() in ASK_PHASES:
+            missing = [k for k in ("expect_from", "expect", "done_when", "due") if k not in fields]
+            if missing:
+                warnings.append(
+                    f"R-STATUS: {phase} row missing {', '.join(k + '=' for k in missing)}"
+                    " (warn-only; Rule 1)")
 
     return malformed, warnings
 
