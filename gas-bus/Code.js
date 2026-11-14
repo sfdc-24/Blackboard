@@ -251,6 +251,8 @@ function maybeRingGrok_(row) {
 
   const phase = String(bcbField_(payload, 'phase') || '').trim().toUpperCase();
   if (GROK_RING_INFO_PHASES.indexOf(phase) !== -1) return;
+  // A waker's own reply (wakerreply=1) is never a wake, as scripts/fleet_doorbell.py also treats it.
+  if (String(bcbField_(payload, 'wakerreply') || '').trim() === '1') return;
 
   // Split BEFORE cleaning: cleanTag_ strips ';' and ',', which is exactly what separates
   // multiple recipients in Target_Surface ("grok;codex") and cc= alike.

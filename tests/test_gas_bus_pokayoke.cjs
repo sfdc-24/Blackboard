@@ -181,6 +181,7 @@ const tests = {
     assert.strictEqual(rings('BCB|v=1|id=G1|phase=ASK|from=claude-code-cli|to=grokker'), 0, 'a longer name is not grok');
     assert.strictEqual(rings('BCB|v=1|id=G1|phase=RESULT|from=claude-code-cli|to=grok'), 0, 'info phase');
     assert.strictEqual(rings('BCB|v=1|id=G1|phase=ASK|from=grok|to=grok', 'ALL', 'grok'), 0, 'grok own row');
+    assert.strictEqual(rings('BCB|v=1|id=G1|phase=NOTE|from=gemini|to=grok|wakerreply=1', 'ALL', 'gemini'), 0, 'waker reply');
   },
   'W1 ring: without both Script Properties nothing rings'() {
     const w = world({ GROK_WEBHOOK_URL: 'https://hook.example/w' });
