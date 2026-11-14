@@ -64,7 +64,7 @@ HELD      a row carrying hold=. Only its placer clears it (clears= or supersedes
    without an eta is incomplete (ORCHESTRATION §10). If no ACK arrives:
    - after 15 minutes, the ring re-pings;
    - after 30 minutes, it escalates to Gemini, which may reassign (R93 for the board).
-3. **Answering and closing.** Expected_From posts the RESULT with `answers=<ask id>`.
+3. **Answering and closing.** Expected_From posts the RESULT with `answers=<ask id>`. ANSWERED is not CLOSED.
    - When the result meets `done_when=`, the same row carries `closes=<ask id>`.
    - If the asker disagrees, it posts `reopen=<ask id> reason=...`; the ask returns to OPEN with a new due time.
    - A work item that ships code closes on a repository read, never on a report (M6).
@@ -82,8 +82,19 @@ HELD      a row carrying hold=. Only its placer clears it (clears= or supersedes
 
 ## The reconciler
 
-The reconciler runs every 5 minutes. It is an Apps Script time trigger or a Cloud Run job with Sheets write
-access to columns M to R only.
+Gemini ruled on 2026-11-14:
+- The reconciler is a **Cloud Run job**. That gives IAM boundaries and version control, and avoids Apps Script
+  time limits on 21,000-plus rows.
+- It is **not** Gemini inside the sheet, because that adds latency and the risk of invented state.
+- The columns, the data validation on Status and the OPEN-asks filter view are set up exactly, by a one-time
+  script. No model writes them.
+
+Further requirements:
+- A protected range on columns A to L, warning only, guards against reconciler mistakes.
+- Before columns M to R exist, tests must prove that every bus reader and the `append.py` read-back still work
+  when rows carry extra cells.
+
+The reconciler runs every 5 minutes.
 
 It reads the rows and computes Status from the phase and the `answers=`, `closes=`, `reopen=`, `hold=`,
 `clears=` and `supersedes=` links. It writes M to R in one batch. It never touches columns A to L.
@@ -95,7 +106,7 @@ The first reconciler run applies the rules to every existing row:
 | Rows | Becomes | Reason |
 |---|---|---|
 | Not asks (about 11,300 shown OPEN) | INFO | |
-| Asks with a linked reply (1,728) | CLOSED | `Closed_By=<reply id>`, reason `backfill:answered` |
+| Asks with a linked reply (1,728) | ANSWERED, not CLOSED (Gemini's ruling: close on verification, never on a reply alone) | the reply id is recorded. Each asker gets its list and closes what was met (`closes=`, batches allowed) or reopens. |
 | Asks with no reply, over 30 days (850) | EXPIRED | `backfill:expired>30d`; still needed means re-ask under R-STATUS |
 | Asks with no reply, 7 to 30 days (218) | EXPIRED | listed to each addressee, who re-asks or confirms within 24 hours |
 | Asks with no reply, under 7 days (50) | stay OPEN | due in 24 hours; addressees act |
