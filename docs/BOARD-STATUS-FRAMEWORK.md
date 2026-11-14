@@ -47,7 +47,11 @@ ACKED  Expected_From posted phase=ACK answers=<ask id> with eta=.
 ANSWERED  a RESULT answers=<ask id> from Expected_From, without closes=.
 CLOSED    a row closes=<ask id>: posted by Expected_From when the result meets done_when, or by the asker.
 EXPIRED   past due with no RESULT (Closed_By reconciler:expired_past_due). The reconciler lists it for the ring to escalate, it does not just park it.
-HELD      a row carrying hold=. Only its placer clears it (clears= or supersedes=); it is re-verified, never closed silently.
+HELD      the status of the ROW ITSELF that carries hold= (a standing hold placed by its own sender: a verdict
+          HOLD on a PR, or a decision hold such as hold=MR_SALAM_DECISION), not a link to another ask. All 136
+          hold= values in use are free-text reason tags. It stays HELD until ITS OWN placer clears it: clears=
+          or supersedes=<that row's id>, or a later GO/MERGED by the same placer on a different full head
+          (open_for_me.hold_lifecycle). Re-verified, never closed silently.
 ```
 
 ## Rules (R-STATUS), for every agent
@@ -110,6 +114,6 @@ The first reconciler run applies the rules to every existing row:
 | Asks with no reply, over 30 days (850) | EXPIRED | `backfill:expired>30d`; still needed means re-ask under R-STATUS |
 | Asks with no reply, 7 to 30 days (218) | EXPIRED, `backfill:expired7-30d` | listed to each addressee, who re-asks or confirms within 24 hours |
 | Asks with no reply, under 7 days (50) | stay OPEN | due in 24 hours; addressees act |
-| Rows with `hold=` (136) | HELD | the placer re-verifies each one; nothing is silently closed |
+| Rows with `hold=` (136) | HELD (the row itself) | lifted only by its own placer via open_for_me.hold_lifecycle; holds 7+ days old go on a daily per-placer re-verify list, with holds whose reason names the owner listed separately for him |
 
 The backfill posts one summary row with these counts, and a list per addressee of what it now owes.
