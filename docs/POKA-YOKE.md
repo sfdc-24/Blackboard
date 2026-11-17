@@ -542,6 +542,10 @@ behind the screen. The architecture lane recorded it as a P0 directive
   - behind-the-screen reasoning (card or text).
 - The agent whose path fails is asked to diagnose its own path at the first
   repeat failure, not after the fourth release.
+- Every retrospective that finds a defect has a "system limitation" section. It
+  researches the service providers, tools and network involved, and records
+  whether the defect is inherent in their design, before any fix is chosen.
+  A defect that is inherent gets a role or route change, not a fix loop.
 - Candidate mechanism: the Model Capability and Limitation Matrix (owed
   2026-11-17), cited by row in any PR that changes a provider-facing voice or
   adapter path. The release guard would refuse such a PR without the citation.
