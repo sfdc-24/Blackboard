@@ -504,6 +504,55 @@ second time, the reviewer spent its whole budget and returned no verdict.
 
 ---
 
+## L-117 — A provider's design limit is a role decision, not a bug to patch
+
+**Incident.** From 2026-11-16 into 2026-11-17, Cody's spoken answers in the
+conference room kept failing the pre-call gate. Four releases and three gate
+reruns went into patching application code around the problem:
+- a cap tied to each line's length;
+- a gate wait for answers that start late;
+- a GPT-Live session that never heard the owner, so no audio of his question
+  could leak into a binder line.
+
+Each patch fixed something real. Cody's short acknowledgement became exact:
+3 of 3 words, first audio at 1.9 s. But his 15-word answers still came out
+paraphrased, 67% of the words in order (`CLAUDE-CLI-RESULT-GATE145-20261117T1033Z`).
+Cody's own diagnosis (`CODEX-RESULT-SELF-DIAGNOSE-20261117T1036Z`) and
+OpenAI's live-conversation guidance agree on the cause: the realtime speech
+model can be *asked* for exact wording but does not *enforce* it. The tests
+were never asked that question until after the fourth release. The owner
+decided to stop working on Cody's voice answers and to keep Cody's answers
+behind the screen. The architecture lane recorded it as a P0 directive
+(`GEMINI-DIRECTIVE-MODEL-CAPABILITY-AUDIT-20261117T1042Z`).
+
+**Naive rule.** "Try harder to make the voice say the line."
+
+**Mechanism — RULE ONLY; candidate mechanism named.**
+- Before a test, gate, cap or fix loop is built around a third-party model or
+  endpoint, its capability boundary is written down first:
+  - is it deterministic or not;
+  - its verbatim ceiling;
+  - its latency floor.
+
+  The source is the provider documentation plus one small live sample.
+- When a failure matches a documented provider characteristic, the fix is a
+  role change, not application code:
+  - conversational voice;
+  - exact readout (app-rendered TTS);
+  - behind-the-screen reasoning (card or text).
+- The agent whose path fails is asked to diagnose its own path at the first
+  repeat failure, not after the fourth release.
+- Every retrospective that finds a defect has a "system limitation" section. It
+  researches the service providers, tools and network involved, and records
+  whether the defect is inherent in their design, before any fix is chosen.
+  A defect that is inherent gets a role or route change, not a fix loop.
+- Candidate mechanism: the Model Capability and Limitation Matrix (owed
+  2026-11-17), cited by row in any PR that changes a provider-facing voice or
+  adapter path. The release guard would refuse such a PR without the citation.
+  No such check exists yet.
+
+---
+
 ## The first thing this file failed to prevent
 
 Recorded because a doctrine document that omits its own first failure is exactly
