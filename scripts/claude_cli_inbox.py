@@ -49,6 +49,8 @@ ADDRESS = re.compile(r"(?:^|\|)\s*(?:to|cc)=([^|]*)", re.I)
 # "now" and skip what is already waiting (Cursor on #294).
 COLD_START = timedelta(hours=6)
 SELF = "claude-code-cli"
+# A compliance ring the runner (scripts/compliance_runner.py) addresses to this session under its own tag.
+OWN_RING = re.compile(r"\|id=CLAUDE-CLI-COMPLIANCE-RING-[^|]*\|(?:[^|]*\|)*?to=claude-code-cli\|")
 
 
 def parse_ts(value) -> datetime | None:
@@ -79,7 +81,9 @@ def is_mine(row) -> bool:
     target = str(row[3]) if len(row) > 3 else ""
     payload = str(row[5]) if len(row) > 5 else ""
     if sender.startswith(SELF):
-        return False                                    # its own rows
+        # Its own rows stay out, except the compliance runner's rings: the runner posts them under this same tag, to
+        # this session. Hidden, they never reached it (Nov 14: six R-PR rings on its replies to the owner went unseen).
+        return bool(OWN_RING.search(payload[:300]))
     if sender == "whatsapp":
         return True
     names = addressees(row)

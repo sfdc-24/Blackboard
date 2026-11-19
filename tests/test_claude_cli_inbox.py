@@ -245,5 +245,24 @@ class MainTest(unittest.TestCase):
             self.assertTrue(printed[0].startswith("READ FAILED"), printed)
 
 
+class OwnCompliancerings(unittest.TestCase):
+    """Nov 14: the compliance runner rang six R-PR gaps on this session's replies to the owner, under this session's
+    own tag. The doorbell hid every own row, so none reached it. A ring addressed to this session now rings."""
+
+    def test_a_ring_the_runner_posts_to_this_session_reaches_it(self):
+        ring = row("2026-11-14T07:17:55Z", "claude-code-cli", "claude-code-cli",
+                   "BCB|v=1|id=CLAUDE-CLI-COMPLIANCE-RING-R-PR-20261114T071755Z-01|phase=ASK|class=COMPLIANCE|"
+                   "from=claude-code-cli|to=claude-code-cli|thread_id=TH-COMPLIANCE|rule=R-PR|text=gap")
+        self.assertTrue(inbox.is_mine(ring))
+
+    def test_its_other_own_rows_still_stay_out(self):
+        for payload in ("BCB|v=1|id=CLAUDE-CLI-RESULT-GROK-SYNC-20261114T0729Z|from=claude-code-cli|to=grok;gemini|",
+                        "BCB|v=1|id=CLAUDE-CLI-COMPLIANCE-RING-R-PR-20261114T071755Z-02|from=claude-code-cli|"
+                        "to=chatgpt-codex-desktop|rule=R-PR|",
+                        "BCB|v=1|id=CLAUDE-CLI-NOTE-X|from=claude-code-cli|to=claude-code-cli|text=a note to self|"):
+            with self.subTest(payload=payload[:40]):
+                self.assertFalse(inbox.is_mine(row("2026-11-14T07:20:00Z", "claude-code-cli", "x", payload)))
+
+
 if __name__ == "__main__":
     unittest.main()
