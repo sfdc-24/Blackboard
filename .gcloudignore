@@ -29,6 +29,7 @@
 !/cloud/drive-intake
 !/cloud/claude-api-worker
 !/cloud/inbox-wake
+!/cloud/status-reconciler
 
 !/scripts
 /scripts/*
@@ -51,6 +52,10 @@
 !/scripts/agent_roster.json
 !/scripts/append.py
 !/scripts/board_say.py
+!/scripts/open_for_me.py
+!/scripts/ask_phases.py
+!/scripts/rstatus_reconcile.py
+!/scripts/status_client.py
 !/scripts/state_store.py
 !/scripts/board_waker.py
 !/scripts/wa_board_outbox.py

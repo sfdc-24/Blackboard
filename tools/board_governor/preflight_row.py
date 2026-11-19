@@ -55,6 +55,7 @@ def main(argv):
     sys.path.insert(0, str(scripts))
     try:
         from append import AUTHORITY_KEYS, _conflicting_keys  # noqa: E402
+        from ask_phases import default_category  # noqa: E402
     except Exception as exc:  # noqa: BLE001
         raise SystemExit(
             "cannot import append.py from {}: {}\n"
@@ -104,7 +105,8 @@ def main(argv):
     row = [
         spec["row_id"], "<stamped by append.py>", spec["source_tag"],
         spec.get("target_surface", "ALL"), spec.get("action_type", "APPEND"),
-        payload, spec.get("category", "OPEN"), spec.get("project_tag", ""),
+        payload, spec["category"] if "category" in spec else default_category(payload),
+        spec.get("project_tag", ""),
         spec.get("gist", ""), spec.get("subgist", ""),
     ]
     print()

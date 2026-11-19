@@ -59,6 +59,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "scripts"))
 from bus import fetch as _bus_fetch, load_env as _bus_load_env  # noqa: E402
 import board_row  # noqa: E402  - the one write rule: never trim a row silently
+from ask_phases import default_category_for_phase  # noqa: E402
 ENV = os.path.join(REPO, ".env")
 BOARD = "Blackboard - Alpha DB"
 BACKUPS = os.path.join(os.path.dirname(REPO), "blackboard-backups")
@@ -374,7 +375,8 @@ def cmd_post(args):
         print("  WARNING: %d chars could not be stored (%s); the row is marked truncated=1"
               % (fitted["chars"], fitted["error"] or "no spill store"))
     gist = args.gist or board_row.split_fields(text)[1][:180]
-    row = [rid, now, tag, to, args.phase, payload, args.category, args.project, gist[:180], ""]
+    category = args.category if args.category is not None else default_category_for_phase(args.phase)
+    row = [rid, now, tag, to, args.phase, payload, category, args.project, gist[:180], ""]
     return append_and_verify(rid, row, fitted, spill)
 
 
@@ -531,6 +533,10 @@ def request_row(tag, op, key, val=None, field=None, count=None, project="FLEET",
                          % (len(payload), board_row.ROW_LIMIT, len(str(val or "").encode("utf-8"))))
     payload = board_row.guard(payload)
     gist = "redis-op %s %s" % (op, key)
+    # Exempt from ask_phases.default_category() on purpose: this row carries no phase= at all
+    # (its grammar is do=redis-op, not BCB-1's phase=), but it is a genuine open ask - the
+    # AYA_RESULT reply is still outstanding - so defaulting it to "" would be a regression,
+    # not a fix, for a request that R-STATUS's phase-based rule was never written to see.
     row = [rid, stamp.strftime("%Y-%m-%dT%H:%M:%S.%fZ"), tag, REQUEST_WORKER, REQUEST_ACTION,
            payload, "OPEN", project, gist[:180], ""]
     return rid, row
@@ -589,7 +595,9 @@ def build_parser():
     po.add_argument("--to", default="ALL")
     po.add_argument("--phase", default="OPEN", choices=["WIP", "OPEN", "DONE", "ASK", "BLOCKED", "RESULT"])
     po.add_argument("--klass", default="NOTE")
-    po.add_argument("--category", default="OPEN")
+    po.add_argument("--category", default=None,
+                    help="defaults to OPEN for an ask-type --phase (ASK/REQUEST/DISPATCH/"
+                         "REVIEW_REQUEST/TASK), else \"\" (R-STATUS Rule 5)")
     po.add_argument("--project", default="SITE")
     po.add_argument("--gist", default=None)
     po.add_argument("--id", default=None)
