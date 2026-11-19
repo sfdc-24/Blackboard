@@ -39,6 +39,13 @@ COLUMNS = [
     "Row_ID", "Timestamp", "Source_Tag", "Target_Surface", "Action_Type",
     "Payload", "Category", "Project Tag", "Gist", "Sub-Gist",
 ]
+# R-STATUS (docs/BOARD-STATUS-FRAMEWORK.md): columns M to R, once
+# scripts/status_sheet_setup.py has named them (adversarial review finding
+# #11: this reader hard-failed on the real header the moment that setup ran).
+# K (padding) and L (bus.py's sender=... stamp, a per-ROW value, never a
+# header name) stay blank in the header row either way.
+STATUS_HEADER_NAMES = ["Status", "Expected_From", "Expected_Response", "Due_UTC",
+                       "Closed_By", "Status_Updated_UTC"]
 
 ISO_TS = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})$")
 HUMAN_DATE = re.compile(
@@ -134,9 +141,14 @@ def load_rows(path):
         raise SystemExit(f"{path}: no rows")
 
     header = [str(cell).strip() for cell in raw[0]]
-    while header and header[-1] == "":
-        header.pop()
-    if header != COLUMNS:
+    named = header[:len(COLUMNS)]
+    if named != COLUMNS:
+        raise SystemExit(f"{path}: unexpected header {header}")
+    tail = header[len(COLUMNS):]
+    status_cells = tail[2:2 + len(STATUS_HEADER_NAMES)]
+    other_cells = tail[:2] + tail[2 + len(STATUS_HEADER_NAMES):]
+    status_ok = not any(status_cells) or status_cells == STATUS_HEADER_NAMES
+    if any(other_cells) or not status_ok:
         raise SystemExit(f"{path}: unexpected header {header}")
 
     rows, refusals = [], []
