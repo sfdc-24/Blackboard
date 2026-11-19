@@ -106,6 +106,8 @@ import sys
 import tempfile
 import time
 
+from ask_phases import default_category_for_phase
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ME = "claude-code-cli"
 KEY = "fleet:inbox:%s"
@@ -198,7 +200,7 @@ def request_row(op: str, key: str, *, value: str | None = None, count: int | Non
         "source_tag": ME,
         "target_surface": "bus-reconciler",
         "action_type": REQUEST_ACTION,
-        "category": "OPEN",
+        "category": default_category_for_phase("REQUEST"),
         "project_tag": "Blackboard",
         "gist": "redis inbox %s" % op,
         "subgist": key,
@@ -408,7 +410,7 @@ def breaker_row(text: str) -> None:
     line = " ".join(str(text).replace("|", "/").split())[:400]
     post({
         "row_id": rid, "source_tag": ME, "target_surface": "claude-code-cli;aya",
-        "action_type": "NOTE", "category": "OPEN", "project_tag": "Blackboard",
+        "action_type": "NOTE", "category": default_category_for_phase("NOTE"), "project_tag": "Blackboard",
         "gist": "redis bridge breaker open", "subgist": "",
         "payload": "|".join(["BCB|v=1", "id=" + rid, "phase=NOTE", "from=" + ME,
                              "to=claude-code-cli,aya", "via=direct", "text=" + line]),
@@ -425,7 +427,7 @@ def unknown_row(op: str, key: str) -> None:
     try:
         post({
             "row_id": rid, "source_tag": ME, "target_surface": "claude-code-cli;aya",
-            "action_type": "NOTE", "category": "OPEN", "project_tag": "Blackboard",
+            "action_type": "NOTE", "category": default_category_for_phase("NOTE"), "project_tag": "Blackboard",
             "gist": "redis bridge unknown outcome", "subgist": "",
             "payload": "|".join(["BCB|v=1", "id=" + rid, "phase=NOTE", "from=" + ME,
                                  "to=claude-code-cli,aya", "via=direct", "text=" + line]),

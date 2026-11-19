@@ -119,8 +119,10 @@ class AppendClientTests(unittest.TestCase):
 
     def test_ambiguous_write_is_not_replayed_and_resolves_by_full_count(self):
         spec = {"row_id": "WRK-one", "source_tag": "claude-code-cli", "payload": "BCB|v=1|id=ONE|from=claude-code-cli|phase=RESULT"}
+        # R-STATUS Rule 5: Category defaults to "" for a non-ask phase like RESULT,
+        # not "OPEN" - the whole point of the rule (scripts/ask_phases.py).
         intended = [spec["row_id"], "2026-09-08T00:00:00.000000Z", spec["source_tag"], "ALL", "APPEND",
-                    spec["payload"], "OPEN", "", "", ""]
+                    spec["payload"], "", "", "", ""]
         reads = [
             {"rows": [row("older")], "total": 9, "filtered": 1},
             {"rows": [intended], "total": 9, "filtered": 1},
@@ -266,7 +268,7 @@ class MatchIsNotIdentityTests(unittest.TestCase):
         also = row("WRK-later2", "BCB|v=1|id=LATER2|phase=RESULT|note=see WRK-cited above")
         intended = row("WRK-cited", spec["payload"])
         intended[2] = spec["source_tag"]
-        intended[6] = "OPEN"
+        intended[6] = ""   # R-STATUS Rule 5: phase=RESULT defaults Category to "", not "OPEN"
         served = {"rows": [intended, quoting, also], "total": 2953, "filtered": 3}
         _, raised, output, send, read = AppendClientTests().run_client(spec, [served])
         self.assertIsNone(raised, "three match hits for one real row must not exit non-zero")

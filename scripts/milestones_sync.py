@@ -133,13 +133,15 @@ def main() -> int:
 
     def note(gist, text):
         try:
+            from ask_phases import default_category_for_phase          # noqa: PLC0415
             from bus import load_env                                    # noqa: PLC0415
             from serve_requests import appender                         # noqa: PLC0415
             stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%MZ")
             rid = "MILESTONES-SYNC-%s" % stamp
             appender(load_env())({
                 "row_id": rid, "source_tag": PRINCIPAL, "target_surface": "grok;claude-code-cli",
-                "action_type": "NOTE", "category": "OPEN", "project_tag": "Blackboard", "gist": gist[:100],
+                "action_type": "NOTE", "category": default_category_for_phase("NOTE"),
+                "project_tag": "Blackboard", "gist": gist[:100],
                 "payload": "BCB|v=1|id=%s|phase=NOTE|from=%s|to=grok,claude-code-cli|evidence=MEASURED|text=%s"
                            % (rid, PRINCIPAL, " ".join(text.replace("|", "/").split()))})
         except Exception as error:                                      # noqa: BLE001
