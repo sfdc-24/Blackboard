@@ -72,8 +72,13 @@ def ack_spec(ask: str, tag: str, now, ring: str = "", receipt: str = "") -> dict
     direct). answers= names the first ring, which call_bridge.answered_asks reads for either ring."""
     row_id = "%s-WAKE-ACK-%s" % (tag.upper(), ask)
     text = "Consumer acceptance recorded at %s for %s; execution completion is not yet verified." % (stamp(now), ask)
+    # R-STATUS Rule 5: Category defaults to OPEN only for an ask-type phase (ASK, REQUEST,
+    # DISPATCH, REVIEW_REQUEST, TASK - scripts/ask_phases.ASK_PHASES). An ACK answers an ask,
+    # it is not one, so it gets the free-label default "", not OPEN. Not imported from
+    # ask_phases here (this module "imports nothing", by design, above) because this row is
+    # always phase=ACK - there is nothing to compute.
     return {"row_id": row_id, "source_tag": tag, "target_surface": RINGER, "action_type": "ACK",
-            "category": "OPEN", "project_tag": "Blackboard", "gist": "Wake taken for %s" % ask,
+            "category": "", "project_tag": "Blackboard", "gist": "Wake taken for %s" % ask,
             "payload": "BCB|v=1|id=%s|phase=ACK|from=%s|via=direct|to=%s|answers=%s|ask=%s|ring=%s|event=worker.accepted|task_id=%s|receipt_id=%s|text=%s" % (
                 row_id, tag, RINGER, WAKE_PREFIX + ask, ask, ring or WAKE_PREFIX + ask, ask, receipt, text)}
 
