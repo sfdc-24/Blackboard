@@ -12,7 +12,9 @@ on (sfdc-24/Blackboard#480); the call bridge already writes there.
 
 Run it in the background, the same way as claude_cli_inbox.py --wait: it exits with the new entries,
 and the caller restarts it. The cursor (REDIS_DOORBELL_CURSOR, default ~/.redis-doorbell-<me>) moves
-only after the entries are printed, so an entry is never skipped. A first run starts at the lane's own
+in two cases only: after the entries of a batch are printed, and past a batch that holds nothing but this
+agent's own rows, which the command line passes over unprinted (see "own rows" below). So an entry meant
+for this agent is never skipped; its own rows are, on purpose. A first run starts at the lane's own
 newest entry id, read from Redis, so nothing added after that is missed.
 
 It needs the bridge for this agent (REDIS_BRIDGE=on, REDIS_BRIDGE_URL, REDIS_BRIDGE_IMPERSONATE; see
@@ -65,7 +67,7 @@ class CursorUnreadable(Exception):
 
 
 def read_cursor(path):
-    """The last entry id printed, or None on a first run (no cursor file at all).
+    """The last entry id printed or passed over as this agent's own, or None on a first run (no cursor file).
 
     Only a missing file is a first run. A file that exists but cannot be read, or holds anything but a
     stream id, raises CursorUnreadable and is left as it is: starting again at the lane's newest entry
