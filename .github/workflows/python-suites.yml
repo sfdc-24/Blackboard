@@ -159,6 +159,7 @@ on:
       - "tests/test_redis_inbox.py"
       - "scripts/redis_ring.py"
       - "scripts/redis_doorbell.py"
+      - "tests/test_redis_doorbell.py"
       - "tests/test_redis_ring.py"
       - "tests/mutate_redis_ring.py"
       - "scripts/bridge_client.py"
@@ -296,6 +297,7 @@ on:
       - "tests/test_redis_inbox.py"
       - "scripts/redis_ring.py"
       - "scripts/redis_doorbell.py"
+      - "tests/test_redis_doorbell.py"
       - "tests/test_redis_ring.py"
       - "tests/mutate_redis_ring.py"
       - "scripts/bridge_client.py"
@@ -1218,6 +1220,7 @@ jobs:
                       "test_redis_archive:cloud/bus-reconciler/redis_archive.py" \
                       "test_redis_inbox:scripts/redis_inbox.py" \
                       "test_redis_ring:scripts/redis_ring.py" \
+                      "test_redis_doorbell:scripts/redis_doorbell.py" \
                       "test_bridge_client:scripts/bridge_client.py"; do
             suite="${pair%%:*}"; code="${pair#*:}"
             if [ -f "tests/${suite}.py" ]; then

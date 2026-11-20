@@ -12,7 +12,9 @@ on (sfdc-24/Blackboard#480); the call bridge already writes there.
 
 Run it in the background, the same way as claude_cli_inbox.py --wait: it exits with the new entries,
 and the caller restarts it. The cursor (REDIS_DOORBELL_CURSOR, default ~/.redis-doorbell-<me>) moves
-only after the entries are printed, so an entry is never skipped. A first run starts at the lane's own
+in two cases only: after the entries of a batch are printed, and past a batch that holds nothing but this
+agent's own rows, which the command line passes over unprinted (see "own rows" below). So an entry meant
+for this agent is never skipped; its own rows are, on purpose. A first run starts at the lane's own
 newest entry id, read from Redis, so nothing added after that is missed.
 
 It needs the bridge for this agent (REDIS_BRIDGE=on, REDIS_BRIDGE_URL, REDIS_BRIDGE_IMPERSONATE; see
@@ -23,8 +25,22 @@ exists but is unreadable (fix or remove it by hand; it is never overwritten).
 A 429 busy (the bridge already holds as many waits as it lets one instance hold) is none of these: the
 doorbell sleeps the seconds the bridge named, plus a little jitter so a crowd does not return together,
 and waits again. It is not a refusal and not a reason to use the board doorbell.
+
+THE PILOT BESIDE THE BOARD DOORBELL (claude-code-cli, 2026-11-20). Two things the command line does that
+ring() does not do unless asked, so scripts/redis_ring.py, which calls ring() itself, is unchanged:
+
+    --format line   one line per entry in the board doorbell's own shape (claude_cli_inbox.line):
+                    "<at> | from <by> | to <me> | id=<row_id>|phase=...|via=redis:<stream id>". A lane
+                    entry is metadata only (the board mirror copies no payload text), so the line names
+                    the row and the session reads it on the board. --format json is the default.
+    own rows        an entry whose `by` is this agent itself is not printed and does not ring: the cursor
+                    moves past it and the wait goes on. Over 24 hours on 2026-11-19/20 that was 522 of the
+                    1,274 board rows the mirror would have put on claude-code-cli's lane: its own ALL rows.
+                    The one exception is the board doorbell's: the compliance runner's rings, posted under
+                    this agent's own tag to this agent (OWN_KEEP). --include-own prints them all.
 """
 import argparse
+import datetime
 import json
 import os
 import random
@@ -36,6 +52,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bridge_client  # noqa: E402
 
 LANE = "fleet:inbox:"
+# Rows this agent posted itself that are still for it (claude_cli_inbox.OWN_RING), by row-id prefix.
+OWN_KEEP = {"claude-code-cli": ("CLAUDE-CLI-COMPLIANCE-RING-",)}
+# The fields a line shows after the row id, in this order, when the entry carries them.
+LINE_FIELDS = ("phase", "thread_id", "msg_type", "class", "for")
 
 
 def cursor_path(me):
@@ -47,7 +67,7 @@ class CursorUnreadable(Exception):
 
 
 def read_cursor(path):
-    """The last entry id printed, or None on a first run (no cursor file at all).
+    """The last entry id printed or passed over as this agent's own, or None on a first run (no cursor file).
 
     Only a missing file is a first run. A file that exists but cannot be read, or holds anything but a
     stream id, raises CursorUnreadable and is left as it is: starting again at the lane's newest entry
@@ -86,9 +106,39 @@ def write_cursor(path, value):
     os.replace(temp, path)
 
 
+def is_own(me, entry):
+    """True when the entry is a row this agent posted itself and not one of OWN_KEEP's."""
+    by = str(entry.get("by") or "").strip().lower()
+    if not by or not (by == me or by.startswith(me + "-")):
+        return False
+    row_id = str(entry.get("row_id") or "")
+    return not any(row_id.startswith(prefix) for prefix in OWN_KEEP.get(me, ()))
+
+
+def _when(text):
+    """A board time as the board doorbell prints it (whole seconds, Z), or the text itself if it is not one."""
+    text = str(text or "").strip()
+    try:
+        moment = datetime.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return text or "-"
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=datetime.timezone.utc)
+    return moment.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def line(me, entry):
+    """One entry in the board doorbell's shape: "<at> | from <by> | to <me> | id=<row_id>|...|via=redis:<id>"."""
+    fields = ["id=%s" % (entry.get("row_id") or "-")]
+    fields += ["%s=%s" % (name, entry[name]) for name in LINE_FIELDS if entry.get(name)]
+    fields.append("via=redis:%s" % (entry.get("id") or "-"))
+    return "%s | from %s | to %s | %s" % (_when(entry.get("at")), entry.get("by") or "-", me, "|".join(fields))
+
+
 def ring(me, attempt=bridge_client.attempt, out=None, cursor_file=None, peek=False, rounds=None,
-         sleep=time.sleep):
-    """Wait until an entry lands in fleet:inbox:<me>; print each as one JSON line. Returns an exit code."""
+         sleep=time.sleep, fmt="json", skip_own=False):
+    """Wait until an entry lands in fleet:inbox:<me>; print each as one JSON line (fmt="line": the board
+    doorbell's shape). skip_own passes over this agent's own rows (is_own). Returns an exit code."""
     out = out or sys.stdout
     path = cursor_file or cursor_path(me)
     try:
@@ -127,8 +177,15 @@ def ring(me, attempt=bridge_client.attempt, out=None, cursor_file=None, peek=Fal
         entries = [entry for entry in (result.get("value") or []) if isinstance(entry, dict)]
         if not entries:
             continue
-        for entry in entries:
-            out.write(json.dumps(entry, sort_keys=True) + "\n")
+        shown = [entry for entry in entries if not (skip_own and is_own(me, entry))]
+        if not shown:
+            # Only this agent's own rows: past them, and wait again. Nothing printed, so nothing rings.
+            after = str(result.get("last") or after)
+            if not peek:
+                write_cursor(path, after)
+            continue
+        for entry in shown:
+            out.write((line(me, entry) if fmt == "line" else json.dumps(entry, sort_keys=True)) + "\n")
         out.flush()
         if not peek:
             write_cursor(path, str(result.get("last") or after))
@@ -140,8 +197,14 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Wait on this agent's Redis lane through the bridge.")
     parser.add_argument("--me", required=True, help="this agent's principal, e.g. claude-code-cli")
     parser.add_argument("--peek", action="store_true", help="print new entries without moving the cursor")
+    parser.add_argument("--format", choices=("json", "line"), default="json",
+                        help="json (default), or line: the board doorbell's own shape")
+    parser.add_argument("--include-own", action="store_true",
+                        help="also ring on rows this agent posted itself (passed over by default)")
     args = parser.parse_args(argv)
-    return ring(args.me.strip().lower(), peek=args.peek)
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")   # as claude_cli_inbox: cp1252 consoles
+    return ring(args.me.strip().lower(), peek=args.peek, fmt=args.format, skip_own=not args.include_own)
 
 
 if __name__ == "__main__":
