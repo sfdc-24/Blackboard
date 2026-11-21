@@ -912,17 +912,20 @@ class TheOpEndpoint(unittest.TestCase):
         # THE PILOT, pinned whole: the chair for one persona, Aya's account for the probe and no more, and
         # (the owner, 2026-11-08) claude-code-cli as the first fleet agent on /op, acting as itself.
         # Another caller, a second persona or another fleet agent fails HERE, in the PR that proposes it.
-        # Grok, Codex and Gemini (the owner, 2026-11-08: the doorbell for every agent) are DOORBELL callers, each
-        # as itself: its own lane and nothing else (Codex on #489). claude-code-cli's fleet-agent line covers its own.
+        # Grok and Codex (the owner, 2026-11-08: the doorbell for every agent) are DOORBELL callers, each as itself:
+        # its own lane and nothing else (Codex on #489). claude-code-cli's fleet-agent line covers its own. Gemini is a
+        # FLEET AGENT on two surfaces, the laptop's fleet-gemini@ and the gemini-waker job's waker-gemini@, both acting
+        # as gemini under its existing access line (GEMINI-RULING-DIRECT-REDIS-OK-20261121T0153Z).
         cli = "fleet-claude-code-cli@sfdc24.iam.gserviceaccount.com"
         grok = "fleet-grok@sfdc24.iam.gserviceaccount.com"
         codex = "fleet-codex@sfdc24.iam.gserviceaccount.com"
         gemini = "fleet-gemini@sfdc24.iam.gserviceaccount.com"
+        waker = "waker-gemini@sfdc24.iam.gserviceaccount.com"
         self.assertEqual({AYA: bridge_op.PROBE, CHAIR: bridge_op.CHAIR, cli: bridge_op.FLEET, grok: bridge_op.DOORBELL,
-                          codex: bridge_op.DOORBELL, gemini: bridge_op.DOORBELL},
+                          codex: bridge_op.DOORBELL, gemini: bridge_op.FLEET, waker: bridge_op.FLEET},
                          purposes, "every line says what it is for")
         self.assertEqual({CHAIR: "conference-chair", cli: "claude-code-cli", grok: "grok",
-                          codex: "chatgpt-codex-desktop", gemini: "gemini"}, callers,
+                          codex: "chatgpt-codex-desktop", gemini: "gemini", waker: "gemini"}, callers,
                          "an account admitted for the probe acts as nobody; the fleet agent acts as itself")
         self.assertEqual({CHAIR: ("claude",)}, bridge_op.load_personas())
         self.assertEqual({CHAIR: ("workshop",)}, bridge_op.load_rooms(), "the owner named one room")
@@ -1027,7 +1030,8 @@ class TheOpEndpoint(unittest.TestCase):
         self.assertTrue(words[0].endswith("fleet-claude-code-cli@sfdc24.iam.gserviceaccount.com,"
                                           "fleet-grok@sfdc24.iam.gserviceaccount.com,"
                                           "fleet-codex@sfdc24.iam.gserviceaccount.com,"
-                                          "fleet-gemini@sfdc24.iam.gserviceaccount.com"))
+                                          "fleet-gemini@sfdc24.iam.gserviceaccount.com,"
+                                          "waker-gemini@sfdc24.iam.gserviceaccount.com"))
         self.assertIn("echo 'set -euo pipefail'", DEPLOY, "the generated script stops at its first failure")
         self.assertIn("deploy_cmds | bash -euo pipefail -s", DEPLOY)
         self.assertLess(DEPLOY.index("echo 'set -euo pipefail'"), DEPLOY.index("gcloud run deploy ${SERVICE}"),
@@ -1652,9 +1656,9 @@ class TheOpEndpoint(unittest.TestCase):
     def test_every_doorbell_account_waits_on_its_own_lane_and_on_no_other(self):
         """The owner, 2026-11-08: the doorbell for every agent. Each account's lane is fleet:inbox:<its principal>,
         the canonical id the board-to-Redis mirror writes (cloud/inbox-wake ALIASES: codex is chatgpt-codex-desktop)."""
+        # fleet-gemini@ left this list for a fleet-agent line (GEMINI-RULING-DIRECT-REDIS-OK-20261121T0153Z).
         accounts = {"fleet-grok@sfdc24.iam.gserviceaccount.com": "grok",
-                    "fleet-codex@sfdc24.iam.gserviceaccount.com": "chatgpt-codex-desktop",
-                    "fleet-gemini@sfdc24.iam.gserviceaccount.com": "gemini"}
+                    "fleet-codex@sfdc24.iam.gserviceaccount.com": "chatgpt-codex-desktop"}
         self.assertEqual(accounts, {email: who for email, who in bridge_op.load_callers().items()
                                     if bridge_op.load_purposes()[email] == bridge_op.DOORBELL})
         lanes = ["fleet:inbox:" + who for who in accounts.values()] + ["fleet:inbox:claude-code-cli"]
@@ -2353,8 +2357,9 @@ class B12RoleLanesThroughTheBridge(unittest.TestCase):
 
     def test_a_doorbell_account_reaches_no_lane_even_its_own_role_s(self):
         conn = gov_tests.FakeRedis()
-        for email, lane in (("fleet-gemini@sfdc24.iam.gserviceaccount.com", "lane:architect"),
-                            ("fleet-codex@sfdc24.iam.gserviceaccount.com", "lane:test")):
+        # fleet-gemini@ was a doorbell here until GEMINI-RULING-DIRECT-REDIS-OK-20261121T0153Z made it a fleet agent:
+        # GeminiDirectThroughTheBridge below holds what it may do now. Codex's account is still a doorbell.
+        for email, lane in (("fleet-codex@sfdc24.iam.gserviceaccount.com", "lane:test"),):
             for body in ({"op": "xadd", "key": lane, "val": self.entry(), "enc": "b64"},
                          {"op": "xrange", "key": lane}):
                 code, out = self.as_(email, body, conn)
@@ -2368,6 +2373,111 @@ class B12RoleLanesThroughTheBridge(unittest.TestCase):
         code, out = self.as_(self.CLI, {"op": "xadd", "key": "lane:coordinator", "val": prose, "enc": "b64"}, conn)
         self.assertEqual((403, "refused"), (code, out["error"]), out)
         self.assertNotIn("lane:coordinator", conn.data)
+
+
+class GeminiDirectThroughTheBridge(unittest.TestCase):
+    """GEMINI-RULING-DIRECT-REDIS-OK-20261121T0153Z: gemini reaches Redis through POST /op on BOTH of its surfaces, the
+    laptop's fleet-gemini@ and the gemini-waker job's waker-gemini@, each a fleet-agent caller acting as gemini. The
+    scope is gemini's EXISTING line in scripts/redis_acl.json, not widened: reads *, writes fleet:, conf: (not the
+    call record), proj: and lane:architect; gov:, v1: and conf:calls refused in code. Through the committed
+    callers.json, the real handler and redis_gov, the way the parity scripts (scripts/gemini_parity.py) ask."""
+
+    setUp = TheOpEndpoint.setUp
+    post = TheOpEndpoint.post
+    SURFACES = ("fleet-gemini@sfdc24.iam.gserviceaccount.com", "waker-gemini@sfdc24.iam.gserviceaccount.com")
+
+    def as_(self, email, body, conn):
+        return self.post(body, claims={"email": email, "email_verified": True}, admitted=email, committed=True,
+                         conn=conn)
+
+    @staticmethod
+    def b64(text):
+        import base64
+        return base64.b64encode(text.encode("utf-8")).decode("ascii")
+
+    def test_both_surfaces_are_fleet_agents_bound_to_gemini_and_the_access_line_is_not_widened(self):
+        for email in self.SURFACES:
+            self.assertEqual(("gemini", bridge_op.FLEET),
+                             (bridge_op.load_callers()[email], bridge_op.load_purposes()[email]), email)
+        self.assertEqual({"read": ["*"], "write": ["fleet:", "conf:", "proj:", "lane:architect"]},
+                         redis_gov.load_acl()["principals"]["gemini"], "gemini's line is these entries and no more")
+        for prefix in ("gov:", "v1:bus:", "v1:agent:", "v1:conf:", "v1:synth:", "conf:calls", "conf:call:",
+                       "conf:callturns:"):
+            self.assertTrue(any(prefix.startswith(p) for p in redis_gov.PROTECTED), prefix)
+        self.assertEqual(("gemini",), redis_gov.ROLE_LANES["lane:architect"])
+
+    def test_set_and_get_on_its_pilot_key_as_itself_on_each_surface(self):
+        for email in self.SURFACES:
+            conn = gov_tests.FakeRedis()
+            key = "fleet:pilot:gemini:20261121T0200Z"
+            with self.subTest(surface=email):
+                code, out = self.as_(email, {"op": "set", "key": key, "val": self.b64("parity"), "enc": "b64",
+                                             "expect": "gemini"}, conn)
+                self.assertEqual((200, "gemini", email), (code, out["principal"], out["caller"]), out)
+                code, out = self.as_(email, {"op": "get", "key": key, "expect": "gemini"}, conn)
+                self.assertEqual((200, True, "parity"), (code, out["found"], out["value"]), out)
+                self.assertEqual(("get", "gemini", "bridge:" + email),
+                                 (conn.audit()[-1]["op"], conn.audit()[-1]["actor"], conn.audit()[-1]["via"]))
+
+    def test_xadd_and_xrange_on_lane_architect_on_each_surface(self):
+        import json
+        for email in self.SURFACES:
+            conn = gov_tests.FakeRedis()
+            entry = self.b64(json.dumps({"event": "parity-check", "ref": "GEMINI-PARITY-20261121T0200Z"}))
+            with self.subTest(surface=email):
+                code, out = self.as_(email, {"op": "xadd", "key": "lane:architect", "val": entry, "enc": "b64"}, conn)
+                self.assertEqual((200, "gemini"), (code, out["principal"]), out)
+                code, out = self.as_(email, {"op": "xrange", "key": "lane:architect", "count": 5}, conn)
+                self.assertEqual((200, ["GEMINI-PARITY-20261121T0200Z"]), (code, [e["ref"] for e in out["value"]]), out)
+
+    def test_lane_build_gov_v1_and_the_call_record_are_refused_with_403_and_nothing_is_written(self):
+        import json
+        lane_entry = self.b64(json.dumps({"event": "parity-check", "ref": "GEMINI-PARITY-X"}))
+        refused = [{"op": "xadd", "key": "lane:build", "val": lane_entry, "enc": "b64"},
+                   {"op": "xadd", "key": "lane:test", "val": lane_entry, "enc": "b64"},
+                   {"op": "set", "key": "gov:test", "val": self.b64("x"), "enc": "b64"},
+                   {"op": "xadd", "key": "gov:audit", "val": self.b64("x"), "enc": "b64"},
+                   {"op": "set", "key": "v1:bus:row:1", "val": self.b64("x"), "enc": "b64"},
+                   {"op": "set", "key": "v1:agent:gemini", "val": self.b64("x"), "enc": "b64"},
+                   {"op": "hset", "key": "v1:conf:workshop:state", "field": "f", "val": self.b64("x"), "enc": "b64"},
+                   {"op": "set", "key": "conf:calls", "val": self.b64("x"), "enc": "b64"},
+                   {"op": "xadd", "key": "conf:callturns:c1", "val": self.b64("x"), "enc": "b64"},
+                   {"op": "set", "key": "conf:call:c1", "val": self.b64("x"), "enc": "b64"},
+                   {"op": "set", "key": "other:x", "val": self.b64("x"), "enc": "b64"}]
+        for email in self.SURFACES:
+            for body in refused:
+                conn = gov_tests.FakeRedis()
+                with self.subTest(surface=email, key=body["key"]):
+                    code, out = self.as_(email, body, conn)
+                    self.assertEqual((403, "refused", False), (code, out["error"], out["executed"]), out)
+                    self.assertEqual("gemini", out["principal"])
+                    self.assertEqual([], [k for k in conn.data if not k.startswith("gov:audit")],
+                                     "a refused write left something behind")
+
+    def test_the_rest_of_its_existing_write_scope_still_works(self):
+        for email in self.SURFACES:
+            conn = gov_tests.FakeRedis()
+            for body in ({"op": "xadd", "key": "conf:side:20261121", "val": self.b64("a line"), "enc": "b64"},
+                         {"op": "set", "key": "proj:gemini:note", "val": self.b64("v"), "enc": "b64"},
+                         {"op": "xadd", "key": "fleet:inbox:claude-code-cli", "val": self.b64("ring"), "enc": "b64"}):
+                with self.subTest(surface=email, key=body["key"]):
+                    code, out = self.as_(email, body, conn)
+                    self.assertEqual((200, "gemini"), (code, out["principal"]), out)
+
+    def test_it_may_not_state_an_author_and_may_not_act_as_another_agent(self):
+        conn = gov_tests.FakeRedis()
+        for email in self.SURFACES:
+            code, out = self.as_(email, {"op": "get", "key": "fleet:x", "author": "claude", "request": "r1"}, conn)
+            self.assertEqual((400, "bad request", False), (code, out["error"], out["executed"]), out)
+            code, out = self.as_(email, {"op": "get", "key": "fleet:x", "expect": "grok"}, conn)
+            self.assertEqual((403, "principal mismatch", "gemini"), (code, out["error"], out["principal"]), out)
+
+    def test_both_surfaces_are_on_the_deploy_allowlist_and_the_invokers(self):
+        for email in self.SURFACES:
+            templated = email.replace("@sfdc24.", "@${PROJECT}.")
+            self.assertIn("serviceAccount:" + templated, DEPLOY)
+            env_line = next(line for line in DEPLOY.splitlines() if "--set-env-vars=" in line)
+            self.assertIn(templated, env_line)
 
 
 if __name__ == "__main__":

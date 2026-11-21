@@ -67,6 +67,17 @@ GH_TOKEN. It holds the bus pair and GEMINI_API_KEY. Optional:
 GEMINI_GITHUB_TOKEN (public PR read; since 2026-09-30 also the OKF write token)
 and GEMINI_OKF_WRITE_TOKEN: okf_land.py writes only into the private conference
 repository, on its own branch with a pull request for review.
+
+THE REDIS BRIDGE (GEMINI-RULING-DIRECT-REDIS-OK-20261121T0153Z). With REDIS_BRIDGE=on,
+REDIS_BRIDGE_URL, REDIS_BRIDGE_IMPERSONATE=waker-gemini@sfdc24.iam.gserviceaccount.com and
+REDIS_BRIDGE_MINT=metadata, a REDIS-OP line in gemini's reply runs through the
+redis-tool-bridge's POST /op as this job's own account, never the VPC and never REDIS_AUTH.
+It falls back to the board request row ONLY when nothing was sent or the bridge said
+"executed": false (agent_waker.redis_direct, bridge_client STRICT); a 502 or any unknown
+outcome is said on the reply and never sent again. A write is recorded in the cursor's
+redis_sent_ids BEFORE it leaves (redis_dispatch below), so a re-run of the same ask sends it
+by no route. REDIS_BRIDGE=off, or unset, is the board route exactly as before, from the next
+execution. `main.py parity` runs scripts/gemini_parity.py as this account (parity() below).
 """
 from __future__ import annotations
 
@@ -278,6 +289,7 @@ def run(argv=None, store=None, waker=None, board_contains=None,
     box = {"state": {"watermark": state.get("watermark", ""),
                      "answered_ids": list(state.get("answered_ids") or []),
                      "unknown_ids": list(state.get("unknown_ids") or []),
+                     "redis_sent_ids": list(state.get("redis_sent_ids") or []),
                      "inflight": state.get("inflight") or "",
                      "claim_owner": state.get("claim_owner") or "",
                      "claim_until": state.get("claim_until") or "",
@@ -416,10 +428,26 @@ def run(argv=None, store=None, waker=None, board_contains=None,
         persist(s)
         return True
 
+    def redis_dispatch(answers_id: str) -> bool:
+        """ONCE PER SOURCE ASK for a Redis write through the bridge (agent_waker.redis_dispatch;
+        GEMINI-RULING-DIRECT-REDIS-OK-20261121T0153Z). The bridge has no request id for a fleet agent, so the
+        durable cursor is the record: an id already in redis_sent_ids was dispatched by an earlier run, which
+        may have died before its reply, and is sent by NO route again. A new id is written in by
+        compare-and-swap BEFORE the write leaves; a lost swap propagates, as a lost claim does, and the loser
+        sends nothing."""
+        if answers_id in (box["state"].get("redis_sent_ids") or []):
+            return False
+        s = dict(box["state"])
+        s["redis_sent_ids"] = (list(s.get("redis_sent_ids") or []) + [answers_id])[-400:]
+        persist(s)
+        return True
+
     original_post = waker.post_reply
     original_call = getattr(waker, "call_agent", None)
     had_claim = hasattr(waker, "claim_answer")
     original_claim = getattr(waker, "claim_answer", None)
+    had_dispatch = hasattr(waker, "redis_dispatch")
+    original_dispatch = getattr(waker, "redis_dispatch", None)
 
     def begin_post(answers_id: str) -> bool:
         """Write phase=posting and renew the lease, then the append may start.
@@ -488,6 +516,7 @@ def run(argv=None, store=None, waker=None, board_contains=None,
 
     waker.post_reply = post_and_record
     waker.claim_answer = claim_answer
+    waker.redis_dispatch = redis_dispatch
     if original_call is not None:
         waker.call_agent = call_agent
 
@@ -507,6 +536,10 @@ def run(argv=None, store=None, waker=None, board_contains=None,
             waker.claim_answer = original_claim
         elif hasattr(waker, "claim_answer"):
             del waker.claim_answer
+        if had_dispatch:
+            waker.redis_dispatch = original_dispatch
+        elif hasattr(waker, "redis_dispatch"):
+            del waker.redis_dispatch
 
     # The pass's own view: its watermark, and answered_ids that already include
     # everything recorded above. Union, so nothing recorded mid-pass is dropped.
@@ -527,6 +560,8 @@ def run(argv=None, store=None, waker=None, board_contains=None,
     final["claim_until"] = box["state"].get("claim_until") or ""
     final["claim_phase"] = box["state"].get("claim_phase") or ""
     final["unknown_ids"] = list(box["state"].get("unknown_ids") or [])
+    # The pass's file does not know this list (agent_waker never writes it); the box is its only record.
+    final["redis_sent_ids"] = list(box["state"].get("redis_sent_ids") or [])
     if final != box["state"]:
         persist(final)
     print(json.dumps({"ran": True, "rc": rc, "watermark": final.get("watermark"),
@@ -534,7 +569,20 @@ def run(argv=None, store=None, waker=None, board_contains=None,
     return rc
 
 
+def parity(argv) -> int:
+    """`python /app/main.py parity [...]`: scripts/gemini_parity.py as the job's own account, waker-gemini@, with a
+    metadata-server token (GEMINI-RULING-DIRECT-REDIS-OK-20261121T0153Z, PARITY TEST). No cursor is read or written
+    and no model is called. Only gemini's job runs it: the parity is gemini's."""
+    if AGENT != "gemini":
+        print(json.dumps({"ran": False, "refused": "the parity check is gemini's; AGENT is %r" % AGENT}))
+        return 2
+    import gemini_parity
+    return gemini_parity.main(["--surface", "waker"] + list(argv))
+
+
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["parity"]:
+        sys.exit(parity(sys.argv[2:]))
     try:
         sys.exit(run())
     except state_store.Conflict as e:

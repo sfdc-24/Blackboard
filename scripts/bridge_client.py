@@ -13,6 +13,8 @@ IT IS OFF UNLESS THREE THINGS ARE SET, AND NOTHING DEPLOYED ANSWERS IT YET
                                         the governed board route exactly as before.
     REDIS_BRIDGE_URL=https://...        the bridge's own URL. It is also the token's audience.
     REDIS_BRIDGE_IMPERSONATE=<sa email> the service account this agent acts as.
+    REDIS_BRIDGE_MINT=gcloud|metadata   optional; how the token is minted (THE TOKEN, below). Unset is
+                                        gcloud. Any other value is a malformed configuration: NotSent.
 
 WHO THIS AGENT IS ON THE BRIDGE (Aya on a125337: the principal binding)
     The bridge decides who a caller acts as from cloud/redis-tool-bridge/callers.json: a verified
@@ -28,6 +30,21 @@ THE TOKEN
     NEVER a key file (decision D2: "no key files"). The token is never printed, logged, written to
     disk or put in a URL, and it is sent to the configured host and nowhere else: a redirect is
     refused rather than followed, because following one would carry the token to its target.
+
+    A CLOUD RUN JOB HAS NO gcloud AND NO ONE TO IMPERSONATE (GEMINI-RULING-DIRECT-REDIS-OK-20261121T0153Z: the
+    gemini-waker job reaches the bridge as its own account, waker-gemini@). REDIS_BRIDGE_MINT=metadata asks the
+    metadata server for that account's identity token, for this audience, with the email in it (mint_metadata):
+    the account is in the path, so a job running as any other account gets no token at all. The answer is held
+    to the same shape as gcloud's, and its email and audience are checked against what was asked before it is
+    sent anywhere. Both checks can only refuse; the bridge verifies the token itself.
+
+STRICT: THE FALLBACK RULE FOR A STATELESS CALLER (the same ruling, FALLBACK)
+    attempt(..., strict=True) returns None - "use the board route" - ONLY when nothing was sent (NotSent, or
+    any reason this module did not send: the switch, the binding, the breaker, the journal) or when the
+    bridge's answer itself said "executed": false. A 400, 404 or 413 WITHOUT that member, a 502, a timeout,
+    and every other outcome-unknown result raise Unknown, for a READ as well as a write: a stateless caller has
+    no journal that outlives its run, so it cannot reconcile a read it is unsure of either, and it is never
+    moved to the board route on a guess.
 
 FIVE OUTCOMES, AND WHAT EACH ONE PERMITS (Aya's review of a125337, blockers 1 and 2)
     The first version had two: "worked" and "failed, so use the board". That was wrong twice over.
@@ -106,6 +123,7 @@ import shutil
 import subprocess
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -115,6 +133,12 @@ CALLERS_FILE = os.path.join(REPO, "cloud", "redis-tool-bridge", "callers.json")
 SWITCH_ENV = "REDIS_BRIDGE"
 URL_ENV = "REDIS_BRIDGE_URL"
 IMPERSONATE_ENV = "REDIS_BRIDGE_IMPERSONATE"
+MINT_ENV = "REDIS_BRIDGE_MINT"
+MINTS = ("gcloud", "metadata")
+# The metadata server's identity endpoint, for ONE named account. Plain http and this host only: it is the
+# link-local metadata server, never a proxy and never the network.
+METADATA_IDENTITY = "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/%s/identity"
+METADATA_TIMEOUT = 10
 TRIP_AFTER = 3
 OPEN_SECONDS = 900
 HTTP_TIMEOUT = 20
@@ -163,7 +187,13 @@ class NotSent(BridgeProblem):
 
 
 class NotExecuted(BridgeProblem):
-    """The bridge or the platform proved the operation did not run."""
+    """The bridge or the platform proved the operation did not run. .proved is True only when the bridge's
+    own answer said "executed": false; a bare 400, 404 or 413 is the platform's word, not the bridge's,
+    and a strict caller does not use the board route on it (STRICT)."""
+
+    def __init__(self, message: str = "", proved: bool = False):
+        super().__init__(message)
+        self.proved = bool(proved)
 
 
 class Denied(BridgeProblem):
@@ -226,7 +256,23 @@ def config(environ=None):
     if not _URL.match(url) or not _SA.match(account):
         raise NotSent("%s is on but %s or %s is missing or malformed"
                       % (SWITCH_ENV, URL_ENV, IMPERSONATE_ENV))
+    mint_mode(env)
     return url, account
+
+
+def mint_mode(environ=None) -> str:
+    """gcloud (the default: impersonation from a login) or metadata (a Cloud Run job's own account). Raises
+    NotSent for anything else: a typo must not quietly pick one of the two."""
+    env = os.environ if environ is None else environ
+    mode = str(env.get(MINT_ENV) or "").strip().lower() or "gcloud"
+    if mode not in MINTS:
+        raise NotSent("%s is not one of %s" % (MINT_ENV, ", ".join(MINTS)))
+    return mode
+
+
+def minter_for(environ=None):
+    """The minting function REDIS_BRIDGE_MINT names."""
+    return mint_metadata if mint_mode(environ) == "metadata" else mint
 
 
 def load_callers(path=None) -> dict:
@@ -309,6 +355,51 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         raise urllib.error.HTTPError(req.full_url, code, "redirect refused", headers, fp)
 
 
+def _claims(token: str) -> dict:
+    """The payload of a JWT, decoded and NOT verified: read only to refuse a token that is not the one asked
+    for. {} when it cannot be read."""
+    try:
+        part = token.split(".")[1]
+        data = json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)).decode("utf-8"))
+    except Exception:  # noqa: BLE001 - an unreadable payload is simply not the token asked for
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def mint_metadata(url: str, account: str, opener=None) -> str:
+    """One identity token for `url`, as `account`, from the metadata server of the Cloud Run job this runs in.
+    Raises NotSent. Nothing the server said is repeated: a failure is a status number or a class name.
+
+    The account is named in the path, so the metadata server mints for that account or for none. format=full
+    puts the email in the token, which the bridge requires (main.verify_caller). No proxy: the request goes to
+    the link-local server directly, and a redirect is refused like any other."""
+    if not _URL.match(str(url or "")) or not _SA.match(str(account or "")):
+        raise NotSent("the metadata minter was given a malformed url or account")
+    query = urllib.parse.urlencode({"audience": url, "format": "full"})
+    req = urllib.request.Request(METADATA_IDENTITY % urllib.parse.quote(account, safe="@.") + "?" + query,
+                                 method="GET")
+    req.add_header("Metadata-Flavor", "Google")
+    opener = opener or urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
+    try:
+        with opener.open(req, timeout=METADATA_TIMEOUT) as response:
+            status, raw = response.status, response.read(16384)
+    except urllib.error.HTTPError as error:
+        raise NotSent("the metadata server minted no token (HTTP %d)" % error.code) from None
+    except Exception as error:  # noqa: BLE001 - the CLASS NAME only
+        raise NotSent("the metadata server could not be reached (%s)"
+                      % re.sub(r"[^A-Za-z]", "", type(error).__name__)[:40]) from None
+    token = (raw or b"").decode("utf-8", "replace").strip()
+    if status != 200 or not _JWT.match(token):
+        raise NotSent("the metadata server returned something that is not an identity token")
+    claims = _claims(token)
+    if str(claims.get("email") or "").strip().lower() != account or claims.get("email_verified") is not True:
+        raise NotSent("the metadata server's token is not for %s" % account)
+    audience = claims.get("aud")
+    if (audience if isinstance(audience, list) else [audience]) != [url]:
+        raise NotSent("the metadata server's token is not for this bridge's audience")
+    return token
+
+
 def call(url: str, token: str, request: dict, opener=None) -> dict:
     """POST one operation to <url>/op. The result dict on a 200 that IS the answer; otherwise one of
     Refused, Denied, NotExecuted, Unknown. Which one is decided by the status and by two closed
@@ -339,8 +430,9 @@ def call(url: str, token: str, request: dict, opener=None) -> dict:
             raise Denied("HTTP 403 principal mismatch") from None
         if status in (401, 403):
             raise Denied(status_label(status)) from None
-        if status in (400, 404, 413) or (status == 503 and answer.get("executed") is False):
-            raise NotExecuted(status_label(status)) from None
+        proved = answer.get("executed") is False
+        if status in (400, 404, 413) or (status == 503 and proved):
+            raise NotExecuted(status_label(status), proved=proved) from None
         raise Unknown(status_label(status)) from None
     except Exception as error:  # noqa: BLE001 - the CLASS NAME only: a message can quote the request
         raise Unknown("no answer (%s)" % re.sub(r"[^A-Za-z]", "", type(error).__name__)[:40]) from None
@@ -540,7 +632,7 @@ def _close(intent, outcome: str, now: float, path, say) -> None:
 
 def attempt(op: str, key: str, *, me: str, value=None, count=None, after=None, environ=None,
             now=None, state_path=None, journal_path=None, callers=None, say=None, announce=None,
-            minter=None, caller=None):
+            minter=None, caller=None, field=None, strict=False):
     """Try one operation through the bridge, as `me`.
 
     Returns the bridge's result dict on success.
@@ -551,6 +643,9 @@ def attempt(op: str, key: str, *, me: str, value=None, count=None, after=None, e
     the operation again by any route.
     Raises Busy when the bridge had no room for a wait: transient. The caller waits .retry_after
     seconds and asks the bridge again; it does not use the board route.
+
+    strict=True (STRICT, above): None only when nothing was sent or the bridge said "executed": false.
+    Every other failure after a send raises Unknown, a read's as well as a write's.
 
     announce(text) is called at most once per trip of the breaker, at the moment it opens, with
     closed words only.
@@ -584,6 +679,8 @@ def attempt(op: str, key: str, *, me: str, value=None, count=None, after=None, e
         request["count"] = int(count)
     if after is not None:
         request["after"] = str(after)
+    if field:
+        request["field"] = str(field)
     intent = None
     if write:
         # BEFORE anything is sent. A write that cannot be remembered is not sent by this route.
@@ -594,7 +691,7 @@ def attempt(op: str, key: str, *, me: str, value=None, count=None, after=None, e
                 "could not be remembered. Using the board route." % type(error).__name__)
             return None
     try:
-        token = (minter or mint)(url, account)
+        token = (minter or minter_for(environ))(url, account)
         result = (caller or call)(url, token, request)
         if str(result.get("principal") or "").strip().lower() != me:
             # An endpoint that did not check `expect` and answered as someone else. For a write this
@@ -612,6 +709,15 @@ def attempt(op: str, key: str, *, me: str, value=None, count=None, after=None, e
         raise
     except (NotSent, NotExecuted, Unknown) as why:
         _count_failure(state, state_path, now, str(why), say, announce)
+        if strict and (isinstance(why, Unknown) or (isinstance(why, NotExecuted) and not why.proved)):
+            # STRICT: sent, and the bridge did not say "executed": false. Never the board route, read or write.
+            if write:
+                try:
+                    _append({"about": intent["id"], "why": str(why)}, journal_path)
+                except OSError:
+                    pass                              # the UNKNOWN line that matters is already on disk
+            say("BRIDGE OUTCOME UNKNOWN: %s. Not sent by the board route." % why)
+            raise Unknown(str(why)) from None
         if isinstance(why, Unknown) and write:
             try:                                      # why it is unknown, for whoever reads the journal
                 _append({"about": intent["id"], "why": str(why)}, journal_path)

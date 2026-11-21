@@ -125,10 +125,12 @@ REDIS, which you may read and write through your adapter, governed and audited:
   ops: get, hgetall, xrange (reads); set, hset (needs field=), hput, xadd, del (writes).
   You may write under conf:, fleet: and proj: only; everything else is read-only to you.
   The side channel every voice on the conference line reads is conf:side:<today, UTC yyyymmdd>.
-- Your adapter posts that line as a request row under your own tag and removes it from the
-  text of your answer. The governed worker judges it under the access list and answers you
-  with ONE later row (AYA_RESULT) saying OK or REFUSED and why. Until that row exists nothing
-  has been written: never say a value is in Redis, only that you asked.
+- Your adapter removes that line from the text of your answer and runs it for you, after you
+  have answered. Where it has the Redis bridge it runs the op there as you and says the outcome
+  on your reply; otherwise it posts the line as a request row under your own tag, and the
+  governed worker answers you with ONE later row (AYA_RESULT) saying OK or REFUSED and why.
+  Either way you write before the outcome exists: never say a value is in Redis, only that
+  you asked.
 - One operation per reply. A value may not contain a pipe. This REDIS-OP line is the ONE
   exception to the no-pipes rule above: it is lifted out of your answer before posting."""
 
@@ -335,7 +337,11 @@ def hands_note(me: str, cfg: dict, env=None) -> str:
                      "for the resources a row names")
     writes = ("; it writes only an OKF file to a review branch of the private conference "
               "repository when a row says land=okf" if cfg.get("okf_land") else "")
-    if cfg.get("redis_requests"):
+    if cfg.get("redis_requests") and _bridge_on(env):
+        writes += ("; it runs one governed Redis request through the Redis bridge as this agent's own "
+                   "service account when the reply carries a REDIS-OP line, and says the outcome on the "
+                   "reply (a board request row only when the bridge ran nothing)")
+    elif cfg.get("redis_requests"):
         writes += ("; it posts one governed Redis request (redis-op, under this agent's own tag) when "
                    "the reply carries a REDIS-OP line, and the worker's AYA_RESULT row says what "
                    "happened")
@@ -952,6 +958,105 @@ def unconfirmed_note(request: dict, detail: str) -> str:
             % (request.get("op", "?"), detail))
 
 
+# ------------------------------------------------------------------- redis-op through the bridge
+# GEMINI-RULING-DIRECT-REDIS-OK-20261121T0153Z. With the bridge switched on for this agent (REDIS_BRIDGE=on and the
+# rest, scripts/bridge_client.py), a REDIS-OP line is run through the redis-tool-bridge's POST /op as the agent's
+# own service account, and its outcome is said on the reply itself: no request row, no AYA_RESULT row, no wait.
+# THE FALLBACK IS STRICT (bridge_client STRICT): the board request row is posted ONLY when nothing was sent or the
+# bridge said "executed": false. A 502 or any outcome-unknown answer is never followed by the board route, for a
+# read or a write; a refusal or a denial is terminal as everywhere else.
+#
+# ONCE PER SOURCE ASK. The board route is idempotent by request_id(); the bridge has no such id for a fleet agent.
+# So a WRITE through the bridge first asks redis_dispatch(answers): True means "not dispatched before, and now
+# recorded as dispatched". The cloud job (cloud/agent-waker/main.py) puts its own here, a compare-and-swap into
+# the durable cursor, so a run that dies between the write and its reply, and is re-run on the same ask, sends
+# the write by NO route the second time. The laptop default records nothing: its gemini task stays disabled.
+REDIS_SUMMARY_CHARS = 300
+
+
+def _bridge_on(env=None) -> bool:
+    """Is the Redis bridge switched on, and well formed, for this process? (bridge_client.config)"""
+    try:
+        import bridge_client                              # noqa: E402
+        return bridge_client.config(os.environ if env is None else env) is not None
+    except Exception:  # noqa: BLE001 - NotSent (malformed) or no module: the board route, as before
+        return False
+
+
+def redis_dispatch(answers_id: str) -> bool:
+    """May this source ask's Redis write be dispatched now? The cloud job replaces this (see above)."""
+    return True
+
+
+def _bridge_summary(result: dict) -> str:
+    """The bridge's answer as the board's AYA_RESULT row would say it (redis_gov.summarise of board_safe), scrubbed,
+    pipe-free and bounded: the hands note is posted into a pipe-delimited row."""
+    try:
+        import redis_gov                                  # noqa: E402 - only the bridge path needs it
+        line = redis_gov.summarise(redis_gov.board_safe(result))
+    except Exception as error:  # noqa: BLE001 - a summary must not cost the reply
+        line = "OK %s (summary unavailable: %s)" % (result.get("op", "?"), type(error).__name__)
+    line = " ".join(okf_land.scrub_secrets(str(line)).replace("|", "/").split())
+    return line if len(line) <= REDIS_SUMMARY_CHARS else line[:REDIS_SUMMARY_CHARS] + "... [cut]"
+
+
+def redis_direct(me: str, request: dict, answers: str, environ=None, attempt=None, dispatch=None) -> tuple:
+    """One REDIS-OP line through the bridge, as `me`. (kind, sentence for the reply):
+
+        ("board", "")       not sent by the bridge: the switch is off, nothing could be sent, or the bridge
+                            said "executed": false. post_request() may be used, exactly as before.
+        ("done", text)      the bridge ran it; text is its outcome
+        ("refused", text)   the access rules refused it          - TERMINAL, never the board route
+        ("denied", text)    the bridge refused this caller       - TERMINAL, never the board route
+        ("unknown", text)   sent, outcome not known              - TERMINAL, never the board route
+        ("held", text)      an earlier run already dispatched this ask's write - sent by NO route again
+    Every sentence names the op and never the key, as unconfirmed_note() does."""
+    import bridge_client                                  # noqa: E402 - only when a REDIS-OP line exists
+    env = os.environ if environ is None else environ
+    try:
+        if bridge_client.config(env) is None:
+            return "board", ""
+    except bridge_client.NotSent:
+        return "board", ""                                # attempt() would say it; the board route is as before
+    op = request.get("op", "?")
+    for part in ("key", "field"):
+        chosen = request.get(part)
+        if chosen and okf_land.scrub_secrets(str(chosen)) != str(chosen):
+            return "refused", ("The Redis op in this reply (%s) was not sent: its %s carries a credential- or "
+                               "address-shaped token." % (op, part))
+    value = request.get("val")
+    if value is not None:
+        value = okf_land.scrub_secrets(str(value))
+    write = op not in bridge_client.READS
+    if write and not (dispatch or redis_dispatch)(answers):
+        return "held", ("The Redis op in this reply (%s) was already dispatched for this ask by an earlier run; it "
+                        "is not sent again by any route." % op)
+    count = request.get("count")
+    try:
+        result = (attempt or bridge_client.attempt)(
+            op, request["key"], me=me, value=value, field=request.get("field") or None,
+            count=int(count) if count not in (None, "") else None, after=request.get("after") or None,
+            environ=env, strict=True)
+    except bridge_client.Refused as why:
+        return "refused", ("The Redis op in this reply (%s) was refused by the access rules: %s. Not sent by the "
+                           "board route, which runs the same rules." % (op, why.reason))
+    except bridge_client.Denied as why:
+        return "denied", ("The Redis op in this reply (%s) was denied by the bridge (%s). Not sent by the board "
+                          "route." % (op, why))
+    except bridge_client.Unknown as why:
+        return "unknown", ("The Redis op in this reply (%s) was sent through the bridge and its outcome is not "
+                           "known (%s). It is not sent again by any route." % (op, why))
+    except bridge_client.Busy:
+        return "unknown", ("The Redis op in this reply (%s) found the bridge busy; it ran nothing and is not sent "
+                           "again from this reply." % op)
+    except (ValueError, TypeError):
+        return "refused", "The Redis op in this reply (%s) was not sent: its count is not a number." % op
+    if result is None:
+        return "board", ""
+    return "done", ("Its adapter ran the Redis op this reply carried through the bridge as %s, with no request "
+                    "row: %s." % (me, _bridge_summary(result)))
+
+
 def call_agent(cfg: dict, prompt: str, max_tokens: int = DEFAULT_MAX_TOKENS):
     """Normalise the two adapters, which do not take the same arguments.
 
@@ -1144,13 +1249,22 @@ def main(argv=None) -> int:
         if cfg.get("redis_requests"):
             request, text = redis_request(text)
             if request and not args.dry_run:
-                ok, detail = post_request(me, cfg, request, args.verbose, answers=src_id)
-                if ok:
-                    redis_row = detail
-                    note = "    redis request posted: %s (%s %s)" % (detail, request["op"], request["key"])
+                # The bridge first, when it is on for this agent; the board request row only when the bridge
+                # sent nothing or said "executed": false (redis_direct, STRICT).
+                kind, said = redis_direct(me, request, src_id)
+                if kind == "board":
+                    ok, detail = post_request(me, cfg, request, args.verbose, answers=src_id)
+                    if ok:
+                        redis_row = detail
+                        note = "    redis request posted: %s (%s %s)" % (detail, request["op"], request["key"])
+                    else:
+                        redis_outcome = unconfirmed_note(request, detail)
+                        note = "    redis request not confirmed: %s" % detail
                 else:
-                    redis_outcome = unconfirmed_note(request, detail)
-                    note = "    redis request not confirmed: %s" % detail
+                    if kind == "done":
+                        redis_row = "bridge"
+                    redis_outcome = said
+                    note = "    redis op through the bridge: %s (%s)" % (kind, request["op"])
                 print(note)
                 log(me, note)
         body = " ".join(okf_land.scrub_secrets(text).split())
@@ -1187,6 +1301,7 @@ def main(argv=None) -> int:
         if redis_outcome:
             hands += " " + redis_outcome
         elif redis_row:
+            # The board route's row id. A bridge answer always carries its own outcome (redis_outcome) instead.
             hands += (" Its adapter posted the Redis request this reply carried as row %s; the "
                       "worker's AYA_RESULT row, not this one, says whether it was done." % redis_row)
         # PY-08: what this answer cost, on the row itself, so a spend question is answered from the

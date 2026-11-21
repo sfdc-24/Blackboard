@@ -68,6 +68,9 @@
 !/scripts/cloud_context.py
 !/scripts/okf_land.py
 !/scripts/fleet_agent.py
+!/scripts/bridge_client.py
+!/scripts/redis_doorbell.py
+!/scripts/gemini_parity.py
 
 # Belt and braces. If a future edit above accidentally re-admits the root, these
 # still never go up. An ignore rule that is redundant today is not wasted.

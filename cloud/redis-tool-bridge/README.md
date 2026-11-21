@@ -103,7 +103,21 @@ governed ops, after the source is verified"). **D1 has not been given. Nothing h
   `fleet:inbox:<principal>`, and `xrange` there with count 1 and no `after` (the first cursor
   `scripts/redis_doorbell.py` reads). Any other op or key, or a field, value or encoding, is a 403 `refused` from
   the door before any connection (`op.py`, `doorbell_refusal`), and `author`/`request` are a 400 as for a fleet
-  agent. Grok, Codex (`chatgpt-codex-desktop`) and Gemini are doorbell callers; claude-code-cli is a fleet agent.
+  agent. Grok and Codex (`chatgpt-codex-desktop`) are doorbell callers; claude-code-cli is a fleet agent.
+- **Gemini is a fleet agent on two surfaces** (GEMINI-RULING-DIRECT-REDIS-OK-20261121T0153Z): the laptop as
+  `fleet-gemini@` (by impersonation) and the Cloud Run job `gemini-waker` as `waker-gemini@` (a metadata-server OIDC
+  token, `REDIS_BRIDGE_MINT=metadata` in `scripts/bridge_client.py`). Both act as `gemini` and nothing wider than its
+  line in `scripts/redis_acl.json`; `gov:`, `v1:` and the call record (`conf:calls`, `conf:call:`, ...) stay refused
+  in code. The waker uses the Sheet route only when the bridge proved nothing ran (`strict=True`).
+  `scripts/gemini_parity.py` is the parity test, one account at a time (`--surface laptop`, or `main.py parity` inside
+  the job). ROLLBACK, each on its own (from Git Bash, `MSYS_NO_PATHCONV=1 gcloud.cmd ...`):
+  - the waker off, from its next execution: `gcloud run jobs update gemini-waker --project=sfdc24 --region=us-central1
+    --update-env-vars=REDIS_BRIDGE=off`; the laptop: `REDIS_BRIDGE=off` in its environment, read on every call.
+  - the bridge back to the revision before this release: `gcloud run services update-traffic redis-tool-bridge
+    --project=sfdc24 --region=us-central1 --to-revisions=redis-tool-bridge-p7e3c0524=100 --quiet`.
+  - the waker's account off the service: `gcloud run services remove-iam-policy-binding redis-tool-bridge
+    --project=sfdc24 --region=us-central1 --member=serviceAccount:waker-gemini@sfdc24.iam.gserviceaccount.com
+    --role=roles/run.invoker`.
 - **Capacity: held waits never starve the chair** (Gemini, GEMINI-ARCH-REDIS-DOORBELL-20261108T1645Z). The
   service serves 32 requests at once on one instance (`--concurrency=32`, one thread a request), and at most 8 of
   them may be held `xwait`s (`op.py`, `MAX_WAITS`). A ninth wait is not queued: it is a 429 `busy` at once, with

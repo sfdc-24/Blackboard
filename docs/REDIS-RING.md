@@ -85,8 +85,9 @@ Redis doorbell for grok: 2 new entries in fleet:inbox:grok, listed by row id bel
 them). The URL and the service-account email are not secrets. The token is minted per request by impersonating that
 account (`gcloud auth print-identity-token --impersonate-service-account`), so the login on that machine needs
 token-creator on its own account and nothing else; no key file exists. Each agent's account must be bound to its own
-principal in `cloud/redis-tool-bridge/callers.json`: grok, codex and gemini as `doorbell` callers (sfdc-24/Blackboard#489),
-claude-code-cli as a `fleet-agent`.
+principal in `cloud/redis-tool-bridge/callers.json`: grok and codex as `doorbell` callers (sfdc-24/Blackboard#489),
+claude-code-cli and gemini as `fleet-agent`s (gemini since GEMINI-RULING-DIRECT-REDIS-OK-20261121T0153Z; a fleet agent's
+line still lets its ring wait on its own lane, so the ring is unchanged).
 
 ## Surviving a reboot
 

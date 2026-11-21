@@ -976,12 +976,15 @@ class TheRealBoundary(Harness, unittest.TestCase):
         not ask with it, and the service refuses it should anything ask anyway. Neither half alone is enough."""
         conn = FakeRedis()
         # Since the owner's 2026-11-08 go, claude-code-cli is the one fleet agent on /op, by its own account, and grok,
-        # Codex and Gemini are doorbell callers (each its own lane only): the client maps them all, as the service does.
+        # Codex are doorbell callers (each its own lane only), and gemini is a fleet agent on two surfaces, the laptop's
+        # fleet-gemini@ and the gemini-waker job's waker-gemini@ (GEMINI-RULING-DIRECT-REDIS-OK-20261121T0153Z): the
+        # client maps them all, as the service does.
         self.assertEqual({"conference-chair@sfdc24.iam.gserviceaccount.com": "conference-chair",
                           "fleet-claude-code-cli@sfdc24.iam.gserviceaccount.com": "claude-code-cli",
                           "fleet-grok@sfdc24.iam.gserviceaccount.com": "grok",
                           "fleet-codex@sfdc24.iam.gserviceaccount.com": "chatgpt-codex-desktop",
-                          "fleet-gemini@sfdc24.iam.gserviceaccount.com": "gemini"},
+                          "fleet-gemini@sfdc24.iam.gserviceaccount.com": "gemini",
+                          "waker-gemini@sfdc24.iam.gserviceaccount.com": "gemini"},
                          bc.load_callers())
         for me, account in ((AYA, AYA_SA), (ME, SA)):
             out, said = self.attempt(BridgeSim(conn, principal="file", account=account), me=me, account=account,
@@ -1757,6 +1760,187 @@ class Reconciling(Harness, unittest.TestCase):
         out = self.unknown_send(conn, worker, lost_after_commit)
         self.assertIn("alert row could not be posted", out)
         self.assertEqual(1, len(self.pending()), "the journal still has it")
+
+
+# ------------------------------------------------------------------------------------------------ gemini direct
+WAKER_SA = "waker-gemini@sfdc24.iam.gserviceaccount.com"
+
+
+def jwt(claims):
+    """A token of the right shape with these claims. Unsigned: the client never verifies, only refuses."""
+    def part(obj):
+        return base64.urlsafe_b64encode(json.dumps(obj).encode("utf-8")).decode("ascii").rstrip("=")
+    return "%s.%s.%s" % (part({"alg": "RS256"}), part(claims), "c2lnbmF0dXJlLXBhcnQ")
+
+
+GOOD = {"email": WAKER_SA, "email_verified": True, "aud": URL}
+
+
+class GeminiDirect_TheMetadataToken(unittest.TestCase):
+    """GEMINI-RULING-DIRECT-REDIS-OK-20261121T0153Z, PATH (b): the gemini-waker job reaches the bridge as its own
+    account, waker-gemini@, with a token from the metadata server, never impersonation and never a key file."""
+
+    def test_the_mint_is_gcloud_unless_it_says_metadata_and_a_typo_is_not_sent(self):
+        self.assertEqual("gcloud", bc.mint_mode({}))
+        self.assertEqual("gcloud", bc.mint_mode({"REDIS_BRIDGE_MINT": "gcloud"}))
+        self.assertEqual("metadata", bc.mint_mode({"REDIS_BRIDGE_MINT": " Metadata "}))
+        self.assertIs(bc.mint, bc.minter_for({}))
+        self.assertIs(bc.mint_metadata, bc.minter_for({"REDIS_BRIDGE_MINT": "metadata"}))
+        for bad in ("meta", "key-file", "on"):
+            with self.assertRaises(bc.NotSent):
+                bc.mint_mode({"REDIS_BRIDGE_MINT": bad})
+            with self.assertRaises(bc.NotSent):
+                bc.config(dict(ON, REDIS_BRIDGE_MINT=bad))
+
+    def test_it_asks_for_the_named_account_for_this_audience_with_the_email_and_nothing_else(self):
+        token = jwt(GOOD)
+        opener = Opener(Answer(200, token.encode("ascii")))
+        self.assertEqual(token, bc.mint_metadata(URL, WAKER_SA, opener=opener))
+        ((request, timeout),) = opener.requests
+        base, _, query = request.full_url.partition("?")
+        self.assertEqual("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/"
+                         + WAKER_SA + "/identity", base, "the account is named: no other account's token comes back")
+        self.assertEqual({"audience": [URL], "format": ["full"]}, urllib.parse.parse_qs(query))
+        self.assertEqual(("GET", "Google"), (request.get_method(), request.get_header("Metadata-flavor")))
+        self.assertIsNone(request.get_header("Authorization"))
+        self.assertEqual(bc.METADATA_TIMEOUT, timeout)
+
+    def test_a_token_for_another_account_or_audience_or_unverified_is_never_used(self):
+        for claims in (dict(GOOD, email="fleet-gemini@sfdc24.iam.gserviceaccount.com"),
+                       dict(GOOD, email_verified="true"), {k: v for k, v in GOOD.items() if k != "email_verified"},
+                       dict(GOOD, aud="https://elsewhere-uc.a.run.app"), dict(GOOD, aud=[URL, "https://x-uc.a.run.app"]),
+                       {k: v for k, v in GOOD.items() if k != "email"}):
+            token = jwt(claims)
+            with self.subTest(claims=claims), self.assertRaises(bc.NotSent) as why:
+                bc.mint_metadata(URL, WAKER_SA, opener=Opener(Answer(200, token.encode("ascii"))))
+            self.assertNotIn(token, str(why.exception))
+        self.assertEqual(jwt(dict(GOOD, aud=[URL])),
+                         bc.mint_metadata(URL, WAKER_SA, opener=Opener(Answer(200, jwt(dict(GOOD, aud=[URL])).encode()))))
+
+    def test_a_metadata_failure_is_not_sent_in_closed_words(self):
+        cases = ((Answer(200, b"not a token at all"), "not an identity token"),
+                 (Answer(500, jwt(GOOD).encode()), "not an identity token"),
+                 (urllib.error.HTTPError("http://metadata", 404, HOSTILE[1], {}, io.BytesIO(HOSTILE[3].encode())),
+                  "HTTP 404"),
+                 (urllib.error.URLError(HOSTILE[1]), "could not be reached (URLError)"),
+                 (TimeoutError(HOSTILE[1]), "could not be reached (TimeoutError)"))
+        for reply, said in cases:
+            with self.subTest(said=said), self.assertRaises(bc.NotSent) as why:
+                bc.mint_metadata(URL, WAKER_SA, opener=Opener(reply))
+            self.assertIn(said, str(why.exception))
+            for word in HOSTILE:
+                self.assertNotIn(word, str(why.exception))
+        with self.assertRaises(bc.NotSent):
+            bc.mint_metadata("http://" + URL[8:], WAKER_SA, opener=Opener(Answer(200, jwt(GOOD).encode())))
+
+    def test_the_default_opener_uses_no_proxy_and_follows_no_redirect(self):
+        seen = []
+
+        def build_opener(*handlers):
+            seen.extend(handlers)
+            return Opener(Answer(200, jwt(GOOD).encode()))
+        with mock.patch.object(bc.urllib.request, "build_opener", build_opener):
+            bc.mint_metadata(URL, WAKER_SA)
+        proxies = [h for h in seen if isinstance(h, bc.urllib.request.ProxyHandler)]
+        self.assertEqual(1, len(proxies))
+        self.assertEqual({}, proxies[0].proxies)
+        self.assertTrue(any(h is bc._NoRedirect or isinstance(h, bc._NoRedirect) for h in seen))
+
+    def test_attempt_mints_by_the_metadata_server_when_the_switch_says_so(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        env = dict(ON, REDIS_BRIDGE_IMPERSONATE=WAKER_SA, REDIS_BRIDGE_MINT="metadata")
+        asked = []
+        with mock.patch.object(bc, "mint_metadata", lambda url, account: asked.append((url, account)) or TOKEN), \
+                mock.patch.object(bc, "mint", lambda *a: self.fail("gcloud is not on a Cloud Run job")):
+            out = bc.attempt("get", "fleet:x", me="gemini", environ=env, callers={WAKER_SA: "gemini"},
+                             state_path=os.path.join(tmp.name, "s.json"), journal_path=os.path.join(tmp.name, "j"),
+                             say=lambda line: None, caller=lambda url, token, request: {"ok": True, "principal": "gemini"})
+        self.assertEqual({"ok": True, "principal": "gemini"}, out)
+        self.assertEqual([(URL, WAKER_SA)], asked)
+
+
+class GeminiDirect_TheStrictFallback(unittest.TestCase):
+    """GEMINI-RULING-DIRECT-REDIS-OK-20261121T0153Z, FALLBACK: the stateless waker uses the Sheet ONLY on NotSent or
+    "executed": false, and NEVER on a 502 or any outcome-unknown result, a read's included."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.journal = os.path.join(self.tmp.name, "unknown.jsonl")
+        self.said, self.requests = [], []
+
+    def go(self, op, outcome, strict=True, field=None, mint=None):
+        state = os.path.join(self.tmp.name, "breaker-%d.json" % len(self.requests))
+
+        def minter(url, account):
+            if mint is not None:
+                raise mint
+            return TOKEN
+
+        def caller(url, token, request):
+            self.requests.append(dict(request))
+            if isinstance(outcome, BaseException):
+                raise outcome
+            if isinstance(outcome, Opener):
+                return bc.call(url, token, request, opener=outcome)
+            return outcome
+        return bc.attempt(op, "fleet:pilot:gemini:x", me="gemini", value=None if op in bc.READS else "v",
+                          environ=dict(ON, REDIS_BRIDGE_IMPERSONATE=WAKER_SA), state_path=state,
+                          journal_path=self.journal, callers={WAKER_SA: "gemini"}, say=self.said.append,
+                          minter=minter, caller=caller, field=field, strict=strict)
+
+    def test_not_sent_may_use_the_sheet_for_a_read_and_a_write(self):
+        for op in ("get", "set"):
+            self.assertIsNone(self.go(op, None, mint=bc.NotSent("the metadata server minted no token (HTTP 404)")))
+        self.assertEqual([], self.requests)
+        self.assertEqual([], bc.pending(self.journal))
+
+    def test_executed_false_from_the_bridge_may_use_the_sheet(self):
+        for status, body in ((503, {"error": "redis unreachable", "executed": False}),
+                             (503, {"error": "service unavailable", "executed": False}),
+                             (400, {"error": "bad request", "executed": False})):
+            for op in ("get", "set"):
+                with self.subTest(status=status, op=op):
+                    self.assertIsNone(self.go(op, Opener(http_error(status, body))))
+        self.assertEqual([], bc.pending(self.journal), "every write line closed as not executed")
+
+    def test_a_502_or_any_unknown_is_never_the_sheet_for_a_read_or_a_write(self):
+        for status, body in ((502, {"error": "outcome unknown", "type": "ConnectionError"}),
+                             (502, {"error": "failed", "type": "TimeoutError"}),
+                             (503, {"error": "unavailable"}),
+                             (500, {}), (504, {}),
+                             (404, {"error": "no such endpoint"}), (413, {"error": "body too large"}), (400, {})):
+            for op in ("get", "xrange", "set", "xadd"):
+                with self.subTest(status=status, op=op), self.assertRaises(bc.Unknown):
+                    self.go(op, Opener(http_error(status, body)))
+        for op in ("get", "set"):
+            for lost in (TimeoutError("read timed out"), ConnectionResetError("reset")):
+                with self.subTest(op=op, lost=type(lost).__name__), self.assertRaises(bc.Unknown):
+                    self.go(op, Opener(lost))
+        self.assertFalse(any("Using the board route" in line for line in self.said), self.said)
+        self.assertTrue(all(entry["op"] in ("set", "xadd") for entry in bc.pending(self.journal)),
+                        "each unsettled write stays UNKNOWN; no read is journalled")
+
+    def test_without_strict_the_old_rule_holds(self):
+        self.assertIsNone(self.go("get", Opener(http_error(502, {"error": "failed"})), strict=False))
+        self.assertIsNone(self.go("get", Opener(http_error(404, {})), strict=False))
+        self.assertIsNone(self.go("set", Opener(http_error(404, {})), strict=False))
+        with self.assertRaises(bc.Unknown):
+            self.go("set", Opener(http_error(502, {"error": "outcome unknown"})), strict=False)
+
+    def test_refused_and_denied_stay_terminal_in_strict(self):
+        with self.assertRaises(bc.Refused):
+            self.go("set", Opener(http_error(403, {"error": "refused", "reason": "that namespace is protected",
+                                                   "executed": False, "audit": "ok"})))
+        with self.assertRaises(bc.Denied):
+            self.go("get", Opener(http_error(401, {"error": "unauthenticated"})))
+
+    def test_a_field_travels_for_hset(self):
+        self.go("hset", {"ok": True, "principal": "gemini"}, field="note")
+        self.assertEqual("note", self.requests[-1]["field"])
+        self.go("set", {"ok": True, "principal": "gemini"})
+        self.assertNotIn("field", self.requests[-1])
 
 
 if __name__ == "__main__":
