@@ -8,7 +8,12 @@ WORKDIR /app
 COPY scripts/bus.py scripts/agent_waker.py scripts/gemini_agent.py \
      scripts/claude_agent.py scripts/repo_context.py scripts/cloud_context.py \
      scripts/okf_land.py scripts/fleet_agent.py scripts/state_store.py \
-     scripts/board_row.py scripts/jev_agent.py scripts/ask_phases.py /app/scripts/
+     scripts/board_row.py scripts/jev_agent.py scripts/ask_phases.py \
+     scripts/bridge_client.py scripts/redis_gov.py scripts/redis_doorbell.py \
+     scripts/gemini_parity.py /app/scripts/
+# The bridge client reads the bridge's own callers.json at <repo>/cloud/redis-tool-bridge/ (bridge_client.CALLERS_FILE):
+# a client that cannot read it maps nobody and never uses the bridge.
+COPY cloud/redis-tool-bridge/callers.json /app/cloud/redis-tool-bridge/callers.json
 COPY cloud/agent-waker/main.py /app/main.py
 
 ENV PYTHONUNBUFFERED=1

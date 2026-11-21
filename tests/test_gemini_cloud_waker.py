@@ -1044,5 +1044,135 @@ class APostThatOutlivesItsTimeout(unittest.TestCase):
         self.assertIn("NOT CONFIRMED after 400 s", buf.getvalue())
 
 
+# ------------------------------------------------------------------------------- gemini's direct Redis path
+import bridge_client  # noqa: E402
+
+BRIDGE_ON = {"REDIS_BRIDGE": "on", "REDIS_BRIDGE_URL": "https://redis-tool-bridge-example-uc.a.run.app",
+             "REDIS_BRIDGE_IMPERSONATE": "waker-gemini@sfdc24.iam.gserviceaccount.com", "REDIS_BRIDGE_MINT": "metadata"}
+
+
+class TheWakerUsesTheBridgeAndTheSheetOnlyWhenNothingRan(unittest.TestCase):
+    """GEMINI-RULING-DIRECT-REDIS-OK-20261121T0153Z, FALLBACK: the stateless waker falls back to the Sheet (the board
+    request row) ONLY on NotSent or "executed": false; NEVER on a 502 or any outcome-unknown result."""
+
+    WRITE = {"op": "xadd", "key": "conf:side:20261121", "val": "the lease holds", "field": None, "count": None}
+    READ = {"op": "xrange", "key": "fleet:inbox:gemini", "val": None, "field": None, "count": "5", "after": "1-0"}
+
+    def direct(self, request, outcome, env=BRIDGE_ON, dispatch=None):
+        self.calls, self.dispatched = [], []
+
+        def attempt(op, key, **kw):
+            self.calls.append(dict(kw, op=op, key=key))
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+
+        def gate(answers):
+            self.dispatched.append(answers)
+            return True if dispatch is None else dispatch
+        return aw.redis_direct("gemini", request, "CCC-ASK-1", environ=env, attempt=attempt, dispatch=gate)
+
+    def test_with_the_switch_off_it_is_the_board_route_exactly_as_before(self):
+        for env in ({}, {"REDIS_BRIDGE": "off"}, dict(BRIDGE_ON, REDIS_BRIDGE_MINT="typo")):
+            self.assertEqual(("board", ""), self.direct(self.WRITE, {"ok": True}, env=env))
+            self.assertEqual(([], []), (self.calls, self.dispatched), env)
+
+    def test_done_through_the_bridge_says_the_outcome_and_asks_strictly(self):
+        kind, said = self.direct(self.WRITE, {"ok": True, "op": "xadd", "key": "conf:side:20261121", "ttl": 604800,
+                                              "principal": "gemini"})
+        self.assertEqual("done", kind)
+        self.assertIn("through the bridge as gemini, with no request row: OK xadd conf:side:20261121", said)
+        (call,) = self.calls
+        self.assertEqual((True, "gemini", "the lease holds"), (call["strict"], call["me"], call["value"]))
+        self.assertEqual(["CCC-ASK-1"], self.dispatched)
+        kind, _ = self.direct(self.READ, {"ok": True, "op": "xrange", "key": "fleet:inbox:gemini", "value": [],
+                                          "principal": "gemini"})
+        self.assertEqual(("done", [], 5, "1-0"), (kind, self.dispatched, self.calls[0]["count"], self.calls[0]["after"]),
+                         "a read is not a dispatch: nothing to hold")
+
+    def test_not_sent_or_executed_false_is_the_board_route(self):
+        self.assertEqual(("board", ""), self.direct(self.WRITE, None))   # attempt's own None: nothing ran
+
+    def test_unknown_refused_and_denied_are_never_the_board_route(self):
+        for outcome, kind in ((bridge_client.Unknown("HTTP 502 failed upstream"), "unknown"),
+                              (bridge_client.Refused("gemini may not write under that key", "ok"), "refused"),
+                              (bridge_client.Denied("HTTP 403 not authorised"), "denied")):
+            for request in (self.WRITE, self.READ):
+                with self.subTest(kind=kind, op=request["op"]):
+                    got, said = self.direct(request, outcome)
+                    self.assertEqual(kind, got)
+                    self.assertNotIn("conf:side", said, "the sentence never names the key")
+                    self.assertIn("(%s)" % request["op"], said)
+
+    def test_a_write_already_dispatched_for_this_ask_is_sent_by_no_route(self):
+        kind, said = self.direct(self.WRITE, {"ok": True, "principal": "gemini"}, dispatch=False)
+        self.assertEqual(("held", []), (kind, self.calls))
+        self.assertIn("not sent again by any route", said)
+
+    def test_a_credential_shaped_key_is_refused_before_anything(self):
+        kind, said = self.direct(dict(self.WRITE, key="proj:AKIAIOSFODNN7EXAMPLE"), {"ok": True})
+        self.assertEqual(("refused", [], []), (kind, self.calls, self.dispatched))
+        self.assertNotIn("AKIA", said)
+
+    def test_a_private_read_is_withheld_from_the_reply_as_the_board_would(self):
+        result = {"ok": True, "op": "xrange", "key": "v1:conf:workshop:events", "principal": "gemini",
+                  "value": [{"id": "1-0", "text": "the owner said something private"}]}
+        kind, said = self.direct(dict(self.READ, key="v1:conf:workshop:events"), result)
+        self.assertEqual("done", kind)
+        self.assertNotIn("something private", said)
+        self.assertNotIn("|", said)
+
+    def test_the_main_loop_posts_the_board_request_only_on_the_board_kind(self):
+        source = (REPO / "scripts" / "agent_waker.py").read_text(encoding="utf-8")
+        loop = source[source.index("kind, said = redis_direct(me, request, src_id)"):]
+        loop = loop[:loop.index("print(note)")]
+        self.assertIn('if kind == "board":\n                    ok, detail = post_request(', loop)
+        self.assertEqual(1, loop.count("post_request("))
+
+    def test_the_hands_note_says_which_route_it_has(self):
+        cfg = aw.AGENTS["gemini"]
+        self.assertIn("through the Redis bridge as this agent's own service account", aw.hands_note("gemini", cfg, BRIDGE_ON))
+        self.assertIn("the worker's AYA_RESULT row says what happened", aw.hands_note("gemini", cfg, {}))
+
+
+class _DispatchingWaker(FakeWaker):
+    """A pass that dispatches one bridge write per id, twice, and records what the gate said."""
+
+    def __init__(self, post_ids):
+        super().__init__(post_ids)
+        self.gates = []
+
+    def main(self, argv):
+        for rid in self.post_ids:
+            self.gates.append((rid, self.redis_dispatch(rid), self.redis_dispatch(rid)))
+        return super().main(argv)
+
+
+class TheCloudCursorHoldsABridgeWriteOncePerAsk(unittest.TestCase):
+    def test_the_first_dispatch_is_recorded_before_the_write_and_no_run_sends_it_twice(self):
+        store = MemStore({"watermark": "2026-11-21T01:00:00Z", "answered_ids": []})
+        w = _DispatchingWaker(["A"])
+        self.assertEqual(0, main.run(store=store, waker=w))
+        self.assertEqual([("A", True, False)], w.gates)
+        self.assertEqual(["A"], store.state["redis_sent_ids"])
+        self.assertTrue(any(save.get("redis_sent_ids") == ["A"] and "A" not in save["answered_ids"]
+                            for save in store.saves), "recorded before the reply, not after")
+        again = _DispatchingWaker(["A"])
+        main.run(store=store, waker=again)
+        self.assertEqual([("A", False, False)], again.gates, "a re-run of the same ask dispatches nothing")
+        self.assertFalse(hasattr(again, "redis_dispatch"), "the hook is taken off after the pass")
+
+    def test_a_lost_swap_propagates_so_the_loser_sends_nothing(self):
+        store = MemStore({"watermark": "2026-11-21T01:00:00Z", "answered_ids": []})
+
+        class Racing(_DispatchingWaker):
+            def main(self, argv):
+                store.gen += 1                      # another run saved first
+                return super().main(argv)
+        with self.assertRaises(state_store.Conflict):
+            main.run(store=store, waker=Racing(["A"]))
+        self.assertNotIn("redis_sent_ids", store.state)
+
+
 if __name__ == "__main__":
     unittest.main()

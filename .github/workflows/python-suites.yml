@@ -164,6 +164,8 @@ on:
       - "tests/mutate_redis_ring.py"
       - "scripts/bridge_client.py"
       - "tests/test_bridge_client.py"
+      - "scripts/gemini_parity.py"
+      - "tests/test_gemini_parity.py"
       - "cloud/redis-tool-bridge/callers.json"
       - "tests/test_inbox_wake.py"
       - "cloud/inbox-wake/main.py"
@@ -302,6 +304,8 @@ on:
       - "tests/mutate_redis_ring.py"
       - "scripts/bridge_client.py"
       - "tests/test_bridge_client.py"
+      - "scripts/gemini_parity.py"
+      - "tests/test_gemini_parity.py"
       - "cloud/redis-tool-bridge/callers.json"
       - "tests/test_inbox_wake.py"
       - "cloud/inbox-wake/main.py"
@@ -1221,7 +1225,8 @@ jobs:
                       "test_redis_inbox:scripts/redis_inbox.py" \
                       "test_redis_ring:scripts/redis_ring.py" \
                       "test_redis_doorbell:scripts/redis_doorbell.py" \
-                      "test_bridge_client:scripts/bridge_client.py"; do
+                      "test_bridge_client:scripts/bridge_client.py" \
+                      "test_gemini_parity:scripts/gemini_parity.py"; do
             suite="${pair%%:*}"; code="${pair#*:}"
             if [ -f "tests/${suite}.py" ]; then
               sudo unshare -n -- "$python_bin" -B -m unittest "tests.${suite}" -v
