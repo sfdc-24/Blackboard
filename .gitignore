@@ -98,6 +98,8 @@ zoom-agent/.tokens.json
 .foundry_waker_state.json
 .grok_wa_inbox_state.json
 .gemini_waker_state.json
+.unacked_watchdog_state.json
+.unacked_watchdog_state.json.tmp
 .redis_bridge_breaker.json
 .redis_bridge_unknown.jsonl
 

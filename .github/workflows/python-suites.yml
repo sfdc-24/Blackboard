@@ -148,6 +148,8 @@ on:
       - "tests/test_fleet_doorbell.py"
       - "scripts/fleet_ring.py"
       - "tests/test_fleet_ring.py"
+      - "scripts/unacked_watchdog.py"
+      - "tests/test_unacked_watchdog.py"
       - "scripts/projects.py"
       - "tests/test_projects.py"
       - "scripts/wake_ack.py"
@@ -288,6 +290,8 @@ on:
       - "tests/test_fleet_doorbell.py"
       - "scripts/fleet_ring.py"
       - "tests/test_fleet_ring.py"
+      - "scripts/unacked_watchdog.py"
+      - "tests/test_unacked_watchdog.py"
       - "scripts/projects.py"
       - "tests/test_projects.py"
       - "scripts/wake_ack.py"
@@ -1219,6 +1223,7 @@ jobs:
                       "test_call_bridge_screen:scripts/call_bridge.py" \
                       "test_fleet_doorbell:scripts/fleet_doorbell.py" \
                       "test_fleet_ring:scripts/fleet_ring.py" \
+                      "test_unacked_watchdog:scripts/unacked_watchdog.py" \
                       "test_projects:scripts/projects.py" \
                       "test_wake_ack:scripts/wake_ack.py" \
                       "test_redis_archive:cloud/bus-reconciler/redis_archive.py" \
