@@ -261,7 +261,7 @@ test('summary shape checks: extra fields, bad base64, oversized sign-in bodies',
 });
 
 // The plan kinds: a one-page plan drafted after a call. Made-up people only.
-const planPdf = Buffer.from('%PDF-1.3\nA free prototype plan\n%%EOF\n', 'latin1');
+const planPdf = Buffer.from('%PDF-1.3\nA proof of concept quote\n%%EOF\n', 'latin1');
 const reviewUrl = 'https://room.example.test/review.html#pl_0123456789abcdef0123';
 
 function signedPlan(kind, overrides = {}, bytes = planPdf) {
@@ -290,10 +290,10 @@ test('a signed plan review goes to the operator once, with the link in the body 
   assert.equal(app.sent.length, 1);
   const [to, subject, text, options] = app.sent[0];
   assert.equal(to, email);
-  assert.match(subject, /^Review: a free prototype plan for Sam, a small bakery$/);
+  assert.match(subject, /^Review: a proof of concept quote for Sam, a small bakery$/);
   assert.equal(text.includes(reviewUrl), true);
   assert.match(text, /Nothing reaches the guest until you press Approve and send/);
-  assert.equal(options.attachments[0].name, 'SFDC24-prototype-plan-review.pdf');
+  assert.equal(options.attachments[0].name, 'SFDC24-proof-of-concept-quote-review.pdf');
   assert.deepEqual(Buffer.from(options.attachments[0].bytes.map((b) => b & 255)), planPdf);
   assert.deepEqual(app.post(request), { ok: false });
   assert.equal(app.sent.length, 1);
@@ -316,10 +316,11 @@ test('an approved plan reaches a guest only once the owner opens the plan kind',
   assert.deepEqual(open.post(signedPlan('plan', { email: 'sam@bakery.example', label: 'Sam' })), { ok: true });
   const [to, subject, text, options] = open.sent[0];
   assert.equal(to, 'sam@bakery.example');
-  assert.equal(subject, 'Your free prototype plan from SFDC24');
+  assert.equal(subject, 'Your proof of concept quote from SFDC24');
   assert.match(text, /^Hi Sam,\n\n/);
-  assert.match(text, /costs you nothing/);
-  assert.equal(options.attachments[0].name, 'SFDC24-free-prototype-plan.pdf');
+  assert.match(text, /its price and turnaround/);
+  assert.equal(/\d/.test(text.replace(/SFDC24/g, '')), false, 'no figure in the email body: they are in the attached quote');
+  assert.equal(options.attachments[0].name, 'SFDC24-proof-of-concept-quote.pdf');
   // Opening plans opens neither summaries nor the sign-in code.
   assert.deepEqual(open.post(signedSummary({ email: 'sam@bakery.example' })), { ok: false });
   assert.deepEqual(open.post(signedRequest({ email: 'sam@bakery.example' })), { ok: false });

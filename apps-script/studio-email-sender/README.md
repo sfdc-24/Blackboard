@@ -53,7 +53,7 @@ summary or as a sign-in code:
 | `plan` | `kind`, `timestamp`, `nonce`, `email`, `pdf`, `pdf_sha256`, `label`, `signature` | `plan`, timestamp, nonce, email, PDF digest, `label` | the allowlist, or anyone when `STUDIO_PLAN_ANY_RECIPIENT` is exactly `true` |
 
 `label` is at most 80 characters with no control character, angle bracket or
-at sign: the review email's subject ("Review: a free prototype plan for ...")
+at sign: the review email's subject ("Review: a proof of concept quote for ...")
 and the approved plan's greeting ("Hi ..."). `review_url` is an `https` link
 with a short plain path, put in the review email's body. The PDF checks, the
 nonce ledger and the freshness window are the summary's.

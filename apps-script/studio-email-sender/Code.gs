@@ -128,28 +128,28 @@ function doPost(e) {
     if (kind === 'plan_review') {
       MailApp.sendEmail(
         request.email,
-        'Review: a free prototype plan' + (request.label ? ' for ' + request.label : ''),
-        'A free prototype plan from your call is ready for your review. Your review ' +
+        'Review: a proof of concept quote' + (request.label ? ' for ' + request.label : ''),
+        'A proof of concept quote from your call is ready for your review. Your review ' +
             'copy is attached; it shows the suggested price of the paid follow-on, ' +
             'which the guest never sees.\n\nReview it, edit it and send it here:\n' +
             request.review_url + '\n\nNothing reaches the guest until you press ' +
             'Approve and send.',
         { name: 'SFDC24', attachments: [
-          Utilities.newBlob(pdfBytes, 'application/pdf', 'SFDC24-prototype-plan-review.pdf')] }
+          Utilities.newBlob(pdfBytes, 'application/pdf', 'SFDC24-proof-of-concept-quote-review.pdf')] }
       );
       return studioEmailResponse_(true);
     }
     if (kind === 'plan') {
       MailApp.sendEmail(
         request.email,
-        'Your free prototype plan from SFDC24',
+        'Your proof of concept quote from SFDC24',
         (request.label ? 'Hi ' + request.label + ',\n\n' : '') +
-            'Thank you for your time on the call. Attached is your free prototype ' +
-            'plan: the flow we will prototype for you, what you will be able to try, ' +
-            'and what comes next. The prototype costs you nothing.\n\n' +
+            'Thank you for your time on the call. Attached is your quote for a proof ' +
+            'of concept: the flow we will build for you, what you will be able to try, ' +
+            'its price and turnaround, and what comes next.\n\n' +
             'Reply to this email to say go.\n\nSFDC24',
         { name: 'SFDC24', attachments: [
-          Utilities.newBlob(pdfBytes, 'application/pdf', 'SFDC24-free-prototype-plan.pdf')] }
+          Utilities.newBlob(pdfBytes, 'application/pdf', 'SFDC24-proof-of-concept-quote.pdf')] }
       );
       return studioEmailResponse_(true);
     }
