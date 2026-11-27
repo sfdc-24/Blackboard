@@ -25,7 +25,8 @@ IMAGE="us-central1-docker.pkg.dev/${PROJECT}/cloud-run-source-deploy/${SERVICE}:
 # 2026-11-08 (00003-j9j); fleet-claude-code-cli, and the doorbell accounts fleet-grok, fleet-codex and
 # fleet-gemini, are the owner's 2026-11-08 additions (callers.json says what each is for). waker-gemini, the
 # gemini-waker job's own account, is gemini's second surface (GEMINI-RULING-DIRECT-REDIS-OK-20261121T0153Z).
-INVOKERS=("serviceAccount:aya-runtime@${PROJECT}.iam.gserviceaccount.com" "serviceAccount:conference-chair@${PROJECT}.iam.gserviceaccount.com" "serviceAccount:fleet-claude-code-cli@${PROJECT}.iam.gserviceaccount.com" "serviceAccount:fleet-grok@${PROJECT}.iam.gserviceaccount.com" "serviceAccount:fleet-codex@${PROJECT}.iam.gserviceaccount.com" "serviceAccount:fleet-gemini@${PROJECT}.iam.gserviceaccount.com" "serviceAccount:waker-gemini@${PROJECT}.iam.gserviceaccount.com")
+# fleet-claude-mobile is claude-mobile's fleet-agent account (callers.json); the next redeploy keeps its run.invoker binding.
+INVOKERS=("serviceAccount:aya-runtime@${PROJECT}.iam.gserviceaccount.com" "serviceAccount:conference-chair@${PROJECT}.iam.gserviceaccount.com" "serviceAccount:fleet-claude-code-cli@${PROJECT}.iam.gserviceaccount.com" "serviceAccount:fleet-grok@${PROJECT}.iam.gserviceaccount.com" "serviceAccount:fleet-codex@${PROJECT}.iam.gserviceaccount.com" "serviceAccount:fleet-gemini@${PROJECT}.iam.gserviceaccount.com" "serviceAccount:waker-gemini@${PROJECT}.iam.gserviceaccount.com" "serviceAccount:fleet-claude-mobile@${PROJECT}.iam.gserviceaccount.com")
 
 usage() {
   cat <<'TXT'
