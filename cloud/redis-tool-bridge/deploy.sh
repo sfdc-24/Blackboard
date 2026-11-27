@@ -25,7 +25,8 @@ IMAGE="us-central1-docker.pkg.dev/${PROJECT}/cloud-run-source-deploy/${SERVICE}:
 # 2026-11-08 (00003-j9j); fleet-claude-code-cli, and the doorbell accounts fleet-grok, fleet-codex and
 # fleet-gemini, are the owner's 2026-11-08 additions (callers.json says what each is for). waker-gemini, the
 # gemini-waker job's own account, is gemini's second surface (GEMINI-RULING-DIRECT-REDIS-OK-20261121T0153Z).
-INVOKERS=("serviceAccount:aya-runtime@${PROJECT}.iam.gserviceaccount.com" "serviceAccount:conference-chair@${PROJECT}.iam.gserviceaccount.com" "serviceAccount:fleet-claude-code-cli@${PROJECT}.iam.gserviceaccount.com" "serviceAccount:fleet-grok@${PROJECT}.iam.gserviceaccount.com" "serviceAccount:fleet-codex@${PROJECT}.iam.gserviceaccount.com" "serviceAccount:fleet-gemini@${PROJECT}.iam.gserviceaccount.com" "serviceAccount:waker-gemini@${PROJECT}.iam.gserviceaccount.com")
+# fleet-claude-mobile is claude-mobile's fleet-agent account (callers.json); the next redeploy keeps its run.invoker binding.
+INVOKERS=("serviceAccount:aya-runtime@${PROJECT}.iam.gserviceaccount.com" "serviceAccount:conference-chair@${PROJECT}.iam.gserviceaccount.com" "serviceAccount:fleet-claude-code-cli@${PROJECT}.iam.gserviceaccount.com" "serviceAccount:fleet-grok@${PROJECT}.iam.gserviceaccount.com" "serviceAccount:fleet-codex@${PROJECT}.iam.gserviceaccount.com" "serviceAccount:fleet-gemini@${PROJECT}.iam.gserviceaccount.com" "serviceAccount:waker-gemini@${PROJECT}.iam.gserviceaccount.com" "serviceAccount:fleet-claude-mobile@${PROJECT}.iam.gserviceaccount.com")
 
 usage() {
   cat <<'TXT'
@@ -123,7 +124,7 @@ gcloud run deploy ${SERVICE} \\
   --min-instances=0 --max-instances=1 --concurrency=32 \\
   --network=default --subnet=default --vpc-egress=private-ranges-only \\
   --set-secrets=/secrets/auth/redis-auth=REDIS_AUTH_STRING:2,/secrets/ca/redis-ca.pem=REDIS_CA_CERT:1 \\
-  '--set-env-vars=^;^REDIS_HOST=${REDIS_HOST};REDIS_PORT=${REDIS_PORT:-6378};REDIS_AUTH_FILE=/secrets/auth/redis-auth;REDIS_CA_CERT_PATH=/secrets/ca/redis-ca.pem;BRIDGE_AUDIENCE=${url};BRIDGE_CALLERS=aya-runtime@${PROJECT}.iam.gserviceaccount.com,conference-chair@${PROJECT}.iam.gserviceaccount.com,fleet-claude-code-cli@${PROJECT}.iam.gserviceaccount.com,fleet-grok@${PROJECT}.iam.gserviceaccount.com,fleet-codex@${PROJECT}.iam.gserviceaccount.com,fleet-gemini@${PROJECT}.iam.gserviceaccount.com,waker-gemini@${PROJECT}.iam.gserviceaccount.com'
+  '--set-env-vars=^;^REDIS_HOST=${REDIS_HOST};REDIS_PORT=${REDIS_PORT:-6378};REDIS_AUTH_FILE=/secrets/auth/redis-auth;REDIS_CA_CERT_PATH=/secrets/ca/redis-ca.pem;BRIDGE_AUDIENCE=${url};BRIDGE_CALLERS=aya-runtime@${PROJECT}.iam.gserviceaccount.com,conference-chair@${PROJECT}.iam.gserviceaccount.com,fleet-claude-code-cli@${PROJECT}.iam.gserviceaccount.com,fleet-grok@${PROJECT}.iam.gserviceaccount.com,fleet-codex@${PROJECT}.iam.gserviceaccount.com,fleet-gemini@${PROJECT}.iam.gserviceaccount.com,waker-gemini@${PROJECT}.iam.gserviceaccount.com,fleet-claude-mobile@${PROJECT}.iam.gserviceaccount.com'
 CMD
   # --no-allow-unauthenticated is the platform half of defect 3. The application allowlist
   # (BRIDGE_CALLERS) is the half this repository can review. Both, independently.
