@@ -247,6 +247,17 @@ class TheDeployScriptIsCorrectNotJustSafe(unittest.TestCase):
                      "BRIDGE_AUDIENCE", "BRIDGE_CALLERS"):
             self.assertIn(name + "=", flags[0], "%s is missing from the one env flag" % name)
 
+    def test_bridge_callers_includes_fleet_claude_mobile(self):
+        """main.allowlist() reads BRIDGE_CALLERS before op.py reads callers.json. run.invoker alone
+        still answers one-mind-mcp with 403 not authorised after a redeploy that omits this entry.
+        The list is comma-separated inside the ^;^ env flag, so the account is one caller, not a
+        new variable."""
+        import re
+        admitted = re.search(r"BRIDGE_CALLERS=([^\s\\']+)", DEPLOY)
+        self.assertIsNotNone(admitted, "deploy.sh sets no BRIDGE_CALLERS")
+        callers = admitted.group(1).split(",")
+        self.assertIn("fleet-claude-mobile@${PROJECT}.iam.gserviceaccount.com", callers)
+
     def test_a_deploy_without_REDIS_HOST_refuses(self):
         self.assertIn('if [ -z "${REDIS_HOST:-}" ]', DEPLOY)
 
@@ -1035,7 +1046,8 @@ class TheOpEndpoint(unittest.TestCase):
                                           "fleet-grok@sfdc24.iam.gserviceaccount.com,"
                                           "fleet-codex@sfdc24.iam.gserviceaccount.com,"
                                           "fleet-gemini@sfdc24.iam.gserviceaccount.com,"
-                                          "waker-gemini@sfdc24.iam.gserviceaccount.com"))
+                                          "waker-gemini@sfdc24.iam.gserviceaccount.com,"
+                                          "fleet-claude-mobile@sfdc24.iam.gserviceaccount.com"))
         self.assertIn("echo 'set -euo pipefail'", DEPLOY, "the generated script stops at its first failure")
         self.assertIn("deploy_cmds | bash -euo pipefail -s", DEPLOY)
         self.assertLess(DEPLOY.index("echo 'set -euo pipefail'"), DEPLOY.index("gcloud run deploy ${SERVICE}"),
