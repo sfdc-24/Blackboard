@@ -3,10 +3,17 @@
  * and (kind "summary") the working-session PDF a visitor asked for at the end
  * of a conversation. Both are HMAC-signed by the controller; the summary
  * signature covers the SHA-256 of the exact PDF attached.
+ *
+ * Two more PDF kinds, for a one-page plan drafted after a call: "plan_review"
+ * (the operator's review copy, with a link to the page where it is approved;
+ * operator allowlist only) and "plan" (the approved copy, to the person it was
+ * written for). Each is signed over its own kind, so no kind's signature is
+ * ever accepted as another's.
  */
 var STUDIO_EMAIL_CODE_MAX_CHARS = 2048;
 var STUDIO_EMAIL_SUMMARY_MAX_CHARS = 4000000;
 var STUDIO_EMAIL_PDF_MAX_CHARS = 3900000;
+var STUDIO_EMAIL_PDF_KINDS = ['summary', 'plan_review', 'plan'];
 
 function doPost(e) {
   try {
@@ -16,12 +23,13 @@ function doPost(e) {
     }
 
     var request = JSON.parse(e.postData.contents);
-    var summary = !!request && typeof request === 'object' && !Array.isArray(request) &&
-        request.kind === 'summary';
-    if (!summary && e.postData.contents.length > STUDIO_EMAIL_CODE_MAX_CHARS) {
+    var kind = (!!request && typeof request === 'object' && !Array.isArray(request) &&
+        STUDIO_EMAIL_PDF_KINDS.indexOf(request.kind) !== -1) ? request.kind : '';
+    var summary = kind === 'summary';
+    if (!kind && e.postData.contents.length > STUDIO_EMAIL_CODE_MAX_CHARS) {
       return studioEmailResponse_(false);
     }
-    if (summary ? !studioEmailValidSummary_(request) : !studioEmailValidRequest_(request)) {
+    if (kind ? !studioEmailValidPdfRequest_(request, kind) : !studioEmailValidRequest_(request)) {
       return studioEmailResponse_(false);
     }
 
@@ -39,16 +47,18 @@ function doPost(e) {
     })) {
       return studioEmailResponse_(false);
     }
-    // A summary may go to a public visitor only when the owner opens that on
-    // purpose; the sign-in code always requires the allowlist.
-    var anyRecipient = summary &&
-        properties.getProperty('STUDIO_SUMMARY_ANY_RECIPIENT') === 'true';
+    // A summary or an approved plan may go to someone off the allowlist only
+    // when the owner opens that kind on purpose, each with its own property.
+    // The sign-in code and the plan's review copy always require the allowlist.
+    var anyRecipient = (summary &&
+        properties.getProperty('STUDIO_SUMMARY_ANY_RECIPIENT') === 'true') ||
+        (kind === 'plan' && properties.getProperty('STUDIO_PLAN_ANY_RECIPIENT') === 'true');
     if (!anyRecipient && allowed.indexOf(request.email) === -1) {
       return studioEmailResponse_(false);
     }
 
-    var canonical = summary
-        ? ['summary', request.timestamp, request.nonce, request.email, request.pdf_sha256].join('\n')
+    var canonical = kind
+        ? studioEmailCanonical_(request, kind)
         : [request.timestamp, request.nonce, request.email, request.code].join('\n');
     var signedBytes = Utilities.computeHmacSha256Signature(
       canonical, secret, Utilities.Charset.UTF_8);
@@ -56,7 +66,7 @@ function doPost(e) {
       return studioEmailResponse_(false);
     }
     var pdfBytes = null;
-    if (summary) {
+    if (kind) {
       // The attachment must be exactly the PDF the controller signed.
       pdfBytes = Utilities.base64Decode(request.pdf);
       var digest = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, pdfBytes);
@@ -115,6 +125,34 @@ function doPost(e) {
       );
       return studioEmailResponse_(true);
     }
+    if (kind === 'plan_review') {
+      MailApp.sendEmail(
+        request.email,
+        'Review: a proof of concept quote' + (request.label ? ' for ' + request.label : ''),
+        'A proof of concept quote from your call is ready for your review. Your review ' +
+            'copy is attached; it shows the suggested price of the paid follow-on, ' +
+            'which the guest never sees.\n\nReview it, edit it and send it here:\n' +
+            request.review_url + '\n\nNothing reaches the guest until you press ' +
+            'Approve and send.',
+        { name: 'SFDC24', attachments: [
+          Utilities.newBlob(pdfBytes, 'application/pdf', 'SFDC24-proof-of-concept-quote-review.pdf')] }
+      );
+      return studioEmailResponse_(true);
+    }
+    if (kind === 'plan') {
+      MailApp.sendEmail(
+        request.email,
+        'Your proof of concept quote from SFDC24',
+        (request.label ? 'Hi ' + request.label + ',\n\n' : '') +
+            'Thank you for your time on the call. Attached is your quote for a proof ' +
+            'of concept: the flow we will build for you, what you will be able to try, ' +
+            'its price and turnaround, and what comes next.\n\n' +
+            'Reply to this email to say go.\n\nSFDC24',
+        { name: 'SFDC24', attachments: [
+          Utilities.newBlob(pdfBytes, 'application/pdf', 'SFDC24-proof-of-concept-quote.pdf')] }
+      );
+      return studioEmailResponse_(true);
+    }
     MailApp.sendEmail(
       request.email,
       'Your SFDC24 Studio verification code',
@@ -142,9 +180,36 @@ function studioEmailValidRequest_(request) {
   return /^[0-9a-f]{64}$/.test(request.signature);
 }
 
-function studioEmailValidSummary_(request) {
+// The exact fields of each PDF kind, sorted, and what each signs after its
+// kind, timestamp, nonce, email and PDF digest.
+var STUDIO_EMAIL_PDF_FIELDS = {
+  summary: 'email,kind,nonce,pdf,pdf_sha256,signature,timestamp',
+  plan_review: 'email,kind,label,nonce,pdf,pdf_sha256,review_url,signature,timestamp',
+  plan: 'email,kind,label,nonce,pdf,pdf_sha256,signature,timestamp'
+};
+var STUDIO_EMAIL_PDF_SIGNED = { summary: [], plan_review: ['review_url', 'label'], plan: ['label'] };
+// A label is a short plain name for the subject or greeting: no control
+// character, no markup and no address.
+var STUDIO_EMAIL_LABEL = /^[^\u0000-\u001f\u007f<>@]{0,80}$/;
+// The review page's link: https only, a host and a short plain path.
+var STUDIO_EMAIL_REVIEW_URL = /^https:\/\/[A-Za-z0-9.-]+(?::[0-9]+)?\/[A-Za-z0-9\/_.#?=&-]{0,200}$/;
+
+function studioEmailCanonical_(request, kind) {
+  return [kind, request.timestamp, request.nonce, request.email, request.pdf_sha256]
+      .concat(STUDIO_EMAIL_PDF_SIGNED[kind].map(function (key) { return request[key]; }))
+      .join('\n');
+}
+
+function studioEmailValidPdfRequest_(request, kind) {
+  if (!studioEmailValidSummary_(request, STUDIO_EMAIL_PDF_FIELDS[kind])) return false;
+  if (kind !== 'summary' && !STUDIO_EMAIL_LABEL.test(request.label)) return false;
+  if (kind === 'plan_review' && !STUDIO_EMAIL_REVIEW_URL.test(request.review_url)) return false;
+  return true;
+}
+
+function studioEmailValidSummary_(request, fields) {
   var keys = Object.keys(request).sort();
-  if (keys.join(',') !== 'email,kind,nonce,pdf,pdf_sha256,signature,timestamp') return false;
+  if (keys.join(',') !== (fields || STUDIO_EMAIL_PDF_FIELDS.summary)) return false;
   if (!keys.every(function (key) { return typeof request[key] === 'string'; })) return false;
   if (!/^[1-9][0-9]{9}$/.test(request.timestamp)) return false;
   if (!studioEmailFresh_(request.timestamp, Date.now() / 1000)) return false;

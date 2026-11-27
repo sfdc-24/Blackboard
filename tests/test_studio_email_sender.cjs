@@ -259,3 +259,99 @@ test('summary shape checks: extra fields, bad base64, oversized sign-in bodies',
   assert.equal(app.sent.length, 0);
   assert.deepEqual(app.postRaw(JSON.stringify(signedRequest({ nonce: 'a'.repeat(32) }))), { ok: true });
 });
+
+// The plan kinds: a one-page plan drafted after a call. Made-up people only.
+const planPdf = Buffer.from('%PDF-1.3\nA proof of concept quote\n%%EOF\n', 'latin1');
+const reviewUrl = 'https://room.example.test/review.html#pl_0123456789abcdef0123';
+
+function signedPlan(kind, overrides = {}, bytes = planPdf) {
+  const body = {
+    kind,
+    timestamp: String(Math.floor(Date.now() / 1000)),
+    nonce: 'abcdefabcdefabcdefabcdefabcdef01',
+    email,
+    pdf: bytes.toString('base64'),
+    pdf_sha256: createHash('sha256').update(bytes).digest('hex'),
+    label: 'Sam, a small bakery',
+    ...(kind === 'plan_review' ? { review_url: reviewUrl } : {}),
+    ...overrides,
+  };
+  const signedFields = kind === 'plan_review' ? [body.review_url, body.label] : [body.label];
+  body.signature = createHmac('sha256', secret)
+    .update([kind, body.timestamp, body.nonce, body.email, body.pdf_sha256, ...signedFields].join('\n'))
+    .digest('hex');
+  return body;
+}
+
+test('a signed plan review goes to the operator once, with the link in the body and the PDF attached', () => {
+  const app = harness();
+  const request = signedPlan('plan_review');
+  assert.deepEqual(app.post(request), { ok: true });
+  assert.equal(app.sent.length, 1);
+  const [to, subject, text, options] = app.sent[0];
+  assert.equal(to, email);
+  assert.match(subject, /^Review: a proof of concept quote for Sam, a small bakery$/);
+  assert.equal(text.includes(reviewUrl), true);
+  assert.match(text, /Nothing reaches the guest until you press Approve and send/);
+  assert.equal(options.attachments[0].name, 'SFDC24-proof-of-concept-quote-review.pdf');
+  assert.deepEqual(Buffer.from(options.attachments[0].bytes.map((b) => b & 255)), planPdf);
+  assert.deepEqual(app.post(request), { ok: false });
+  assert.equal(app.sent.length, 1);
+  assert.equal(JSON.stringify(app.logs).includes(email), false);
+});
+
+test('a plan review never leaves the allowlist, whatever the properties say', () => {
+  const app = harness({ extraProperties: [['STUDIO_SUMMARY_ANY_RECIPIENT', 'true'], ['STUDIO_PLAN_ANY_RECIPIENT', 'true']] });
+  assert.deepEqual(app.post(signedPlan('plan_review', { email: 'sam@bakery.example' })), { ok: false });
+  assert.equal(app.sent.length, 0);
+});
+
+test('an approved plan reaches a guest only once the owner opens the plan kind', () => {
+  const closed = harness();
+  assert.deepEqual(closed.post(signedPlan('plan', { email: 'sam@bakery.example', label: 'Sam' })), { ok: false });
+  const summaryOnly = harness({ extraProperties: [['STUDIO_SUMMARY_ANY_RECIPIENT', 'true']] });
+  assert.deepEqual(summaryOnly.post(signedPlan('plan', { email: 'sam@bakery.example', label: 'Sam' })), { ok: false });
+  assert.equal(closed.sent.length + summaryOnly.sent.length, 0);
+  const open = harness({ extraProperties: [['STUDIO_PLAN_ANY_RECIPIENT', 'true']] });
+  assert.deepEqual(open.post(signedPlan('plan', { email: 'sam@bakery.example', label: 'Sam' })), { ok: true });
+  const [to, subject, text, options] = open.sent[0];
+  assert.equal(to, 'sam@bakery.example');
+  assert.equal(subject, 'Your proof of concept quote from SFDC24');
+  assert.match(text, /^Hi Sam,\n\n/);
+  assert.match(text, /its price and turnaround/);
+  assert.equal(/\d/.test(text.replace(/SFDC24/g, '')), false, 'no figure in the email body: they are in the attached quote');
+  assert.equal(options.attachments[0].name, 'SFDC24-proof-of-concept-quote.pdf');
+  // Opening plans opens neither summaries nor the sign-in code.
+  assert.deepEqual(open.post(signedSummary({ email: 'sam@bakery.example' })), { ok: false });
+  assert.deepEqual(open.post(signedRequest({ email: 'sam@bakery.example' })), { ok: false });
+  assert.equal(open.sent.length, 1);
+});
+
+test('each kind signs its own fields: no kind is accepted under another, and the link and label are signed', () => {
+  const app = harness({ extraProperties: [['STUDIO_PLAN_ANY_RECIPIENT', 'true']] });
+  const review = signedPlan('plan_review');
+  const plan = signedPlan('plan');
+  const summary = signedSummary();
+  assert.deepEqual(app.post({ ...review, review_url: 'https://elsewhere.example.test/x' }), { ok: false });
+  assert.deepEqual(app.post({ ...review, label: 'Someone else' }), { ok: false });
+  assert.deepEqual(app.post({ ...plan, label: 'Someone else' }), { ok: false });
+  const { review_url: _dropped, ...asPlan } = review;
+  assert.deepEqual(app.post({ ...asPlan, kind: 'plan' }), { ok: false });
+  assert.deepEqual(app.post({ ...plan, kind: 'summary' }), { ok: false });
+  assert.deepEqual(app.post({ ...summary, kind: 'plan', label: '' }), { ok: false });
+  assert.equal(app.sent.length, 0);
+});
+
+test('plan shape checks: link, label and PDF', () => {
+  const app = harness({ extraProperties: [['STUDIO_PLAN_ANY_RECIPIENT', 'true']] });
+  assert.deepEqual(app.post(signedPlan('plan_review', { review_url: 'http://room.example.test/review.html' })), { ok: false });
+  assert.deepEqual(app.post(signedPlan('plan_review', { review_url: 'javascript:alert(1)' })), { ok: false });
+  assert.deepEqual(app.post(signedPlan('plan_review', { label: 'a@b.example' })), { ok: false });
+  assert.deepEqual(app.post(signedPlan('plan', { label: '<b>Sam</b>' })), { ok: false });
+  assert.deepEqual(app.post(signedPlan('plan', { label: 'x'.repeat(81) })), { ok: false });
+  assert.deepEqual(app.post({ ...signedPlan('plan'), extra: 'x' }), { ok: false });
+  assert.deepEqual(app.post(signedPlan('plan', { nonce: '2'.repeat(32) }, Buffer.from('<html>no</html>', 'latin1'))), { ok: false });
+  assert.equal(app.sent.length, 0);
+  assert.deepEqual(app.post(signedPlan('plan', { label: '' , nonce: '3'.repeat(32) })), { ok: true });
+  assert.equal(app.sent[0][2].startsWith('Thank you'), true);
+});

@@ -38,3 +38,35 @@ asks for a summary to an address it verified at sign-in.
 
 The new kind needs no new OAuth scope: `script.send_mail` covers attachments.
 Deploy it as a new version of the same web app deployment so the URL is kept.
+
+## A plan for review, and the approved plan (kinds `plan_review` and `plan`)
+
+After a call, a server drafts a one-page plan and sends the operator a review
+copy; the person it was written for gets their copy only after the operator
+approves it on a review page. Two kinds carry those PDFs, each with its own
+fields and its own signature, so neither can be replayed as the other, as a
+summary or as a sign-in code:
+
+| kind | fields (all strings) | signed, one per line | recipient |
+|---|---|---|---|
+| `plan_review` | `kind`, `timestamp`, `nonce`, `email`, `pdf`, `pdf_sha256`, `review_url`, `label`, `signature` | `plan_review`, timestamp, nonce, email, PDF digest, `review_url`, `label` | the operator allowlist, always |
+| `plan` | `kind`, `timestamp`, `nonce`, `email`, `pdf`, `pdf_sha256`, `label`, `signature` | `plan`, timestamp, nonce, email, PDF digest, `label` | the allowlist, or anyone when `STUDIO_PLAN_ANY_RECIPIENT` is exactly `true` |
+
+`label` is at most 80 characters with no control character, angle bracket or
+at sign: the review email's subject ("Review: a proof of concept quote for ...")
+and the approved plan's greeting ("Hi ..."). `review_url` is an `https` link
+with a short plain path, put in the review email's body. The PDF checks, the
+nonce ledger and the freshness window are the summary's.
+`STUDIO_SUMMARY_ANY_RECIPIENT` does not open `plan`, and
+`STUDIO_PLAN_ANY_RECIPIENT` does not open `summary` or the sign-in code.
+
+### Deploying the plan kinds (the owner, in his own account)
+
+1. Open this script at script.google.com, signed in as the account that
+   deploys it, and replace `Code.gs` with this file from `main`.
+2. Project Settings, Script Properties: check that `STUDIO_OPERATOR_EMAILS`
+   lists the address that should receive review copies; add
+   `STUDIO_PLAN_ANY_RECIPIENT` = `true` so an approved plan can reach a guest.
+3. Deploy, Manage deployments, edit the existing web app deployment, choose
+   Version: New version, then Deploy. The URL stays the same, and no new
+   permission is asked for (`script.send_mail` already covers attachments).
