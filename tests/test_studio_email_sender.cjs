@@ -355,3 +355,59 @@ test('plan shape checks: link, label and PDF', () => {
   assert.deepEqual(app.post(signedPlan('plan', { label: '' , nonce: '3'.repeat(32) })), { ok: true });
   assert.equal(app.sent[0][2].startsWith('Thank you'), true);
 });
+
+// The feedback kind: a guest's feedback after a trial session, to the operator only. Made-up businesses only.
+const feedbackPdf = Buffer.from('%PDF-1.3\nGuest feedback from a solo demo\n%%EOF\n', 'latin1');
+
+function signedFeedback(overrides = {}, bytes = feedbackPdf) {
+  const body = {
+    kind: 'feedback',
+    timestamp: String(Math.floor(Date.now() / 1000)),
+    nonce: 'fedcbafedcbafedcbafedcbafedcba01',
+    email,
+    pdf: bytes.toString('base64'),
+    pdf_sha256: createHash('sha256').update(bytes).digest('hex'),
+    label: 'Harbour Bakery trial',
+    ...overrides,
+  };
+  body.signature = createHmac('sha256', secret)
+    .update(['feedback', body.timestamp, body.nonce, body.email, body.pdf_sha256, body.label].join('\n'))
+    .digest('hex');
+  return body;
+}
+
+test('a signed feedback digest goes to the operator once, with the PDF attached and no guest words in the body', () => {
+  const app = harness();
+  const request = signedFeedback();
+  assert.deepEqual(app.post(request), { ok: true });
+  assert.equal(app.sent.length, 1);
+  const [to, subject, text, options] = app.sent[0];
+  assert.equal(to, email);
+  assert.equal(subject, 'Guest feedback from a solo demo: Harbour Bakery trial');
+  assert.match(text, /logged for you only/);
+  assert.equal(options.attachments[0].name, 'SFDC24-guest-feedback.pdf');
+  assert.deepEqual(Buffer.from(options.attachments[0].bytes.map((b) => b & 255)), feedbackPdf);
+  assert.deepEqual(app.post(request), { ok: false }, 'a nonce is spent once');
+  assert.equal(app.sent.length, 1);
+  assert.equal(JSON.stringify(app.logs).includes(email), false);
+});
+
+test('feedback never leaves the allowlist, whatever the properties say', () => {
+  const app = harness({ extraProperties: [['STUDIO_SUMMARY_ANY_RECIPIENT', 'true'], ['STUDIO_PLAN_ANY_RECIPIENT', 'true']] });
+  assert.deepEqual(app.post(signedFeedback({ email: 'guest@bakery.example' })), { ok: false });
+  assert.equal(app.sent.length, 0);
+});
+
+test('feedback signs its own kind and label, and keeps the PDF and label checks', () => {
+  const app = harness({ extraProperties: [['STUDIO_PLAN_ANY_RECIPIENT', 'true']] });
+  const feedback = signedFeedback();
+  assert.deepEqual(app.post({ ...feedback, kind: 'plan' }), { ok: false });
+  assert.deepEqual(app.post({ ...signedPlan('plan'), kind: 'feedback' }), { ok: false });
+  assert.deepEqual(app.post({ ...feedback, label: 'Someone else' }), { ok: false });
+  assert.deepEqual(app.post(signedFeedback({ label: 'a@b.example' })), { ok: false });
+  assert.deepEqual(app.post({ ...feedback, extra: 'x' }), { ok: false });
+  assert.deepEqual(app.post(signedFeedback({ nonce: '4'.repeat(32) }, Buffer.from('<html>no</html>', 'latin1'))), { ok: false });
+  assert.equal(app.sent.length, 0);
+  assert.deepEqual(app.post(signedFeedback({ label: '', nonce: '5'.repeat(32) })), { ok: true });
+  assert.equal(app.sent[0][1], 'Guest feedback from a solo demo');
+});

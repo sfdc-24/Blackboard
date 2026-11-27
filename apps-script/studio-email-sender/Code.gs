@@ -9,11 +9,15 @@
  * operator allowlist only) and "plan" (the approved copy, to the person it was
  * written for). Each is signed over its own kind, so no kind's signature is
  * ever accepted as another's.
+ *
+ * Kind "feedback": a one-page digest of what a guest said when asked for
+ * feedback after a trial session, to the operator allowlist only (no property
+ * opens it to anyone else).
  */
 var STUDIO_EMAIL_CODE_MAX_CHARS = 2048;
 var STUDIO_EMAIL_SUMMARY_MAX_CHARS = 4000000;
 var STUDIO_EMAIL_PDF_MAX_CHARS = 3900000;
-var STUDIO_EMAIL_PDF_KINDS = ['summary', 'plan_review', 'plan'];
+var STUDIO_EMAIL_PDF_KINDS = ['summary', 'plan_review', 'plan', 'feedback'];
 
 function doPost(e) {
   try {
@@ -49,7 +53,7 @@ function doPost(e) {
     }
     // A summary or an approved plan may go to someone off the allowlist only
     // when the owner opens that kind on purpose, each with its own property.
-    // The sign-in code and the plan's review copy always require the allowlist.
+    // The sign-in code, the plan's review copy and feedback always require the allowlist.
     var anyRecipient = (summary &&
         properties.getProperty('STUDIO_SUMMARY_ANY_RECIPIENT') === 'true') ||
         (kind === 'plan' && properties.getProperty('STUDIO_PLAN_ANY_RECIPIENT') === 'true');
@@ -139,6 +143,18 @@ function doPost(e) {
       );
       return studioEmailResponse_(true);
     }
+    if (kind === 'feedback') {
+      MailApp.sendEmail(
+        request.email,
+        'Guest feedback from a solo demo' + (request.label ? ': ' + request.label : ''),
+        'A guest left feedback at the end of a solo demo session. It is attached, ' +
+            'with the session time. It was logged for you only; nothing was done ' +
+            'with it in the call.',
+        { name: 'SFDC24', attachments: [
+          Utilities.newBlob(pdfBytes, 'application/pdf', 'SFDC24-guest-feedback.pdf')] }
+      );
+      return studioEmailResponse_(true);
+    }
     if (kind === 'plan') {
       MailApp.sendEmail(
         request.email,
@@ -185,9 +201,10 @@ function studioEmailValidRequest_(request) {
 var STUDIO_EMAIL_PDF_FIELDS = {
   summary: 'email,kind,nonce,pdf,pdf_sha256,signature,timestamp',
   plan_review: 'email,kind,label,nonce,pdf,pdf_sha256,review_url,signature,timestamp',
-  plan: 'email,kind,label,nonce,pdf,pdf_sha256,signature,timestamp'
+  plan: 'email,kind,label,nonce,pdf,pdf_sha256,signature,timestamp',
+  feedback: 'email,kind,label,nonce,pdf,pdf_sha256,signature,timestamp'
 };
-var STUDIO_EMAIL_PDF_SIGNED = { summary: [], plan_review: ['review_url', 'label'], plan: ['label'] };
+var STUDIO_EMAIL_PDF_SIGNED = { summary: [], plan_review: ['review_url', 'label'], plan: ['label'], feedback: ['label'] };
 // A label is a short plain name for the subject or greeting: no control
 // character, no markup and no address.
 var STUDIO_EMAIL_LABEL = /^[^\u0000-\u001f\u007f<>@]{0,80}$/;
