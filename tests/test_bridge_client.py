@@ -975,12 +975,14 @@ class TheRealBoundary(Harness, unittest.TestCase):
         for the probe only (conference docs/PERSONA-WRITE-CONFIRMATION-A1.md, section 12). So the client does
         not ask with it, and the service refuses it should anything ask anyway. Neither half alone is enough."""
         conn = FakeRedis()
-        # Since the owner's 2026-11-08 go, claude-code-cli is the one fleet agent on /op, by its own account, and grok,
-        # Codex are doorbell callers (each its own lane only), and gemini is a fleet agent on two surfaces, the laptop's
+        # Since the owner's 2026-11-08 go, claude-code-cli is a fleet agent on /op, by its own account.
+        # claude-mobile is a fleet-agent caller, as itself, by fleet-claude-mobile@. Grok and Codex are
+        # doorbell callers (each its own lane only), and gemini is a fleet agent on two surfaces, the laptop's
         # fleet-gemini@ and the gemini-waker job's waker-gemini@ (GEMINI-RULING-DIRECT-REDIS-OK-20261121T0153Z): the
         # client maps them all, as the service does.
         self.assertEqual({"conference-chair@sfdc24.iam.gserviceaccount.com": "conference-chair",
                           "fleet-claude-code-cli@sfdc24.iam.gserviceaccount.com": "claude-code-cli",
+                          "fleet-claude-mobile@sfdc24.iam.gserviceaccount.com": "claude-mobile",
                           "fleet-grok@sfdc24.iam.gserviceaccount.com": "grok",
                           "fleet-codex@sfdc24.iam.gserviceaccount.com": "chatgpt-codex-desktop",
                           "fleet-gemini@sfdc24.iam.gserviceaccount.com": "gemini",
