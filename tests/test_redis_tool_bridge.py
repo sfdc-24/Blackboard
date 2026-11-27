@@ -916,15 +916,19 @@ class TheOpEndpoint(unittest.TestCase):
         # its own lane and nothing else (Codex on #489). claude-code-cli's fleet-agent line covers its own. Gemini is a
         # FLEET AGENT on two surfaces, the laptop's fleet-gemini@ and the gemini-waker job's waker-gemini@, both acting
         # as gemini under its existing access line (GEMINI-RULING-DIRECT-REDIS-OK-20261121T0153Z).
+        # claude-mobile is a fleet-agent caller, as itself, by fleet-claude-mobile@. Its access line already
+        # writes fleet: and conf:; this line does not widen it.
         cli = "fleet-claude-code-cli@sfdc24.iam.gserviceaccount.com"
+        mobile = "fleet-claude-mobile@sfdc24.iam.gserviceaccount.com"
         grok = "fleet-grok@sfdc24.iam.gserviceaccount.com"
         codex = "fleet-codex@sfdc24.iam.gserviceaccount.com"
         gemini = "fleet-gemini@sfdc24.iam.gserviceaccount.com"
         waker = "waker-gemini@sfdc24.iam.gserviceaccount.com"
-        self.assertEqual({AYA: bridge_op.PROBE, CHAIR: bridge_op.CHAIR, cli: bridge_op.FLEET, grok: bridge_op.DOORBELL,
+        self.assertEqual({AYA: bridge_op.PROBE, CHAIR: bridge_op.CHAIR, cli: bridge_op.FLEET,
+                          mobile: bridge_op.FLEET, grok: bridge_op.DOORBELL,
                           codex: bridge_op.DOORBELL, gemini: bridge_op.FLEET, waker: bridge_op.FLEET},
                          purposes, "every line says what it is for")
-        self.assertEqual({CHAIR: "conference-chair", cli: "claude-code-cli", grok: "grok",
+        self.assertEqual({CHAIR: "conference-chair", cli: "claude-code-cli", mobile: "claude-mobile", grok: "grok",
                           codex: "chatgpt-codex-desktop", gemini: "gemini", waker: "gemini"}, callers,
                          "an account admitted for the probe acts as nobody; the fleet agent acts as itself")
         self.assertEqual({CHAIR: ("claude",)}, bridge_op.load_personas())

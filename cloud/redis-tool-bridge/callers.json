@@ -20,6 +20,10 @@
       "principal": "claude-code-cli",
       "for": "fleet-agent"
     },
+    "fleet-claude-mobile@sfdc24.iam.gserviceaccount.com": {
+      "principal": "claude-mobile",
+      "for": "fleet-agent"
+    },
     "fleet-codex@sfdc24.iam.gserviceaccount.com": {
       "principal": "chatgpt-codex-desktop",
       "for": "doorbell"
