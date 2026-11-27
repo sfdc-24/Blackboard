@@ -51,6 +51,7 @@ summary or as a sign-in code:
 |---|---|---|---|
 | `plan_review` | `kind`, `timestamp`, `nonce`, `email`, `pdf`, `pdf_sha256`, `review_url`, `label`, `signature` | `plan_review`, timestamp, nonce, email, PDF digest, `review_url`, `label` | the operator allowlist, always |
 | `plan` | `kind`, `timestamp`, `nonce`, `email`, `pdf`, `pdf_sha256`, `label`, `signature` | `plan`, timestamp, nonce, email, PDF digest, `label` | the allowlist, or anyone when `STUDIO_PLAN_ANY_RECIPIENT` is exactly `true` |
+| `feedback` | `kind`, `timestamp`, `nonce`, `email`, `pdf`, `pdf_sha256`, `label`, `signature` | `feedback`, timestamp, nonce, email, PDF digest, `label` | the operator allowlist, always |
 
 `label` is at most 80 characters with no control character, angle bracket or
 at sign: the review email's subject ("Review: a proof of concept quote for ...")
@@ -70,3 +71,14 @@ nonce ledger and the freshness window are the summary's.
 3. Deploy, Manage deployments, edit the existing web app deployment, choose
    Version: New version, then Deploy. The URL stays the same, and no new
    permission is asked for (`script.send_mail` already covers attachments).
+
+## Guest feedback (kind `feedback`)
+
+After a guest's trial session a server sends the operator a one-page digest of
+what the guest said when asked for feedback. Its fields and signature are the
+`plan` kind's under its own kind name (`feedback`), so neither is ever accepted
+as the other. It goes to the operator allowlist only: no Script Property opens
+it to anyone else. The subject is "Guest feedback from a solo demo" and the
+label after it; the body carries no word of the guest's, which stay in the
+attached PDF. Deploy it as a new version of the same web app deployment, as
+above; no new permission is asked for.
