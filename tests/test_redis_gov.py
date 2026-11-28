@@ -1507,3 +1507,26 @@ class TheSoloBriefLivesNoLongerThanAPass(unittest.TestCase):
     def test_other_conf_keys_keep_their_ttl(self):
         self.assertEqual(604800, gov.ttl_for(ACL, "conf:briefing"))
         self.assertEqual(86400, gov.ttl_for(ACL, "conf:persona:rigel"))
+
+
+class TheGatewayWritesTheSoloBriefAndNothingElse(unittest.TestCase):
+    """The conference gateway's principal (pending the owner's approval, D2): it reads and writes
+    conf:solo_brief: and nothing else. The bridge's writer door narrows it further to 16-hex keys."""
+
+    KEY = "conf:solo_brief:0123456789abcdef"
+
+    def test_it_puts_reads_and_deletes_a_brief(self):
+        conn = FakeRedis()
+        val = base64.b64encode(json.dumps({"company": "Example Co"}).encode("utf-8")).decode("ascii")
+        self.assertTrue(run(conn, "conference-gateway", "hput", self.KEY, val=val, enc="b64")["ok"])
+        self.assertEqual({"company": "Example Co"}, run(conn, "conference-gateway", "hgetall", self.KEY)["value"])
+        self.assertTrue(run(conn, "conference-gateway", "del", self.KEY)["ok"])
+
+    def test_every_other_namespace_is_refused(self):
+        conn = FakeRedis()
+        for op, key in (("set", "conf:briefing"), ("hset", "conf:lessons"), ("get", "conf:briefing"),
+                        ("xadd", "fleet:inbox:grok"), ("xrange", "fleet:inbox:grok"), ("get", "fleet:x"),
+                        ("set", "proj:x"), ("get", "proj:x"), ("set", "conf:persona:20261014:claude")):
+            out = run(conn, "conference-gateway", op, key, field="f" if op == "hset" else "", val="x")
+            self.assertFalse(out["ok"], (op, key))
+            self.assertIn("refused", out)

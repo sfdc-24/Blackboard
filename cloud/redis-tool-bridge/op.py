@@ -81,6 +81,7 @@ THE BODY
     its line in callers.json, never the request:
         a fleet agent     may not state either member: a 400. Its own name is already the verified one.
         a doorbell        may not state either member: a 400, as a fleet agent.
+        a writer          may not state either member: a 400, as a fleet agent.
         the chair         must state both on every op: a 400 without them.
         a probe account   is admitted to the service for /probe and is refused here: a 403.
 
@@ -122,6 +123,17 @@ THE BODY
     "executed": false (doorbell_refusal). A 403 "refused" is TERMINAL for scripts/bridge_client.py, so a client is
     not moved to the board route around it. Whatever the access list allows the principal is not widened by this
     line; it is narrowed to these two.
+
+    THE WRITER (pending the owner's approval, callers.json how_to_change, D2): the conference gateway's solo
+    guest pass writes one public company brief per pass. A caller whose line says "for": "writer" acts as its
+    principal and may do three things, each on ONE key family, conf:solo_brief:<16 lower-case hex>, exactly as sent:
+        hput              the brief itself, the whole hash at once (redis_gov sets its 25 h TTL from the key)
+        hgetall           read it back
+        del               remove it at the pass's end
+    No field and no after; only hput carries a value. Every other op, every other key (a bad suffix among them),
+    and either form with anything more, is refused here, before any connection: a 403 "refused" with the door's
+    reason, "audit": "not recorded", "executed": false (writer_refusal). Its access line is narrowed to the same
+    prefix in scripts/redis_acl.json, so the two gates agree.
 
     THE HOUR, KEPT IN REDIS (Gemini on e6433ea, GROK-407FIX-428REV-0225Z: the service scales to zero, and a count
     kept only in memory starts again at nought with every new instance). Each ceiling is held twice:
@@ -175,11 +187,14 @@ MEMBERS = ("op", "key", "field", "val", "enc", "count", "after", "expect", "auth
 # inside any other op is an unknown outcome. Restated from redis_gov.OPS_READ and held equal by a test.
 READS = ("get", "hgetall", "xrange")
 # What a caller is FOR: its line in callers.json says, and a line that says anything else maps nobody.
-FLEET, CHAIR, PROBE, DOORBELL = "fleet-agent", "chair", "probe", "doorbell"
-PURPOSES = (FLEET, CHAIR, PROBE, DOORBELL)
+FLEET, CHAIR, PROBE, DOORBELL, WRITER = "fleet-agent", "chair", "probe", "doorbell", "writer"
+PURPOSES = (FLEET, CHAIR, PROBE, DOORBELL, WRITER)
 # THE DOORBELL: a caller's own lane (redis_gov.WAIT_LANE), and the two ops it runs there.
 DOORBELL_LANE = "fleet:inbox:"
 DOORBELL_OPS = ("xwait", "xrange")
+# THE WRITER: the one key family it touches, and the three ops it runs there.
+WRITER_OPS = ("hput", "hgetall", "del")
+_SOLO_BRIEF_KEY = re.compile(r"conf:solo_brief:[0-9a-f]{16}")
 # CAPACITY: the ops that hold their request for a wait (redis_gov.OPS_WAIT, restated and held equal by a test),
 # how many may be held at once on this instance, and how long a caller turned away is told to wait.
 WAITS = ("xwait",)
@@ -228,6 +243,8 @@ def _lines(path=None) -> dict:
                                                                 probe only, which /op refuses
         {"principal": ..., "for": "doorbell"}                   its own lane's doorbell and nothing else
                                                                 (THE DOORBELL, doorbell_refusal)
+        {"principal": ..., "for": "writer"}                     conf:solo_brief:<16 hex> and nothing else
+                                                                (THE WRITER, writer_refusal)
         {"principal": ..., "for": "chair", "personas": [...]}   the conference chair, and the personas it may
                                                                 name: one to MAX_PERSONAS names, each once
         that line plus "rooms": [...]                          the rooms whose canvas it may post to: one to
@@ -247,7 +264,7 @@ def _lines(path=None) -> dict:
         personas, rooms = (), ()
         if isinstance(line, str):
             who, purpose = line, FLEET
-        elif isinstance(line, dict) and set(line) == {"principal", "for"} and line["for"] in (FLEET, PROBE, DOORBELL):
+        elif isinstance(line, dict) and set(line) == {"principal", "for"} and line["for"] in (FLEET, PROBE, DOORBELL, WRITER):
             who, purpose = line["principal"], line["for"]
         elif isinstance(line, dict) and line.get("for") == CHAIR and set(line) in (
                 {"principal", "for", "personas"}, {"principal", "for", "personas", "rooms"}):
@@ -404,6 +421,20 @@ def doorbell_refusal(request: dict, who: str) -> str:
     return ""
 
 
+def writer_refusal(request: dict) -> str:
+    """Why this is not an op a writer caller may run, in words fit for the caller; "" when it is. The op and the
+    key as they were SENT. Never the key it was sent, and never the value."""
+    if request["op"] not in WRITER_OPS:
+        return "a writer caller may run hput, hgetall and del on a solo brief, and nothing else"
+    if not _SOLO_BRIEF_KEY.fullmatch(request["key"]):
+        return "a writer caller touches conf:solo_brief:<16 lower-case hex> and no other key"
+    if request["field"] or request["after"]:
+        return "a writer op takes no field and no after"
+    if request["op"] != "hput" and (request["val"] or request["enc"]):
+        return "only a writer's hput carries a value"
+    return ""
+
+
 def parse(raw: bytes) -> tuple:
     """(request dict, None) or (None, why). The why is for our log; the caller gets 'bad request'."""
     try:
@@ -498,6 +529,12 @@ def handle(caller: str, raw: bytes, connect, log, callers=None, gov=None, acl=No
         why = doorbell_refusal(request, who)
         if why:
             log("op by %s as %s: not a doorbell op (%s)" % (caller, who, why))
+            return 403, {"error": "refused", "reason": why, "executed": False, "audit": "not recorded",
+                         "caller": caller, "principal": who}
+    if purpose == WRITER:
+        why = writer_refusal(request)
+        if why:
+            log("op by %s as %s: not a writer op (%s)" % (caller, who, why))
             return 403, {"error": "refused", "reason": why, "executed": False, "audit": "not recorded",
                          "caller": caller, "principal": who}
     if op in WAITS:

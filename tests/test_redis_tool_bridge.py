@@ -935,12 +935,17 @@ class TheOpEndpoint(unittest.TestCase):
         codex = "fleet-codex@sfdc24.iam.gserviceaccount.com"
         gemini = "fleet-gemini@sfdc24.iam.gserviceaccount.com"
         waker = "waker-gemini@sfdc24.iam.gserviceaccount.com"
+        # The conference gateway (pending the owner's approval, D2) is a WRITER caller, as conference-gateway: one
+        # key family, conf:solo_brief:<16 hex>, and nothing else (writer_refusal, and its access line).
+        gateway = "conference-gateway@sfdc24.iam.gserviceaccount.com"
         self.assertEqual({AYA: bridge_op.PROBE, CHAIR: bridge_op.CHAIR, cli: bridge_op.FLEET,
                           mobile: bridge_op.FLEET, grok: bridge_op.DOORBELL,
-                          codex: bridge_op.DOORBELL, gemini: bridge_op.FLEET, waker: bridge_op.FLEET},
+                          codex: bridge_op.DOORBELL, gemini: bridge_op.FLEET, waker: bridge_op.FLEET,
+                          gateway: bridge_op.WRITER},
                          purposes, "every line says what it is for")
         self.assertEqual({CHAIR: "conference-chair", cli: "claude-code-cli", mobile: "claude-mobile", grok: "grok",
-                          codex: "chatgpt-codex-desktop", gemini: "gemini", waker: "gemini"}, callers,
+                          codex: "chatgpt-codex-desktop", gemini: "gemini", waker: "gemini",
+                          gateway: "conference-gateway"}, callers,
                          "an account admitted for the probe acts as nobody; the fleet agent acts as itself")
         self.assertEqual({CHAIR: ("claude",)}, bridge_op.load_personas())
         self.assertEqual({CHAIR: ("workshop",)}, bridge_op.load_rooms(), "the owner named one room")
@@ -970,6 +975,23 @@ class TheOpEndpoint(unittest.TestCase):
                 self.assertEqual(("xwait", "xrange"), bridge_op.DOORBELL_OPS)
                 for op in bridge_op.DOORBELL_OPS:
                     self.assertTrue(may(who, op, lane), "%s cannot %s %s" % (who, op, lane))
+                continue
+            if purposes[email] == bridge_op.WRITER:
+                # Both gates agree: the access line is the solo brief prefix and no more, and the door
+                # (writer_refusal) narrows it further to the 16-hex keys and three ops.
+                self.assertEqual({"read": ["conf:solo_brief:"], "write": ["conf:solo_brief:"]},
+                                 acl["principals"][who], "a writer's line is these entries and no more")
+                self.assertEqual(("hput", "hgetall", "del"), bridge_op.WRITER_OPS)
+                for op in bridge_op.WRITER_OPS:
+                    self.assertTrue(may(who, op, "conf:solo_brief:0123456789abcdef"), op)
+                self.assertEqual(90000, redis_gov.ttl_for(acl, "conf:solo_brief:0123456789abcdef"))
+                for op, key in (("set", "conf:briefing"), ("hput", "conf:briefing"), ("get", "conf:briefing"),
+                                ("hput", "conf:lessons"), ("hgetall", "conf:lessons"), ("set", "conf:x"),
+                                ("hput", "conf:persona:20261014:claude"), ("hset", "conf:canvas:workshop:chair"),
+                                ("xadd", "fleet:inbox:grok"), ("get", "fleet:x"), ("xrange", "fleet:inbox:grok"),
+                                ("set", "proj:x"), ("get", "proj:x"), ("xrange", "gov:audit"), ("set", "gov:x"),
+                                ("get", "v1:conf:room:x"), ("xadd", "lane:build"), ("hset", "stage:recover")):
+                    self.assertFalse(may(who, op, key), "the writer can %s %s" % (op, key))
                 continue
             self.assertEqual({"read": ["conf:persona:"], "write": ["conf:persona:", "conf:canvas:"]},
                              acl["principals"][who], "the chair's line is these entries and no more")
@@ -1072,6 +1094,9 @@ class TheOpEndpoint(unittest.TestCase):
             "door@x": {"principal": "Grok", "for": "doorbell"},            # its own lane's doorbell
             "doorp@x": {"principal": "grok", "for": "doorbell", "personas": ["claude"]},
             "doorr@x": {"principal": "grok", "for": "doorbell", "rooms": ["workshop"]},
+            "writer@x": {"principal": "Conference-Gateway", "for": "writer"},   # one key family
+            "writerp@x": {"principal": "conference-gateway", "for": "writer", "personas": ["claude"]},
+            "writerr@x": {"principal": "conference-gateway", "for": "writer", "rooms": ["workshop"]},
             "other@x": {"principal": "grok", "for": "admin"},              # for nothing this file knows
             "more@x": dict(chair, personas=["claude"], note="x"),          # a member too many
             "none@x": {"for": "chair", "personas": ["claude"]}, "blank@x": dict(chair, principal=" ", personas=["claude"]),
@@ -1096,9 +1121,10 @@ class TheOpEndpoint(unittest.TestCase):
             path = os.path.join(tmp, "callers.json")
             pathlib.Path(path).write_text(json.dumps({"callers": lines}), encoding="utf-8")
             self.assertEqual({"old@x": "grok", "agent@x": "grok", "chair@x": "conference-chair",
-                              "rooms@x": "conference-chair", "door@x": "grok"}, bridge_op.load_callers(path))
+                              "rooms@x": "conference-chair", "door@x": "grok", "writer@x": "conference-gateway"},
+                             bridge_op.load_callers(path))
             self.assertEqual({"old@x": "fleet-agent", "agent@x": "fleet-agent", "chair@x": "chair", "probe@x": "probe",
-                              "rooms@x": "chair", "door@x": "doorbell"},
+                              "rooms@x": "chair", "door@x": "doorbell", "writer@x": "writer"},
                              bridge_op.load_purposes(path))
             self.assertEqual({"chair@x": ("claude", "grok"), "rooms@x": ("claude",)}, bridge_op.load_personas(path))
             self.assertEqual({"rooms@x": ("workshop",)}, bridge_op.load_rooms(path))
@@ -1662,6 +1688,83 @@ class TheOpEndpoint(unittest.TestCase):
                 self.assertEqual((400, {"error": "bad request", "executed": False}), (code, self.said(out)))
                 self.assertIn("not the chair", self.log)
         self.assertEqual([], connected)
+
+    # --- THE WRITER (pending the owner's approval, D2): the conference gateway, by conference-gateway@, may hput,
+    # hgetall and del conf:solo_brief:<16 hex>, and nothing else. Through the committed file and the real handler.
+    GATEWAY = "conference-gateway@sfdc24.iam.gserviceaccount.com"
+    BRIEF = "conf:solo_brief:0123456789abcdef"
+
+    def as_gateway(self, body, **more):
+        return self.post(body, claims={"email": self.GATEWAY, "email_verified": True}, admitted=self.GATEWAY,
+                         committed=True, **more)
+
+    def test_the_writer_puts_reads_and_deletes_a_solo_brief_as_itself(self):
+        import json
+        brief = self.b64(json.dumps({"company": "Example Co", "summary": "public facts only"}))
+        code, out = self.as_gateway({"op": "hput", "key": self.BRIEF, "val": brief, "enc": "b64",
+                                     "expect": "conference-gateway"})
+        self.assertEqual((200, "conference-gateway"), (code, out["principal"]), out)
+        conn = self.conn
+        code, out = self.as_gateway({"op": "hgetall", "key": self.BRIEF}, conn=conn)
+        self.assertEqual((200, {"company": "Example Co", "summary": "public facts only"}), (code, out["value"]), out)
+        code, out = self.as_gateway({"op": "del", "key": self.BRIEF}, conn=conn)
+        self.assertEqual(200, code, out)
+        code, out = self.as_gateway({"op": "hgetall", "key": self.BRIEF}, conn=conn)
+        self.assertEqual((200, {}), (code, out["value"] or {}), out)
+        self.assertEqual(["hput", "hgetall", "del", "hgetall"], [entry["op"] for entry in conn.audit()])
+        last = conn.audit()[-1]
+        self.assertEqual(("conference-gateway", "bridge:" + self.GATEWAY), (last["actor"], last["via"]))
+
+    def test_the_writer_may_do_nothing_else_and_nothing_else_reaches_redis(self):
+        import json
+        connected = []
+
+        def connect():
+            connected.append(1)
+            return self.conn
+        val = {"val": self.b64(json.dumps({"company": "hunter2"})), "enc": "b64"}
+        bad_keys = ("conf:briefing", "conf:lessons", "conf:x", "fleet:inbox:grok", "fleet:x", "proj:x", "gov:audit",
+                    "conf:persona:20261014:claude", "conf:canvas:workshop:chair", "stage:recover",
+                    "conf:solo_brief:", "conf:solo_brief:0123456789abcde", "conf:solo_brief:0123456789abcdef0",
+                    "conf:solo_brief:0123456789ABCDEF", "conf:solo_brief:0123456789abcdeg",
+                    "conf:solo_brief:0123456789abcdef:x", " conf:solo_brief:0123456789abcdef",
+                    "conf:solo_brief:0123456789abcdef ", "conf:solo_brief:*", "conf:solo_brief_0123456789abcdef")
+        bodies = []
+        for key in bad_keys:
+            bodies += [{"op": "hput", "key": key, **val}, {"op": "hgetall", "key": key}, {"op": "del", "key": key}]
+        for op in ("get", "set", "hset", "xadd", "xrange", "xwait", "HPUT", "Del", "hgetall "):
+            bodies.append({"op": op, "key": self.BRIEF, "field": "f", "after": "0-0", **val})
+            bodies.append({"op": op, "key": self.BRIEF})
+        bodies += [{"op": "hput", "key": self.BRIEF, "field": "company", **val},
+                   {"op": "hgetall", "key": self.BRIEF, "after": "0-0"},
+                   {"op": "hgetall", "key": self.BRIEF, **val}, {"op": "del", "key": self.BRIEF, **val},
+                   {"op": "del", "key": self.BRIEF, "enc": "b64"}, {"op": "hgetall", "key": self.BRIEF, "field": "x"}]
+        for body in bodies:
+            with self.subTest(body=body):
+                code, out = self.as_gateway(body, connect=connect)
+                self.assertEqual((403, "refused", False, "not recorded", "conference-gateway"),
+                                 (code, out["error"], out["executed"], out["audit"], out["principal"]), out)
+                self.assertIn("writer", out["reason"])
+                self.assertIn("not a writer op", self.log)
+                self.assertNotIn("hunter2", self.log + out["reason"])
+        self.assertEqual(([], []), (connected, self.conn.audit()), "refused at the door, before any connection")
+        for body in ({"op": "hput", "key": self.BRIEF, "author": "claude", "request": "R-1", **val},
+                     {"op": "hgetall", "key": self.BRIEF, "author": "conference-gateway"},
+                     {"op": "del", "key": self.BRIEF, "request": "R-1"}):
+            with self.subTest(body=body):
+                code, out = self.as_gateway(body, connect=connect)
+                self.assertEqual((400, {"error": "bad request", "executed": False}), (code, self.said(out)))
+                self.assertIn("not the chair", self.log)
+        self.assertEqual([], connected)
+
+    def test_the_writer_s_reason_never_names_the_key_it_was_sent(self):
+        code, out = self.as_gateway({"op": "hgetall", "key": "conf:solo_brief:secretsecretsecret"})
+        self.assertEqual(403, code)
+        self.assertNotIn("secret", out["reason"] + self.log)
+
+    def test_the_writer_is_not_yet_on_the_deploy_allowlist(self):
+        """The owner's yes comes first (D2): the release session adds it to BRIDGE_CALLERS and grants run.invoker."""
+        self.assertNotIn("conference-gateway@", DEPLOY)
 
     def test_the_doorbell_s_reason_names_its_own_lane_and_never_the_key_it_was_sent(self):
         code, out = self.as_grok({"op": "xwait", "key": "fleet:inbox:secretlane", "after": "0-0"})
