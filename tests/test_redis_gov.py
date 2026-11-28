@@ -1468,3 +1468,42 @@ class NothingLeaks(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TheStageRecoveryKeyIsClaudeCodeClisAlone(unittest.TestCase):
+    """V13-S2a (SFDC24-ARCHITECTURE-V13 Rev 6, owner-approved Nov 27): only the stage manager,
+    claude-code-cli, may write stage:recover, and it lives five minutes. stage: is not a lane:, so the
+    stream-only role-lane rule does not apply to it."""
+
+    OTHERS = ("grok", "cursor", "claude-mobile", "gemini", "chatgpt-codex-desktop", "conference-chair",
+              "owner", "copilot", "claude-api", "pi1-cli")
+
+    def test_claude_code_cli_writes_reads_and_deletes_it(self):
+        conn = FakeRedis()
+        self.assertTrue(run(conn, "claude-code-cli", "hset", "stage:recover", field="cmd",
+                            val="clear_modal")["ok"])
+        self.assertEqual({"cmd": "clear_modal"}, run(conn, "claude-code-cli", "hgetall", "stage:recover")["value"])
+        self.assertTrue(run(conn, "claude-code-cli", "del", "stage:recover")["ok"])
+
+    def test_every_other_principal_is_refused(self):
+        for who in self.OTHERS:
+            conn = FakeRedis()
+            got = run(conn, who, "hset", "stage:recover", field="cmd", val="clear_modal")
+            self.assertFalse(got["ok"], who)
+            self.assertFalse(run(conn, who, "set", "stage:recover", val="x")["ok"], who)
+
+    def test_it_expires_in_five_minutes(self):
+        self.assertEqual(300, gov.ttl_for(ACL, "stage:recover"))
+
+
+class TheSoloBriefLivesNoLongerThanAPass(unittest.TestCase):
+    """V13-S2a: a solo pass lives at most 24 h (gateway solo.MAX_TTL_HOURS), so its public company brief
+    expires by 25 h at the latest, shorter than the 7-day conf: default. The call-end delete and the
+    read-time expiry check stay in greg-line; this is the backstop."""
+
+    def test_the_backstop_is_twenty_five_hours(self):
+        self.assertEqual(90000, gov.ttl_for(ACL, "conf:solo_brief:0123456789abcdef"))
+
+    def test_other_conf_keys_keep_their_ttl(self):
+        self.assertEqual(604800, gov.ttl_for(ACL, "conf:briefing"))
+        self.assertEqual(86400, gov.ttl_for(ACL, "conf:persona:rigel"))
