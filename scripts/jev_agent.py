@@ -161,6 +161,81 @@ def read_answer(question, answer):
     return None, None
 
 
+def ask_yesno(state, question, model=None):
+    """One raw P(yes) from Jev for an explicit (state, question) pair. Returns
+    (probability, None) or (None, reason). For programmatic callers (the J1/J2/J3
+    board-compliance tools) that already have their question and state and want the
+    float back, not ask()'s formatted text parsed out of a jev:spec row."""
+    key = _key()
+    if not key:
+        return None, "no JEV_API_KEY in the environment or .env"
+    text = str(state or "")[:CONTEXT_CHARS]
+    body = {"model": model or MODEL, "state": text,
+            "questions": {"q": {"type": "noul", "instructions": question}}}
+    request = urllib.request.Request(
+        SYSTEMONE, data=json.dumps(body).encode("utf-8"), method="POST",
+        headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+            data = json.loads(response.read().decode("utf-8") or "{}")
+    except urllib.error.HTTPError as error:
+        detail = ""
+        try:
+            detail = error.read().decode("utf-8", "replace")[:200]
+        except Exception:  # noqa: BLE001
+            pass
+        return None, "systemone HTTP %s: %s" % (error.code, detail or error.reason)
+    except Exception as error:  # noqa: BLE001 - callers report, never crash
+        return None, "systemone %s: %s" % (type(error).__name__, str(error)[:160])
+    if not isinstance(data, dict):
+        return None, "systemone answered a non-object"
+    answers = data.get("answers") if isinstance(data.get("answers"), dict) else {}
+    answer = answers.get("q")
+    if not isinstance(answer, dict) or not isinstance(answer.get("noul"), (int, float)):
+        return None, ("systemone shape mismatch; response keys: %s"
+                      % ", ".join(sorted(str(k) for k in data)[:10]))
+    return float(answer["noul"]), None
+
+
+def ask_choice(state, question, options, model=None):
+    """One (choice, confidence) pair from Jev for an explicit (state, question, options)
+    triple. Returns ((choice, confidence), None) or (None, reason). Sibling of
+    ask_yesno() for programmatic callers that need a "choice" decision rather than noul."""
+    key = _key()
+    if not key:
+        return None, "no JEV_API_KEY in the environment or .env"
+    if not (2 <= len(options) <= CHOICES_MAX) or len(set(options)) != len(options):
+        return None, "bad options: need 2..%d unique choices" % CHOICES_MAX
+    text = str(state or "")[:CONTEXT_CHARS]
+    body = {"model": model or MODEL, "state": text,
+            "questions": {"q": {"type": "choice", "instructions": question,
+                                "criteria": {name: name for name in options}}}}
+    request = urllib.request.Request(
+        SYSTEMONE, data=json.dumps(body).encode("utf-8"), method="POST",
+        headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+            data = json.loads(response.read().decode("utf-8") or "{}")
+    except urllib.error.HTTPError as error:
+        detail = ""
+        try:
+            detail = error.read().decode("utf-8", "replace")[:200]
+        except Exception:  # noqa: BLE001
+            pass
+        return None, "systemone HTTP %s: %s" % (error.code, detail or error.reason)
+    except Exception as error:  # noqa: BLE001 - callers report, never crash
+        return None, "systemone %s: %s" % (type(error).__name__, str(error)[:160])
+    if not isinstance(data, dict):
+        return None, "systemone answered a non-object"
+    answers = data.get("answers") if isinstance(data.get("answers"), dict) else {}
+    answer = answers.get("q")
+    if not isinstance(answer, dict) or answer.get("choice") is None:
+        return None, ("systemone shape mismatch; response keys: %s"
+                      % ", ".join(sorted(str(k) for k in data)[:10]))
+    conf = answer.get("confidence")
+    return (str(answer["choice"]), float(conf) if isinstance(conf, (int, float)) else None), None
+
+
 def ask(prompt, model=None):
     """One typed decision from Jev. Returns (text, route) or (None, reason).
 
